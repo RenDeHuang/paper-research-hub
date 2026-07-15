@@ -49,7 +49,26 @@ _EMAIL_PATTERN = re.compile(
     r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
     flags=re.IGNORECASE,
 )
-_URL_PATTERN = re.compile(r"https?://[^\s<>{}\[\]\"']+")
+_URL_PATTERN = re.compile(r"""https?://[^\s<>{}\[\]"'`*)]+""")
+_MAG_VALUE = re.compile(r"^\d+$")
+_PMID_PREFIX = re.compile(
+    r"^(?:"
+    r"https?://pubmed\.ncbi\.nlm\.nih\.gov/"
+    r"|https?://www\.ncbi\.nlm\.nih\.gov/pubmed/"
+    r"|pmid:"
+    r")",
+    flags=re.IGNORECASE,
+)
+_PMID_VALUE = re.compile(r"^\d+$")
+_PMCID_PREFIX = re.compile(
+    r"^(?:"
+    r"https?://(?:www\.)?ncbi\.nlm\.nih\.gov/pmc/articles/"
+    r"|https?://pmc\.ncbi\.nlm\.nih\.gov/articles/"
+    r"|pmcid:"
+    r")",
+    flags=re.IGNORECASE,
+)
+_PMCID_VALUE = re.compile(r"^PMC\d+$")
 _REPOSITORY_HOSTS = {
     "github.com": "github",
     "gitlab.com": "gitlab",
@@ -466,10 +485,25 @@ def _external_identifiers(
             ),
             normalize_semantic_scholar_paper_id,
         ),
+        (
+            "mag",
+            id_map.get("mag"),
+            _normalize_mag_id,
+        ),
+        (
+            "pmid",
+            id_map.get("pmid"),
+            _normalize_pmid,
+        ),
+        (
+            "pmcid",
+            id_map.get("pmcid"),
+            _normalize_pmcid,
+        ),
     )
     identifiers: list[ExternalIdentifierData] = []
     for scheme, raw_value, normalizer in candidates:
-        value = _string(raw_value)
+        value = _identifier_string(raw_value)
         normalized = normalizer(value)
         if value is None or normalized is None:
             continue
@@ -739,10 +773,11 @@ def _code_repositories(
             if normalized is None:
                 continue
             provider, normalized_url, repository_name = normalized
+            repository_url = _clean_repository_url(match.group(0))
             repositories[normalized_url] = CodeRepositoryData(
                 provider=provider,
                 repository_name=repository_name,
-                repository_url=match.group(0).rstrip(".,;:!?"),
+                repository_url=repository_url,
                 normalized_url=normalized_url,
             )
     return tuple(repositories.values())
@@ -751,7 +786,7 @@ def _code_repositories(
 def _normalize_repository_url(
     raw_url: str,
 ) -> tuple[str, str, str] | None:
-    cleaned = raw_url.rstrip(".,;:!?")
+    cleaned = _clean_repository_url(raw_url)
     parsed = urlsplit(cleaned)
     host = (parsed.hostname or "").lower().removeprefix("www.")
     provider = _REPOSITORY_HOSTS.get(host)
@@ -766,6 +801,32 @@ def _normalize_repository_url(
     path = f"/{owner}/{repository}"
     normalized_url = urlunsplit(("https", host, path, "", ""))
     return provider, normalized_url, f"{owner}/{repository}"
+
+
+def _clean_repository_url(raw_url: str) -> str:
+    return raw_url.rstrip(".,;:!?)]}>*`")
+
+
+def _normalize_mag_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized if _MAG_VALUE.fullmatch(normalized) else None
+
+
+def _normalize_pmid(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = _PMID_PREFIX.sub("", value.strip(), count=1).rstrip("/")
+    return normalized if _PMID_VALUE.fullmatch(normalized) else None
+
+
+def _normalize_pmcid(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = _PMCID_PREFIX.sub("", value.strip(), count=1).rstrip("/")
+    normalized = normalized.upper()
+    return normalized if _PMCID_VALUE.fullmatch(normalized) else None
 
 
 def _parse_date(value: Any) -> date | None:
@@ -856,3 +917,11 @@ def _nested_string(
 
 def _string(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _identifier_string(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return None

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-15T10:04:04.659737+00:00",
+  "generated_at": "2026-07-15T10:30:42.869181+00:00",
   "source": "openalex",
   "query": "LLM agent benchmark",
   "from_date": "2025-01-01",
@@ -24,11 +24,20 @@
   "database_counts_after_replay": {
     "work": 20,
     "source_record": 20,
-    "external_identifier": 44,
+    "external_identifier": 47,
     "field_assertion": 320,
     "topic": 41,
     "code_repository": 5,
     "metric_snapshot": 20
   },
-  "scope_assertions_at_rule_version": 20
+  "external_identifiers_by_scheme": {
+    "arxiv": 4,
+    "doi": 20,
+    "mag": 1,
+    "openalex": 20,
+    "pmid": 2
+  },
+  "excluded_source_records": 0,
+  "scope_assertions": 20,
+  "excluded_scope_assertions": 0
 }

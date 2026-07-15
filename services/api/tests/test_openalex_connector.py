@@ -61,6 +61,9 @@ def test_parse_record_maps_openalex_work_and_provenance() -> None:
         "arxiv": "2607.12345",
         "openreview": "Forum_AbC123",
         "s2": "0123456789abcdef0123456789abcdef01234567",
+        "mag": "2741809807",
+        "pmid": "12345678",
+        "pmcid": "PMC1234567",
     }
     assert work.title == "AgentBench: Evaluating LLM Agents with Tool Use"
     assert work.abstract == (
@@ -328,3 +331,27 @@ def test_malformed_openalex_record_is_an_explicit_connector_error() -> None:
         match="is_corresponding",
     ):
         OpenAlexConnector.parse_record(malformed)
+
+
+def test_markdown_wrapped_repository_url_drops_closing_punctuation() -> None:
+    from paper_hub.connectors.openalex import OpenAlexConnector
+
+    raw = json.loads(json.dumps(_fixture()["results"][0]))
+    raw["abstract_inverted_index"] = {
+        "The": [0],
+        "code": [1],
+        "is": [2],
+        "[available](https://github.com/example/wrapped-repo).": [3],
+    }
+
+    record = OpenAlexConnector.parse_record(raw)
+
+    assert len(record.parsed.code_repositories) == 1
+    repository = record.parsed.code_repositories[0]
+    assert repository.repository_url == (
+        "https://github.com/example/wrapped-repo"
+    )
+    assert repository.normalized_url == (
+        "https://github.com/example/wrapped-repo"
+    )
+    assert repository.repository_name == "example/wrapped-repo"

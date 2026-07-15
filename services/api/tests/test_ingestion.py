@@ -5,8 +5,8 @@ from pathlib import Path
 from alembic import command
 import pytest
 from sqlalchemy import create_engine, func, select, text
-from sqlalchemy.exc import DBAPIError
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.orm import Session, Session as SQLAlchemySession
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "openalex_works.json"
@@ -63,8 +63,20 @@ def test_same_snapshot_is_idempotent_in_real_postgresql(migrated_engine) -> None
             session.scalar(
                 select(func.count()).select_from(ExternalIdentifier)
             )
-            == 5
+            == 8
         )
+        assert set(
+            session.scalars(select(ExternalIdentifier.scheme)).all()
+        ) == {
+            "openalex",
+            "doi",
+            "arxiv",
+            "openreview",
+            "s2",
+            "mag",
+            "pmid",
+            "pmcid",
+        }
         assert (
             session.scalar(select(func.count()).select_from(FieldAssertion))
             >= 12
@@ -221,27 +233,289 @@ def test_similar_titles_without_shared_controlled_id_do_not_merge(
         assert session.scalar(select(func.count()).select_from(Work)) == 2
 
 
-def test_out_of_scope_record_is_reported_and_not_persisted(
+def test_noncanonical_external_identifier_does_not_merge_works(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IdentityConflictError, IngestionService
+    from paper_hub.models import Work
+
+    first_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    first_raw["doi"] = None
+    first_raw["ids"] = {
+        "openalex": first_raw["id"],
+        "mag": "2741809807",
+    }
+    first_raw["primary_location"] = None
+    first_raw["best_oa_location"] = None
+    first_raw["locations"] = []
+
+    second_raw = json.loads(json.dumps(first_raw))
+    second_raw["id"] = "https://openalex.org/W2222222222"
+    second_raw["ids"]["openalex"] = second_raw["id"]
+    second_raw["title"] = "Another LLM Agent Evaluation"
+    second_raw["display_name"] = second_raw["title"]
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(_record(first_raw))
+        session.commit()
+
+        with pytest.raises(
+            IdentityConflictError,
+            match="external identifier is already owned",
+        ):
+            IngestionService(session).ingest(
+                _record(second_raw, minute=10)
+            )
+        session.rollback()
+
+        work = session.get(Work, first.work_id)
+        assert work.canonical_key == "openalex:W2741809807"
+        assert work.title == first_raw["title"]
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+
+
+def test_out_of_scope_record_is_auditable_and_idempotent(
     migrated_engine,
 ) -> None:
     from paper_hub.connectors.openalex import OPENALEX_SCOPE_RULE_VERSION
     from paper_hub.ingestion import IngestionService
-    from paper_hub.models import SourceRecord, Work
+    from paper_hub.models import FieldAssertion, SourceRecord, Work
 
     with Session(migrated_engine) as session:
-        result = IngestionService(session).ingest(
-            _record(_fixture()["results"][1])
-        )
+        record = _record(_fixture()["results"][1])
+        first = IngestionService(session).ingest(record)
+        second = IngestionService(session).ingest(record)
         session.commit()
 
-        assert result.status == "excluded"
-        assert result.reason == "no_agent_llm_scope_term_match"
-        assert result.scope_rule_version == OPENALEX_SCOPE_RULE_VERSION
-        assert result.scope_evidence == ()
+        source_records = session.scalars(select(SourceRecord)).all()
+        assertions = session.scalars(select(FieldAssertion)).all()
+
+        assert first.status == "excluded"
+        assert second.status == "excluded"
+        assert first.source_record_id == second.source_record_id
+        assert first.reason == "no_agent_llm_scope_term_match"
+        assert first.scope_rule_version == OPENALEX_SCOPE_RULE_VERSION
+        assert first.scope_evidence == ()
+        assert session.scalar(select(func.count()).select_from(Work)) == 0
+        assert len(source_records) == 1
+        assert source_records[0].source == record.source
+        assert source_records[0].source_record_id == record.source_record_id
+        assert source_records[0].retrieved_at == record.retrieved_at
+        assert source_records[0].content_hash == record.content_hash
+        assert source_records[0].source_updated_at == (
+            record.source_updated_at
+        )
+        assert source_records[0].work_id is None
+        assert source_records[0].paper_version_id is None
+        assert source_records[0].raw_payload == record.raw_payload
+        assert len(assertions) == 1
+        assert assertions[0].field_name == "scope"
+        assert assertions[0].source == record.source
+        assert assertions[0].parser_version == record.parser_version
+        assert assertions[0].value == {
+            "included": False,
+            "rule_version": OPENALEX_SCOPE_RULE_VERSION,
+            "evidence": [],
+            "reason": "no_agent_llm_scope_term_match",
+        }
+
+    with pytest.raises(DBAPIError, match="immutable"):
+        with migrated_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE source_record
+                    SET raw_payload = CAST(:payload AS jsonb)
+                    WHERE id = :source_record_id
+                    """
+                ),
+                {
+                    "payload": json.dumps({"mutated": True}),
+                    "source_record_id": first.source_record_id,
+                },
+            )
+
+
+def test_cli_rolls_back_and_zeros_counts_when_later_page_fails(
+    migrated_engine,
+    monkeypatch,
+    capsys,
+) -> None:
+    from paper_hub import cli
+    from paper_hub.config import get_settings
+    from paper_hub.connectors.openalex import OpenAlexResponseError
+    from paper_hub.models import SourceRecord, Work
+
+    class FailingPaginationConnector:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def fetch_records(self, **_: object):
+            yield _record(_fixture()["results"][0])
+            raise OpenAlexResponseError("OpenAlex page 2 failed")
+
+    database_url = migrated_engine.url.render_as_string(
+        hide_password=False
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("OPENALEX_CONTACT_EMAIL", "research@example.com")
+    monkeypatch.setattr(cli, "OpenAlexConnector", FailingPaginationConnector)
+    get_settings.cache_clear()
+
+    exit_code = cli.main(
+        ["sync-openalex", "--query", "agents", "--max-results", "2"]
+    )
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert output == {
+        "excluded": 0,
+        "failed": 1,
+        "inserted": 0,
+        "unchanged": 0,
+        "updated": 0,
+    }
+    assert "OpenAlex page 2 failed" in captured.err
+    with Session(migrated_engine) as session:
         assert session.scalar(select(func.count()).select_from(Work)) == 0
         assert (
             session.scalar(select(func.count()).select_from(SourceRecord)) == 0
         )
+    get_settings.cache_clear()
+
+
+def test_cli_rolls_back_and_zeros_counts_when_commit_fails(
+    migrated_engine,
+    monkeypatch,
+    capsys,
+) -> None:
+    from paper_hub import cli
+    from paper_hub.config import get_settings
+    from paper_hub.models import SourceRecord, Work
+
+    class OneRecordConnector:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def fetch_records(self, **_: object):
+            yield _record(_fixture()["results"][0])
+            yield _record(_fixture()["results"][1], minute=1)
+
+    class CommitFailingSession(SQLAlchemySession):
+        def commit(self) -> None:
+            raise SQLAlchemyError("forced commit failure")
+
+    database_url = migrated_engine.url.render_as_string(
+        hide_password=False
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("OPENALEX_CONTACT_EMAIL", "research@example.com")
+    monkeypatch.setattr(cli, "OpenAlexConnector", OneRecordConnector)
+    monkeypatch.setattr(cli, "Session", CommitFailingSession)
+    get_settings.cache_clear()
+
+    exit_code = cli.main(
+        ["sync-openalex", "--query", "agents", "--max-results", "2"]
+    )
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert output == {
+        "excluded": 0,
+        "failed": 1,
+        "inserted": 0,
+        "unchanged": 0,
+        "updated": 0,
+    }
+    assert "database commit failed: SQLAlchemyError" in captured.err
+    with Session(migrated_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Work)) == 0
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord)) == 0
+        )
+    get_settings.cache_clear()
+
+
+def test_cli_reports_committed_inserted_and_excluded_counts(
+    migrated_engine,
+    monkeypatch,
+    capsys,
+) -> None:
+    from paper_hub import cli
+    from paper_hub.config import get_settings
+    from paper_hub.models import FieldAssertion, SourceRecord, Work
+
+    class IncludedAndExcludedConnector:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def fetch_records(self, **_: object):
+            yield _record(_fixture()["results"][0])
+            yield _record(_fixture()["results"][1], minute=1)
+
+    database_url = migrated_engine.url.render_as_string(
+        hide_password=False
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("OPENALEX_CONTACT_EMAIL", "research@example.com")
+    monkeypatch.setattr(
+        cli,
+        "OpenAlexConnector",
+        IncludedAndExcludedConnector,
+    )
+    get_settings.cache_clear()
+
+    exit_code = cli.main(
+        ["sync-openalex", "--query", "agents", "--max-results", "2"]
+    )
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert output == {
+        "excluded": 1,
+        "failed": 0,
+        "inserted": 1,
+        "unchanged": 0,
+        "updated": 0,
+    }
+    with Session(migrated_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord)) == 2
+        )
+        excluded_record = session.scalar(
+            select(SourceRecord).where(SourceRecord.work_id.is_(None))
+        )
+        scope_assertion = session.scalar(
+            select(FieldAssertion).where(
+                FieldAssertion.source_record_id == excluded_record.id,
+                FieldAssertion.field_name == "scope",
+            )
+        )
+        assert scope_assertion.value["included"] is False
+    get_settings.cache_clear()
 
 
 def test_ingestion_persists_topics_code_and_citation_snapshot(

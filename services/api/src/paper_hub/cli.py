@@ -18,7 +18,19 @@ from paper_hub.connectors.openalex import (
     OpenAlexError,
 )
 from paper_hub.db import build_engine
-from paper_hub.ingestion import IngestionService, IngestionSummary
+from paper_hub.ingestion import (
+    IngestionError,
+    IngestionService,
+    IngestionSummary,
+)
+
+
+class SyncCommitError(RuntimeError):
+    def __init__(self, cause: Exception) -> None:
+        self.cause_type = cause.__class__.__name__
+        super().__init__(
+            f"database commit failed: {self.cause_type}"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,34 +95,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             api_key=settings.openalex_api_key,
         ) as connector:
             with Session(engine) as session:
+                pending_summary = IngestionSummary()
                 try:
                     for record in connector.fetch_records(
                         query=args.query,
                         from_date=args.from_date,
                         max_results=args.max_results,
                     ):
-                        try:
-                            with session.begin_nested():
-                                result = IngestionService(session).ingest(record)
-                            summary.add(result)
-                        except Exception as exc:
-                            summary.failed += 1
-                            print(
-                                "record failed "
-                                f"{record.source}:{record.source_record_id}: "
-                                f"{exc.__class__.__name__}: {exc}",
-                                file=sys.stderr,
-                            )
-                    session.commit()
-                except OpenAlexError as exc:
+                        result = IngestionService(session).ingest(record)
+                        pending_summary.add(result)
+                    try:
+                        session.commit()
+                    except Exception as exc:
+                        session.rollback()
+                        raise SyncCommitError(exc) from exc
+                except SyncCommitError:
+                    raise
+                except Exception:
                     session.rollback()
-                    summary.failed += 1
-                    print(str(exc), file=sys.stderr)
+                    raise
+                summary = pending_summary
+    except SyncCommitError as exc:
+        summary = IngestionSummary(failed=1)
+        print(str(exc), file=sys.stderr)
+    except OpenAlexError as exc:
+        summary = IngestionSummary(failed=1)
+        print(str(exc), file=sys.stderr)
+    except IngestionError as exc:
+        summary = IngestionSummary(failed=1)
+        print(f"record ingestion failed: {exc}", file=sys.stderr)
     except SQLAlchemyError as exc:
-        summary.failed += 1
+        summary = IngestionSummary(failed=1)
         print(
-            "database operation failed: "
+            "database transaction failed: "
             f"{exc.__class__.__name__}",
+            file=sys.stderr,
+        )
+    except Exception as exc:
+        summary = IngestionSummary(failed=1)
+        print(
+            f"sync failed: {exc.__class__.__name__}",
             file=sys.stderr,
         )
     finally:

@@ -24,6 +24,7 @@ from paper_hub.models import (
     Topic,
     Work,
 )
+from paper_hub.normalization import APPROVED_CANONICAL_PREFIXES
 
 
 IngestionStatus = Literal[
@@ -94,14 +95,6 @@ class IngestionService:
             }
             for evidence in parsed.scope.evidence
         )
-        if not parsed.scope.included:
-            return IngestionResult(
-                status="excluded",
-                reason=parsed.scope.reason,
-                scope_rule_version=parsed.scope.rule_version,
-                scope_evidence=scope_evidence,
-            )
-
         existing_snapshot = self.session.scalar(
             select(SourceRecord).where(
                 SourceRecord.source == record.source,
@@ -110,10 +103,48 @@ class IngestionService:
             )
         )
         if existing_snapshot is not None:
+            if not parsed.scope.included:
+                return IngestionResult(
+                    status="excluded",
+                    source_record_id=existing_snapshot.id,
+                    reason=parsed.scope.reason,
+                    scope_rule_version=parsed.scope.rule_version,
+                    scope_evidence=scope_evidence,
+                )
             return IngestionResult(
                 status="unchanged",
                 work_id=existing_snapshot.work_id,
                 source_record_id=existing_snapshot.id,
+                scope_rule_version=parsed.scope.rule_version,
+                scope_evidence=scope_evidence,
+            )
+        if not parsed.scope.included:
+            source_record = SourceRecord(
+                work_id=None,
+                paper_version_id=None,
+                source_record_id=record.source_record_id,
+                content_hash=record.content_hash,
+                raw_payload=record.raw_payload,
+                source_updated_at=record.source_updated_at,
+                http_status=record.http_status,
+                **self._provenance(record, parsed),
+            )
+            self.session.add(source_record)
+            self.session.flush()
+            self.session.add(
+                FieldAssertion(
+                    source_record_id=source_record.id,
+                    field_name="scope",
+                    value=_json_value(parsed.scope),
+                    parser_version=record.parser_version,
+                    **self._provenance(record, parsed),
+                )
+            )
+            self.session.flush()
+            return IngestionResult(
+                status="excluded",
+                source_record_id=source_record.id,
+                reason=parsed.scope.reason,
                 scope_rule_version=parsed.scope.rule_version,
                 scope_evidence=scope_evidence,
             )
@@ -164,6 +195,8 @@ class IngestionService:
     def _resolve_work(self, parsed: ParsedWork) -> Work | None:
         matched_works: dict[UUID, Work] = {}
         for identifier in parsed.external_identifiers:
+            if identifier.scheme not in APPROVED_CANONICAL_PREFIXES:
+                continue
             existing_identifier = self.session.scalar(
                 select(ExternalIdentifier).where(
                     ExternalIdentifier.scheme == identifier.scheme,

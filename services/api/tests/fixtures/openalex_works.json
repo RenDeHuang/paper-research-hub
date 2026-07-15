@@ -23,7 +23,10 @@
         "doi": "https://doi.org/10.48550/arXiv.2607.12345",
         "arxiv": "https://arxiv.org/abs/2607.12345",
         "openreview": "Forum_AbC123",
-        "semantic_scholar": "0123456789abcdef0123456789abcdef01234567"
+        "semantic_scholar": "0123456789abcdef0123456789abcdef01234567",
+        "mag": "2741809807",
+        "pmid": "https://pubmed.ncbi.nlm.nih.gov/12345678",
+        "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567"
       },
       "abstract_inverted_index": {
         "We": [0],
