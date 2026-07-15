@@ -1,17 +1,26 @@
 from datetime import date, datetime
-from typing import Any
+from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+)
 
 from paper_hub.models import RecordStatus
-from paper_hub.normalization import is_approved_canonical_key
+from paper_hub.normalization import normalize_canonical_key
 
 
 class ProvenanceSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     source: str = Field(min_length=1, max_length=64)
     source_url: str | None = None
-    retrieved_at: datetime
+    retrieved_at: AwareDatetime
     source_license: str | None = None
     content_license: str | None = None
     status: RecordStatus = RecordStatus.ACTIVE
@@ -19,9 +28,10 @@ class ProvenanceSchema(BaseModel):
 
 class FieldAssertionCreate(ProvenanceSchema):
     field_name: str = Field(min_length=1, max_length=128)
-    value: Any
-    source_record_id: str = Field(min_length=1, max_length=255)
+    value: JsonValue
+    source_record_id: UUID
     parser_version: str = Field(min_length=1, max_length=64)
+    confidence: Decimal | None = Field(default=None, ge=0, le=1)
 
 
 class WorkCreate(ProvenanceSchema):
@@ -30,22 +40,25 @@ class WorkCreate(ProvenanceSchema):
     abstract: str | None = None
     publication_date: date | None = None
 
-    @field_validator("canonical_key")
+    @field_validator("canonical_key", mode="before")
     @classmethod
-    def require_approved_canonical_key(cls, value: str) -> str:
-        if not is_approved_canonical_key(value):
+    def normalize_approved_canonical_key(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("canonical_key must be a string")
+        normalized = normalize_canonical_key(value)
+        if normalized is None:
             raise ValueError(
-                "canonical_key must use an approved prefix and non-empty value"
+                "canonical_key must be a normalized approved external identifier"
             )
-        return value
+        return normalized
 
 
 class WorkRead(WorkCreate):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
 
     id: UUID
-    created_at: datetime
-    updated_at: datetime
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
 
 
 class PaperVersionCreate(ProvenanceSchema):
@@ -55,13 +68,14 @@ class PaperVersionCreate(ProvenanceSchema):
     version_type: str = Field(min_length=1, max_length=32)
     title: str | None = None
     abstract: str | None = None
-    published_at: datetime | None = None
+    submitted_at: AwareDatetime | None = None
+    published_at: AwareDatetime | None = None
     version_url: str | None = None
 
 
 class PaperVersionRead(PaperVersionCreate):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
 
     id: UUID
-    created_at: datetime
-    updated_at: datetime
+    created_at: AwareDatetime
+    updated_at: AwareDatetime

@@ -17,12 +17,14 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
+    settings = get_settings()
     context.configure(
-        url=get_settings().database_url,
+        url=settings.sqlalchemy_database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        compare_server_default=True,
     )
 
     with context.begin_transaction():
@@ -30,8 +32,9 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    settings = get_settings()
     connectable = create_engine(
-        get_settings().database_url,
+        settings.sqlalchemy_database_url,
         poolclass=pool.NullPool,
     )
 
@@ -40,6 +43,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
+            compare_server_default=True,
         )
 
         with context.begin_transaction():

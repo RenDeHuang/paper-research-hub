@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
@@ -71,8 +72,12 @@ def test_arxiv_versions_share_a_canonical_identity() -> None:
             "openalex:W1234567890",
         ),
         (
-            {"semantic_scholar_paper_id": "A0B1C2D3"},
-            "s2:a0b1c2d3",
+            {
+                "semantic_scholar_paper_id": (
+                    "A0B1C2D3E4F5678901234567890ABCDEFFEDCBA9"
+                )
+            },
+            "s2:a0b1c2d3e4f5678901234567890abcdeffedcba9",
         ),
     ],
 )
@@ -106,12 +111,13 @@ def test_field_assertion_schema_preserves_provenance_and_licenses() -> None:
     from paper_hub.schemas import FieldAssertionCreate
 
     retrieved_at = datetime(2026, 7, 15, 8, 30, tzinfo=UTC)
+    source_record_id = UUID("c67b8c4d-150f-43c4-9e2e-861695f0fa4e")
 
     assertion = FieldAssertionCreate(
         field_name="title",
         value="Planning Agents with Tool Use",
         source="openalex",
-        source_record_id="W123",
+        source_record_id=source_record_id,
         source_url="https://example.test/works/W123",
         retrieved_at=retrieved_at,
         source_license="CC0",
@@ -120,7 +126,7 @@ def test_field_assertion_schema_preserves_provenance_and_licenses() -> None:
     )
 
     assert assertion.source == "openalex"
-    assert assertion.source_record_id == "W123"
+    assert assertion.source_record_id == source_record_id
     assert assertion.retrieved_at == retrieved_at
     assert assertion.source_license == "CC0"
     assert assertion.content_license == "CC BY 4.0"
@@ -134,7 +140,7 @@ def test_field_assertion_schema_preserves_provenance_and_licenses() -> None:
         "arxiv:2401.01234",
         "openreview:Forum_AbC123",
         "openalex:W1234567890",
-        "s2:a0b1c2d3",
+        "s2:a0b1c2d3e4f5678901234567890abcdeffedcba9",
     ],
 )
 def test_work_schema_accepts_only_approved_canonical_prefixes(
@@ -205,7 +211,7 @@ def test_database_configuration_rejects_non_postgresql_urls() -> None:
         _env_file=None,
     )
 
-    assert settings.database_url.startswith("postgresql")
+    assert settings.database_url.get_secret_value().startswith("postgresql")
     with pytest.raises(ValidationError):
         Settings(database_url="sqlite:///paper_hub.db", _env_file=None)
 
@@ -253,7 +259,7 @@ def test_core_models_have_provenance_status_constraints_and_relationships() -> N
     assert {
         foreign_key.target_fullname
         for foreign_key in Base.metadata.tables["field_assertion"].foreign_keys
-    } >= {"work.id", "source_record.id"}
+    } == {"source_record.id"}
     assert {
         foreign_key.target_fullname
         for foreign_key in Base.metadata.tables["code_repository"].foreign_keys
@@ -331,13 +337,21 @@ def test_model_metadata_compiles_with_postgresql_dialect() -> None:
     assert "JSONB" in source_record_sql
 
 
-def test_alembic_initial_migration_generates_postgresql_sql() -> None:
+def test_alembic_initial_migration_generates_postgresql_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from alembic import command
     from alembic.config import Config
+    from paper_hub.config import get_settings
 
     service_root = Path(__file__).resolve().parents[1]
     output = StringIO()
     config = Config(service_root / "alembic.ini", output_buffer=output)
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://paper_hub:test@db/paper_hub",
+    )
+    get_settings.cache_clear()
 
     command.upgrade(config, "head", sql=True)
 
@@ -347,20 +361,26 @@ def test_alembic_initial_migration_generates_postgresql_sql() -> None:
     assert "CREATE TABLE paper_version" in migration_sql
     assert "CREATE TABLE ranking_snapshot" in migration_sql
     assert "CONSTRAINT ck_work_canonical_key_approved_prefix CHECK" in migration_sql
+    assert "0002_enforce_canonical_integrity" in migration_sql
 
-    ranking_sql = migration_sql.split(
-        "CREATE TABLE ranking_snapshot (",
-        maxsplit=1,
-    )[1].split("\n);", maxsplit=1)[0]
-    assert "subject_id" not in ranking_sql
-    assert "subject_type" not in ranking_sql
-    assert "work_id UUID" in ranking_sql
-    assert "topic_id UUID" in ranking_sql
-    assert "method_id UUID" in ranking_sql
-    assert "FOREIGN KEY(work_id) REFERENCES work (id)" in ranking_sql
-    assert "FOREIGN KEY(topic_id) REFERENCES topic (id)" in ranking_sql
-    assert "FOREIGN KEY(method_id) REFERENCES method (id)" in ranking_sql
+    assert "ALTER TABLE ranking_snapshot DROP COLUMN subject_id" in migration_sql
+    assert "ALTER TABLE ranking_snapshot DROP COLUMN subject_type" in migration_sql
+    assert "ALTER TABLE ranking_snapshot ADD COLUMN work_id UUID" in migration_sql
+    assert "ALTER TABLE ranking_snapshot ADD COLUMN topic_id UUID" in migration_sql
+    assert "ALTER TABLE ranking_snapshot ADD COLUMN method_id UUID" in migration_sql
+    assert (
+        "FOREIGN KEY(work_id) REFERENCES work (id) ON DELETE CASCADE"
+        in migration_sql
+    )
+    assert (
+        "FOREIGN KEY(topic_id) REFERENCES topic (id) ON DELETE CASCADE"
+        in migration_sql
+    )
+    assert (
+        "FOREIGN KEY(method_id) REFERENCES method (id) ON DELETE CASCADE"
+        in migration_sql
+    )
     assert (
         "CONSTRAINT ck_ranking_snapshot_exactly_one_subject CHECK"
-        in ranking_sql
+        in migration_sql
     )

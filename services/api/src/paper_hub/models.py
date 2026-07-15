@@ -158,7 +158,7 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint(
             CANONICAL_KEY_SQL_CHECK,
-            name="canonical_key_approved_prefix",
+            name="ck_work_canonical_key_approved_prefix",
         ),
         UniqueConstraint("canonical_key", name="uq_work_canonical_key"),
     )
@@ -171,49 +171,62 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     versions: Mapped[list[PaperVersion]] = relationship(
         back_populates="work",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     source_records: Mapped[list[SourceRecord]] = relationship(
         back_populates="work",
+        foreign_keys="SourceRecord.work_id",
+        passive_deletes=True,
     )
     external_identifiers: Mapped[list[ExternalIdentifier]] = relationship(
         back_populates="work",
         cascade="all, delete-orphan",
-    )
-    field_assertions: Mapped[list[FieldAssertion]] = relationship(
-        back_populates="work",
-        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     topics: Mapped[list[Topic]] = relationship(
         secondary=work_topic,
         back_populates="works",
+        passive_deletes=True,
     )
     methods: Mapped[list[Method]] = relationship(
         secondary=work_method,
         back_populates="works",
+        passive_deletes=True,
     )
     datasets: Mapped[list[Dataset]] = relationship(
         secondary=work_dataset,
         back_populates="works",
+        passive_deletes=True,
     )
     benchmarks: Mapped[list[Benchmark]] = relationship(
         secondary=work_benchmark,
         back_populates="works",
+        passive_deletes=True,
     )
     code_repositories: Mapped[list[CodeRepository]] = relationship(
         back_populates="work",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     metric_snapshots: Mapped[list[MetricSnapshot]] = relationship(
         back_populates="work",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     ranking_snapshots: Mapped[list[RankingSnapshot]] = relationship(
         back_populates="work",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
 class PaperVersion(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     __tablename__ = "paper_version"
     __table_args__ = (
+        CheckConstraint(
+            "version_number IS NULL OR version_number >= 1",
+            name="ck_paper_version_version_number_positive",
+        ),
         UniqueConstraint(
             "work_id",
             "version_label",
@@ -234,21 +247,29 @@ class PaperVersion(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version_url: Mapped[str | None] = mapped_column(Text)
 
-    work: Mapped[Work] = relationship(back_populates="versions")
+    work: Mapped[Work] = relationship(
+        back_populates="versions",
+        passive_deletes=True,
+    )
     source_records: Mapped[list[SourceRecord]] = relationship(
         back_populates="paper_version",
+        foreign_keys="SourceRecord.paper_version_id",
+        passive_deletes=True,
     )
     external_identifiers: Mapped[list[ExternalIdentifier]] = relationship(
         back_populates="paper_version",
-    )
-    field_assertions: Mapped[list[FieldAssertion]] = relationship(
-        back_populates="paper_version",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
 class SourceRecord(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     __tablename__ = "source_record"
     __table_args__ = (
+        CheckConstraint(
+            "work_id IS NULL OR paper_version_id IS NULL",
+            name="ck_source_record_single_owner",
+        ),
         UniqueConstraint(
             "source",
             "source_record_id",
@@ -268,15 +289,24 @@ class SourceRecord(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     http_status: Mapped[int | None] = mapped_column(Integer)
 
-    work: Mapped[Work | None] = relationship(back_populates="source_records")
+    work: Mapped[Work | None] = relationship(
+        back_populates="source_records",
+        foreign_keys=[work_id],
+        passive_deletes=True,
+    )
     paper_version: Mapped[PaperVersion | None] = relationship(
         back_populates="source_records",
+        foreign_keys=[paper_version_id],
+        passive_deletes=True,
     )
     external_identifiers: Mapped[list[ExternalIdentifier]] = relationship(
         back_populates="source_record",
+        passive_deletes=True,
     )
     field_assertions: Mapped[list[FieldAssertion]] = relationship(
         back_populates="source_record",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -312,9 +342,11 @@ class ExternalIdentifier(
     work: Mapped[Work] = relationship(back_populates="external_identifiers")
     paper_version: Mapped[PaperVersion | None] = relationship(
         back_populates="external_identifiers",
+        passive_deletes=True,
     )
     source_record: Mapped[SourceRecord | None] = relationship(
         back_populates="external_identifiers",
+        passive_deletes=True,
     )
 
 
@@ -326,6 +358,10 @@ class FieldAssertion(
 ):
     __tablename__ = "field_assertion"
     __table_args__ = (
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="ck_field_assertion_confidence_range",
+        ),
         UniqueConstraint(
             "source_record_id",
             "field_name",
@@ -334,13 +370,6 @@ class FieldAssertion(
         ),
     )
 
-    work_id: Mapped[UUID] = mapped_column(
-        ForeignKey("work.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    paper_version_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("paper_version.id", ondelete="CASCADE"),
-    )
     source_record_id: Mapped[UUID] = mapped_column(
         ForeignKey("source_record.id", ondelete="CASCADE"),
         nullable=False,
@@ -350,12 +379,9 @@ class FieldAssertion(
     parser_version: Mapped[str] = mapped_column(String(64), nullable=False)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
 
-    work: Mapped[Work] = relationship(back_populates="field_assertions")
-    paper_version: Mapped[PaperVersion | None] = relationship(
-        back_populates="field_assertions",
-    )
     source_record: Mapped[SourceRecord] = relationship(
         back_populates="field_assertions",
+        passive_deletes=True,
     )
 
 
@@ -372,9 +398,12 @@ class Topic(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     works: Mapped[list[Work]] = relationship(
         secondary=work_topic,
         back_populates="topics",
+        passive_deletes=True,
     )
     ranking_snapshots: Mapped[list[RankingSnapshot]] = relationship(
         back_populates="topic",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -391,9 +420,12 @@ class Method(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     works: Mapped[list[Work]] = relationship(
         secondary=work_method,
         back_populates="methods",
+        passive_deletes=True,
     )
     ranking_snapshots: Mapped[list[RankingSnapshot]] = relationship(
         back_populates="method",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -411,6 +443,7 @@ class Dataset(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     works: Mapped[list[Work]] = relationship(
         secondary=work_dataset,
         back_populates="datasets",
+        passive_deletes=True,
     )
 
 
@@ -428,6 +461,7 @@ class Benchmark(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     works: Mapped[list[Work]] = relationship(
         secondary=work_benchmark,
         back_populates="benchmarks",
+        passive_deletes=True,
     )
 
 
@@ -459,9 +493,14 @@ class CodeRepository(
         server_default="false",
     )
 
-    work: Mapped[Work] = relationship(back_populates="code_repositories")
+    work: Mapped[Work] = relationship(
+        back_populates="code_repositories",
+        passive_deletes=True,
+    )
     metric_snapshots: Mapped[list[MetricSnapshot]] = relationship(
         back_populates="code_repository",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -476,7 +515,11 @@ class MetricSnapshot(
         CheckConstraint(
             "(work_id IS NOT NULL AND code_repository_id IS NULL) OR "
             "(work_id IS NULL AND code_repository_id IS NOT NULL)",
-            name="single_target",
+            name="ck_metric_snapshot_single_target",
+        ),
+        CheckConstraint(
+            "window_days IS NULL OR window_days > 0",
+            name="ck_metric_snapshot_window_days_positive",
         ),
         UniqueConstraint(
             "work_id",
@@ -515,9 +558,13 @@ class MetricSnapshot(
     window_days: Mapped[int | None] = mapped_column(Integer)
     details: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB)
 
-    work: Mapped[Work | None] = relationship(back_populates="metric_snapshots")
+    work: Mapped[Work | None] = relationship(
+        back_populates="metric_snapshots",
+        passive_deletes=True,
+    )
     code_repository: Mapped[CodeRepository | None] = relationship(
         back_populates="metric_snapshots",
+        passive_deletes=True,
     )
 
 
@@ -533,7 +580,15 @@ class RankingSnapshot(
             "(CASE WHEN work_id IS NOT NULL THEN 1 ELSE 0 END + "
             "CASE WHEN topic_id IS NOT NULL THEN 1 ELSE 0 END + "
             "CASE WHEN method_id IS NOT NULL THEN 1 ELSE 0 END) = 1",
-            name="exactly_one_subject",
+            name="ck_ranking_snapshot_exactly_one_subject",
+        ),
+        CheckConstraint(
+            "rank_position >= 1",
+            name="ck_ranking_snapshot_rank_position_positive",
+        ),
+        CheckConstraint(
+            "window_days > 0",
+            name="ck_ranking_snapshot_window_days_positive",
         ),
         UniqueConstraint(
             "ranking_name",
@@ -586,8 +641,15 @@ class RankingSnapshot(
     coverage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     explanation: Mapped[str | None] = mapped_column(Text)
 
-    work: Mapped[Work | None] = relationship(back_populates="ranking_snapshots")
-    topic: Mapped[Topic | None] = relationship(back_populates="ranking_snapshots")
+    work: Mapped[Work | None] = relationship(
+        back_populates="ranking_snapshots",
+        passive_deletes=True,
+    )
+    topic: Mapped[Topic | None] = relationship(
+        back_populates="ranking_snapshots",
+        passive_deletes=True,
+    )
     method: Mapped[Method | None] = relationship(
         back_populates="ranking_snapshots",
+        passive_deletes=True,
     )

@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from functools import lru_cache
 
 from sqlalchemy import MetaData, create_engine
 from sqlalchemy.engine import Engine
@@ -10,7 +11,7 @@ from paper_hub.config import Settings, get_settings
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
     "uq": "uq_%(table_name)s_%(column_0_name)s",
-    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "ck": "ck_%(table_name)s_%(column_0_name)s",
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
     "pk": "pk_%(table_name)s",
 }
@@ -23,15 +24,25 @@ class Base(DeclarativeBase):
 def build_engine(settings: Settings | None = None) -> Engine:
     resolved_settings = settings or get_settings()
     return create_engine(
-        resolved_settings.database_url,
+        resolved_settings.sqlalchemy_database_url,
         pool_pre_ping=True,
     )
 
 
-engine = build_engine()
-SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+@lru_cache(maxsize=1)
+def get_engine() -> Engine:
+    return build_engine()
+
+
+@lru_cache(maxsize=1)
+def get_session_factory() -> sessionmaker[Session]:
+    return sessionmaker(
+        bind=get_engine(),
+        autoflush=False,
+        expire_on_commit=False,
+    )
 
 
 def get_session() -> Generator[Session, None, None]:
-    with SessionLocal() as session:
+    with get_session_factory()() as session:
         yield session

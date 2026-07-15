@@ -85,11 +85,6 @@ def upgrade() -> None:
         sa.Column("publication_date", sa.Date(), nullable=True),
         *_provenance_columns(),
         *_timestamp_columns(),
-        sa.CheckConstraint(
-            "canonical_key ~ "
-            "'^(doi|arxiv|openreview|openalex|s2):[^[:space:]]+$'",
-            name="canonical_key_approved_prefix",
-        ),
         sa.PrimaryKeyConstraint("id", name="pk_work"),
         sa.UniqueConstraint("canonical_key", name="uq_work_canonical_key"),
     )
@@ -423,9 +418,8 @@ def upgrade() -> None:
         "ranking_snapshot",
         _id_column(),
         sa.Column("ranking_name", sa.String(length=64), nullable=False),
-        sa.Column("work_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("topic_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("method_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("subject_type", sa.String(length=32), nullable=False),
+        sa.Column("subject_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("rank_position", sa.Integer(), nullable=False),
         sa.Column(
             "score",
@@ -447,38 +441,7 @@ def upgrade() -> None:
         sa.Column("explanation", sa.Text(), nullable=True),
         *_provenance_columns(),
         *_timestamp_columns(),
-        sa.CheckConstraint(
-            "(CASE WHEN work_id IS NOT NULL THEN 1 ELSE 0 END + "
-            "CASE WHEN topic_id IS NOT NULL THEN 1 ELSE 0 END + "
-            "CASE WHEN method_id IS NOT NULL THEN 1 ELSE 0 END) = 1",
-            name="exactly_one_subject",
-        ),
-        sa.ForeignKeyConstraint(
-            ["method_id"],
-            ["method.id"],
-            name="fk_ranking_snapshot_method_id_method",
-            ondelete="CASCADE",
-        ),
-        sa.ForeignKeyConstraint(
-            ["topic_id"],
-            ["topic.id"],
-            name="fk_ranking_snapshot_topic_id_topic",
-            ondelete="CASCADE",
-        ),
-        sa.ForeignKeyConstraint(
-            ["work_id"],
-            ["work.id"],
-            name="fk_ranking_snapshot_work_id_work",
-            ondelete="CASCADE",
-        ),
         sa.PrimaryKeyConstraint("id", name="pk_ranking_snapshot"),
-        sa.UniqueConstraint(
-            "ranking_name",
-            "method_id",
-            "window_days",
-            "computed_at",
-            name="uq_ranking_snapshot_method_window_time",
-        ),
         sa.UniqueConstraint(
             "ranking_name",
             "window_days",
@@ -488,17 +451,11 @@ def upgrade() -> None:
         ),
         sa.UniqueConstraint(
             "ranking_name",
-            "topic_id",
+            "subject_type",
+            "subject_id",
             "window_days",
             "computed_at",
-            name="uq_ranking_snapshot_topic_window_time",
-        ),
-        sa.UniqueConstraint(
-            "ranking_name",
-            "work_id",
-            "window_days",
-            "computed_at",
-            name="uq_ranking_snapshot_work_window_time",
+            name="uq_ranking_snapshot_subject_window_time",
         ),
     )
 
