@@ -1,43 +1,99 @@
 {
-  "generated_at": "2026-07-15T10:30:42.869181+00:00",
+  "generated_at": "2026-07-15T15:03:02.335833+00:00",
+  "mode": "replay_of_preserved_live_capture",
+  "successful_live_sync": false,
+  "git_head": "05f0a52300aa7109239d56bb4d08448ffd320b6f",
   "source": "openalex",
-  "query": "LLM agent benchmark",
-  "from_date": "2025-01-01",
-  "max_results": 20,
-  "api_key_used": false,
-  "first_run": {
-    "exit_code": 0,
+  "alembic_head": "0004_versioned_scope_assessment",
+  "parser_version": "openalex-v1",
+  "scope_rule_version": "agent-llm-v1",
+  "capture_source_absolute_path": "/Users/huangrende/Documents/论文自媒体/智能体文献测试/data/live_demo/openalex_search_raw.json",
+  "capture_archive_relative_path": "artifacts/source-captures/openalex_search_raw.json",
+  "capture_sha256": "ec22c0a0685c077e812fb49f38ceb9757e5fa56419d39ec82a41897cc3d5f487",
+  "capture_size_bytes": 335007,
+  "capture_record_count": 10,
+  "capture_time": "2026-07-15T10:25:52.963553+08:00",
+  "capture_birthtime": "2026-07-15T10:25:52.963117+08:00",
+  "capture_time_basis": "source_file_mtime",
+  "capture_is_automatic_test_fixture": false,
+  "capture_request": {
+    "from_publication_date": "2026-01-01",
+    "to_publication_date": "2026-07-15",
+    "fulltext_search": "LLM agent benchmark evaluation",
+    "per_page": 10,
+    "openalex_total_count_at_capture": 33051,
+    "openalex_request_cost_usd": 0.001
+  },
+  "network_attempt": {
+    "api_key_used": false,
+    "attempted_at": "2026-07-15T15:00:13.146928+00:00",
+    "completed_at": "2026-07-15T15:00:13.841027+00:00",
+    "error": "OpenAlex request was rate limited with HTTP 429; Retry-After=32386",
+    "error_type": "OpenAlexRateLimitError",
+    "from_date": "2025-01-01",
+    "http_status": 429,
+    "max_results": 10,
+    "operation": "sync-openalex network fetch probe",
+    "outcome": "failed",
+    "query": "LLM agent benchmark",
+    "retry_after": "32386",
+    "successful_live_sync": false
+  },
+  "replay_started_at": "2026-07-15T15:03:01.949607+00:00",
+  "replay_completed_at": "2026-07-15T15:03:02.335833+00:00",
+  "first_replay": {
+    "started_at": "2026-07-15T15:03:01.949611+00:00",
+    "completed_at": "2026-07-15T15:03:02.284615+00:00",
+    "records_processed": 10,
+    "inserted": 10,
+    "updated": 0,
     "excluded": 0,
     "failed": 0,
-    "inserted": 20,
-    "unchanged": 0,
-    "updated": 0
+    "unchanged": 0
   },
   "idempotency_replay": {
-    "exit_code": 0,
+    "started_at": "2026-07-15T15:03:02.294380+00:00",
+    "completed_at": "2026-07-15T15:03:02.327909+00:00",
+    "records_processed": 10,
+    "inserted": 0,
+    "updated": 0,
     "excluded": 0,
     "failed": 0,
-    "inserted": 0,
-    "unchanged": 20,
-    "updated": 0
+    "unchanged": 10
   },
-  "database_counts_after_replay": {
-    "work": 20,
-    "source_record": 20,
-    "external_identifier": 47,
-    "field_assertion": 320,
-    "topic": 41,
-    "code_repository": 5,
-    "metric_snapshot": 20
+  "database_counts_after_first_replay": {
+    "work": 10,
+    "source_record": 10,
+    "external_identifier": 28,
+    "field_assertion": 150,
+    "scope_assessment": 10,
+    "topic": 19,
+    "code_repository": 0,
+    "metric_snapshot": 10
   },
+  "database_counts_after_idempotency_replay": {
+    "work": 10,
+    "source_record": 10,
+    "external_identifier": 28,
+    "field_assertion": 150,
+    "scope_assessment": 10,
+    "topic": 19,
+    "code_repository": 0,
+    "metric_snapshot": 10
+  },
+  "idempotency_database_counts_unchanged": true,
   "external_identifiers_by_scheme": {
-    "arxiv": 4,
-    "doi": 20,
+    "arxiv": 6,
+    "doi": 10,
     "mag": 1,
-    "openalex": 20,
-    "pmid": 2
+    "openalex": 10,
+    "pmid": 1
   },
-  "excluded_source_records": 0,
-  "scope_assertions": 20,
-  "excluded_scope_assertions": 0
+  "scope_assessments_by_rule_version": {
+    "agent-llm-v1": 10
+  },
+  "current_rule_scope_assessments": 10,
+  "included_scope_assessments": 10,
+  "excluded_scope_assessments": 0,
+  "source_records_without_work": 0
 }
