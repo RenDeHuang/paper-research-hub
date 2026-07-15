@@ -51,6 +51,19 @@ def test_identical_dois_share_a_canonical_identity() -> None:
     assert first == second == "doi:10.1000/abc"
 
 
+def test_canonical_identity_prefers_s2_over_openalex() -> None:
+    from paper_hub.normalization import canonical_identity
+
+    assert canonical_identity(
+        {
+            "openalex_id": "W1234567890",
+            "semantic_scholar_paper_id": (
+                "0123456789abcdef0123456789abcdef01234567"
+            ),
+        }
+    ) == "s2:0123456789abcdef0123456789abcdef01234567"
+
+
 def test_arxiv_versions_share_a_canonical_identity() -> None:
     from paper_hub.normalization import canonical_identity
 

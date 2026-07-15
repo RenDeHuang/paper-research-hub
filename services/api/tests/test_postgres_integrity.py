@@ -560,6 +560,7 @@ def test_0003_to_0004_scope_assessment_upgrade_and_downgrade_are_executable(
     work_id = uuid4()
     included_source_id = uuid4()
     excluded_source_id = uuid4()
+    post_upgrade_source_id = uuid4()
     try:
         with engine.begin() as connection:
             connection.execute(
@@ -750,21 +751,271 @@ def test_0003_to_0004_scope_assessment_upgrade_and_downgrade_are_executable(
                 )
             ) == 2
 
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W1000000003',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": post_upgrade_source_id,
+                    "work_id": work_id,
+                    "content_hash": "c" * 64,
+                },
+            )
+            for rule_version in (
+                "agent-llm-scope-v2",
+                "agent-llm-scope-v3",
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO scope_assessment (
+                            id,
+                            source_record_id,
+                            rule_version,
+                            included,
+                            reason,
+                            evidence,
+                            evaluated_at,
+                            work_id
+                        )
+                        VALUES (
+                            :id,
+                            :source_record_id,
+                            :rule_version,
+                            true,
+                            NULL,
+                            '[]'::jsonb,
+                            :evaluated_at,
+                            :work_id
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "source_record_id": post_upgrade_source_id,
+                        "rule_version": rule_version,
+                        "evaluated_at": datetime.now(UTC),
+                        "work_id": work_id,
+                    },
+                )
+
         command.downgrade(
             alembic_config,
             "0003_openalex_source_provenance",
         )
         assert "scope_assessment" not in inspect(engine).get_table_names()
         with engine.connect() as connection:
+            scope_assertions = connection.execute(
+                text(
+                    """
+                    SELECT value, parser_version
+                    FROM field_assertion
+                    WHERE source_record_id = :source_record_id
+                      AND field_name = 'scope'
+                    ORDER BY value ->> 'rule_version'
+                    """
+                ),
+                {"source_record_id": post_upgrade_source_id},
+            ).mappings().all()
+            assert [
+                assertion["value"]["rule_version"]
+                for assertion in scope_assertions
+            ] == [
+                "agent-llm-scope-v2",
+                "agent-llm-scope-v3",
+            ]
+            assert len(
+                {
+                    assertion["parser_version"]
+                    for assertion in scope_assertions
+                }
+            ) == 2
+    finally:
+        engine.dispose()
+
+
+def test_0005_adds_projection_provenance_and_cascading_scope_work_fk(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0004_versioned_scope_assessment")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (
+                        id, canonical_key, title, source
+                    )
+                    VALUES (
+                        :id, 'doi:10.1000/projection-migration',
+                        'Projection migration fixture', 'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source_updated_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W1000000004',
+                        :content_hash,
+                        '{}'::jsonb,
+                        :source_updated_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "d" * 64,
+                    "source_updated_at": datetime(
+                        2026,
+                        7,
+                        15,
+                        8,
+                        0,
+                        tzinfo=UTC,
+                    ),
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'agent-llm-v1',
+                        true,
+                        NULL,
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "source_record_id": source_id,
+                    "evaluated_at": datetime.now(UTC),
+                    "work_id": work_id,
+                },
+            )
+
+        command.upgrade(alembic_config, "head")
+
+        inspector = inspect(engine)
+        work_columns = {
+            column["name"] for column in inspector.get_columns("work")
+        }
+        assert {
+            "projection_source",
+            "projection_source_record_id",
+            "projection_source_updated_at",
+        } <= work_columns
+        scope_work_fk = next(
+            foreign_key
+            for foreign_key in inspector.get_foreign_keys(
+                "scope_assessment"
+            )
+            if foreign_key["constrained_columns"] == ["work_id"]
+        )
+        assert scope_work_fk["options"].get("ondelete") == "CASCADE"
+        with engine.connect() as connection:
+            projection = connection.execute(
+                text(
+                    """
+                    SELECT
+                        projection_source,
+                        projection_source_record_id,
+                        projection_source_updated_at
+                    FROM work
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": work_id},
+            ).one()
+            assert projection == (
+                "openalex",
+                "W1000000004",
+                datetime(2026, 7, 15, 8, 0, tzinfo=UTC),
+            )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM work WHERE id = :work_id"),
+                {"work_id": work_id},
+            )
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    "SELECT count(*) FROM source_record WHERE id = :id"
+                ),
+                {"id": source_id},
+            ) == 1
             assert connection.scalar(
                 text(
                     """
                     SELECT count(*)
-                    FROM field_assertion
-                    WHERE field_name = 'scope'
+                    FROM scope_assessment
+                    WHERE source_record_id = :source_record_id
                     """
-                )
-            ) == 2
+                ),
+                {"source_record_id": source_id},
+            ) == 0
+
+        command.downgrade(
+            alembic_config,
+            "0004_versioned_scope_assessment",
+        )
+        downgraded_columns = {
+            column["name"] for column in inspect(engine).get_columns("work")
+        }
+        assert "projection_source_updated_at" not in downgraded_columns
     finally:
         engine.dispose()
 
@@ -913,7 +1164,7 @@ def test_offline_head_sql_applies_to_historical_schema_variants(
 
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0004_versioned_scope_assessment"
+            ) == "0005_work_projection_integrity"
             context = MigrationContext.configure(
                 connection,
                 opts={

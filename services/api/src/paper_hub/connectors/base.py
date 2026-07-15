@@ -114,6 +114,7 @@ class ParsedWork:
     institutions: tuple[InstitutionData, ...]
     publication_date: date | None
     work_type: str | None
+    is_retracted: bool
     topics: tuple[TopicData, ...]
     open_access: OpenAccessData
     license: str | None

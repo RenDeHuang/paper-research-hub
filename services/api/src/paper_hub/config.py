@@ -2,7 +2,13 @@ from functools import lru_cache
 from pathlib import Path
 import re
 
-from pydantic import PostgresDsn, SecretStr, TypeAdapter, field_validator
+from pydantic import (
+    Field,
+    PostgresDsn,
+    SecretStr,
+    TypeAdapter,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +30,17 @@ class Settings(BaseSettings):
     database_url: SecretStr
     openalex_contact_email: str | None = None
     openalex_api_key: SecretStr | None = None
+    openalex_max_retries: int = Field(default=3, ge=0, le=10)
+    openalex_retry_backoff_seconds: float = Field(
+        default=1.0,
+        ge=0,
+        le=60,
+    )
+    openalex_max_retry_wait_seconds: float = Field(
+        default=30.0,
+        ge=0,
+        le=300,
+    )
 
     @field_validator("database_url")
     @classmethod

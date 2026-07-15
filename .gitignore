@@ -13,3 +13,4 @@ dist/
 *.log
 data/raw/
 data/derived/
+/artifacts/source-captures/

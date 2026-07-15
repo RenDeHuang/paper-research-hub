@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
         "sync-openalex",
         help="Fetch and ingest scoped OpenAlex works",
     )
-    sync_parser.add_argument("--query", required=True)
+    sync_parser.add_argument("--query", required=True, type=_nonblank_query)
     sync_parser.add_argument("--from-date", type=_iso_date)
     sync_parser.add_argument(
         "--max-results",
@@ -93,6 +93,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         with OpenAlexConnector(
             contact_email=settings.openalex_contact_email,
             api_key=settings.openalex_api_key,
+            max_retries=settings.openalex_max_retries,
+            retry_backoff_seconds=(
+                settings.openalex_retry_backoff_seconds
+            ),
+            max_retry_wait_seconds=(
+                settings.openalex_max_retry_wait_seconds
+            ),
         ) as connector:
             with Session(engine) as session:
                 pending_summary = IngestionSummary()
@@ -151,6 +158,15 @@ def _iso_date(value: str) -> date:
         raise argparse.ArgumentTypeError(
             "--from-date must use YYYY-MM-DD"
         ) from exc
+
+
+def _nonblank_query(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise argparse.ArgumentTypeError(
+            "--query must not be blank"
+        )
+    return normalized
 
 
 def _bounded_max_results(value: str) -> int:

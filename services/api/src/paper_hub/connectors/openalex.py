@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 import json
+import math
 import re
+import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -44,6 +47,13 @@ OPENALEX_SCOPE_RULE_VERSION = "agent-llm-v1"
 OPENALEX_MAX_RESULTS = 1000
 OPENALEX_PAGE_SIZE = 100
 OPENALEX_SOURCE_LICENSE = "CC0"
+OPENALEX_DEFAULT_MAX_RETRIES = 3
+OPENALEX_DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
+OPENALEX_DEFAULT_MAX_RETRY_WAIT_SECONDS = 30.0
+OPENALEX_MAX_RETRIES = 10
+OPENALEX_MAX_RETRY_BACKOFF_SECONDS = 60.0
+OPENALEX_MAX_RETRY_WAIT_SECONDS = 300.0
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 _EMAIL_PATTERN = re.compile(
     r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
@@ -111,16 +121,35 @@ class OpenAlexTimeoutError(OpenAlexError):
 
 
 class OpenAlexRateLimitError(OpenAlexError):
-    def __init__(self, retry_after: str | None) -> None:
+    def __init__(
+        self,
+        retry_after: str | None,
+        *,
+        max_retry_wait_seconds: float | None = None,
+    ) -> None:
         self.retry_after = retry_after
         message = "OpenAlex request was rate limited with HTTP 429"
         if retry_after:
             message += f"; Retry-After={retry_after}"
+        if max_retry_wait_seconds is not None:
+            message += (
+                "; Retry-After exceeds maximum retry wait of "
+                f"{max_retry_wait_seconds:g} seconds"
+            )
         super().__init__(message)
 
 
 class OpenAlexResponseError(OpenAlexError):
-    """OpenAlex returned a non-success or malformed response."""
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: str | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.retry_after = retry_after
+        super().__init__(message)
 
 
 class OpenAlexParseError(OpenAlexError, ConnectorParseError):
@@ -141,13 +170,62 @@ class OpenAlexConnector:
             pool=5.0,
         ),
         client: httpx.Client | None = None,
+        max_retries: int = OPENALEX_DEFAULT_MAX_RETRIES,
+        retry_backoff_seconds: float = (
+            OPENALEX_DEFAULT_RETRY_BACKOFF_SECONDS
+        ),
+        max_retry_wait_seconds: float = (
+            OPENALEX_DEFAULT_MAX_RETRY_WAIT_SECONDS
+        ),
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         normalized_email = contact_email.strip()
         if not _EMAIL_PATTERN.fullmatch(normalized_email):
             raise ValueError("a valid OpenAlex contact email is required")
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or not 0 <= max_retries <= OPENALEX_MAX_RETRIES
+        ):
+            raise ValueError(
+                "max_retries must be an integer between 0 and "
+                f"{OPENALEX_MAX_RETRIES}"
+            )
+        if (
+            isinstance(retry_backoff_seconds, bool)
+            or not isinstance(retry_backoff_seconds, (int, float))
+            or not math.isfinite(retry_backoff_seconds)
+            or not (
+                0
+                <= retry_backoff_seconds
+                <= OPENALEX_MAX_RETRY_BACKOFF_SECONDS
+            )
+        ):
+            raise ValueError(
+                "retry_backoff_seconds must be between 0 and "
+                f"{OPENALEX_MAX_RETRY_BACKOFF_SECONDS:g}"
+            )
+        if (
+            isinstance(max_retry_wait_seconds, bool)
+            or not isinstance(max_retry_wait_seconds, (int, float))
+            or not math.isfinite(max_retry_wait_seconds)
+            or not (
+                0
+                <= max_retry_wait_seconds
+                <= OPENALEX_MAX_RETRY_WAIT_SECONDS
+            )
+        ):
+            raise ValueError(
+                "max_retry_wait_seconds must be between 0 and "
+                f"{OPENALEX_MAX_RETRY_WAIT_SECONDS:g}"
+            )
         self.contact_email = normalized_email
         self.api_key = api_key
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = float(retry_backoff_seconds)
+        self.max_retry_wait_seconds = float(max_retry_wait_seconds)
+        self.sleep = sleep
         self._owns_client = client is None
         self.client = client or httpx.Client(timeout=timeout)
 
@@ -237,7 +315,7 @@ class OpenAlexConnector:
         params: dict[str, str | int] = {
             "search": query,
             "cursor": cursor,
-            "per-page": per_page,
+            "per_page": per_page,
             "mailto": self.contact_email,
         }
         if from_date is not None:
@@ -253,29 +331,7 @@ class OpenAlexConnector:
             )
         }
 
-        try:
-            response = self.client.get(
-                OPENALEX_API_URL,
-                params=params,
-                headers=headers,
-                timeout=self.timeout,
-            )
-        except httpx.TimeoutException as exc:
-            raise OpenAlexTimeoutError(
-                "OpenAlex request timed out"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise OpenAlexError(
-                f"OpenAlex request failed: {exc.__class__.__name__}"
-            ) from exc
-
-        if response.status_code == 429:
-            raise OpenAlexRateLimitError(response.headers.get("Retry-After"))
-        if not 200 <= response.status_code < 300:
-            raise OpenAlexResponseError(
-                "OpenAlex request failed with HTTP "
-                f"{response.status_code}"
-            )
+        response = self._send_with_retry(params=params, headers=headers)
         try:
             payload = response.json()
         except (json.JSONDecodeError, ValueError) as exc:
@@ -287,6 +343,92 @@ class OpenAlexConnector:
                 "OpenAlex response must be a JSON object"
             )
         return payload, response.status_code, datetime.now(UTC)
+
+    def _send_with_retry(
+        self,
+        *,
+        params: Mapping[str, str | int],
+        headers: Mapping[str, str],
+    ) -> httpx.Response:
+        for retry_number in range(self.max_retries + 1):
+            try:
+                response = self.client.get(
+                    OPENALEX_API_URL,
+                    params=params,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+            except httpx.TimeoutException as exc:
+                raise OpenAlexTimeoutError(
+                    "OpenAlex request timed out"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise OpenAlexError(
+                    f"OpenAlex request failed: {exc.__class__.__name__}"
+                ) from exc
+
+            if 200 <= response.status_code < 300:
+                return response
+            if response.status_code not in _RETRYABLE_STATUS_CODES:
+                raise self._response_error(response)
+
+            retry_after = response.headers.get("Retry-After")
+            retry_after_seconds = _retry_after_seconds(retry_after)
+            if (
+                retry_after_seconds is not None
+                and retry_after_seconds > self.max_retry_wait_seconds
+            ):
+                raise self._response_error(
+                    response,
+                    wait_cap_exceeded=True,
+                )
+            if retry_number >= self.max_retries:
+                raise self._response_error(response)
+
+            delay = (
+                retry_after_seconds
+                if retry_after_seconds is not None
+                else min(
+                    self.retry_backoff_seconds * (2**retry_number),
+                    self.max_retry_wait_seconds,
+                )
+            )
+            self.sleep(delay)
+
+        raise AssertionError("retry loop did not return or raise")
+
+    def _response_error(
+        self,
+        response: httpx.Response,
+        *,
+        wait_cap_exceeded: bool = False,
+    ) -> OpenAlexError:
+        retry_after = response.headers.get("Retry-After")
+        if response.status_code == 429:
+            return OpenAlexRateLimitError(
+                retry_after,
+                max_retry_wait_seconds=(
+                    self.max_retry_wait_seconds
+                    if wait_cap_exceeded
+                    else None
+                ),
+            )
+        message = (
+            "OpenAlex request failed with HTTP "
+            f"{response.status_code}"
+        )
+        if retry_after:
+            message += f"; Retry-After={retry_after}"
+        if wait_cap_exceeded:
+            message += (
+                "; Retry-After exceeds maximum retry wait of "
+                f"{self.max_retry_wait_seconds:g} seconds"
+            )
+        return OpenAlexResponseError(
+            message,
+            status_code=response.status_code,
+            retry_after=retry_after,
+        )
 
     @classmethod
     def parse_record(
@@ -350,6 +492,11 @@ class OpenAlexConnector:
             else None
         )
         scope = _scope_decision(title, abstract, topics)
+        is_retracted = raw_payload.get("is_retracted", False)
+        if not isinstance(is_retracted, bool):
+            raise OpenAlexParseError(
+                "OpenAlex is_retracted must be a boolean"
+            )
         parsed = ParsedWork(
             canonical_key=canonical_key,
             external_identifiers=external_identifiers,
@@ -359,6 +506,7 @@ class OpenAlexConnector:
             institutions=institutions,
             publication_date=_parse_date(raw_payload.get("publication_date")),
             work_type=_string(raw_payload.get("type")),
+            is_retracted=is_retracted,
             topics=topics,
             open_access=open_access,
             license=license_value,
@@ -390,6 +538,24 @@ class OpenAlexConnector:
             parser_version=OPENALEX_PARSER_VERSION,
             parsed=parsed,
         )
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if normalized.isdigit():
+        return float(int(normalized))
+    try:
+        retry_at = parsedate_to_datetime(normalized)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+    seconds = (
+        retry_at.astimezone(UTC) - datetime.now(UTC)
+    ).total_seconds()
+    return max(0.0, seconds)
 
 
 def _required_title(raw_payload: Mapping[str, Any]) -> str:

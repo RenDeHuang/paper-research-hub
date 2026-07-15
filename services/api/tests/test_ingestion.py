@@ -1,7 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+from threading import Barrier
 
 from alembic import command
 import pytest
@@ -156,6 +158,134 @@ def test_new_hash_adds_snapshot_and_assertions_without_duplicate_work(
         assert work.title == updated["title"]
 
 
+def test_older_snapshot_does_not_overwrite_newer_work_projection(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import RecordStatus, SourceRecord, Work
+
+    older_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    newer_raw = json.loads(json.dumps(older_raw))
+    newer_raw["title"] = "Newest Retracted LLM Agent Benchmark"
+    newer_raw["display_name"] = newer_raw["title"]
+    newer_raw["updated_date"] = "2026-07-16T08:00:00"
+    newer_raw["is_retracted"] = True
+
+    with Session(migrated_engine) as session:
+        newer = IngestionService(session).ingest(
+            _record(newer_raw, minute=5)
+        )
+        older = IngestionService(session).ingest(_record(older_raw))
+        session.commit()
+
+        work = session.get(Work, newer.work_id)
+        assert older.status == "updated"
+        assert work.title == newer_raw["title"]
+        assert work.status == RecordStatus.RETRACTED
+        assert work.projection_source == "openalex"
+        assert work.projection_source_record_id == "W2741809807"
+        assert work.projection_source_updated_at == datetime(
+            2026,
+            7,
+            16,
+            8,
+            0,
+            tzinfo=UTC,
+        )
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord))
+            == 2
+        )
+
+
+def test_concurrent_same_snapshot_is_idempotent_in_real_postgresql(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import ScopeAssessment, SourceRecord, Work
+
+    record = _record(_fixture()["results"][0])
+    barrier = Barrier(2)
+
+    def ingest_once() -> str:
+        with Session(migrated_engine) as session:
+            barrier.wait(timeout=10)
+            result = IngestionService(session).ingest(record)
+            session.commit()
+            return result.status
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = sorted(
+            future.result(timeout=30)
+            for future in (
+                executor.submit(ingest_once),
+                executor.submit(ingest_once),
+            )
+        )
+
+    assert statuses == ["inserted", "unchanged"]
+    with Session(migrated_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord))
+            == 1
+        )
+        assert (
+            session.scalar(
+                select(func.count()).select_from(ScopeAssessment)
+            )
+            == 1
+        )
+
+
+def test_concurrent_shared_canonical_identity_creates_one_work(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import SourceRecord, Work
+
+    first_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    first_raw["ids"] = {
+        "openalex": first_raw["id"],
+        "doi": first_raw["doi"],
+    }
+    first_raw["primary_location"] = None
+    first_raw["best_oa_location"] = None
+    first_raw["locations"] = []
+
+    second_raw = json.loads(json.dumps(first_raw))
+    second_raw["id"] = "https://openalex.org/W2222222222"
+    second_raw["ids"]["openalex"] = second_raw["id"]
+    second_raw["updated_date"] = "2026-07-15T08:00:00"
+    barrier = Barrier(2)
+
+    def ingest_once(raw: dict, minute: int) -> str:
+        with Session(migrated_engine) as session:
+            barrier.wait(timeout=10)
+            result = IngestionService(session).ingest(
+                _record(raw, minute=minute)
+            )
+            session.commit()
+            return result.status
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = sorted(
+            future.result(timeout=30)
+            for future in (
+                executor.submit(ingest_once, first_raw, 0),
+                executor.submit(ingest_once, second_raw, 1),
+            )
+        )
+
+    assert statuses == ["inserted", "updated"]
+    with Session(migrated_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord))
+            == 2
+        )
+
+
 def test_raw_snapshot_columns_are_database_immutable(migrated_engine) -> None:
     from paper_hub.ingestion import IngestionService
 
@@ -225,6 +355,87 @@ def test_controlled_external_identifier_deduplicates_without_title_matching(
         assert session.scalar(select(func.count()).select_from(Work)) == 1
         assert (
             session.scalar(select(func.count()).select_from(SourceRecord)) == 2
+        )
+
+
+def test_stronger_canonical_identifier_upgrades_existing_work(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import Work
+
+    openalex_only = json.loads(json.dumps(_fixture()["results"][0]))
+    openalex_only["doi"] = None
+    openalex_only["ids"] = {"openalex": openalex_only["id"]}
+    openalex_only["primary_location"] = None
+    openalex_only["best_oa_location"] = None
+    openalex_only["locations"] = []
+
+    with_doi = json.loads(json.dumps(openalex_only))
+    with_doi["doi"] = "https://doi.org/10.1000/stronger-id"
+    with_doi["ids"]["doi"] = with_doi["doi"]
+    with_doi["updated_date"] = "2026-07-15T08:00:00"
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(_record(openalex_only))
+        session.commit()
+        second = IngestionService(session).ingest(
+            _record(with_doi, minute=1)
+        )
+        session.commit()
+
+        work = session.get(Work, first.work_id)
+        assert second.work_id == first.work_id
+        assert work.canonical_key == "doi:10.1000/stronger-id"
+
+
+def test_canonical_upgrade_conflict_is_explicit(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IdentityConflictError, IngestionService
+    from paper_hub.models import Work
+
+    first_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    first_raw["doi"] = None
+    first_raw["ids"] = {"openalex": first_raw["id"]}
+    first_raw["primary_location"] = None
+    first_raw["best_oa_location"] = None
+    first_raw["locations"] = []
+
+    target_raw = json.loads(json.dumps(first_raw))
+    target_raw["id"] = "https://openalex.org/W3333333333"
+    target_raw["doi"] = "https://doi.org/10.1000/conflicting-upgrade"
+    target_raw["ids"] = {
+        "openalex": target_raw["id"],
+        "doi": target_raw["doi"],
+    }
+
+    upgrade_raw = json.loads(json.dumps(first_raw))
+    upgrade_raw["doi"] = target_raw["doi"]
+    upgrade_raw["ids"]["doi"] = target_raw["doi"]
+    upgrade_raw["updated_date"] = "2026-07-15T09:00:00"
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(_record(first_raw))
+        target = IngestionService(session).ingest(
+            _record(target_raw, minute=1)
+        )
+        session.commit()
+
+        with pytest.raises(
+            IdentityConflictError,
+            match="multiple works",
+        ):
+            IngestionService(session).ingest(
+                _record(upgrade_raw, minute=2)
+            )
+        session.rollback()
+
+        assert first.work_id != target.work_id
+        assert session.scalar(select(func.count()).select_from(Work)) == 2
+        assert (
+            session.get(Work, first.work_id).canonical_key
+            == "openalex:W2741809807"
         )
 
 
@@ -876,6 +1087,64 @@ def test_ingestion_persists_topics_code_and_citation_snapshot(
         assert session.scalar(select(func.count()).select_from(Topic)) == 2
 
 
+def test_session_and_sql_work_delete_preserve_raw_source_records(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import ScopeAssessment, SourceRecord, Work
+
+    first_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    second_raw = json.loads(json.dumps(first_raw))
+    second_raw["id"] = "https://openalex.org/W4444444444"
+    second_raw["doi"] = "https://doi.org/10.1000/sql-delete"
+    second_raw["ids"] = {
+        "openalex": second_raw["id"],
+        "doi": second_raw["doi"],
+    }
+    second_raw["primary_location"] = None
+    second_raw["best_oa_location"] = None
+    second_raw["locations"] = []
+
+    with Session(migrated_engine) as session:
+        orm_result = IngestionService(session).ingest(_record(first_raw))
+        sql_result = IngestionService(session).ingest(
+            _record(second_raw, minute=1)
+        )
+        session.commit()
+        expected_payloads = {
+            orm_result.source_record_id: first_raw,
+            sql_result.source_record_id: second_raw,
+        }
+
+        work = session.get(Work, orm_result.work_id)
+        session.delete(work)
+        session.commit()
+
+    with migrated_engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM work WHERE id = :work_id"),
+            {"work_id": sql_result.work_id},
+        )
+
+    with Session(migrated_engine) as session:
+        for source_record_id, raw_payload in expected_payloads.items():
+            source_record = session.get(SourceRecord, source_record_id)
+            assert source_record is not None
+            assert source_record.work_id is None
+            assert source_record.raw_payload == raw_payload
+            assert (
+                session.scalar(
+                    select(func.count())
+                    .select_from(ScopeAssessment)
+                    .where(
+                        ScopeAssessment.source_record_id
+                        == source_record_id
+                    )
+                )
+                == 0
+            )
+
+
 def test_cli_requires_database_url_and_contact_email(
     monkeypatch,
     capsys,
@@ -938,3 +1207,21 @@ def test_cli_rejects_max_results_above_hard_limit(capsys) -> None:
 
     assert exc_info.value.code == 2
     assert "max-results" in capsys.readouterr().err
+
+
+def test_cli_rejects_blank_query_before_loading_database_config(
+    monkeypatch,
+    capsys,
+) -> None:
+    from paper_hub import cli
+
+    def unexpected_settings_load():
+        pytest.fail("blank query must fail before loading database config")
+
+    monkeypatch.setattr(cli, "get_settings", unexpected_settings_load)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["sync-openalex", "--query", "   "])
+
+    assert exc_info.value.code == 2
+    assert "query" in capsys.readouterr().err

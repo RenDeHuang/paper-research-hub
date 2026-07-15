@@ -16,6 +16,7 @@
       "display_name": "AgentBench: Evaluating LLM Agents with Tool Use",
       "publication_date": "2026-07-10",
       "type": "preprint",
+      "is_retracted": false,
       "cited_by_count": 42,
       "updated_date": "2026-07-14T12:34:56.000000",
       "ids": {
@@ -159,6 +160,7 @@
       "display_name": "Catalytic Oxidation of Methane on Supported Metals",
       "publication_date": "2026-06-20",
       "type": "article",
+      "is_retracted": false,
       "cited_by_count": 3,
       "updated_date": "2026-07-13T08:00:00",
       "ids": {

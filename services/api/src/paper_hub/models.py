@@ -167,6 +167,13 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     abstract: Mapped[str | None] = mapped_column(Text)
     publication_date: Mapped[date | None] = mapped_column(Date)
+    projection_source: Mapped[str | None] = mapped_column(String(64))
+    projection_source_record_id: Mapped[str | None] = mapped_column(
+        String(255)
+    )
+    projection_source_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     versions: Mapped[list[PaperVersion]] = relationship(
         back_populates="work",
@@ -220,7 +227,7 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     )
     scope_assessments: Mapped[list[ScopeAssessment]] = relationship(
         back_populates="work",
-        passive_deletes=True,
+        passive_deletes="all",
     )
 
 
@@ -363,7 +370,7 @@ class ScopeAssessment(UUIDPrimaryKeyMixin, Base):
         server_default=func.now(),
     )
     work_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("work.id"),
+        ForeignKey("work.id", ondelete="CASCADE"),
     )
 
     source_record: Mapped[SourceRecord] = relationship(

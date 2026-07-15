@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from paper_hub.connectors.base import (
@@ -20,6 +20,7 @@ from paper_hub.models import (
     ExternalIdentifier,
     FieldAssertion,
     MetricSnapshot,
+    RecordStatus,
     ScopeAssessment,
     SourceRecord,
     Topic,
@@ -88,6 +89,7 @@ class IngestionService:
                 "raw payload no longer matches its content hash"
             )
         parsed = record.parsed
+        self._acquire_identity_locks(record, parsed)
         scope_evidence = tuple(
             {
                 "field": evidence.field,
@@ -192,11 +194,16 @@ class IngestionService:
                 title=parsed.title,
                 abstract=parsed.abstract,
                 publication_date=parsed.publication_date,
+                projection_source=record.source,
+                projection_source_record_id=record.source_record_id,
+                projection_source_updated_at=record.source_updated_at,
+                status=self._work_status(parsed),
                 **self._provenance(record, parsed),
             )
             self.session.add(work)
             self.session.flush()
         else:
+            self._upgrade_canonical_key(work, parsed)
             self._update_work_projection(work, record, parsed)
 
         if source_record is None:
@@ -326,12 +333,68 @@ class IngestionService:
             )
         return next(iter(matched_works.values()), None)
 
+    def _acquire_identity_locks(
+        self,
+        record: ConnectorRecord[ParsedWork],
+        parsed: ParsedWork,
+    ) -> None:
+        lock_keys = {
+            f"source:{record.source}:{record.source_record_id}",
+            *(
+                "external:"
+                f"{identifier.scheme}:{identifier.normalized_value}"
+                for identifier in parsed.external_identifiers
+            ),
+        }
+        for lock_key in sorted(lock_keys):
+            self.session.execute(
+                text(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended(:lock_key, 0)
+                    )
+                    """
+                ),
+                {"lock_key": lock_key},
+            )
+
+    def _upgrade_canonical_key(
+        self,
+        work: Work,
+        parsed: ParsedWork,
+    ) -> None:
+        priority = {
+            scheme: index
+            for index, scheme in enumerate(APPROVED_CANONICAL_PREFIXES)
+        }
+        current_scheme = work.canonical_key.split(":", maxsplit=1)[0]
+        candidate_scheme = parsed.canonical_key.split(":", maxsplit=1)[0]
+        if priority[candidate_scheme] >= priority[current_scheme]:
+            return
+        owner = self.session.scalar(
+            select(Work).where(
+                Work.canonical_key == parsed.canonical_key,
+                Work.id != work.id,
+            )
+        )
+        if owner is not None:
+            raise IdentityConflictError(
+                "stronger canonical key is already owned by another work"
+            )
+        work.canonical_key = parsed.canonical_key
+
     def _update_work_projection(
         self,
         work: Work,
         record: ConnectorRecord[ParsedWork],
         parsed: ParsedWork,
     ) -> None:
+        if (
+            work.projection_source_updated_at is not None
+            and record.source_updated_at
+            <= work.projection_source_updated_at
+        ):
+            return
         work.title = parsed.title
         work.abstract = parsed.abstract
         work.publication_date = parsed.publication_date
@@ -340,6 +403,10 @@ class IngestionService:
         work.retrieved_at = record.retrieved_at
         work.source_license = OPENALEX_SOURCE_LICENSE
         work.content_license = parsed.license
+        work.status = self._work_status(parsed)
+        work.projection_source = record.source
+        work.projection_source_record_id = record.source_record_id
+        work.projection_source_updated_at = record.source_updated_at
 
     def _persist_external_identifiers(
         self,
@@ -385,6 +452,7 @@ class IngestionService:
             "institutions": parsed.institutions,
             "publication_date": parsed.publication_date,
             "type": parsed.work_type,
+            "is_retracted": parsed.is_retracted,
             "topics": parsed.topics,
             "open_access": parsed.open_access,
             "license": parsed.license,
@@ -464,8 +532,6 @@ class IngestionService:
                 )
             )
             if repository is not None:
-                if repository.work_id != work.id:
-                    continue
                 continue
             self.session.add(
                 CodeRepository(
@@ -524,6 +590,14 @@ class IngestionService:
             "source_license": OPENALEX_SOURCE_LICENSE,
             "content_license": parsed.license,
         }
+
+    @staticmethod
+    def _work_status(parsed: ParsedWork) -> RecordStatus:
+        return (
+            RecordStatus.RETRACTED
+            if parsed.is_retracted
+            else RecordStatus.ACTIVE
+        )
 
 
 def _source_url(record: ConnectorRecord[ParsedWork]) -> str:

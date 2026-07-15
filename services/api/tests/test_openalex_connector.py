@@ -72,6 +72,7 @@ def test_parse_record_maps_openalex_work_and_provenance() -> None:
     )
     assert work.publication_date == date(2026, 7, 10)
     assert work.work_type == "preprint"
+    assert work.is_retracted is False
     assert work.citation_count == 42
     assert work.updated_at == record.source_updated_at
 
@@ -203,6 +204,8 @@ def test_fetch_uses_contact_identity_api_key_and_cursor_pagination() -> None:
         "from_publication_date:2026-01-01"
     )
     assert requests[0].url.params["cursor"] == "*"
+    assert requests[0].url.params["per_page"] == "2"
+    assert "per-page" not in requests[0].url.params
     assert requests[1].url.params["cursor"] == "next-page"
 
 
@@ -263,6 +266,7 @@ def test_429_and_non_2xx_errors_are_explicit_and_do_not_leak_api_key() -> None:
         contact_email=CONTACT_EMAIL,
         api_key=SecretStr(API_KEY),
         client=httpx.Client(transport=httpx.MockTransport(rate_limited)),
+        max_retries=0,
     )
     with pytest.raises(OpenAlexRateLimitError) as rate_exc:
         list(rate_connector.fetch_records(query="agents", max_results=1))
@@ -280,10 +284,199 @@ def test_429_and_non_2xx_errors_are_explicit_and_do_not_leak_api_key() -> None:
         contact_email=CONTACT_EMAIL,
         api_key=SecretStr(API_KEY),
         client=httpx.Client(transport=httpx.MockTransport(unavailable)),
+        max_retries=0,
     )
     with pytest.raises(OpenAlexResponseError, match="503") as response_exc:
         list(unavailable_connector.fetch_records(query="agents", max_results=1))
     assert API_KEY not in str(response_exc.value)
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+def test_retryable_server_errors_use_bounded_exponential_backoff(
+    status_code: int,
+) -> None:
+    from paper_hub.connectors.openalex import OpenAlexConnector
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(status_code, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"next_cursor": None},
+                "results": [_fixture()["results"][0]],
+            },
+            request=request,
+        )
+
+    connector = OpenAlexConnector(
+        contact_email=CONTACT_EMAIL,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=2,
+        retry_backoff_seconds=0.5,
+        max_retry_wait_seconds=10,
+        sleep=sleeps.append,
+    )
+
+    records = list(
+        connector.fetch_records(query="agents", max_results=1)
+    )
+
+    assert len(records) == 1
+    assert attempts == 3
+    assert sleeps == [0.5, 1.0]
+
+
+def test_429_retry_respects_retry_after_within_wait_cap() -> None:
+    from paper_hub.connectors.openalex import OpenAlexConnector
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "3"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"next_cursor": None},
+                "results": [_fixture()["results"][0]],
+            },
+            request=request,
+        )
+
+    connector = OpenAlexConnector(
+        contact_email=CONTACT_EMAIL,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=1,
+        retry_backoff_seconds=0.25,
+        max_retry_wait_seconds=10,
+        sleep=sleeps.append,
+    )
+
+    assert len(
+        list(connector.fetch_records(query="agents", max_results=1))
+    ) == 1
+    assert attempts == 2
+    assert sleeps == [3.0]
+
+
+def test_retry_after_above_wait_cap_is_preserved_and_fails_fast() -> None:
+    from paper_hub.connectors.openalex import (
+        OpenAlexConnector,
+        OpenAlexRateLimitError,
+    )
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "32386"},
+            request=request,
+        )
+
+    connector = OpenAlexConnector(
+        contact_email=CONTACT_EMAIL,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=3,
+        retry_backoff_seconds=1,
+        max_retry_wait_seconds=30,
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(OpenAlexRateLimitError) as exc_info:
+        list(connector.fetch_records(query="agents", max_results=1))
+
+    assert exc_info.value.retry_after == "32386"
+    assert "maximum retry wait" in str(exc_info.value)
+    assert attempts == 1
+    assert sleeps == []
+
+
+def test_non_retryable_4xx_is_not_retried() -> None:
+    from paper_hub.connectors.openalex import (
+        OpenAlexConnector,
+        OpenAlexResponseError,
+    )
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(400, request=request)
+
+    connector = OpenAlexConnector(
+        contact_email=CONTACT_EMAIL,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=3,
+        retry_backoff_seconds=1,
+        max_retry_wait_seconds=30,
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(OpenAlexResponseError, match="400"):
+        list(connector.fetch_records(query="agents", max_results=1))
+
+    assert attempts == 1
+    assert sleeps == []
+
+
+def test_retryable_error_stops_after_configured_max_retries() -> None:
+    from paper_hub.connectors.openalex import (
+        OpenAlexConnector,
+        OpenAlexResponseError,
+    )
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, request=request)
+
+    connector = OpenAlexConnector(
+        contact_email=CONTACT_EMAIL,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=2,
+        retry_backoff_seconds=0.5,
+        max_retry_wait_seconds=10,
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(OpenAlexResponseError, match="503"):
+        list(connector.fetch_records(query="agents", max_results=1))
+
+    assert attempts == 3
+    assert sleeps == [0.5, 1.0]
+
+
+def test_parse_record_maps_is_retracted_to_parsed_work() -> None:
+    from paper_hub.connectors.openalex import OpenAlexConnector
+
+    raw = json.loads(json.dumps(_fixture()["results"][0]))
+    raw["is_retracted"] = True
+
+    record = OpenAlexConnector.parse_record(raw)
+
+    assert record.parsed.is_retracted is True
 
 
 def test_openalex_configuration_requires_email_and_hides_api_key() -> None:
@@ -299,10 +492,16 @@ def test_openalex_configuration_requires_email_and_hides_api_key() -> None:
         ),
         openalex_contact_email=CONTACT_EMAIL,
         openalex_api_key=API_KEY,
+        openalex_max_retries=4,
+        openalex_retry_backoff_seconds=0.75,
+        openalex_max_retry_wait_seconds=12,
         _env_file=None,
     )
     assert isinstance(settings.openalex_api_key, SecretStr)
     assert API_KEY not in repr(settings)
+    assert settings.openalex_max_retries == 4
+    assert settings.openalex_retry_backoff_seconds == 0.75
+    assert settings.openalex_max_retry_wait_seconds == 12
 
     with pytest.raises(ValidationError):
         Settings(
@@ -311,6 +510,29 @@ def test_openalex_configuration_requires_email_and_hides_api_key() -> None:
             ),
             openalex_contact_email="not-an-email",
             _env_file=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_retries": 1.5},
+        {"max_retries": 11},
+        {"retry_backoff_seconds": 61},
+        {"retry_backoff_seconds": float("inf")},
+        {"max_retry_wait_seconds": 301},
+        {"max_retry_wait_seconds": float("nan")},
+    ],
+)
+def test_openalex_retry_configuration_must_remain_bounded(
+    kwargs: dict[str, object],
+) -> None:
+    from paper_hub.connectors.openalex import OpenAlexConnector
+
+    with pytest.raises(ValueError):
+        OpenAlexConnector(
+            contact_email=CONTACT_EMAIL,
+            **kwargs,
         )
 
 

@@ -292,6 +292,73 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute(
         """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM scope_assessment
+                WHERE length(rule_version) > 64
+            ) THEN
+                RAISE EXCEPTION
+                    'Cannot backfill scope rule_version longer than 64 characters';
+            END IF;
+        END;
+        $$;
+        """
+    )
+    op.execute(
+        """
+        INSERT INTO field_assertion (
+            id,
+            source_record_id,
+            field_name,
+            value,
+            parser_version,
+            confidence,
+            source,
+            source_url,
+            retrieved_at,
+            source_license,
+            content_license,
+            status,
+            created_at,
+            updated_at
+        )
+        SELECT
+            assessment.id,
+            assessment.source_record_id,
+            'scope',
+            jsonb_build_object(
+                'included', assessment.included,
+                'rule_version', assessment.rule_version,
+                'reason', assessment.reason,
+                'evidence', assessment.evidence
+            ),
+            assessment.rule_version,
+            NULL,
+            source.source,
+            source.source_url,
+            source.retrieved_at,
+            source.source_license,
+            source.content_license,
+            source.status,
+            assessment.evaluated_at,
+            assessment.evaluated_at
+        FROM scope_assessment AS assessment
+        JOIN source_record AS source
+          ON source.id = assessment.source_record_id
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM field_assertion AS assertion
+            WHERE assertion.source_record_id = assessment.source_record_id
+              AND assertion.field_name = 'scope'
+              AND assertion.value ->> 'rule_version'
+                  = assessment.rule_version
+        )
+        """
+    )
+    op.execute(
+        """
         DROP TRIGGER IF EXISTS
             trg_source_record_scope_work_match
         ON source_record

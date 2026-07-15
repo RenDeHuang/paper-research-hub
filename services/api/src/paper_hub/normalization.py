@@ -28,8 +28,8 @@ APPROVED_CANONICAL_PREFIXES = (
     "doi",
     "arxiv",
     "openreview",
-    "openalex",
     "s2",
+    "openalex",
 )
 _CANONICAL_KEY = re.compile(
     rf"^({'|'.join(APPROVED_CANONICAL_PREFIXES)}):(.*)$",
@@ -152,14 +152,6 @@ def canonical_identity(record: Mapping[str, Any]) -> str | None:
     if openreview_forum_id is not None:
         return f"openreview:{openreview_forum_id}"
 
-    openalex_id = _first_normalized(
-        record,
-        normalize_openalex_id,
-        "openalex_id",
-    )
-    if openalex_id is not None:
-        return f"openalex:{openalex_id}"
-
     semantic_scholar_paper_id = _first_normalized(
         record,
         normalize_semantic_scholar_paper_id,
@@ -169,6 +161,14 @@ def canonical_identity(record: Mapping[str, Any]) -> str | None:
     )
     if semantic_scholar_paper_id is not None:
         return f"s2:{semantic_scholar_paper_id}"
+
+    openalex_id = _first_normalized(
+        record,
+        normalize_openalex_id,
+        "openalex_id",
+    )
+    if openalex_id is not None:
+        return f"openalex:{openalex_id}"
 
     return None
 
