@@ -2,9 +2,10 @@ from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from paper_hub.models import RecordStatus
+from paper_hub.normalization import is_approved_canonical_key
 
 
 class ProvenanceSchema(BaseModel):
@@ -28,6 +29,15 @@ class WorkCreate(ProvenanceSchema):
     title: str = Field(min_length=1)
     abstract: str | None = None
     publication_date: date | None = None
+
+    @field_validator("canonical_key")
+    @classmethod
+    def require_approved_canonical_key(cls, value: str) -> str:
+        if not is_approved_canonical_key(value):
+            raise ValueError(
+                "canonical_key must use an approved prefix and non-empty value"
+            )
+        return value
 
 
 class WorkRead(WorkCreate):

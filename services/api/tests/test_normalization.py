@@ -59,6 +59,32 @@ def test_arxiv_versions_share_a_canonical_identity() -> None:
     assert first == second == "arxiv:2401.01234"
 
 
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        (
+            {"openreview_forum_id": "Forum_AbC123"},
+            "openreview:Forum_AbC123",
+        ),
+        (
+            {"openalex_id": "https://openalex.org/w1234567890"},
+            "openalex:W1234567890",
+        ),
+        (
+            {"semantic_scholar_paper_id": "A0B1C2D3"},
+            "s2:a0b1c2d3",
+        ),
+    ],
+)
+def test_explicit_external_ids_generate_controlled_canonical_identities(
+    record: dict[str, str],
+    expected: str,
+) -> None:
+    from paper_hub.normalization import canonical_identity
+
+    assert canonical_identity(record) == expected
+
+
 def test_similar_titles_do_not_generate_a_canonical_identity() -> None:
     from paper_hub.normalization import canonical_identity
 
@@ -67,6 +93,13 @@ def test_similar_titles_do_not_generate_a_canonical_identity() -> None:
 
     assert first is None
     assert second is None
+
+
+def test_arbitrary_canonical_key_is_not_accepted_as_identity_evidence() -> None:
+    from paper_hub.normalization import canonical_identity
+
+    assert canonical_identity({"canonical_key": "title:planning-agents"}) is None
+    assert canonical_identity({"canonical_key": "custom:record-123"}) is None
 
 
 def test_field_assertion_schema_preserves_provenance_and_licenses() -> None:
@@ -92,6 +125,74 @@ def test_field_assertion_schema_preserves_provenance_and_licenses() -> None:
     assert assertion.source_license == "CC0"
     assert assertion.content_license == "CC BY 4.0"
     assert assertion.parser_version == "openalex-v1"
+
+
+@pytest.mark.parametrize(
+    "canonical_key",
+    [
+        "doi:10.1000/example",
+        "arxiv:2401.01234",
+        "openreview:Forum_AbC123",
+        "openalex:W1234567890",
+        "s2:a0b1c2d3",
+    ],
+)
+def test_work_schema_accepts_only_approved_canonical_prefixes(
+    canonical_key: str,
+) -> None:
+    from paper_hub.schemas import WorkCreate
+
+    work = WorkCreate(
+        canonical_key=canonical_key,
+        title="Planning Agents with Tool Use",
+        source="openalex",
+        retrieved_at=datetime(2026, 7, 15, 8, 30, tzinfo=UTC),
+    )
+
+    assert work.canonical_key == canonical_key
+
+
+@pytest.mark.parametrize(
+    "canonical_key",
+    [
+        "title:planning-agents",
+        "custom:record-123",
+        "doi:",
+        "openreview:",
+        "openalex:   ",
+        " s2:a0b1c2d3",
+    ],
+)
+def test_work_schema_rejects_unapproved_or_empty_canonical_keys(
+    canonical_key: str,
+) -> None:
+    from paper_hub.schemas import WorkCreate
+
+    with pytest.raises(ValidationError):
+        WorkCreate(
+            canonical_key=canonical_key,
+            title="Planning Agents with Tool Use",
+            source="openalex",
+            retrieved_at=datetime(2026, 7, 15, 8, 30, tzinfo=UTC),
+        )
+
+
+def test_work_table_enforces_approved_canonical_key_prefixes() -> None:
+    from sqlalchemy import CheckConstraint
+
+    from paper_hub.models import Base
+
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in Base.metadata.tables["work"].constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert "ck_work_canonical_key_approved_prefix" in constraints
+    assert "canonical_key" in constraints["ck_work_canonical_key_approved_prefix"]
+    assert "openreview" in constraints["ck_work_canonical_key_approved_prefix"]
+    assert "openalex" in constraints["ck_work_canonical_key_approved_prefix"]
+    assert "s2" in constraints["ck_work_canonical_key_approved_prefix"]
 
 
 def test_database_configuration_rejects_non_postgresql_urls() -> None:
@@ -167,6 +268,51 @@ def test_core_models_have_provenance_status_constraints_and_relationships() -> N
     )
 
 
+def test_ranking_snapshot_uses_relational_exactly_one_subject_model() -> None:
+    from sqlalchemy import CheckConstraint, UniqueConstraint, inspect
+
+    from paper_hub.models import Base, RankingSnapshot
+
+    table = Base.metadata.tables["ranking_snapshot"]
+    assert {"work_id", "topic_id", "method_id"} <= set(table.columns.keys())
+    assert "subject_id" not in table.columns
+    assert "subject_type" not in table.columns
+    assert {
+        foreign_key.target_fullname for foreign_key in table.foreign_keys
+    } == {"work.id", "topic.id", "method.id"}
+
+    check_constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    exactly_one = check_constraints[
+        "ck_ranking_snapshot_exactly_one_subject"
+    ]
+    assert "work_id IS NOT NULL" in exactly_one
+    assert "topic_id IS NOT NULL" in exactly_one
+    assert "method_id IS NOT NULL" in exactly_one
+
+    unique_column_sets = {
+        frozenset(column.name for column in constraint.columns)
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    for subject_column in ("work_id", "topic_id", "method_id"):
+        assert frozenset(
+            {
+                "ranking_name",
+                subject_column,
+                "window_days",
+                "computed_at",
+            }
+        ) in unique_column_sets
+
+    assert {"work", "topic", "method"} <= set(
+        inspect(RankingSnapshot).relationships.keys()
+    )
+
+
 def test_model_metadata_compiles_with_postgresql_dialect() -> None:
     from sqlalchemy.dialects import postgresql
     from sqlalchemy.schema import CreateTable
@@ -200,3 +346,21 @@ def test_alembic_initial_migration_generates_postgresql_sql() -> None:
     assert "CREATE TABLE work" in migration_sql
     assert "CREATE TABLE paper_version" in migration_sql
     assert "CREATE TABLE ranking_snapshot" in migration_sql
+    assert "CONSTRAINT ck_work_canonical_key_approved_prefix CHECK" in migration_sql
+
+    ranking_sql = migration_sql.split(
+        "CREATE TABLE ranking_snapshot (",
+        maxsplit=1,
+    )[1].split("\n);", maxsplit=1)[0]
+    assert "subject_id" not in ranking_sql
+    assert "subject_type" not in ranking_sql
+    assert "work_id UUID" in ranking_sql
+    assert "topic_id UUID" in ranking_sql
+    assert "method_id UUID" in ranking_sql
+    assert "FOREIGN KEY(work_id) REFERENCES work (id)" in ranking_sql
+    assert "FOREIGN KEY(topic_id) REFERENCES topic (id)" in ranking_sql
+    assert "FOREIGN KEY(method_id) REFERENCES method (id)" in ranking_sql
+    assert (
+        "CONSTRAINT ck_ranking_snapshot_exactly_one_subject CHECK"
+        in ranking_sql
+    )

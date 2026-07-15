@@ -28,6 +28,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from paper_hub.db import Base
+from paper_hub.normalization import CANONICAL_KEY_SQL_CHECK
 
 
 class RecordStatus(str, Enum):
@@ -155,6 +156,10 @@ work_benchmark = Table(
 class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     __tablename__ = "work"
     __table_args__ = (
+        CheckConstraint(
+            CANONICAL_KEY_SQL_CHECK,
+            name="canonical_key_approved_prefix",
+        ),
         UniqueConstraint("canonical_key", name="uq_work_canonical_key"),
     )
 
@@ -199,6 +204,9 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
         cascade="all, delete-orphan",
     )
     metric_snapshots: Mapped[list[MetricSnapshot]] = relationship(
+        back_populates="work",
+    )
+    ranking_snapshots: Mapped[list[RankingSnapshot]] = relationship(
         back_populates="work",
     )
 
@@ -365,6 +373,9 @@ class Topic(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
         secondary=work_topic,
         back_populates="topics",
     )
+    ranking_snapshots: Mapped[list[RankingSnapshot]] = relationship(
+        back_populates="topic",
+    )
 
 
 class Method(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
@@ -380,6 +391,9 @@ class Method(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     works: Mapped[list[Work]] = relationship(
         secondary=work_method,
         back_populates="methods",
+    )
+    ranking_snapshots: Mapped[list[RankingSnapshot]] = relationship(
+        back_populates="method",
     )
 
 
@@ -515,13 +529,32 @@ class RankingSnapshot(
 ):
     __tablename__ = "ranking_snapshot"
     __table_args__ = (
+        CheckConstraint(
+            "(CASE WHEN work_id IS NOT NULL THEN 1 ELSE 0 END + "
+            "CASE WHEN topic_id IS NOT NULL THEN 1 ELSE 0 END + "
+            "CASE WHEN method_id IS NOT NULL THEN 1 ELSE 0 END) = 1",
+            name="exactly_one_subject",
+        ),
         UniqueConstraint(
             "ranking_name",
-            "subject_type",
-            "subject_id",
+            "work_id",
             "window_days",
             "computed_at",
-            name="uq_ranking_snapshot_subject_window_time",
+            name="uq_ranking_snapshot_work_window_time",
+        ),
+        UniqueConstraint(
+            "ranking_name",
+            "topic_id",
+            "window_days",
+            "computed_at",
+            name="uq_ranking_snapshot_topic_window_time",
+        ),
+        UniqueConstraint(
+            "ranking_name",
+            "method_id",
+            "window_days",
+            "computed_at",
+            name="uq_ranking_snapshot_method_window_time",
         ),
         UniqueConstraint(
             "ranking_name",
@@ -533,8 +566,15 @@ class RankingSnapshot(
     )
 
     ranking_name: Mapped[str] = mapped_column(String(64), nullable=False)
-    subject_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    subject_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    work_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("work.id", ondelete="CASCADE"),
+    )
+    topic_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("topic.id", ondelete="CASCADE"),
+    )
+    method_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("method.id", ondelete="CASCADE"),
+    )
     rank_position: Mapped[int] = mapped_column(Integer, nullable=False)
     score: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
     window_days: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -545,3 +585,9 @@ class RankingSnapshot(
     formula_version: Mapped[str] = mapped_column(String(64), nullable=False)
     coverage: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     explanation: Mapped[str | None] = mapped_column(Text)
+
+    work: Mapped[Work | None] = relationship(back_populates="ranking_snapshots")
+    topic: Mapped[Topic | None] = relationship(back_populates="ranking_snapshots")
+    method: Mapped[Method | None] = relationship(
+        back_populates="ranking_snapshots",
+    )
