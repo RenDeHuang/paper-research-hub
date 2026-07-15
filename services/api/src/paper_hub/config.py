@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+import re
 
 from pydantic import PostgresDsn, SecretStr, TypeAdapter, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -8,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 ROOT_ENV_FILE = PROJECT_ROOT / ".env"
 POSTGRES_DSN_ADAPTER = TypeAdapter(PostgresDsn)
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class Settings(BaseSettings):
@@ -20,6 +22,8 @@ class Settings(BaseSettings):
     )
 
     database_url: SecretStr
+    openalex_contact_email: str | None = None
+    openalex_api_key: SecretStr | None = None
 
     @field_validator("database_url")
     @classmethod
@@ -31,6 +35,21 @@ class Settings(BaseSettings):
                 "DATABASE_URL must use PostgreSQL with the psycopg driver"
             )
         return SecretStr(str(parsed))
+
+    @field_validator("openalex_contact_email")
+    @classmethod
+    def validate_openalex_contact_email(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not EMAIL_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                "OPENALEX_CONTACT_EMAIL must be a valid email address"
+            )
+        return normalized
 
     @property
     def sqlalchemy_database_url(self) -> str:

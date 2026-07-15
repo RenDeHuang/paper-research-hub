@@ -1,0 +1,209 @@
+{
+  "meta": {
+    "count": 2,
+    "db_response_time_ms": 7,
+    "page": null,
+    "per_page": 100,
+    "next_cursor": null,
+    "groups_count": null,
+    "cost_usd": 0.0001
+  },
+  "results": [
+    {
+      "id": "https://openalex.org/W2741809807",
+      "doi": "https://doi.org/10.48550/arXiv.2607.12345",
+      "title": "AgentBench: Evaluating LLM Agents with Tool Use",
+      "display_name": "AgentBench: Evaluating LLM Agents with Tool Use",
+      "publication_date": "2026-07-10",
+      "type": "preprint",
+      "cited_by_count": 42,
+      "updated_date": "2026-07-14T12:34:56.000000",
+      "ids": {
+        "openalex": "https://openalex.org/W2741809807",
+        "doi": "https://doi.org/10.48550/arXiv.2607.12345",
+        "arxiv": "https://arxiv.org/abs/2607.12345",
+        "openreview": "Forum_AbC123",
+        "semantic_scholar": "0123456789abcdef0123456789abcdef01234567"
+      },
+      "abstract_inverted_index": {
+        "We": [0],
+        "study": [1],
+        "LLM": [2],
+        "agents": [3],
+        "with": [4],
+        "tool": [5],
+        "use": [6],
+        "and": [7],
+        "release": [8],
+        "code": [9],
+        "at": [10],
+        "https://github.com/example/agentbench.": [11]
+      },
+      "authorships": [
+        {
+          "author_position": "first",
+          "is_corresponding": true,
+          "author": {
+            "id": "https://openalex.org/A5023888391",
+            "display_name": "Ada Example",
+            "orcid": "https://orcid.org/0000-0001-2345-6789"
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I123456789",
+              "display_name": "Example University",
+              "ror": "https://ror.org/012345678",
+              "country_code": "US",
+              "type": "education"
+            }
+          ]
+        },
+        {
+          "author_position": "last",
+          "is_corresponding": false,
+          "author": {
+            "id": "https://openalex.org/A5099999999",
+            "display_name": "Grace Sample",
+            "orcid": null
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I987654321",
+              "display_name": "Sample AI Lab",
+              "ror": null,
+              "country_code": "GB",
+              "type": "facility"
+            }
+          ]
+        }
+      ],
+      "topics": [
+        {
+          "id": "https://openalex.org/T10001",
+          "display_name": "Large Language Models",
+          "score": 0.998
+        },
+        {
+          "id": "https://openalex.org/T10002",
+          "display_name": "Autonomous Agents",
+          "score": 0.976
+        }
+      ],
+      "primary_topic": {
+        "id": "https://openalex.org/T10001",
+        "display_name": "Large Language Models",
+        "score": 0.998,
+        "subfield": {
+          "id": "https://openalex.org/subfields/1702",
+          "display_name": "Artificial Intelligence"
+        },
+        "field": {
+          "id": "https://openalex.org/fields/17",
+          "display_name": "Computer Science"
+        },
+        "domain": {
+          "id": "https://openalex.org/domains/3",
+          "display_name": "Physical Sciences"
+        }
+      },
+      "open_access": {
+        "is_oa": true,
+        "oa_status": "green",
+        "oa_url": "https://arxiv.org/pdf/2607.12345",
+        "any_repository_has_fulltext": true
+      },
+      "primary_location": {
+        "is_oa": true,
+        "landing_page_url": "https://arxiv.org/abs/2607.12345",
+        "pdf_url": "https://arxiv.org/pdf/2607.12345",
+        "license": "cc-by",
+        "license_id": "https://openalex.org/licenses/cc-by",
+        "version": "submittedVersion",
+        "source": {
+          "id": "https://openalex.org/S4306400194",
+          "display_name": "arXiv"
+        }
+      },
+      "best_oa_location": {
+        "is_oa": true,
+        "landing_page_url": "https://arxiv.org/abs/2607.12345",
+        "pdf_url": "https://arxiv.org/pdf/2607.12345",
+        "license": "cc-by",
+        "license_id": "https://openalex.org/licenses/cc-by",
+        "version": "submittedVersion",
+        "source": {
+          "id": "https://openalex.org/S4306400194",
+          "display_name": "arXiv"
+        }
+      },
+      "locations": [
+        {
+          "is_oa": true,
+          "landing_page_url": "https://arxiv.org/abs/2607.12345",
+          "pdf_url": "https://arxiv.org/pdf/2607.12345",
+          "license": "cc-by",
+          "version": "submittedVersion",
+          "source": {
+            "display_name": "arXiv"
+          }
+        }
+      ]
+    },
+    {
+      "id": "https://openalex.org/W9988776655",
+      "doi": "https://doi.org/10.1000/catalysis",
+      "title": "Catalytic Oxidation of Methane on Supported Metals",
+      "display_name": "Catalytic Oxidation of Methane on Supported Metals",
+      "publication_date": "2026-06-20",
+      "type": "article",
+      "cited_by_count": 3,
+      "updated_date": "2026-07-13T08:00:00",
+      "ids": {
+        "openalex": "https://openalex.org/W9988776655",
+        "doi": "https://doi.org/10.1000/catalysis"
+      },
+      "abstract_inverted_index": {
+        "Methane": [0],
+        "oxidation": [1],
+        "is": [2],
+        "measured": [3],
+        "over": [4],
+        "supported": [5],
+        "metal": [6],
+        "catalysts.": [7]
+      },
+      "authorships": [],
+      "topics": [
+        {
+          "id": "https://openalex.org/T20001",
+          "display_name": "Heterogeneous Catalysis",
+          "score": 0.991
+        }
+      ],
+      "primary_topic": {
+        "id": "https://openalex.org/T20001",
+        "display_name": "Heterogeneous Catalysis",
+        "score": 0.991
+      },
+      "open_access": {
+        "is_oa": false,
+        "oa_status": "closed",
+        "oa_url": null,
+        "any_repository_has_fulltext": false
+      },
+      "primary_location": {
+        "is_oa": false,
+        "landing_page_url": "https://example.test/catalysis",
+        "pdf_url": null,
+        "license": null,
+        "version": "publishedVersion",
+        "source": {
+          "display_name": "Example Journal"
+        }
+      },
+      "best_oa_location": null,
+      "locations": []
+    }
+  ],
+  "group_by": []
+}

@@ -3,6 +3,7 @@ ENV_FILE ?= .env
 -include $(ENV_FILE)
 
 export DATABASE_URL NEXT_PUBLIC_API_URL UVICORN_HOST UVICORN_PORT
+export OPENALEX_CONTACT_EMAIL OPENALEX_API_KEY
 
 .PHONY: install dev-api dev-web test test-api test-web build
 

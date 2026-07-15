@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-07-15T10:04:04.659737+00:00",
+  "source": "openalex",
+  "query": "LLM agent benchmark",
+  "from_date": "2025-01-01",
+  "max_results": 20,
+  "api_key_used": false,
+  "first_run": {
+    "exit_code": 0,
+    "excluded": 0,
+    "failed": 0,
+    "inserted": 20,
+    "unchanged": 0,
+    "updated": 0
+  },
+  "idempotency_replay": {
+    "exit_code": 0,
+    "excluded": 0,
+    "failed": 0,
+    "inserted": 0,
+    "unchanged": 20,
+    "updated": 0
+  },
+  "database_counts_after_replay": {
+    "work": 20,
+    "source_record": 20,
+    "external_identifier": 44,
+    "field_assertion": 320,
+    "topic": 41,
+    "code_repository": 5,
+    "metric_snapshot": 20
+  },
+  "scope_assertions_at_rule_version": 20
+}

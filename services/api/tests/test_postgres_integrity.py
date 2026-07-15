@@ -207,7 +207,7 @@ def _install_historical_schema(
             engine.dispose()
 
 
-def _offline_0002_upgrade_sql() -> str:
+def _offline_head_upgrade_sql() -> str:
     from alembic.config import Config
 
     output = StringIO()
@@ -664,7 +664,7 @@ def test_c744_physical_0001_upgrades_to_current_head(
 
 
 @pytest.mark.parametrize("variant", ["d1aacd8", "c74476a"])
-def test_offline_0002_sql_applies_to_historical_schema_variants(
+def test_offline_head_sql_applies_to_historical_schema_variants(
     clean_postgres_url: str,
     tmp_path: Path,
     variant: str,
@@ -679,7 +679,7 @@ def test_offline_0002_sql_applies_to_historical_schema_variants(
         clean_postgres_url,
         variant,
     )
-    offline_sql = _offline_0002_upgrade_sql()
+    offline_sql = _offline_head_upgrade_sql()
     psycopg_url = clean_postgres_url.replace(
         "postgresql+psycopg://",
         "postgresql://",
@@ -695,7 +695,7 @@ def test_offline_0002_sql_applies_to_historical_schema_variants(
 
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0002_enforce_canonical_integrity"
+            ) == "0003_openalex_source_provenance"
             context = MigrationContext.configure(
                 connection,
                 opts={

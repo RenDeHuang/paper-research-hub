@@ -282,6 +282,9 @@ class SourceRecord(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     source_record_id: Mapped[str] = mapped_column(String(255), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     http_status: Mapped[int | None] = mapped_column(Integer)
 
     work: Mapped[Work | None] = relationship(
