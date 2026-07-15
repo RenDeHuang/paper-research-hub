@@ -2,6 +2,9 @@
   "name": "paper-hub",
   "private": true,
   "packageManager": "pnpm@10.29.2",
+  "engines": {
+    "node": ">=22.12.0 <23"
+  },
   "scripts": {
     "build": "pnpm --dir apps/web build",
     "test": "pnpm test:api && pnpm test:web",

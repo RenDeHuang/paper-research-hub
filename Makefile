@@ -1,3 +1,9 @@
+ENV_FILE ?= .env
+
+-include $(ENV_FILE)
+
+export NEXT_PUBLIC_API_URL UVICORN_HOST UVICORN_PORT
+
 .PHONY: install dev-api dev-web test test-api test-web build
 
 install:
@@ -5,7 +11,7 @@ install:
 	uv sync --project services/api
 
 dev-api:
-	uv run --project services/api uvicorn paper_hub.main:app --reload --app-dir services/api/src
+	uv run --directory services/api uvicorn paper_hub.main:app --reload --reload-dir src
 
 dev-web:
 	pnpm --dir apps/web dev

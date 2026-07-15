@@ -8,13 +8,19 @@ dependencies = [
   "uvicorn[standard]==0.51.0",
 ]
 
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12"]
+build-backend = "uv_build"
+
 [dependency-groups]
 dev = [
   "httpx2==2.7.0",
   "pytest==9.1.1",
 ]
 
+[tool.uv.build-backend]
+module-name = "paper_hub"
+
 [tool.pytest.ini_options]
 addopts = "-ra"
-pythonpath = ["src"]
 testpaths = ["tests"]
