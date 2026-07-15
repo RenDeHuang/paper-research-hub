@@ -5,7 +5,7 @@
   "replay_git_head": "05f0a52300aa7109239d56bb4d08448ffd320b6f",
   "source": "openalex",
   "replay_alembic_head": "0004_versioned_scope_assessment",
-  "repository_alembic_head_after_quality_fix": "0006_reset_work_projections",
+  "repository_alembic_head_after_quality_fix": "0007_repo_work_many_to_many",
   "statistics_context": "historical preserved-capture replay under the recorded replay schema; not a successful network live sync",
   "parser_version": "openalex-v1",
   "scope_rule_version": "agent-llm-v1",

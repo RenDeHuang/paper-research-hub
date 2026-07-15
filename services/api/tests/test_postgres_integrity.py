@@ -319,21 +319,34 @@ def _insert_delete_graph(engine, suffix: str) -> dict[str, UUID]:
             text(
                 """
                 INSERT INTO code_repository (
-                    id, work_id, provider, repository_name,
+                    id, provider, repository_name,
                     repository_url, normalized_url, source
                 )
                 VALUES (
-                    :id, :work_id, 'github', :repository_name,
+                    :id, 'github', :repository_name,
                     :repository_url, :normalized_url, 'test'
                 )
                 """
             ),
             {
                 "id": ids["repository"],
-                "work_id": ids["work"],
                 "repository_name": suffix,
                 "repository_url": f"https://github.test/paper/{suffix}",
                 "normalized_url": f"https://github.test/paper/{suffix}",
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO work_code_repository (
+                    work_id, code_repository_id
+                )
+                VALUES (:work_id, :repository_id)
+                """
+            ),
+            {
+                "work_id": ids["work"],
+                "repository_id": ids["repository"],
             },
         )
         connection.execute(
@@ -409,6 +422,20 @@ def _delete_result(engine, ids: dict[str, UUID]) -> dict[str, object]:
             "repository": connection.scalar(
                 text("SELECT count(*) FROM code_repository WHERE id = :id"),
                 {"id": ids["repository"]},
+            ),
+            "repository_link": connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM work_code_repository
+                    WHERE work_id = :work_id
+                      AND code_repository_id = :repository_id
+                    """
+                ),
+                {
+                    "work_id": ids["work"],
+                    "repository_id": ids["repository"],
+                },
             ),
             "metric": connection.scalar(
                 text("SELECT count(*) FROM metric_snapshot WHERE id = :id"),
@@ -1274,6 +1301,182 @@ def test_0006_resets_unverified_projection_and_replay_repairs_latest_snapshot(
         engine.dispose()
 
 
+def test_0007_migrates_repository_ownership_to_many_to_many_and_downgrades_safely(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0006_reset_work_projections")
+    engine = create_engine(clean_postgres_url)
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    first_repository_id = uuid4()
+    second_repository_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            for work_id, canonical_key in (
+                (first_work_id, "doi:10.1000/repo-migration-one"),
+                (second_work_id, "doi:10.1000/repo-migration-two"),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (
+                            id, canonical_key, title, source
+                        )
+                        VALUES (
+                            :id, :canonical_key,
+                            'Repository migration fixture', 'test'
+                        )
+                        """
+                    ),
+                    {"id": work_id, "canonical_key": canonical_key},
+                )
+            for repository_id, work_id, suffix in (
+                (first_repository_id, first_work_id, "one"),
+                (second_repository_id, second_work_id, "two"),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO code_repository (
+                            id, work_id, provider, repository_name,
+                            repository_url, normalized_url, source
+                        )
+                        VALUES (
+                            :id, :work_id, 'github', :repository_name,
+                            :repository_url, :normalized_url, 'test'
+                        )
+                        """
+                    ),
+                    {
+                        "id": repository_id,
+                        "work_id": work_id,
+                        "repository_name": f"repo-{suffix}",
+                        "repository_url": (
+                            f"https://github.com/example/repo-{suffix}"
+                        ),
+                        "normalized_url": (
+                            f"https://github.com/example/repo-{suffix}"
+                        ),
+                    },
+                )
+
+        command.upgrade(
+            alembic_config,
+            "0007_repo_work_many_to_many",
+        )
+
+        inspector = inspect(engine)
+        assert "work_id" not in {
+            column["name"]
+            for column in inspector.get_columns("code_repository")
+        }
+        assert set(
+            inspector.get_pk_constraint(
+                "work_code_repository"
+            )["constrained_columns"]
+        ) == {"work_id", "code_repository_id"}
+        foreign_keys = {
+            tuple(foreign_key["constrained_columns"]): (
+                foreign_key["referred_table"],
+                foreign_key["options"].get("ondelete"),
+            )
+            for foreign_key in inspector.get_foreign_keys(
+                "work_code_repository"
+            )
+        }
+        assert foreign_keys == {
+            ("work_id",): ("work", "CASCADE"),
+            ("code_repository_id",): (
+                "code_repository",
+                "CASCADE",
+            ),
+        }
+        with engine.connect() as connection:
+            assert set(
+                connection.execute(
+                    text(
+                        """
+                        SELECT work_id, code_repository_id
+                        FROM work_code_repository
+                        """
+                    )
+                ).all()
+            ) == {
+                (first_work_id, first_repository_id),
+                (second_work_id, second_repository_id),
+            }
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work_code_repository (
+                        work_id, code_repository_id
+                    )
+                    VALUES (:work_id, :repository_id)
+                    """
+                ),
+                {
+                    "work_id": second_work_id,
+                    "repository_id": first_repository_id,
+                },
+            )
+
+        with pytest.raises(
+            DBAPIError,
+            match=(
+                "cannot downgrade code repositories with "
+                "zero or multiple work associations"
+            ),
+        ):
+            command.downgrade(
+                alembic_config,
+                "0006_reset_work_projections",
+            )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM work_code_repository
+                    WHERE work_id = :work_id
+                      AND code_repository_id = :repository_id
+                    """
+                ),
+                {
+                    "work_id": second_work_id,
+                    "repository_id": first_repository_id,
+                },
+            )
+        command.downgrade(
+            alembic_config,
+            "0006_reset_work_projections",
+        )
+
+        downgraded_columns = {
+            column["name"]
+            for column in inspect(engine).get_columns("code_repository")
+        }
+        assert "work_id" in downgraded_columns
+        assert "work_code_repository" not in inspect(engine).get_table_names()
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    """
+                    SELECT id, work_id
+                    FROM code_repository
+                    ORDER BY normalized_url
+                    """
+                )
+            ).all() == [
+                (first_repository_id, first_work_id),
+                (second_repository_id, second_work_id),
+            ]
+    finally:
+        engine.dispose()
+
+
 def test_c744_physical_0001_upgrades_to_current_head(
     alembic_config,
     clean_postgres_url: str,
@@ -1418,7 +1621,7 @@ def test_offline_head_sql_applies_to_historical_schema_variants(
 
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0006_reset_work_projections"
+            ) == "0007_repo_work_many_to_many"
             context = MigrationContext.configure(
                 connection,
                 opts={
@@ -1927,8 +2130,9 @@ def test_session_delete_and_sql_delete_have_identical_results(
             "source": (None, None),
             "assertion": 1,
             "external": 0,
-            "repository": 0,
-            "metric": 0,
+            "repository": 1,
+            "repository_link": 0,
+            "metric": 1,
             "ranking": 0,
         }
         assert _delete_result(engine, orm_ids) == expected
@@ -1970,6 +2174,7 @@ def test_loaded_version_delete_matches_sql_cascades(
             "assertion": 1,
             "external": 1,
             "repository": 1,
+            "repository_link": 1,
             "metric": 1,
             "ranking": 1,
         }

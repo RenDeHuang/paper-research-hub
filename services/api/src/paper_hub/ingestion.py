@@ -26,6 +26,7 @@ from paper_hub.models import (
     SourceRecord,
     Topic,
     Work,
+    work_code_repository,
 )
 from paper_hub.normalization import APPROVED_CANONICAL_PREFIXES
 
@@ -119,7 +120,8 @@ class IngestionService:
                 if (
                     existing_assessment.included
                     and self._projection_requires_rebuild(
-                        existing_assessment
+                        existing_assessment,
+                        record,
                     )
                 ):
                     return self._include_snapshot(
@@ -364,6 +366,7 @@ class IngestionService:
     def _projection_requires_rebuild(
         self,
         assessment: ScopeAssessment,
+        record: ConnectorRecord[ParsedWork],
     ) -> bool:
         if assessment.work_id is None:
             raise IdentityConflictError(
@@ -374,13 +377,19 @@ class IngestionService:
             raise IdentityConflictError(
                 "included scope assessment references a missing work"
             )
-        return any(
+        if any(
             value is None
             for value in (
                 work.projection_source,
                 work.projection_source_record_id,
                 work.projection_source_updated_at,
             )
+        ):
+            return True
+        return (
+            record.source_updated_at is not None
+            and record.source_updated_at
+            > work.projection_source_updated_at
         )
 
     def _acquire_identity_locks(
@@ -595,10 +604,9 @@ class IngestionService:
             parsed.code_repositories,
             key=lambda repository: repository.normalized_url,
         ):
-            self.session.execute(
+            repository_id = self.session.scalar(
                 pg_insert(CodeRepository)
                 .values(
-                    work_id=work.id,
                     provider=parsed_repository.provider,
                     repository_name=(
                         parsed_repository.repository_name
@@ -615,6 +623,26 @@ class IngestionService:
                 .on_conflict_do_nothing(
                     constraint="uq_code_repository_normalized_url"
                 )
+                .returning(CodeRepository.id)
+            )
+            if repository_id is None:
+                repository_id = self.session.scalar(
+                    select(CodeRepository.id).where(
+                        CodeRepository.normalized_url
+                        == parsed_repository.normalized_url
+                    )
+                )
+            if repository_id is None:
+                raise IngestionError(
+                    "code repository upsert did not return or resolve a row"
+                )
+            self.session.execute(
+                pg_insert(work_code_repository)
+                .values(
+                    work_id=work.id,
+                    code_repository_id=repository_id,
+                )
+                .on_conflict_do_nothing()
             )
 
     def _persist_citation_metric(

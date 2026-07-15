@@ -152,6 +152,27 @@ work_benchmark = Table(
     ),
 )
 
+work_code_repository = Table(
+    "work_code_repository",
+    Base.metadata,
+    Column(
+        "work_id",
+        Uuid,
+        ForeignKey("work.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "code_repository_id",
+        Uuid,
+        ForeignKey("code_repository.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Index(
+        "ix_work_code_repository_code_repository_id",
+        "code_repository_id",
+    ),
+)
+
 
 class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     __tablename__ = "work"
@@ -211,8 +232,8 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
         passive_deletes=True,
     )
     code_repositories: Mapped[list[CodeRepository]] = relationship(
-        back_populates="work",
-        cascade="all, delete-orphan",
+        secondary=work_code_repository,
+        back_populates="works",
         passive_deletes=True,
     )
     metric_snapshots: Mapped[list[MetricSnapshot]] = relationship(
@@ -541,10 +562,6 @@ class CodeRepository(
         ),
     )
 
-    work_id: Mapped[UUID] = mapped_column(
-        ForeignKey("work.id", ondelete="CASCADE"),
-        nullable=False,
-    )
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     repository_name: Mapped[str] = mapped_column(String(255), nullable=False)
     repository_url: Mapped[str] = mapped_column(Text, nullable=False)
@@ -555,7 +572,8 @@ class CodeRepository(
         server_default="false",
     )
 
-    work: Mapped[Work] = relationship(
+    works: Mapped[list[Work]] = relationship(
+        secondary=work_code_repository,
         back_populates="code_repositories",
         passive_deletes=True,
     )

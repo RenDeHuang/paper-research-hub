@@ -310,10 +310,16 @@ def test_core_models_have_provenance_status_constraints_and_relationships() -> N
         foreign_key.target_fullname
         for foreign_key in Base.metadata.tables["field_assertion"].foreign_keys
     } == {"source_record.id"}
+    code_repository = Base.metadata.tables["code_repository"]
+    assert "work_id" not in code_repository.columns
+    work_code_repository = Base.metadata.tables["work_code_repository"]
     assert {
         foreign_key.target_fullname
-        for foreign_key in Base.metadata.tables["code_repository"].foreign_keys
-    } >= {"work.id"}
+        for foreign_key in work_code_repository.foreign_keys
+    } == {"work.id", "code_repository.id"}
+    assert {
+        column.name for column in work_code_repository.primary_key.columns
+    } == {"work_id", "code_repository_id"}
 
     external_identifier = Base.metadata.tables["external_identifier"]
     assert {

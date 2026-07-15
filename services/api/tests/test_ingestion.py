@@ -278,6 +278,98 @@ def test_older_snapshot_does_not_overwrite_newer_work_projection(
         )
 
 
+@pytest.mark.parametrize(
+    ("replay_order", "expected_statuses"),
+    [
+        (("older", "newer"), ["updated", "updated"]),
+        (("newer", "older"), ["updated", "unchanged"]),
+    ],
+)
+def test_same_rule_replay_after_projection_reset_converges_to_latest_snapshot(
+    migrated_engine,
+    replay_order: tuple[str, str],
+    expected_statuses: list[str],
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import RecordStatus, SourceRecord, Work
+
+    older_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    older_raw["title"] = "Older LLM Agent Projection"
+    older_raw["display_name"] = older_raw["title"]
+    older_raw["abstract_inverted_index"] = {
+        "Older": [0],
+        "LLM": [1],
+        "agent": [2],
+        "abstract": [3],
+    }
+    older_raw["updated_date"] = "2026-07-14T08:00:00"
+    older_raw["is_retracted"] = False
+
+    newer_raw = json.loads(json.dumps(older_raw))
+    newer_raw["title"] = "Newest Retracted LLM Agent Projection"
+    newer_raw["display_name"] = newer_raw["title"]
+    newer_raw["abstract_inverted_index"] = {
+        "Newest": [0],
+        "retracted": [1],
+        "LLM": [2],
+        "agent": [3],
+        "abstract": [4],
+    }
+    newer_raw["updated_date"] = "2026-07-16T08:00:00"
+    newer_raw["is_retracted"] = True
+
+    records = {
+        "older": _record(older_raw),
+        "newer": _record(newer_raw, minute=1),
+    }
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(records["older"])
+        IngestionService(session).ingest(records["newer"])
+        session.commit()
+
+        session.execute(
+            text(
+                """
+                UPDATE work
+                SET
+                    title = 'Unverified pre-0006 projection',
+                    abstract = 'Unverified abstract',
+                    status = 'active',
+                    projection_source = NULL,
+                    projection_source_record_id = NULL,
+                    projection_source_updated_at = NULL
+                WHERE id = :work_id
+                """
+            ),
+            {"work_id": first.work_id},
+        )
+        session.commit()
+
+        statuses = []
+        for key in replay_order:
+            statuses.append(
+                IngestionService(session).ingest(records[key]).status
+            )
+            session.commit()
+
+        session.expire_all()
+        work = session.get(Work, first.work_id)
+        assert statuses == expected_statuses
+        assert work.title == newer_raw["title"]
+        assert work.abstract == "Newest retracted LLM agent abstract"
+        assert work.status == RecordStatus.RETRACTED
+        assert work.projection_source == "openalex"
+        assert work.projection_source_record_id == "W2741809807"
+        assert (
+            work.projection_source_updated_at
+            == records["newer"].source_updated_at
+        )
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord))
+            == 2
+        )
+
+
 def test_concurrent_same_snapshot_is_idempotent_in_real_postgresql(
     migrated_engine,
 ) -> None:
@@ -399,7 +491,10 @@ def test_concurrent_distinct_works_share_topics_without_unique_failure(
 
     assert statuses == ["inserted", "inserted"]
     with Session(migrated_engine) as session:
-        assert session.scalar(select(func.count()).select_from(Work)) == 2
+        works = session.scalars(
+            select(Work).order_by(Work.canonical_key)
+        ).all()
+        assert len(works) == 2
         assert (
             session.scalar(select(func.count()).select_from(SourceRecord))
             == 2
@@ -454,7 +549,10 @@ def test_concurrent_distinct_works_share_repository_without_unique_failure(
 
     assert statuses == ["inserted", "inserted"]
     with Session(migrated_engine) as session:
-        assert session.scalar(select(func.count()).select_from(Work)) == 2
+        works = session.scalars(
+            select(Work).order_by(Work.canonical_key)
+        ).all()
+        assert len(works) == 2
         assert (
             session.scalar(select(func.count()).select_from(SourceRecord))
             == 2
@@ -464,6 +562,18 @@ def test_concurrent_distinct_works_share_repository_without_unique_failure(
                 select(func.count()).select_from(CodeRepository)
             )
             == 2
+        )
+        expected_urls = {
+            "https://github.com/example/shared-one",
+            "https://github.com/example/shared-two",
+        }
+        assert all(
+            {
+                repository.normalized_url
+                for repository in work.code_repositories
+            }
+            == expected_urls
+            for work in works
         )
 
 

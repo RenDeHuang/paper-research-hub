@@ -323,7 +323,6 @@ def test_relationship_delete_configuration_matches_database_cascades() -> None:
     required_delete_orphan = {
         inspect(Work).relationships.versions,
         inspect(Work).relationships.external_identifiers,
-        inspect(Work).relationships.code_repositories,
         inspect(Work).relationships.metric_snapshots,
         inspect(Work).relationships.ranking_snapshots,
         inspect(SourceRecord).relationships.field_assertions,
@@ -338,7 +337,9 @@ def test_relationship_delete_configuration_matches_database_cascades() -> None:
 
     for relationship in (
         inspect(Work).relationships.source_records,
+        inspect(Work).relationships.code_repositories,
         inspect(PaperVersion).relationships.source_records,
+        inspect(CodeRepository).relationships.works,
     ):
         assert relationship.passive_deletes is True
         assert "delete" not in relationship.cascade
