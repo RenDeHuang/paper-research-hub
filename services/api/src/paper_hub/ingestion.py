@@ -132,19 +132,30 @@ class IngestionService:
                         persist_scope_assessment=False,
                         force_projection=True,
                     )
+                if not existing_assessment.included:
+                    self._link_existing_exclusion(
+                        existing_snapshot,
+                        existing_assessment,
+                        parsed,
+                    )
                 return self._existing_assessment_result(
                     existing_snapshot,
                     existing_assessment,
                 )
             if not parsed.scope.included:
+                work = self._resolve_existing_work_for_scope(
+                    existing_snapshot,
+                    parsed,
+                )
                 self._persist_scope_assessment(
                     existing_snapshot,
                     parsed,
-                    work=None,
+                    work=work,
                 )
                 self.session.flush()
                 return IngestionResult(
                     status="excluded",
+                    work_id=work.id if work is not None else None,
                     source_record_id=existing_snapshot.id,
                     reason=parsed.scope.reason,
                     scope_rule_version=parsed.scope.rule_version,
@@ -157,6 +168,7 @@ class IngestionService:
                 scope_evidence,
             )
         if not parsed.scope.included:
+            work = self._resolve_work(parsed)
             source_record = self._create_source_record(
                 work=None,
                 record=record,
@@ -165,11 +177,12 @@ class IngestionService:
             self._persist_scope_assessment(
                 source_record,
                 parsed,
-                work=None,
+                work=work,
             )
             self.session.flush()
             return IngestionResult(
                 status="excluded",
+                work_id=work.id if work is not None else None,
                 source_record_id=source_record.id,
                 reason=parsed.scope.reason,
                 scope_rule_version=parsed.scope.rule_version,
@@ -329,11 +342,59 @@ class IngestionService:
             )
         return IngestionResult(
             status="excluded",
+            work_id=assessment.work_id,
             source_record_id=source_record.id,
             reason=assessment.reason,
             scope_rule_version=assessment.rule_version,
             scope_evidence=evidence,
         )
+
+    def _resolve_existing_work_for_scope(
+        self,
+        source_record: SourceRecord,
+        parsed: ParsedWork,
+    ) -> Work | None:
+        work = self._resolve_work(parsed)
+        if source_record.work_id is None:
+            return work
+        source_work = self.session.get(Work, source_record.work_id)
+        if source_work is None:
+            raise IdentityConflictError(
+                "source record references a missing canonical work"
+            )
+        if work is not None and work.id != source_work.id:
+            raise IdentityConflictError(
+                "source record and controlled identifiers point "
+                "to different works"
+            )
+        return source_work
+
+    def _link_existing_exclusion(
+        self,
+        source_record: SourceRecord,
+        assessment: ScopeAssessment,
+        parsed: ParsedWork,
+    ) -> Work | None:
+        work = self._resolve_existing_work_for_scope(
+            source_record,
+            parsed,
+        )
+        if assessment.work_id is not None:
+            assessment_work = self.session.get(Work, assessment.work_id)
+            if assessment_work is None:
+                raise IdentityConflictError(
+                    "scope assessment references a missing canonical work"
+                )
+            if work is not None and work.id != assessment_work.id:
+                raise IdentityConflictError(
+                    "scope assessment and controlled identifiers point "
+                    "to different works"
+                )
+            return assessment_work
+        if work is not None:
+            assessment.work_id = work.id
+            self.session.flush()
+        return work
 
     def _resolve_work(self, parsed: ParsedWork) -> Work | None:
         matched_works: dict[UUID, Work] = {}

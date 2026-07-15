@@ -154,7 +154,7 @@ def _add_work(
                 reason="excluded_by_scope_v2",
                 evidence=[],
                 evaluated_at=NOW,
-                work_id=None,
+                work_id=work.id,
             )
         )
 

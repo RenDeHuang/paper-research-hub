@@ -360,8 +360,8 @@ class ScopeAssessment(UUIDPrimaryKeyMixin, Base):
             "("
             "included AND work_id IS NOT NULL AND reason IS NULL"
             ") OR ("
-            "NOT included AND work_id IS NULL "
-            "AND reason IS NOT NULL AND btrim(reason) <> ''"
+            "NOT included AND reason IS NOT NULL "
+            "AND btrim(reason) <> ''"
             ")",
             name="ck_scope_assessment_inclusion_consistency",
         ),
@@ -381,6 +381,11 @@ class ScopeAssessment(UUIDPrimaryKeyMixin, Base):
         Index(
             "ix_scope_assessment_record_evaluated_at",
             "source_record_id",
+            "evaluated_at",
+        ),
+        Index(
+            "ix_scope_assessment_work_evaluated_at",
+            "work_id",
             "evaluated_at",
         ),
     )

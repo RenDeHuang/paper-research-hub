@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 from threading import Barrier, Lock
+from uuid import UUID
 
 from alembic import command
 import pytest
@@ -51,6 +52,34 @@ def _with_scope(
         reason=None if included else f"excluded_by_{rule_version}",
     )
     return replace(record, parsed=replace(record.parsed, scope=scope))
+
+
+def _new_hash_with_scope(
+    record,
+    *,
+    minute: int,
+    included: bool,
+    rule_version: str = "agent-llm-scope-v1",
+):
+    raw = json.loads(json.dumps(record.raw_payload))
+    raw["cited_by_count"] = int(raw.get("cited_by_count") or 0) + minute + 1
+    raw["publication_date"] = datetime.now(UTC).date().isoformat()
+    raw["publication_year"] = datetime.now(UTC).year
+    raw["title"] = (
+        "LLM Agent Scope Reassessment"
+        if included
+        else "Protein Folding Benchmark"
+    )
+    raw["display_name"] = raw["title"]
+    raw["abstract_inverted_index"] = None
+    raw["topics"] = []
+    parsed = _record(raw, minute=minute)
+    assert parsed.parsed.scope.included is included
+    return _with_scope(
+        parsed,
+        rule_version=rule_version,
+        included=included,
+    )
 
 
 def _independent_work(
@@ -999,7 +1028,7 @@ def test_scope_rule_upgrade_from_included_to_excluded_is_current(
         ).mappings().one()
         assert current["included"] is False
         assert current["reason"] == "excluded_by_agent-llm-scope-v2"
-        assert current["work_id"] is None
+        assert current["work_id"] == first.work_id
         assert session.scalar(
             text(
                 """
@@ -1072,6 +1101,289 @@ def test_scope_rule_upgrade_reuses_existing_work_and_returns_updated(
             )
             == 2
         )
+
+
+def test_new_excluded_hash_hides_prior_included_work_across_public_apis(
+    migrated_engine,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from paper_hub.db import get_session
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.main import app
+    from paper_hub.models import Method, ScopeAssessment, SourceRecord, Work
+    from paper_hub.repositories import slug_for_canonical_key
+
+    first_record = _with_scope(
+        _record(_fixture()["results"][0]),
+        rule_version="agent-llm-scope-v1",
+        included=True,
+    )
+    excluded_record = _new_hash_with_scope(
+        first_record,
+        minute=1,
+        included=False,
+    )
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(first_record)
+        session.commit()
+        excluded = IngestionService(session).ingest(excluded_record)
+        session.commit()
+
+        assert excluded.work_id == first.work_id
+        excluded_source = session.get(SourceRecord, excluded.source_record_id)
+        assert excluded_source is not None
+        assert excluded_source.work_id is None
+        excluded_assessment = session.scalar(
+            select(ScopeAssessment).where(
+                ScopeAssessment.source_record_id == excluded_source.id
+            )
+        )
+        assert excluded_assessment is not None
+        assert excluded_assessment.included is False
+        assert excluded_assessment.work_id == first.work_id
+
+        work = session.get(Work, first.work_id)
+        assert work is not None
+        work.methods.append(
+            Method(
+                name="Logical Source Method",
+                normalized_name="logical-source-method",
+                description=None,
+                source="test",
+                retrieved_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
+        canonical_key = work.canonical_key
+
+    def override_session():
+        with Session(migrated_engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        with TestClient(app) as client:
+            listing = client.get("/api/v1/papers")
+            detail = client.get(
+                f"/api/v1/papers/{slug_for_canonical_key(canonical_key)}"
+            )
+            stats = client.get("/api/v1/stats")
+            topics = client.get("/api/v1/topics")
+            methods = client.get("/api/v1/methods")
+
+            assert listing.status_code == 200
+            assert listing.json()["total"] == 0
+            assert detail.status_code == 404
+            assert stats.json()["papers"] == 0
+            assert topics.json()["items"] == []
+            assert methods.json()["items"] == []
+
+            for ranking in (
+                "latest",
+                "citation_velocity",
+                "code_growth",
+            ):
+                payload = client.get(
+                    "/api/v1/trends/papers",
+                    params={"ranking": ranking, "window_days": 90},
+                ).json()
+                exposed_keys = {
+                    item["canonical_key"] for item in payload["items"]
+                } | {
+                    item["canonical_key"]
+                    for item in payload["missing_signals"]
+                    if item["canonical_key"] is not None
+                }
+                assert canonical_key not in exposed_keys
+
+            assert client.get(
+                "/api/v1/trends/topics",
+                params={"window_days": 90},
+            ).json()["items"] == []
+            assert client.get(
+                "/api/v1/trends/methods",
+                params={"window_days": 90},
+            ).json()["items"] == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_new_included_hash_overrides_prior_unassociated_exclusion(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import ScopeAssessment, Work
+    from paper_hub.repositories import public_work_predicate
+
+    excluded_record = _new_hash_with_scope(
+        _record(_fixture()["results"][0]),
+        minute=0,
+        included=False,
+    )
+    included_record = _new_hash_with_scope(
+        excluded_record,
+        minute=1,
+        included=True,
+    )
+
+    with Session(migrated_engine) as session:
+        excluded = IngestionService(session).ingest(excluded_record)
+        session.commit()
+        included = IngestionService(session).ingest(included_record)
+        session.commit()
+
+        old_assessment = session.scalar(
+            select(ScopeAssessment).where(
+                ScopeAssessment.source_record_id == excluded.source_record_id
+            )
+        )
+        assert old_assessment is not None
+        assert old_assessment.work_id is None
+        assert included.work_id is not None
+        assert session.scalar(
+            select(func.count())
+            .select_from(Work)
+            .where(public_work_predicate())
+        ) == 1
+
+
+def test_replayed_exclusion_links_to_work_created_by_independent_source(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import ScopeAssessment
+
+    excluded_record = _new_hash_with_scope(
+        _record(_fixture()["results"][0]),
+        minute=0,
+        included=False,
+    )
+    included_record = replace(
+        _new_hash_with_scope(
+            excluded_record,
+            minute=1,
+            included=True,
+        ),
+        source="crossref",
+    )
+
+    with Session(migrated_engine) as session:
+        excluded = IngestionService(session).ingest(excluded_record)
+        session.commit()
+        included = IngestionService(session).ingest(included_record)
+        session.commit()
+        replay = IngestionService(session).ingest(excluded_record)
+        session.commit()
+
+        assert included.work_id is not None
+        assert replay.status == "excluded"
+        assert replay.work_id == included.work_id
+        assessment = session.scalar(
+            select(ScopeAssessment).where(
+                ScopeAssessment.source_record_id == excluded.source_record_id
+            )
+        )
+        assert assessment is not None
+        assert assessment.work_id == included.work_id
+
+
+def test_other_included_logical_source_keeps_work_public(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import Work
+    from paper_hub.repositories import public_work_predicate
+
+    openalex_record = _with_scope(
+        _record(_fixture()["results"][0]),
+        rule_version="agent-llm-scope-v1",
+        included=True,
+    )
+    independent_source = replace(
+        openalex_record,
+        source="crossref",
+    )
+    excluded_openalex = _new_hash_with_scope(
+        openalex_record,
+        minute=1,
+        included=False,
+    )
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(openalex_record)
+        session.commit()
+        second = IngestionService(session).ingest(independent_source)
+        session.commit()
+        excluded = IngestionService(session).ingest(excluded_openalex)
+        session.commit()
+
+        assert second.work_id == first.work_id
+        assert excluded.work_id == first.work_id
+        assert session.scalar(
+            select(func.count())
+            .select_from(Work)
+            .where(public_work_predicate())
+        ) == 1
+
+
+def test_logical_source_scope_order_is_stable_when_times_match(
+    migrated_engine,
+    monkeypatch,
+) -> None:
+    import paper_hub.ingestion as ingestion_module
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import SourceRecord, Work
+    from paper_hub.repositories import public_work_predicate
+
+    fixed_time = datetime(2026, 7, 15, 9, tzinfo=UTC)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_time.replace(tzinfo=None)
+            return fixed_time
+
+    monkeypatch.setattr(ingestion_module, "datetime", FrozenDateTime)
+    included_record = _with_scope(
+        _record(_fixture()["results"][0]),
+        rule_version="agent-llm-scope-v1",
+        included=True,
+    )
+    excluded_record = _new_hash_with_scope(
+        included_record,
+        minute=0,
+        included=False,
+    )
+    source_ids = iter((UUID(int=1), UUID(int=2)))
+
+    with Session(migrated_engine) as session:
+        def assign_source_ids(
+            target_session,
+            _flush_context,
+            _instances,
+        ) -> None:
+            for item in target_session.new:
+                if isinstance(item, SourceRecord) and item.id is None:
+                    item.id = next(source_ids)
+
+        event.listen(session, "before_flush", assign_source_ids)
+        try:
+            first = IngestionService(session).ingest(included_record)
+            session.commit()
+            second = IngestionService(session).ingest(excluded_record)
+            session.commit()
+        finally:
+            event.remove(session, "before_flush", assign_source_ids)
+
+        assert first.work_id == second.work_id
+        assert session.scalar(
+            select(func.count())
+            .select_from(Work)
+            .where(public_work_predicate())
+        ) == 0
 
 
 def test_cli_rolls_back_and_zeros_counts_when_later_page_fails(
@@ -1347,7 +1659,7 @@ def test_cli_reports_excluded_for_current_rule_after_prior_inclusion(
             )
         )
         assert current.included is False
-        assert current.work_id is None
+        assert current.work_id == session.scalar(select(Work.id))
     get_settings.cache_clear()
 
 

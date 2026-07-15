@@ -115,23 +115,43 @@ def canonical_key_from_slug(slug: str) -> str | None:
 def public_work_predicate():
     scope = aliased(ScopeAssessment)
     source = aliased(SourceRecord)
-    current_included = (
-        select(scope.included)
-        .select_from(scope)
-        .join(source, source.id == scope.source_record_id)
-        .where(source.work_id == Work.id)
+    latest_scope = aliased(ScopeAssessment)
+    latest_source = aliased(SourceRecord)
+    latest_assessment_id = (
+        select(latest_scope.id)
+        .select_from(latest_scope)
+        .join(
+            latest_source,
+            latest_source.id == latest_scope.source_record_id,
+        )
+        .where(
+            latest_scope.work_id == Work.id,
+            latest_source.source == source.source,
+            latest_source.source_record_id == source.source_record_id,
+        )
         .order_by(
-            scope.evaluated_at.desc(),
-            source.source_updated_at.desc().nullslast(),
-            source.retrieved_at.desc(),
-            scope.rule_version.desc(),
-            scope.id.desc(),
+            latest_source.source_updated_at.desc().nullslast(),
+            latest_source.retrieved_at.desc(),
+            latest_scope.evaluated_at.desc(),
+            latest_source.id.desc(),
+            latest_scope.rule_version.desc(),
+            latest_scope.id.desc(),
         )
         .limit(1)
-        .correlate(Work)
+        .correlate(Work, source)
         .scalar_subquery()
     )
-    return current_included.is_(True)
+    return exists(
+        select(literal(1))
+        .select_from(scope)
+        .join(source, source.id == scope.source_record_id)
+        .where(
+            scope.work_id == Work.id,
+            scope.included.is_(True),
+            scope.id == latest_assessment_id,
+        )
+        .correlate(Work)
+    )
 
 
 class PaperRepository:
@@ -207,8 +227,9 @@ class PaperRepository:
                     CodeRepository.metric_snapshots
                 ),
                 selectinload(Work.metric_snapshots),
-                selectinload(Work.source_records).selectinload(
-                    SourceRecord.scope_assessments
+                selectinload(Work.source_records),
+                selectinload(Work.scope_assessments).selectinload(
+                    ScopeAssessment.source_record
                 ),
             )
         )
@@ -321,7 +342,7 @@ class PaperRepository:
                     "status": source.status,
                 }
                 for source in sorted(
-                    work.source_records,
+                    self._associated_source_records(work),
                     key=lambda item: (
                         item.source_updated_at or item.retrieved_at,
                         item.retrieved_at,
@@ -1177,24 +1198,24 @@ class PaperRepository:
 
     @staticmethod
     def _current_scope_state(work: Work) -> dict[str, object] | None:
-        assessments = [
-            (assessment, source)
-            for source in work.source_records
-            for assessment in source.scope_assessments
-        ]
+        assessments = list(work.scope_assessments)
         if not assessments:
             return None
         current = max(
             assessments,
             key=lambda item: (
-                item[0].evaluated_at,
-                item[1].source_updated_at is not None,
-                item[1].source_updated_at or item[1].retrieved_at,
-                item[1].retrieved_at,
-                item[0].rule_version,
-                str(item[0].id),
+                item.source_record.source_updated_at is not None,
+                (
+                    item.source_record.source_updated_at
+                    or item.source_record.retrieved_at
+                ),
+                item.source_record.retrieved_at,
+                item.evaluated_at,
+                str(item.source_record.id),
+                item.rule_version,
+                str(item.id),
             ),
-        )[0]
+        )
         return {
             "included": current.included,
             "rule_version": current.rule_version,
@@ -1202,6 +1223,13 @@ class PaperRepository:
             "evidence": current.evidence,
             "evaluated_at": current.evaluated_at,
         }
+
+    @staticmethod
+    def _associated_source_records(work: Work) -> list[SourceRecord]:
+        by_id = {source.id: source for source in work.source_records}
+        for assessment in work.scope_assessments:
+            by_id[assessment.source_record.id] = assessment.source_record
+        return list(by_id.values())
 
     @staticmethod
     def _taxonomy(subject: str):
