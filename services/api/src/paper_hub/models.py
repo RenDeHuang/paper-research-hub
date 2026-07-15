@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    cast,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -182,6 +183,17 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
             name="ck_work_canonical_key_approved_prefix",
         ),
         UniqueConstraint("canonical_key", name="uq_work_canonical_key"),
+        Index(
+            "ix_work_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_work_publication_date_canonical_key",
+            "publication_date",
+            "canonical_key",
+        ),
     )
 
     canonical_key: Mapped[str] = mapped_column(String(512), nullable=False)
@@ -466,6 +478,15 @@ class FieldAssertion(
         back_populates="field_assertions",
         passive_deletes=True,
     )
+
+
+Index(
+    "ix_field_assertion_authors_trgm",
+    cast(FieldAssertion.value, Text).label("authors_text"),
+    postgresql_using="gin",
+    postgresql_ops={"authors_text": "gin_trgm_ops"},
+    postgresql_where=FieldAssertion.field_name == "authors",
+)
 
 
 class Topic(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):

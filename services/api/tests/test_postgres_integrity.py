@@ -1621,7 +1621,7 @@ def test_offline_head_sql_applies_to_historical_schema_variants(
 
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0007_repo_work_many_to_many"
+            ) == "0008_search_api_indexes"
             context = MigrationContext.configure(
                 connection,
                 opts={
