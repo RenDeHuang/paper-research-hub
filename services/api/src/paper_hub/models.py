@@ -256,11 +256,6 @@ class PaperVersion(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
         foreign_keys="SourceRecord.paper_version_id",
         passive_deletes=True,
     )
-    external_identifiers: Mapped[list[ExternalIdentifier]] = relationship(
-        back_populates="paper_version",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
 
 
 class SourceRecord(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
@@ -299,10 +294,6 @@ class SourceRecord(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
         foreign_keys=[paper_version_id],
         passive_deletes=True,
     )
-    external_identifiers: Mapped[list[ExternalIdentifier]] = relationship(
-        back_populates="source_record",
-        passive_deletes=True,
-    )
     field_assertions: Mapped[list[FieldAssertion]] = relationship(
         back_populates="source_record",
         cascade="all, delete-orphan",
@@ -329,22 +320,11 @@ class ExternalIdentifier(
         ForeignKey("work.id", ondelete="CASCADE"),
         nullable=False,
     )
-    paper_version_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("paper_version.id", ondelete="CASCADE"),
-    )
-    source_record_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("source_record.id", ondelete="SET NULL"),
-    )
     scheme: Mapped[str] = mapped_column(String(32), nullable=False)
     normalized_value: Mapped[str] = mapped_column(String(512), nullable=False)
     raw_value: Mapped[str] = mapped_column(String(512), nullable=False)
 
-    work: Mapped[Work] = relationship(back_populates="external_identifiers")
-    paper_version: Mapped[PaperVersion | None] = relationship(
-        back_populates="external_identifiers",
-        passive_deletes=True,
-    )
-    source_record: Mapped[SourceRecord | None] = relationship(
+    work: Mapped[Work] = relationship(
         back_populates="external_identifiers",
         passive_deletes=True,
     )

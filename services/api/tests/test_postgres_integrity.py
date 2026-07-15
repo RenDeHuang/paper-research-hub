@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 from uuid import UUID, uuid4
 
 from alembic import command
@@ -20,6 +21,39 @@ INITIAL_MIGRATION = (
 INITIAL_MIGRATION_SHA256 = (
     "7771e5358c3679aed87a1299e3aff52ad07bb0e945a2754ccc7c973bccd7c931"
 )
+REPOSITORY_ROOT = SERVICE_ROOT.parents[1]
+HISTORICAL_INITIAL_MIGRATION_PATH = (
+    "services/api/alembic/versions/0001_initial_schema.py"
+)
+HISTORICAL_ENV_SOURCE = """
+from alembic import context
+from sqlalchemy import MetaData, create_engine, pool
+
+config = context.config
+target_metadata = MetaData(
+    naming_convention={
+        "ix": "ix_%(column_0_label)s",
+        "uq": "uq_%(table_name)s_%(column_0_name)s",
+        "ck": "ck_%(table_name)s_%(constraint_name)s",
+        "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+        "pk": "pk_%(table_name)s",
+    }
+)
+
+
+def run_migrations_online() -> None:
+    connectable = create_engine(
+        config.get_main_option("sqlalchemy.url"),
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+run_migrations_online()
+"""
 
 
 def _insert_old_schema_fixture(connection) -> dict[str, UUID]:
@@ -129,6 +163,36 @@ def _assert_integrity_error(engine, statement: str, parameters: dict) -> None:
             connection.execute(text(statement), parameters)
 
 
+def _historical_alembic_config(
+    tmp_path: Path,
+    database_url: str,
+    commit: str,
+):
+    from alembic.config import Config
+
+    script_root = tmp_path / f"{commit}_alembic"
+    versions_root = script_root / "versions"
+    versions_root.mkdir(parents=True)
+    migration_source = subprocess.run(
+        [
+            "git",
+            "show",
+            f"{commit}:{HISTORICAL_INITIAL_MIGRATION_PATH}",
+        ],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    (script_root / "env.py").write_text(HISTORICAL_ENV_SOURCE)
+    (versions_root / "0001_initial_schema.py").write_text(migration_source)
+
+    config = Config()
+    config.set_main_option("script_location", str(script_root))
+    config.set_main_option("sqlalchemy.url", database_url)
+    return config
+
+
 def _insert_delete_graph(engine, suffix: str) -> dict[str, UUID]:
     ids = {
         "work": uuid4(),
@@ -209,20 +273,17 @@ def _insert_delete_graph(engine, suffix: str) -> dict[str, UUID]:
             text(
                 """
                 INSERT INTO external_identifier (
-                    id, work_id, paper_version_id, source_record_id,
-                    scheme, normalized_value, raw_value, source
+                    id, work_id, scheme, normalized_value, raw_value, source
                 )
                 VALUES (
-                    :id, :work_id, :paper_version_id, :source_record_id,
-                    'doi', :normalized_value, :raw_value, 'test'
+                    :id, :work_id, 'doi',
+                    :normalized_value, :raw_value, 'test'
                 )
                 """
             ),
             {
                 "id": ids["external"],
                 "work_id": ids["work"],
-                "paper_version_id": ids["version"],
-                "source_record_id": ids["source"],
                 "normalized_value": f"10.1000/{suffix}",
                 "raw_value": f"10.1000/{suffix}",
             },
@@ -342,8 +403,14 @@ def test_0001_migration_matches_committed_baseline() -> None:
 def test_0001_to_0002_upgrade_and_downgrade_are_executable(
     alembic_config,
     clean_postgres_url: str,
+    tmp_path: Path,
 ) -> None:
-    command.upgrade(alembic_config, "0001_initial_schema")
+    historical_config = _historical_alembic_config(
+        tmp_path,
+        clean_postgres_url,
+        "d1aacd8",
+    )
+    command.upgrade(historical_config, "0001_initial_schema")
     engine = create_engine(clean_postgres_url)
     try:
         old_columns = {
@@ -352,6 +419,15 @@ def test_0001_to_0002_upgrade_and_downgrade_are_executable(
         }
         assert {"subject_type", "subject_id"} <= old_columns
         assert "work_id" not in old_columns
+        assert (
+            "ck_metric_snapshot_ck_metric_snapshot_single_target"
+            in {
+                constraint["name"]
+                for constraint in inspect(engine).get_check_constraints(
+                    "metric_snapshot"
+                )
+            }
+        )
 
         with engine.begin() as connection:
             ids = _insert_old_schema_fixture(connection)
@@ -387,6 +463,25 @@ def test_0001_to_0002_upgrade_and_downgrade_are_executable(
             }
             assert "work_id" not in assertion_columns
             assert "paper_version_id" not in assertion_columns
+            external_identifier_columns = {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "external_identifier"
+                )
+            }
+            assert "paper_version_id" not in external_identifier_columns
+            assert "source_record_id" not in external_identifier_columns
+            metric_check_names = {
+                constraint["name"]
+                for constraint in inspect(connection).get_check_constraints(
+                    "metric_snapshot"
+                )
+            }
+            assert "ck_metric_snapshot_single_target" in metric_check_names
+            assert (
+                "ck_metric_snapshot_ck_metric_snapshot_single_target"
+                not in metric_check_names
+            )
 
         command.downgrade(alembic_config, "0001_initial_schema")
         downgraded_columns = {
@@ -396,6 +491,16 @@ def test_0001_to_0002_upgrade_and_downgrade_are_executable(
         assert {"subject_type", "subject_id"} <= downgraded_columns
         assert "work_id" not in downgraded_columns
         with engine.connect() as connection:
+            external_identifier_columns = {
+                column["name"]
+                for column in inspect(connection).get_columns(
+                    "external_identifier"
+                )
+            }
+            assert {
+                "paper_version_id",
+                "source_record_id",
+            } <= external_identifier_columns
             assert connection.execute(
                 text(
                     """
@@ -416,6 +521,119 @@ def test_0001_to_0002_upgrade_and_downgrade_are_executable(
             ).one() == (ids["work"], ids["version"])
 
         command.upgrade(alembic_config, "head")
+    finally:
+        engine.dispose()
+
+
+def test_c744_physical_0001_upgrades_to_current_head(
+    alembic_config,
+    clean_postgres_url: str,
+    tmp_path: Path,
+) -> None:
+    c744_config = _historical_alembic_config(
+        tmp_path,
+        clean_postgres_url,
+        "c74476a",
+    )
+    command.upgrade(c744_config, "0001_initial_schema")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    ranking_id = uuid4()
+    now = datetime(2026, 7, 15, 8, 30, tzinfo=UTC)
+    try:
+        before = inspect(engine)
+        assert {
+            "work_id",
+            "topic_id",
+            "method_id",
+        } <= {
+            column["name"]
+            for column in before.get_columns("ranking_snapshot")
+        }
+        assert "subject_id" not in {
+            column["name"]
+            for column in before.get_columns("ranking_snapshot")
+        }
+        assert (
+            "ck_metric_snapshot_ck_metric_snapshot_single_target"
+            in {
+                constraint["name"]
+                for constraint in before.get_check_constraints(
+                    "metric_snapshot"
+                )
+            }
+        )
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id, 'doi:10.1000/c744-variant',
+                        'C744 variant', 'test'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO ranking_snapshot (
+                        id, ranking_name, work_id, rank_position, score,
+                        window_days, computed_at, formula_version,
+                        coverage, source
+                    )
+                    VALUES (
+                        :id, 'weekly-c744', :work_id, 1, 1,
+                        7, :computed_at, 'v1', '{}'::jsonb, 'test'
+                    )
+                    """
+                ),
+                {
+                    "id": ranking_id,
+                    "work_id": work_id,
+                    "computed_at": now,
+                },
+            )
+
+        command.upgrade(alembic_config, "head")
+
+        with engine.connect() as connection:
+            final_inspector = inspect(connection)
+            assert connection.scalar(
+                text("SELECT count(*) FROM ranking_snapshot WHERE id = :id"),
+                {"id": ranking_id},
+            ) == 1
+            assert {
+                column["name"]
+                for column in final_inspector.get_columns(
+                    "external_identifier"
+                )
+            }.isdisjoint({"paper_version_id", "source_record_id"})
+            metric_check_names = {
+                constraint["name"]
+                for constraint in final_inspector.get_check_constraints(
+                    "metric_snapshot"
+                )
+            }
+            assert "ck_metric_snapshot_single_target" in metric_check_names
+            assert (
+                "ck_metric_snapshot_ck_metric_snapshot_single_target"
+                not in metric_check_names
+            )
+
+            from paper_hub.models import Base
+
+            context = MigrationContext.configure(
+                connection,
+                opts={
+                    "compare_type": True,
+                    "compare_server_default": True,
+                },
+            )
+            assert compare_metadata(context, Base.metadata) == []
     finally:
         engine.dispose()
 
@@ -744,7 +962,6 @@ def test_loaded_version_delete_matches_sql_cascades(
             assert version is not None
             assert len(version.source_records) == 1
             assert len(version.source_records[0].field_assertions) == 1
-            assert len(version.external_identifiers) == 1
             session.delete(version)
             session.commit()
 
@@ -759,7 +976,7 @@ def test_loaded_version_delete_matches_sql_cascades(
             "version": 0,
             "source": (None, None),
             "assertion": 1,
-            "external": 0,
+            "external": 1,
             "repository": 1,
             "metric": 1,
             "ranking": 1,

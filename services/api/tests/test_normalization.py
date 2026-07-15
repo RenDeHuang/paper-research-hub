@@ -90,6 +90,43 @@ def test_explicit_external_ids_generate_controlled_canonical_identities(
     assert canonical_identity(record) == expected
 
 
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        (
+            {
+                "arxiv_id": "not-an-arxiv-id",
+                "arxiv": "2401.01234v3",
+            },
+            "arxiv:2401.01234",
+        ),
+        (
+            {
+                "openreview_forum_id": " ",
+                "openreview_id": "Forum_Backup123",
+            },
+            "openreview:Forum_Backup123",
+        ),
+        (
+            {
+                "semantic_scholar_paper_id": "invalid",
+                "semantic_scholar_id": (
+                    "A0B1C2D3E4F5678901234567890ABCDEFFEDCBA9"
+                ),
+            },
+            "s2:a0b1c2d3e4f5678901234567890abcdeffedcba9",
+        ),
+    ],
+)
+def test_invalid_primary_alias_does_not_hide_valid_fallback(
+    record: dict[str, str],
+    expected: str,
+) -> None:
+    from paper_hub.normalization import canonical_identity
+
+    assert canonical_identity(record) == expected
+
+
 def test_similar_titles_do_not_generate_a_canonical_identity() -> None:
     from paper_hub.normalization import canonical_identity
 
@@ -266,6 +303,12 @@ def test_core_models_have_provenance_status_constraints_and_relationships() -> N
     } >= {"work.id"}
 
     external_identifier = Base.metadata.tables["external_identifier"]
+    assert {
+        foreign_key.target_fullname
+        for foreign_key in external_identifier.foreign_keys
+    } == {"work.id"}
+    assert "paper_version_id" not in external_identifier.columns
+    assert "source_record_id" not in external_identifier.columns
     assert any(
         {column.name for column in constraint.columns}
         == {"scheme", "normalized_value"}

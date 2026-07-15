@@ -1,5 +1,5 @@
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 
@@ -134,29 +134,38 @@ def canonical_identity(record: Mapping[str, Any]) -> str | None:
     if doi is not None:
         return f"doi:{doi}"
 
-    arxiv_id = normalize_arxiv_id(
-        _string_value(record.get("arxiv_id") or record.get("arxiv"))
+    arxiv_id = _first_normalized(
+        record,
+        normalize_arxiv_id,
+        "arxiv_id",
+        "arxiv",
     )
     if arxiv_id is not None:
         return f"arxiv:{arxiv_id}"
 
-    openreview_forum_id = normalize_openreview_forum_id(
-        _first_string(record, "openreview_forum_id", "openreview_id")
+    openreview_forum_id = _first_normalized(
+        record,
+        normalize_openreview_forum_id,
+        "openreview_forum_id",
+        "openreview_id",
     )
     if openreview_forum_id is not None:
         return f"openreview:{openreview_forum_id}"
 
-    openalex_id = normalize_openalex_id(_first_string(record, "openalex_id"))
+    openalex_id = _first_normalized(
+        record,
+        normalize_openalex_id,
+        "openalex_id",
+    )
     if openalex_id is not None:
         return f"openalex:{openalex_id}"
 
-    semantic_scholar_paper_id = normalize_semantic_scholar_paper_id(
-        _first_string(
-            record,
-            "semantic_scholar_paper_id",
-            "semantic_scholar_id",
-            "s2_paper_id",
-        )
+    semantic_scholar_paper_id = _first_normalized(
+        record,
+        normalize_semantic_scholar_paper_id,
+        "semantic_scholar_paper_id",
+        "semantic_scholar_id",
+        "s2_paper_id",
     )
     if semantic_scholar_paper_id is not None:
         return f"s2:{semantic_scholar_paper_id}"
@@ -168,11 +177,15 @@ def _string_value(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _first_string(record: Mapping[str, Any], *keys: str) -> str | None:
+def _first_normalized(
+    record: Mapping[str, Any],
+    normalizer: Callable[[str | None], str | None],
+    *keys: str,
+) -> str | None:
     for key in keys:
-        value = _string_value(record.get(key))
-        if value is not None:
-            return value
+        normalized = normalizer(_string_value(record.get(key)))
+        if normalized is not None:
+            return normalized
     return None
 
 

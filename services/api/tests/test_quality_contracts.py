@@ -208,6 +208,14 @@ def test_database_url_is_required_secret_and_stable(
     assert isinstance(settings.database_url, SecretStr)
     assert password not in repr(settings)
     assert Path(Settings.model_config["env_file"]).is_absolute()
+    assert Settings.model_config["hide_input_in_errors"] is True
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            database_url=f"sqlite://paper_hub:{password}@db/paper_hub",
+            _env_file=None,
+        )
+    assert password not in str(exc_info.value)
 
 
 def test_alembic_requires_database_url_and_compares_server_defaults() -> None:
@@ -220,9 +228,16 @@ def test_alembic_requires_database_url_and_compares_server_defaults() -> None:
 
 
 def test_ownership_constraints_prevent_cross_work_pollution() -> None:
-    from paper_hub.models import Base, PaperVersion, SourceRecord, Work
+    from paper_hub.models import (
+        Base,
+        ExternalIdentifier,
+        PaperVersion,
+        SourceRecord,
+        Work,
+    )
 
     source_record = Base.metadata.tables["source_record"]
+    external_identifier = Base.metadata.tables["external_identifier"]
     field_assertion = Base.metadata.tables["field_assertion"]
 
     assert {"source_record_id"} == {
@@ -259,6 +274,13 @@ def test_ownership_constraints_prevent_cross_work_pollution() -> None:
     assert inspect(SourceRecord).relationships.paper_version.local_columns == {
         source_record.c.paper_version_id
     }
+    assert {
+        (foreign_key.parent.name, foreign_key.target_fullname)
+        for foreign_key in external_identifier.foreign_keys
+    } == {("work_id", "work.id")}
+    assert set(inspect(ExternalIdentifier).relationships.keys()) == {"work"}
+    assert "external_identifiers" not in inspect(PaperVersion).relationships
+    assert "external_identifiers" not in inspect(SourceRecord).relationships
 
 
 def test_model_check_constraints_cover_numeric_domains() -> None:
@@ -304,7 +326,6 @@ def test_relationship_delete_configuration_matches_database_cascades() -> None:
         inspect(Work).relationships.code_repositories,
         inspect(Work).relationships.metric_snapshots,
         inspect(Work).relationships.ranking_snapshots,
-        inspect(PaperVersion).relationships.external_identifiers,
         inspect(SourceRecord).relationships.field_assertions,
         inspect(CodeRepository).relationships.metric_snapshots,
         inspect(Topic).relationships.ranking_snapshots,
