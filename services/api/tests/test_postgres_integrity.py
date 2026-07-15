@@ -10,7 +10,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 import psycopg
 import pytest
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
@@ -946,7 +946,10 @@ def test_0005_adds_projection_provenance_and_cascading_scope_work_fk(
                 },
             )
 
-        command.upgrade(alembic_config, "head")
+        command.upgrade(
+            alembic_config,
+            "0005_work_projection_integrity",
+        )
 
         inspector = inspect(engine)
         work_columns = {
@@ -1016,6 +1019,257 @@ def test_0005_adds_projection_provenance_and_cascading_scope_work_fk(
             column["name"] for column in inspect(engine).get_columns("work")
         }
         assert "projection_source_updated_at" not in downgraded_columns
+    finally:
+        engine.dispose()
+
+
+def test_0006_resets_unverified_projection_and_replay_repairs_latest_snapshot(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from paper_hub.connectors.openalex import OpenAlexConnector
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import (
+        FieldAssertion,
+        RecordStatus,
+        SourceRecord,
+        Work,
+    )
+
+    fixture = json.loads(
+        (FIXTURES_ROOT / "openalex_works.json").read_text(
+            encoding="utf-8"
+        )
+    )["results"][0]
+    older_raw = json.loads(json.dumps(fixture))
+    older_raw["title"] = "Stale LLM Agent Projection"
+    older_raw["display_name"] = older_raw["title"]
+    older_raw["abstract_inverted_index"] = {
+        "Stale": [0],
+        "LLM": [1],
+        "agent": [2],
+        "abstract": [3],
+    }
+    older_raw["updated_date"] = "2026-07-14T08:00:00"
+    older_raw["is_retracted"] = False
+
+    latest_raw = json.loads(json.dumps(fixture))
+    latest_raw["title"] = "Latest Retracted LLM Agent Projection"
+    latest_raw["display_name"] = latest_raw["title"]
+    latest_raw["abstract_inverted_index"] = {
+        "Latest": [0],
+        "LLM": [1],
+        "agent": [2],
+        "abstract": [3],
+    }
+    latest_raw["updated_date"] = "2026-07-16T08:00:00"
+    latest_raw["is_retracted"] = True
+
+    older_record = OpenAlexConnector.parse_record(
+        older_raw,
+        retrieved_at=datetime(2026, 7, 16, 9, 5, tzinfo=UTC),
+        http_status=200,
+    )
+    latest_record = OpenAlexConnector.parse_record(
+        latest_raw,
+        retrieved_at=datetime(2026, 7, 16, 9, 0, tzinfo=UTC),
+        http_status=200,
+    )
+
+    command.upgrade(alembic_config, "0004_versioned_scope_assessment")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (
+                        id,
+                        canonical_key,
+                        title,
+                        abstract,
+                        status,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :canonical_key,
+                        :title,
+                        :abstract,
+                        'active',
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": work_id,
+                    "canonical_key": latest_record.parsed.canonical_key,
+                    "title": older_record.parsed.title,
+                    "abstract": older_record.parsed.abstract,
+                },
+            )
+            for source_id, record in (
+                (uuid4(), latest_record),
+                (uuid4(), older_record),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source_updated_at,
+                            http_status,
+                            source,
+                            retrieved_at
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            :source_record_id,
+                            :content_hash,
+                            CAST(:raw_payload AS jsonb),
+                            :source_updated_at,
+                            :http_status,
+                            :source,
+                            :retrieved_at
+                        )
+                        """
+                    ),
+                    {
+                        "id": source_id,
+                        "work_id": work_id,
+                        "source_record_id": record.source_record_id,
+                        "content_hash": record.content_hash,
+                        "raw_payload": json.dumps(record.raw_payload),
+                        "source_updated_at": record.source_updated_at,
+                        "http_status": record.http_status,
+                        "source": record.source,
+                        "retrieved_at": record.retrieved_at,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO scope_assessment (
+                            id,
+                            source_record_id,
+                            rule_version,
+                            included,
+                            reason,
+                            evidence,
+                            evaluated_at,
+                            work_id
+                        )
+                        VALUES (
+                            :id,
+                            :source_record_id,
+                            :rule_version,
+                            true,
+                            NULL,
+                            '[]'::jsonb,
+                            :evaluated_at,
+                            :work_id
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "source_record_id": source_id,
+                        "rule_version": (
+                            record.parsed.scope.rule_version
+                        ),
+                        "evaluated_at": record.retrieved_at,
+                        "work_id": work_id,
+                    },
+                )
+
+        command.upgrade(
+            alembic_config,
+            "0005_work_projection_integrity",
+        )
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    """
+                    SELECT
+                        title,
+                        abstract,
+                        status,
+                        projection_source,
+                        projection_source_record_id,
+                        projection_source_updated_at
+                    FROM work
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": work_id},
+            ).one() == (
+                older_record.parsed.title,
+                older_record.parsed.abstract,
+                "active",
+                latest_record.source,
+                latest_record.source_record_id,
+                latest_record.source_updated_at,
+            )
+
+        command.upgrade(alembic_config, "head")
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    """
+                    SELECT
+                        projection_source,
+                        projection_source_record_id,
+                        projection_source_updated_at
+                    FROM work
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": work_id},
+            ).one() == (None, None, None)
+
+        with Session(engine) as session:
+            repaired = IngestionService(session).ingest(latest_record)
+            session.commit()
+            work = session.get(Work, work_id)
+
+            assert repaired.status == "updated"
+            assert repaired.work_id == work_id
+            assert work.title == latest_record.parsed.title
+            assert work.abstract == latest_record.parsed.abstract
+            assert work.status == RecordStatus.RETRACTED
+            assert work.projection_source == latest_record.source
+            assert (
+                work.projection_source_record_id
+                == latest_record.source_record_id
+            )
+            assert (
+                work.projection_source_updated_at
+                == latest_record.source_updated_at
+            )
+            assert work.source == latest_record.source
+            assert work.retrieved_at == latest_record.retrieved_at
+            assert (
+                session.scalar(
+                    select(func.count()).select_from(SourceRecord)
+                )
+                == 2
+            )
+            assert (
+                session.scalar(
+                    select(func.count()).select_from(FieldAssertion)
+                )
+                > 0
+            )
+
+            replay = IngestionService(session).ingest(latest_record)
+            session.commit()
+            assert replay.status == "unchanged"
     finally:
         engine.dispose()
 
@@ -1164,7 +1418,7 @@ def test_offline_head_sql_applies_to_historical_schema_variants(
 
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0005_work_projection_integrity"
+            ) == "0006_reset_work_projections"
             context = MigrationContext.configure(
                 connection,
                 opts={

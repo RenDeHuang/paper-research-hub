@@ -7,6 +7,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from paper_hub.connectors.base import (
@@ -115,6 +116,20 @@ class IngestionService:
                 )
             )
             if existing_assessment is not None:
+                if (
+                    existing_assessment.included
+                    and self._projection_requires_rebuild(
+                        existing_assessment
+                    )
+                ):
+                    return self._include_snapshot(
+                        existing_snapshot,
+                        record,
+                        parsed,
+                        scope_evidence,
+                        persist_scope_assessment=False,
+                        force_projection=True,
+                    )
                 return self._existing_assessment_result(
                     existing_snapshot,
                     existing_assessment,
@@ -172,6 +187,9 @@ class IngestionService:
         record: ConnectorRecord[ParsedWork],
         parsed: ParsedWork,
         scope_evidence: tuple[dict[str, str], ...],
+        *,
+        persist_scope_assessment: bool = True,
+        force_projection: bool = False,
     ) -> IngestionResult:
         work = self._resolve_work(parsed)
         if source_record is not None and source_record.work_id is not None:
@@ -204,7 +222,12 @@ class IngestionService:
             self.session.flush()
         else:
             self._upgrade_canonical_key(work, parsed)
-            self._update_work_projection(work, record, parsed)
+            self._update_work_projection(
+                work,
+                record,
+                parsed,
+                force=force_projection,
+            )
 
         if source_record is None:
             source_record = self._create_source_record(
@@ -225,7 +248,12 @@ class IngestionService:
         self._persist_topics(work, record, parsed)
         self._persist_code_repositories(work, record, parsed)
         self._persist_citation_metric(work, source_record, record, parsed)
-        self._persist_scope_assessment(source_record, parsed, work=work)
+        if persist_scope_assessment:
+            self._persist_scope_assessment(
+                source_record,
+                parsed,
+                work=work,
+            )
         self.session.flush()
 
         return IngestionResult(
@@ -333,6 +361,28 @@ class IngestionService:
             )
         return next(iter(matched_works.values()), None)
 
+    def _projection_requires_rebuild(
+        self,
+        assessment: ScopeAssessment,
+    ) -> bool:
+        if assessment.work_id is None:
+            raise IdentityConflictError(
+                "included scope assessment has no canonical work"
+            )
+        work = self.session.get(Work, assessment.work_id)
+        if work is None:
+            raise IdentityConflictError(
+                "included scope assessment references a missing work"
+            )
+        return any(
+            value is None
+            for value in (
+                work.projection_source,
+                work.projection_source_record_id,
+                work.projection_source_updated_at,
+            )
+        )
+
     def _acquire_identity_locks(
         self,
         record: ConnectorRecord[ParsedWork],
@@ -388,9 +438,12 @@ class IngestionService:
         work: Work,
         record: ConnectorRecord[ParsedWork],
         parsed: ParsedWork,
+        *,
+        force: bool = False,
     ) -> None:
         if (
-            work.projection_source_updated_at is not None
+            not force
+            and work.projection_source_updated_at is not None
             and record.source_updated_at
             <= work.projection_source_updated_at
         ):
@@ -490,15 +543,14 @@ class IngestionService:
         parsed: ParsedWork,
     ) -> None:
         existing_topic_ids = {topic.id for topic in work.topics}
-        for parsed_topic in parsed.topics:
+        for parsed_topic in sorted(
+            parsed.topics,
+            key=lambda topic: _normalize_name(topic.display_name),
+        ):
             normalized_name = _normalize_name(parsed_topic.display_name)
-            topic = self.session.scalar(
-                select(Topic).where(
-                    Topic.normalized_name == normalized_name
-                )
-            )
-            if topic is None:
-                topic = Topic(
+            topic_id = self.session.scalar(
+                pg_insert(Topic)
+                .values(
                     name=parsed_topic.display_name,
                     normalized_name=normalized_name,
                     description=None,
@@ -512,8 +564,23 @@ class IngestionService:
                     source_license=OPENALEX_SOURCE_LICENSE,
                     content_license=None,
                 )
-                self.session.add(topic)
-                self.session.flush()
+                .on_conflict_do_nothing(
+                    constraint="uq_topic_normalized_name"
+                )
+                .returning(Topic.id)
+            )
+            if topic_id is None:
+                topic = self.session.scalar(
+                    select(Topic).where(
+                        Topic.normalized_name == normalized_name
+                    )
+                )
+            else:
+                topic = self.session.get(Topic, topic_id)
+            if topic is None:
+                raise IngestionError(
+                    "topic upsert did not return or resolve a row"
+                )
             if topic.id not in existing_topic_ids:
                 work.topics.append(topic)
                 existing_topic_ids.add(topic.id)
@@ -524,24 +591,29 @@ class IngestionService:
         record: ConnectorRecord[ParsedWork],
         parsed: ParsedWork,
     ) -> None:
-        for parsed_repository in parsed.code_repositories:
-            repository = self.session.scalar(
-                select(CodeRepository).where(
-                    CodeRepository.normalized_url
-                    == parsed_repository.normalized_url
-                )
-            )
-            if repository is not None:
-                continue
-            self.session.add(
-                CodeRepository(
+        for parsed_repository in sorted(
+            parsed.code_repositories,
+            key=lambda repository: repository.normalized_url,
+        ):
+            self.session.execute(
+                pg_insert(CodeRepository)
+                .values(
                     work_id=work.id,
                     provider=parsed_repository.provider,
-                    repository_name=parsed_repository.repository_name,
-                    repository_url=parsed_repository.repository_url,
-                    normalized_url=parsed_repository.normalized_url,
+                    repository_name=(
+                        parsed_repository.repository_name
+                    ),
+                    repository_url=(
+                        parsed_repository.repository_url
+                    ),
+                    normalized_url=(
+                        parsed_repository.normalized_url
+                    ),
                     is_official=False,
                     **self._provenance(record, parsed),
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_code_repository_normalized_url"
                 )
             )
 

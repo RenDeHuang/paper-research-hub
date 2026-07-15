@@ -3,11 +3,11 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Lock
 
 from alembic import command
 import pytest
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.orm import Session, Session as SQLAlchemySession
 
@@ -51,6 +51,86 @@ def _with_scope(
         reason=None if included else f"excluded_by_{rule_version}",
     )
     return replace(record, parsed=replace(record.parsed, scope=scope))
+
+
+def _independent_work(
+    *,
+    openalex_id: str,
+    doi: str,
+) -> dict:
+    raw = json.loads(json.dumps(_fixture()["results"][0]))
+    raw["id"] = f"https://openalex.org/{openalex_id}"
+    raw["doi"] = f"https://doi.org/{doi}"
+    raw["ids"] = {
+        "openalex": raw["id"],
+        "doi": raw["doi"],
+    }
+    raw["primary_location"] = None
+    raw["best_oa_location"] = None
+    raw["locations"] = []
+    return raw
+
+
+def _concurrent_ingest_at_insert(
+    engine,
+    *,
+    records: tuple,
+    table_name: str,
+) -> list[str]:
+    from paper_hub.ingestion import IngestionService
+
+    start_barrier = Barrier(len(records))
+    insert_barrier = Barrier(len(records))
+    synchronized_connections: set[int] = set()
+    synchronized_connections_lock = Lock()
+
+    def synchronize_insert(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        if not statement.lstrip().startswith(
+            f"INSERT INTO {table_name}"
+        ):
+            return
+        connection_id = id(_connection)
+        with synchronized_connections_lock:
+            if connection_id in synchronized_connections:
+                return
+            synchronized_connections.add(connection_id)
+        insert_barrier.wait(timeout=10)
+
+    def ingest_once(record) -> str:
+        with Session(engine) as session:
+            start_barrier.wait(timeout=10)
+            result = IngestionService(session).ingest(record)
+            session.commit()
+            return result.status
+
+    event.listen(
+        engine,
+        "before_cursor_execute",
+        synchronize_insert,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=len(records)) as executor:
+            futures = [
+                executor.submit(ingest_once, record)
+                for record in records
+            ]
+            return sorted(
+                future.result(timeout=30)
+                for future in futures
+            )
+    finally:
+        event.remove(
+            engine,
+            "before_cursor_execute",
+            synchronize_insert,
+        )
 
 
 @pytest.fixture
@@ -282,6 +362,107 @@ def test_concurrent_shared_canonical_identity_creates_one_work(
         assert session.scalar(select(func.count()).select_from(Work)) == 1
         assert (
             session.scalar(select(func.count()).select_from(SourceRecord))
+            == 2
+        )
+
+
+def test_concurrent_distinct_works_share_topics_without_unique_failure(
+    migrated_engine,
+) -> None:
+    from paper_hub.models import SourceRecord, Topic, Work, work_topic
+
+    first_raw = _independent_work(
+        openalex_id="W5000000001",
+        doi="10.1000/concurrent-topic-one",
+    )
+    second_raw = _independent_work(
+        openalex_id="W5000000002",
+        doi="10.1000/concurrent-topic-two",
+    )
+    for raw in (first_raw, second_raw):
+        raw["abstract_inverted_index"] = {
+            "LLM": [0],
+            "agents": [1],
+            "share": [2],
+            "topics": [3],
+        }
+    second_raw["topics"] = list(reversed(second_raw["topics"]))
+
+    statuses = _concurrent_ingest_at_insert(
+        migrated_engine,
+        records=(
+            _record(first_raw),
+            _record(second_raw, minute=1),
+        ),
+        table_name="topic",
+    )
+
+    assert statuses == ["inserted", "inserted"]
+    with Session(migrated_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Work)) == 2
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord))
+            == 2
+        )
+        assert session.scalar(select(func.count()).select_from(Topic)) == 2
+        assert (
+            session.scalar(select(func.count()).select_from(work_topic))
+            == 4
+        )
+
+
+def test_concurrent_distinct_works_share_repository_without_unique_failure(
+    migrated_engine,
+) -> None:
+    from paper_hub.models import CodeRepository, SourceRecord, Work
+
+    first_raw = _independent_work(
+        openalex_id="W5000000003",
+        doi="10.1000/concurrent-repository-one",
+    )
+    second_raw = _independent_work(
+        openalex_id="W5000000004",
+        doi="10.1000/concurrent-repository-two",
+    )
+    for raw in (first_raw, second_raw):
+        raw["topics"] = []
+    first_raw["abstract_inverted_index"] = {
+        "LLM": [0],
+        "agents": [1],
+        "publish": [2],
+        "https://github.com/example/shared-one": [3],
+        "and": [4],
+        "https://github.com/example/shared-two": [5],
+    }
+    second_raw["abstract_inverted_index"] = {
+        "LLM": [0],
+        "agents": [1],
+        "publish": [2],
+        "https://github.com/example/shared-two": [3],
+        "and": [4],
+        "https://github.com/example/shared-one": [5],
+    }
+
+    statuses = _concurrent_ingest_at_insert(
+        migrated_engine,
+        records=(
+            _record(first_raw),
+            _record(second_raw, minute=1),
+        ),
+        table_name="code_repository",
+    )
+
+    assert statuses == ["inserted", "inserted"]
+    with Session(migrated_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Work)) == 2
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord))
+            == 2
+        )
+        assert (
+            session.scalar(
+                select(func.count()).select_from(CodeRepository)
+            )
             == 2
         )
 
