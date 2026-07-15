@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -24,6 +25,30 @@ def _record(raw: dict, *, minute: int = 0):
         retrieved_at=datetime(2026, 7, 15, 9, minute, tzinfo=UTC),
         http_status=200,
     )
+
+
+def _with_scope(
+    record,
+    *,
+    rule_version: str,
+    included: bool,
+):
+    from paper_hub.connectors.base import ScopeDecision, ScopeEvidence
+
+    evidence = (
+        ScopeEvidence(
+            field="title",
+            term="scope-upgrade",
+            matched_text=record.parsed.title,
+        ),
+    ) if included else ()
+    scope = ScopeDecision(
+        included=included,
+        rule_version=rule_version,
+        evidence=evidence,
+        reason=None if included else f"excluded_by_{rule_version}",
+    )
+    return replace(record, parsed=replace(record.parsed, scope=scope))
 
 
 @pytest.fixture
@@ -279,7 +304,12 @@ def test_out_of_scope_record_is_auditable_and_idempotent(
 ) -> None:
     from paper_hub.connectors.openalex import OPENALEX_SCOPE_RULE_VERSION
     from paper_hub.ingestion import IngestionService
-    from paper_hub.models import FieldAssertion, SourceRecord, Work
+    from paper_hub.models import (
+        FieldAssertion,
+        ScopeAssessment,
+        SourceRecord,
+        Work,
+    )
 
     with Session(migrated_engine) as session:
         record = _record(_fixture()["results"][1])
@@ -289,6 +319,7 @@ def test_out_of_scope_record_is_auditable_and_idempotent(
 
         source_records = session.scalars(select(SourceRecord)).all()
         assertions = session.scalars(select(FieldAssertion)).all()
+        assessments = session.scalars(select(ScopeAssessment)).all()
 
         assert first.status == "excluded"
         assert second.status == "excluded"
@@ -308,16 +339,15 @@ def test_out_of_scope_record_is_auditable_and_idempotent(
         assert source_records[0].work_id is None
         assert source_records[0].paper_version_id is None
         assert source_records[0].raw_payload == record.raw_payload
-        assert len(assertions) == 1
-        assert assertions[0].field_name == "scope"
-        assert assertions[0].source == record.source
-        assert assertions[0].parser_version == record.parser_version
-        assert assertions[0].value == {
-            "included": False,
-            "rule_version": OPENALEX_SCOPE_RULE_VERSION,
-            "evidence": [],
-            "reason": "no_agent_llm_scope_term_match",
-        }
+        assert assertions == []
+        assert len(assessments) == 1
+        assert assessments[0].source_record_id == source_records[0].id
+        assert assessments[0].rule_version == OPENALEX_SCOPE_RULE_VERSION
+        assert assessments[0].included is False
+        assert assessments[0].reason == "no_agent_llm_scope_term_match"
+        assert assessments[0].evidence == []
+        assert assessments[0].evaluated_at is not None
+        assert assessments[0].work_id is None
 
     with pytest.raises(DBAPIError, match="immutable"):
         with migrated_engine.begin() as connection:
@@ -334,6 +364,212 @@ def test_out_of_scope_record_is_auditable_and_idempotent(
                     "source_record_id": first.source_record_id,
                 },
             )
+
+
+def test_scope_rule_upgrade_from_excluded_to_included_reuses_snapshot(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import SourceRecord, Work
+
+    record = _record(_fixture()["results"][1])
+    v1 = _with_scope(
+        record,
+        rule_version="agent-llm-scope-v1",
+        included=False,
+    )
+    v2 = _with_scope(
+        record,
+        rule_version="agent-llm-scope-v2",
+        included=True,
+    )
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(v1)
+        session.commit()
+        second = IngestionService(session).ingest(v2)
+        session.commit()
+        replay = IngestionService(session).ingest(v2)
+        session.commit()
+
+        assert first.status == "excluded"
+        assert second.status == "inserted"
+        assert replay.status == "unchanged"
+        assert replay.work_id == second.work_id
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord)) == 1
+        )
+        source_record = session.scalar(select(SourceRecord))
+        assert source_record.work_id == second.work_id
+
+        assessments = session.execute(
+            text(
+                """
+                SELECT
+                    rule_version,
+                    included,
+                    reason,
+                    evidence,
+                    evaluated_at,
+                    work_id
+                FROM scope_assessment
+                WHERE source_record_id = :source_record_id
+                ORDER BY rule_version
+                """
+            ),
+            {"source_record_id": source_record.id},
+        ).mappings().all()
+        assert len(assessments) == 2
+        assert assessments[0]["rule_version"] == "agent-llm-scope-v1"
+        assert assessments[0]["included"] is False
+        assert assessments[0]["reason"] == (
+            "excluded_by_agent-llm-scope-v1"
+        )
+        assert assessments[0]["evidence"] == []
+        assert assessments[0]["evaluated_at"] is not None
+        assert assessments[0]["work_id"] is None
+        assert assessments[1]["rule_version"] == "agent-llm-scope-v2"
+        assert assessments[1]["included"] is True
+        assert assessments[1]["reason"] is None
+        assert assessments[1]["evidence"] == [
+            {
+                "field": "title",
+                "term": "scope-upgrade",
+                "matched_text": record.parsed.title,
+            }
+        ]
+        assert assessments[1]["evaluated_at"] is not None
+        assert assessments[1]["work_id"] == second.work_id
+
+
+def test_scope_rule_upgrade_from_included_to_excluded_is_current(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import SourceRecord, Work
+
+    record = _record(_fixture()["results"][0])
+    v1 = _with_scope(
+        record,
+        rule_version="agent-llm-scope-v1",
+        included=True,
+    )
+    v2 = _with_scope(
+        record,
+        rule_version="agent-llm-scope-v2",
+        included=False,
+    )
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(v1)
+        session.commit()
+        second = IngestionService(session).ingest(v2)
+        session.commit()
+        replay = IngestionService(session).ingest(v2)
+        session.commit()
+
+        assert first.status == "inserted"
+        assert second.status == "excluded"
+        assert second.scope_rule_version == "agent-llm-scope-v2"
+        assert replay.status == "excluded"
+        assert replay.source_record_id == first.source_record_id
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord)) == 1
+        )
+        source_record = session.scalar(select(SourceRecord))
+        assert source_record.work_id == first.work_id
+
+        current = session.execute(
+            text(
+                """
+                SELECT included, reason, work_id
+                FROM scope_assessment
+                WHERE source_record_id = :source_record_id
+                  AND rule_version = :rule_version
+                """
+            ),
+            {
+                "source_record_id": source_record.id,
+                "rule_version": "agent-llm-scope-v2",
+            },
+        ).mappings().one()
+        assert current["included"] is False
+        assert current["reason"] == "excluded_by_agent-llm-scope-v2"
+        assert current["work_id"] is None
+        assert session.scalar(
+            text(
+                """
+                SELECT count(*)
+                FROM scope_assessment
+                WHERE source_record_id = :source_record_id
+                """
+            ),
+            {"source_record_id": source_record.id},
+        ) == 2
+
+
+def test_scope_rule_upgrade_reuses_existing_work_and_returns_updated(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import ScopeAssessment, SourceRecord, Work
+
+    target_raw = json.loads(json.dumps(_fixture()["results"][1]))
+    existing_raw = json.loads(json.dumps(target_raw))
+    existing_raw["id"] = "https://openalex.org/W1111111111"
+    existing_raw["ids"]["openalex"] = existing_raw["id"]
+
+    existing = _with_scope(
+        _record(existing_raw),
+        rule_version="agent-llm-scope-v1",
+        included=True,
+    )
+    target = _record(target_raw, minute=1)
+    v1 = _with_scope(
+        target,
+        rule_version="agent-llm-scope-v1",
+        included=False,
+    )
+    v2 = _with_scope(
+        target,
+        rule_version="agent-llm-scope-v2",
+        included=True,
+    )
+
+    with Session(migrated_engine) as session:
+        existing_result = IngestionService(session).ingest(existing)
+        session.commit()
+        excluded_result = IngestionService(session).ingest(v1)
+        session.commit()
+        included_result = IngestionService(session).ingest(v2)
+        session.commit()
+
+        assert existing_result.status == "inserted"
+        assert excluded_result.status == "excluded"
+        assert included_result.status == "updated"
+        assert included_result.work_id == existing_result.work_id
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord)) == 2
+        )
+        target_source = session.scalar(
+            select(SourceRecord).where(
+                SourceRecord.source_record_id == target.source_record_id
+            )
+        )
+        assert target_source.work_id == existing_result.work_id
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(ScopeAssessment)
+                .where(
+                    ScopeAssessment.source_record_id == target_source.id
+                )
+            )
+            == 2
+        )
 
 
 def test_cli_rolls_back_and_zeros_counts_when_later_page_fails(
@@ -457,7 +693,7 @@ def test_cli_reports_committed_inserted_and_excluded_counts(
 ) -> None:
     from paper_hub import cli
     from paper_hub.config import get_settings
-    from paper_hub.models import FieldAssertion, SourceRecord, Work
+    from paper_hub.models import ScopeAssessment, SourceRecord, Work
 
     class IncludedAndExcludedConnector:
         def __init__(self, **_: object) -> None:
@@ -508,13 +744,108 @@ def test_cli_reports_committed_inserted_and_excluded_counts(
         excluded_record = session.scalar(
             select(SourceRecord).where(SourceRecord.work_id.is_(None))
         )
-        scope_assertion = session.scalar(
-            select(FieldAssertion).where(
-                FieldAssertion.source_record_id == excluded_record.id,
-                FieldAssertion.field_name == "scope",
+        scope_assessment = session.scalar(
+            select(ScopeAssessment).where(
+                ScopeAssessment.source_record_id == excluded_record.id,
             )
         )
-        assert scope_assertion.value["included"] is False
+        assert scope_assessment.included is False
+    get_settings.cache_clear()
+
+
+def test_cli_reports_excluded_for_current_rule_after_prior_inclusion(
+    migrated_engine,
+    monkeypatch,
+    capsys,
+) -> None:
+    from paper_hub import cli
+    from paper_hub.config import get_settings
+    from paper_hub.models import ScopeAssessment, SourceRecord, Work
+
+    record = _record(_fixture()["results"][0])
+    v1 = _with_scope(
+        record,
+        rule_version="agent-llm-scope-v1",
+        included=True,
+    )
+    v2 = _with_scope(
+        record,
+        rule_version="agent-llm-scope-v2",
+        included=False,
+    )
+
+    class V1Connector:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def fetch_records(self, **_: object):
+            yield v1
+
+    class V2Connector(V1Connector):
+        def fetch_records(self, **_: object):
+            yield v2
+
+    database_url = migrated_engine.url.render_as_string(
+        hide_password=False
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("OPENALEX_CONTACT_EMAIL", "research@example.com")
+    get_settings.cache_clear()
+
+    monkeypatch.setattr(cli, "OpenAlexConnector", V1Connector)
+    first_exit = cli.main(
+        ["sync-openalex", "--query", "agents", "--max-results", "1"]
+    )
+    first_output = json.loads(capsys.readouterr().out)
+
+    monkeypatch.setattr(cli, "OpenAlexConnector", V2Connector)
+    second_exit = cli.main(
+        ["sync-openalex", "--query", "agents", "--max-results", "1"]
+    )
+    second_capture = capsys.readouterr()
+    second_output = json.loads(second_capture.out)
+
+    assert first_exit == 0
+    assert first_output == {
+        "excluded": 0,
+        "failed": 0,
+        "inserted": 1,
+        "unchanged": 0,
+        "updated": 0,
+    }
+    assert second_exit == 0
+    assert second_capture.err == ""
+    assert second_output == {
+        "excluded": 1,
+        "failed": 0,
+        "inserted": 0,
+        "unchanged": 0,
+        "updated": 0,
+    }
+    with Session(migrated_engine) as session:
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord)) == 1
+        )
+        assert (
+            session.scalar(
+                select(func.count()).select_from(ScopeAssessment)
+            )
+            == 2
+        )
+        current = session.scalar(
+            select(ScopeAssessment).where(
+                ScopeAssessment.rule_version == "agent-llm-scope-v2"
+            )
+        )
+        assert current.included is False
+        assert current.work_id is None
     get_settings.cache_clear()
 
 

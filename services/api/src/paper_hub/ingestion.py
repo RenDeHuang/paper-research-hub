@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
@@ -20,6 +20,7 @@ from paper_hub.models import (
     ExternalIdentifier,
     FieldAssertion,
     MetricSnapshot,
+    ScopeAssessment,
     SourceRecord,
     Topic,
     Work,
@@ -103,7 +104,26 @@ class IngestionService:
             )
         )
         if existing_snapshot is not None:
+            existing_assessment = self.session.scalar(
+                select(ScopeAssessment).where(
+                    ScopeAssessment.source_record_id
+                    == existing_snapshot.id,
+                    ScopeAssessment.rule_version
+                    == parsed.scope.rule_version,
+                )
+            )
+            if existing_assessment is not None:
+                return self._existing_assessment_result(
+                    existing_snapshot,
+                    existing_assessment,
+                )
             if not parsed.scope.included:
+                self._persist_scope_assessment(
+                    existing_snapshot,
+                    parsed,
+                    work=None,
+                )
+                self.session.flush()
                 return IngestionResult(
                     status="excluded",
                     source_record_id=existing_snapshot.id,
@@ -111,34 +131,22 @@ class IngestionService:
                     scope_rule_version=parsed.scope.rule_version,
                     scope_evidence=scope_evidence,
                 )
-            return IngestionResult(
-                status="unchanged",
-                work_id=existing_snapshot.work_id,
-                source_record_id=existing_snapshot.id,
-                scope_rule_version=parsed.scope.rule_version,
-                scope_evidence=scope_evidence,
+            return self._include_snapshot(
+                existing_snapshot,
+                record,
+                parsed,
+                scope_evidence,
             )
         if not parsed.scope.included:
-            source_record = SourceRecord(
-                work_id=None,
-                paper_version_id=None,
-                source_record_id=record.source_record_id,
-                content_hash=record.content_hash,
-                raw_payload=record.raw_payload,
-                source_updated_at=record.source_updated_at,
-                http_status=record.http_status,
-                **self._provenance(record, parsed),
+            source_record = self._create_source_record(
+                work=None,
+                record=record,
+                parsed=parsed,
             )
-            self.session.add(source_record)
-            self.session.flush()
-            self.session.add(
-                FieldAssertion(
-                    source_record_id=source_record.id,
-                    field_name="scope",
-                    value=_json_value(parsed.scope),
-                    parser_version=record.parser_version,
-                    **self._provenance(record, parsed),
-                )
+            self._persist_scope_assessment(
+                source_record,
+                parsed,
+                work=None,
             )
             self.session.flush()
             return IngestionResult(
@@ -149,7 +157,34 @@ class IngestionService:
                 scope_evidence=scope_evidence,
             )
 
+        return self._include_snapshot(
+            None,
+            record,
+            parsed,
+            scope_evidence,
+        )
+
+    def _include_snapshot(
+        self,
+        source_record: SourceRecord | None,
+        record: ConnectorRecord[ParsedWork],
+        parsed: ParsedWork,
+        scope_evidence: tuple[dict[str, str], ...],
+    ) -> IngestionResult:
         work = self._resolve_work(parsed)
+        if source_record is not None and source_record.work_id is not None:
+            source_work = self.session.get(Work, source_record.work_id)
+            if source_work is None:
+                raise IdentityConflictError(
+                    "source record references a missing canonical work"
+                )
+            if work is None:
+                work = source_work
+            elif work.id != source_work.id:
+                raise IdentityConflictError(
+                    "source record and controlled identifiers point "
+                    "to different works"
+                )
         is_new_work = work is None
         if work is None:
             work = Work(
@@ -164,8 +199,45 @@ class IngestionService:
         else:
             self._update_work_projection(work, record, parsed)
 
-        source_record = SourceRecord(
+        if source_record is None:
+            source_record = self._create_source_record(
+                work=work,
+                record=record,
+                parsed=parsed,
+            )
+        elif source_record.work_id is None:
+            source_record.work_id = work.id
+            self.session.flush()
+        elif source_record.work_id != work.id:
+            raise IdentityConflictError(
+                "source record is already linked to another work"
+            )
+
+        self._persist_external_identifiers(work, record, parsed)
+        self._persist_field_assertions(source_record, record, parsed)
+        self._persist_topics(work, record, parsed)
+        self._persist_code_repositories(work, record, parsed)
+        self._persist_citation_metric(work, source_record, record, parsed)
+        self._persist_scope_assessment(source_record, parsed, work=work)
+        self.session.flush()
+
+        return IngestionResult(
+            status="inserted" if is_new_work else "updated",
             work_id=work.id,
+            source_record_id=source_record.id,
+            scope_rule_version=parsed.scope.rule_version,
+            scope_evidence=scope_evidence,
+        )
+
+    def _create_source_record(
+        self,
+        *,
+        work: Work | None,
+        record: ConnectorRecord[ParsedWork],
+        parsed: ParsedWork,
+    ) -> SourceRecord:
+        source_record = SourceRecord(
+            work_id=work.id if work is not None else None,
             paper_version_id=None,
             source_record_id=record.source_record_id,
             content_hash=record.content_hash,
@@ -176,20 +248,54 @@ class IngestionService:
         )
         self.session.add(source_record)
         self.session.flush()
+        return source_record
 
-        self._persist_external_identifiers(work, record, parsed)
-        self._persist_field_assertions(source_record, record, parsed)
-        self._persist_topics(work, record, parsed)
-        self._persist_code_repositories(work, record, parsed)
-        self._persist_citation_metric(work, source_record, record, parsed)
-        self.session.flush()
+    def _persist_scope_assessment(
+        self,
+        source_record: SourceRecord,
+        parsed: ParsedWork,
+        *,
+        work: Work | None,
+    ) -> None:
+        self.session.add(
+            ScopeAssessment(
+                source_record_id=source_record.id,
+                rule_version=parsed.scope.rule_version,
+                included=parsed.scope.included,
+                reason=parsed.scope.reason,
+                evidence=_json_value(parsed.scope.evidence),
+                evaluated_at=datetime.now(UTC),
+                work_id=work.id if work is not None else None,
+            )
+        )
 
+    @staticmethod
+    def _existing_assessment_result(
+        source_record: SourceRecord,
+        assessment: ScopeAssessment,
+    ) -> IngestionResult:
+        evidence = tuple(
+            {
+                "field": str(item["field"]),
+                "term": str(item["term"]),
+                "matched_text": str(item["matched_text"]),
+            }
+            for item in assessment.evidence
+        )
+        if assessment.included:
+            return IngestionResult(
+                status="unchanged",
+                work_id=assessment.work_id,
+                source_record_id=source_record.id,
+                scope_rule_version=assessment.rule_version,
+                scope_evidence=evidence,
+            )
         return IngestionResult(
-            status="inserted" if is_new_work else "updated",
-            work_id=work.id,
+            status="excluded",
             source_record_id=source_record.id,
-            scope_rule_version=parsed.scope.rule_version,
-            scope_evidence=scope_evidence,
+            reason=assessment.reason,
+            scope_rule_version=assessment.rule_version,
+            scope_evidence=evidence,
         )
 
     def _resolve_work(self, parsed: ParsedWork) -> Work | None:
@@ -287,9 +393,18 @@ class IngestionService:
             "citation_count": parsed.citation_count,
             "source_updated_at": record.source_updated_at,
             "code_repositories": parsed.code_repositories,
-            "scope": parsed.scope,
         }
+        existing_field_names = set(
+            self.session.scalars(
+                select(FieldAssertion.field_name).where(
+                    FieldAssertion.source_record_id == source_record.id,
+                    FieldAssertion.parser_version == record.parser_version,
+                )
+            ).all()
+        )
         for field_name, value in assertions.items():
+            if field_name in existing_field_names:
+                continue
             self.session.add(
                 FieldAssertion(
                     source_record_id=source_record.id,

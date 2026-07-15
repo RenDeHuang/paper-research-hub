@@ -218,6 +218,10 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    scope_assessments: Mapped[list[ScopeAssessment]] = relationship(
+        back_populates="work",
+        passive_deletes=True,
+    )
 
 
 class PaperVersion(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
@@ -300,6 +304,74 @@ class SourceRecord(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
     field_assertions: Mapped[list[FieldAssertion]] = relationship(
         back_populates="source_record",
         cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    scope_assessments: Mapped[list[ScopeAssessment]] = relationship(
+        back_populates="source_record",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class ScopeAssessment(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "scope_assessment"
+    __table_args__ = (
+        CheckConstraint(
+            "("
+            "included AND work_id IS NOT NULL AND reason IS NULL"
+            ") OR ("
+            "NOT included AND work_id IS NULL "
+            "AND reason IS NOT NULL AND btrim(reason) <> ''"
+            ")",
+            name="ck_scope_assessment_inclusion_consistency",
+        ),
+        CheckConstraint(
+            "btrim(rule_version) <> ''",
+            name="ck_scope_assessment_rule_version_nonempty",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(evidence) = 'array'",
+            name="ck_scope_assessment_evidence_array",
+        ),
+        UniqueConstraint(
+            "source_record_id",
+            "rule_version",
+            name="uq_scope_assessment_record_rule",
+        ),
+        Index(
+            "ix_scope_assessment_record_evaluated_at",
+            "source_record_id",
+            "evaluated_at",
+        ),
+    )
+
+    source_record_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_record.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    rule_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    included: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    evidence: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+    )
+    evaluated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    work_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("work.id"),
+    )
+
+    source_record: Mapped[SourceRecord] = relationship(
+        back_populates="scope_assessments",
+        passive_deletes=True,
+    )
+    work: Mapped[Work | None] = relationship(
+        back_populates="scope_assessments",
         passive_deletes=True,
     )
 

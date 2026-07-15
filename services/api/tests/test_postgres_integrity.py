@@ -551,6 +551,224 @@ def test_0001_to_0002_upgrade_and_downgrade_are_executable(
         engine.dispose()
 
 
+def test_0003_to_0004_scope_assessment_upgrade_and_downgrade_are_executable(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0003_openalex_source_provenance")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    included_source_id = uuid4()
+    excluded_source_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (
+                        id, canonical_key, title, source
+                    )
+                    VALUES (
+                        :id, 'doi:10.1000/scope-migration',
+                        'Scope migration fixture', 'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            for source_id, source_record_id, content_hash, owner_id in (
+                (
+                    included_source_id,
+                    "W1000000001",
+                    "a" * 64,
+                    work_id,
+                ),
+                (
+                    excluded_source_id,
+                    "W1000000002",
+                    "b" * 64,
+                    None,
+                ),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            :source_record_id,
+                            :content_hash,
+                            CAST(:raw_payload AS jsonb),
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": source_id,
+                        "work_id": owner_id,
+                        "source_record_id": source_record_id,
+                        "content_hash": content_hash,
+                        "raw_payload": json.dumps({"id": source_record_id}),
+                    },
+                )
+            for source_id, value in (
+                (
+                    included_source_id,
+                    {
+                        "included": True,
+                        "rule_version": "agent-llm-scope-v1",
+                        "reason": None,
+                        "evidence": [
+                            {
+                                "field": "title",
+                                "term": "agent",
+                                "matched_text": "Agent benchmark",
+                            }
+                        ],
+                    },
+                ),
+                (
+                    excluded_source_id,
+                    {
+                        "included": False,
+                        "rule_version": "agent-llm-scope-v1",
+                        "reason": "no_agent_llm_scope_term_match",
+                        "evidence": [],
+                    },
+                ),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO field_assertion (
+                            id,
+                            source_record_id,
+                            field_name,
+                            value,
+                            parser_version,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :source_record_id,
+                            'scope',
+                            CAST(:value AS jsonb),
+                            'openalex-work-parser-v1',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "source_record_id": source_id,
+                        "value": json.dumps(value),
+                    },
+                )
+
+        command.upgrade(alembic_config, "head")
+
+        inspector = inspect(engine)
+        assert "scope_assessment" in inspector.get_table_names()
+        assert {
+            "id",
+            "source_record_id",
+            "rule_version",
+            "included",
+            "reason",
+            "evidence",
+            "evaluated_at",
+            "work_id",
+        } == {
+            column["name"]
+            for column in inspector.get_columns("scope_assessment")
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints(
+                "scope_assessment"
+            )
+        } == {"uq_scope_assessment_record_rule"}
+        assert "ck_scope_assessment_inclusion_consistency" in {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints(
+                "scope_assessment"
+            )
+        }
+
+        with engine.connect() as connection:
+            assessments = connection.execute(
+                text(
+                    """
+                    SELECT
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    FROM scope_assessment
+                    ORDER BY source_record_id
+                    """
+                )
+            ).mappings().all()
+            assert len(assessments) == 2
+            by_source = {
+                assessment["source_record_id"]: assessment
+                for assessment in assessments
+            }
+            included = by_source[included_source_id]
+            assert included["rule_version"] == "agent-llm-scope-v1"
+            assert included["included"] is True
+            assert included["reason"] is None
+            assert included["evidence"][0]["term"] == "agent"
+            assert included["evaluated_at"] is not None
+            assert included["work_id"] == work_id
+            excluded = by_source[excluded_source_id]
+            assert excluded["included"] is False
+            assert excluded["reason"] == (
+                "no_agent_llm_scope_term_match"
+            )
+            assert excluded["evidence"] == []
+            assert excluded["evaluated_at"] is not None
+            assert excluded["work_id"] is None
+            assert connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM field_assertion
+                    WHERE field_name = 'scope'
+                    """
+                )
+            ) == 2
+
+        command.downgrade(
+            alembic_config,
+            "0003_openalex_source_provenance",
+        )
+        assert "scope_assessment" not in inspect(engine).get_table_names()
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM field_assertion
+                    WHERE field_name = 'scope'
+                    """
+                )
+            ) == 2
+    finally:
+        engine.dispose()
+
+
 def test_c744_physical_0001_upgrades_to_current_head(
     alembic_config,
     clean_postgres_url: str,
@@ -695,7 +913,7 @@ def test_offline_head_sql_applies_to_historical_schema_variants(
 
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0003_openalex_source_provenance"
+            ) == "0004_versioned_scope_assessment"
             context = MigrationContext.configure(
                 connection,
                 opts={
@@ -972,6 +1190,204 @@ def test_database_constraints_reject_invalid_writes(
             """,
             {"id": uuid4(), "work_id": work_id, "computed_at": now},
         )
+    finally:
+        engine.dispose()
+
+
+def test_scope_assessment_constraints_reject_inconsistent_rows(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    other_work_id = uuid4()
+    source_id = uuid4()
+    assessment_id = uuid4()
+    try:
+        assert "scope_assessment" in inspect(engine).get_table_names()
+        with engine.begin() as connection:
+            for item_id, canonical_key in (
+                (work_id, "doi:10.1000/scope-valid"),
+                (other_work_id, "doi:10.1000/scope-other"),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (:id, :canonical_key, 'Scope work', 'test')
+                        """
+                    ),
+                    {"id": item_id, "canonical_key": canonical_key},
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'scope-source',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'test'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "d" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v1',
+                        true,
+                        NULL,
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_id,
+                    "source_record_id": source_id,
+                    "evaluated_at": datetime.now(UTC),
+                    "work_id": work_id,
+                },
+            )
+
+        _assert_integrity_error(
+            engine,
+            """
+            INSERT INTO scope_assessment (
+                id, source_record_id, rule_version, included,
+                reason, evidence, evaluated_at, work_id
+            )
+            VALUES (
+                :id, :source_record_id, 'scope-v1', true,
+                NULL, '[]'::jsonb, :evaluated_at, :work_id
+            )
+            """,
+            {
+                "id": uuid4(),
+                "source_record_id": source_id,
+                "evaluated_at": datetime.now(UTC),
+                "work_id": work_id,
+            },
+        )
+        _assert_integrity_error(
+            engine,
+            """
+            INSERT INTO scope_assessment (
+                id, source_record_id, rule_version, included,
+                reason, evidence, evaluated_at, work_id
+            )
+            VALUES (
+                :id, :source_record_id, 'scope-v2', false,
+                'excluded', '[]'::jsonb, :evaluated_at, :work_id
+            )
+            """,
+            {
+                "id": uuid4(),
+                "source_record_id": source_id,
+                "evaluated_at": datetime.now(UTC),
+                "work_id": work_id,
+            },
+        )
+        with pytest.raises(
+            DBAPIError,
+            match="scope assessment work must match source record work",
+        ):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO scope_assessment (
+                            id,
+                            source_record_id,
+                            rule_version,
+                            included,
+                            reason,
+                            evidence,
+                            evaluated_at,
+                            work_id
+                        )
+                        VALUES (
+                            :id,
+                            :source_record_id,
+                            'scope-v3',
+                            true,
+                            NULL,
+                            '[]'::jsonb,
+                            :evaluated_at,
+                            :work_id
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "source_record_id": source_id,
+                        "evaluated_at": datetime.now(UTC),
+                        "work_id": other_work_id,
+                    },
+                )
+        with pytest.raises(
+            DBAPIError,
+            match="scope assessments are immutable",
+        ):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE scope_assessment
+                        SET evidence = '[{"term": "changed"}]'::jsonb
+                        WHERE id = :id
+                        """
+                    ),
+                    {"id": assessment_id},
+                )
+        with pytest.raises(
+            DBAPIError,
+            match="source record work must match included scope assessments",
+        ):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE source_record
+                        SET work_id = :work_id
+                        WHERE id = :source_record_id
+                        """
+                    ),
+                    {
+                        "work_id": other_work_id,
+                        "source_record_id": source_id,
+                    },
+                )
     finally:
         engine.dispose()
 
