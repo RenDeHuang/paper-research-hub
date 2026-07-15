@@ -13,7 +13,7 @@ dev-web:
 test: test-api test-web
 
 test-api:
-	uv run --project services/api pytest -v
+	uv run --directory services/api pytest -v
 
 test-web:
 	pnpm --dir apps/web test
