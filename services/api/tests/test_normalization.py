@@ -403,27 +403,30 @@ def test_alembic_initial_migration_generates_postgresql_sql(
     assert "CREATE TABLE work" in migration_sql
     assert "CREATE TABLE paper_version" in migration_sql
     assert "CREATE TABLE ranking_snapshot" in migration_sql
-    assert "CONSTRAINT ck_work_canonical_key_approved_prefix CHECK" in migration_sql
+    assert (
+        'DROP CONSTRAINT IF EXISTS '
+        '"ck_work_canonical_key_approved_prefix"'
+    ) in migration_sql
+    assert '"ck_work_canonical_key_approved_prefix" CHECK' in migration_sql
     assert "0002_enforce_canonical_integrity" in migration_sql
 
-    assert "ALTER TABLE ranking_snapshot DROP COLUMN subject_id" in migration_sql
-    assert "ALTER TABLE ranking_snapshot DROP COLUMN subject_type" in migration_sql
-    assert "ALTER TABLE ranking_snapshot ADD COLUMN work_id UUID" in migration_sql
-    assert "ALTER TABLE ranking_snapshot ADD COLUMN topic_id UUID" in migration_sql
-    assert "ALTER TABLE ranking_snapshot ADD COLUMN method_id UUID" in migration_sql
+    assert "DROP COLUMN IF EXISTS subject_id" in migration_sql
+    assert "DROP COLUMN IF EXISTS subject_type" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS work_id UUID" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS topic_id UUID" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS method_id UUID" in migration_sql
+    assert "information_schema.columns" in migration_sql
+    assert "IF NOT EXISTS (SELECT 1 FROM pg_constraint" in migration_sql
     assert (
-        "FOREIGN KEY(work_id) REFERENCES work (id) ON DELETE CASCADE"
+        "FOREIGN KEY (work_id) REFERENCES work (id) ON DELETE CASCADE"
         in migration_sql
     )
     assert (
-        "FOREIGN KEY(topic_id) REFERENCES topic (id) ON DELETE CASCADE"
+        "FOREIGN KEY (topic_id) REFERENCES topic (id) ON DELETE CASCADE"
         in migration_sql
     )
     assert (
-        "FOREIGN KEY(method_id) REFERENCES method (id) ON DELETE CASCADE"
+        "FOREIGN KEY (method_id) REFERENCES method (id) ON DELETE CASCADE"
         in migration_sql
     )
-    assert (
-        "CONSTRAINT ck_ranking_snapshot_exactly_one_subject CHECK"
-        in migration_sql
-    )
+    assert '"ck_ranking_snapshot_exactly_one_subject" CHECK' in migration_sql

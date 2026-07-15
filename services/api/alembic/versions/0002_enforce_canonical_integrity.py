@@ -274,6 +274,96 @@ def _validate_source_ownership() -> None:
     )
 
 
+def _offline_replace_check_constraint(
+    table_name: str,
+    constraint_name: str,
+    condition: str,
+    *,
+    aliases: tuple[str, ...] = (),
+) -> None:
+    drop_statements = "\n".join(
+        f'ALTER TABLE "{table_name}" DROP CONSTRAINT IF EXISTS "{name}";'
+        for name in (constraint_name, *aliases)
+    )
+    op.execute(
+        sa.text(
+            f"""
+            {drop_statements}
+            ALTER TABLE "{table_name}"
+                ADD CONSTRAINT "{constraint_name}" CHECK ({condition});
+            """
+        )
+    )
+
+
+def _offline_ensure_constraint(
+    table_name: str,
+    constraint_name: str,
+    definition: str,
+    *,
+    aliases: tuple[str, ...] = (),
+) -> None:
+    target_exists = (
+        "EXISTS ("
+        "SELECT 1 FROM pg_constraint "
+        f"WHERE conname = '{constraint_name}' "
+        f"AND conrelid = '{table_name}'::regclass"
+        ")"
+    )
+    if aliases:
+        target_cleanup = "\n".join(
+            f'ALTER TABLE "{table_name}" '
+            f'DROP CONSTRAINT IF EXISTS "{alias}";'
+            for alias in aliases
+        )
+        alias_branches = []
+        for index, alias in enumerate(aliases):
+            remaining_cleanup = "\n".join(
+                f'ALTER TABLE "{table_name}" '
+                f'DROP CONSTRAINT IF EXISTS "{other_alias}";'
+                for other_alias in aliases[index + 1 :]
+            )
+            alias_branches.append(
+                "ELSIF EXISTS ("
+                "SELECT 1 FROM pg_constraint "
+                f"WHERE conname = '{alias}' "
+                f"AND conrelid = '{table_name}'::regclass"
+                ") THEN\n"
+                f'ALTER TABLE "{table_name}" '
+                f'RENAME CONSTRAINT "{alias}" TO "{constraint_name}";\n'
+                f"{remaining_cleanup}"
+            )
+        branches = "\n".join(alias_branches)
+        body = f"""
+            IF {target_exists} THEN
+                {target_cleanup}
+            {branches}
+            ELSE
+                ALTER TABLE "{table_name}"
+                    ADD CONSTRAINT "{constraint_name}" {definition};
+            END IF;
+        """
+    else:
+        body = f"""
+            IF NOT {target_exists} THEN
+                ALTER TABLE "{table_name}"
+                    ADD CONSTRAINT "{constraint_name}" {definition};
+            END IF;
+        """
+
+    op.execute(
+        sa.text(
+            f"""
+            DO $$
+            BEGIN
+                {body}
+            END
+            $$;
+            """
+        )
+    )
+
+
 def _upgrade_online() -> None:
     _validate_canonical_keys()
     _replace_check_constraint(
@@ -446,15 +536,19 @@ def _upgrade_online() -> None:
 
 def _upgrade_offline() -> None:
     _validate_canonical_keys()
-    op.create_check_constraint(
-        "ck_work_canonical_key_approved_prefix",
+    _offline_replace_check_constraint(
         "work",
+        "ck_work_canonical_key_approved_prefix",
         CANONICAL_KEY_CHECK,
+        aliases=("canonical_key_approved_prefix",),
     )
-    op.create_check_constraint(
-        "ck_paper_version_version_number_positive",
+    _offline_ensure_constraint(
         "paper_version",
-        "version_number IS NULL OR version_number >= 1",
+        "ck_paper_version_version_number_positive",
+        "CHECK (version_number IS NULL OR version_number >= 1)",
+        aliases=(
+            "ck_paper_version_ck_paper_version_version_number_positive",
+        ),
     )
 
     _validate_source_ownership()
@@ -467,159 +561,143 @@ def _upgrade_offline() -> None:
             """
         )
     )
-    op.create_check_constraint(
-        "ck_source_record_single_owner",
+    _offline_replace_check_constraint(
         "source_record",
+        "ck_source_record_single_owner",
         "work_id IS NULL OR paper_version_id IS NULL",
+        aliases=("ck_source_record_version_requires_work",),
     )
-
-    op.drop_constraint(
-        "fk_field_assertion_paper_version_id_paper_version",
-        "field_assertion",
-        type_="foreignkey",
-    )
-    op.drop_constraint(
-        "fk_field_assertion_work_id_work",
-        "field_assertion",
-        type_="foreignkey",
-    )
-    op.drop_column("field_assertion", "paper_version_id")
-    op.drop_column("field_assertion", "work_id")
-    op.create_check_constraint(
-        "ck_field_assertion_confidence_range",
-        "field_assertion",
-        "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
-    )
-
-    op.drop_constraint(
-        "fk_external_identifier_paper_version_id_paper_version",
-        "external_identifier",
-        type_="foreignkey",
-    )
-    op.drop_constraint(
-        "fk_external_identifier_source_record_id_source_record",
-        "external_identifier",
-        type_="foreignkey",
-    )
-    op.drop_column("external_identifier", "paper_version_id")
-    op.drop_column("external_identifier", "source_record_id")
 
     op.execute(
         sa.text(
-            f"""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname =
-                        'ck_metric_snapshot_ck_metric_snapshot_single_target'
-                      AND conrelid = 'metric_snapshot'::regclass
-                ) AND EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'ck_metric_snapshot_single_target'
-                      AND conrelid = 'metric_snapshot'::regclass
-                ) THEN
-                    ALTER TABLE metric_snapshot DROP CONSTRAINT
-                        ck_metric_snapshot_ck_metric_snapshot_single_target;
-                ELSIF EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname =
-                        'ck_metric_snapshot_ck_metric_snapshot_single_target'
-                      AND conrelid = 'metric_snapshot'::regclass
-                ) THEN
-                    ALTER TABLE metric_snapshot RENAME CONSTRAINT
-                        ck_metric_snapshot_ck_metric_snapshot_single_target
-                        TO ck_metric_snapshot_single_target;
-                ELSIF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'ck_metric_snapshot_single_target'
-                      AND conrelid = 'metric_snapshot'::regclass
-                ) THEN
-                    ALTER TABLE metric_snapshot ADD CONSTRAINT
-                        ck_metric_snapshot_single_target
-                        CHECK ({METRIC_SINGLE_TARGET_CHECK});
-                END IF;
-            END
-            $$;
+            """
+            ALTER TABLE field_assertion
+                DROP COLUMN IF EXISTS paper_version_id;
+            ALTER TABLE field_assertion
+                DROP COLUMN IF EXISTS work_id;
             """
         )
     )
-    op.create_check_constraint(
-        "ck_metric_snapshot_window_days_positive",
-        "metric_snapshot",
-        "window_days IS NULL OR window_days > 0",
+    _offline_ensure_constraint(
+        "field_assertion",
+        "ck_field_assertion_confidence_range",
+        "CHECK ("
+        "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)"
+        ")",
+        aliases=(
+            "ck_field_assertion_ck_field_assertion_confidence_range",
+        ),
     )
 
-    op.execute(sa.text("DELETE FROM ranking_snapshot"))
-    op.drop_constraint(
-        "uq_ranking_snapshot_subject_window_time",
-        "ranking_snapshot",
-        type_="unique",
-    )
-    op.drop_column("ranking_snapshot", "subject_id")
-    op.drop_column("ranking_snapshot", "subject_type")
-    for column_name in ("work_id", "topic_id", "method_id"):
-        op.add_column(
-            "ranking_snapshot",
-            sa.Column(
-                column_name,
-                postgresql.UUID(as_uuid=True),
-                nullable=True,
-            ),
+    op.execute(
+        sa.text(
+            """
+            ALTER TABLE external_identifier
+                DROP COLUMN IF EXISTS paper_version_id;
+            ALTER TABLE external_identifier
+                DROP COLUMN IF EXISTS source_record_id;
+            """
         )
-    op.create_foreign_key(
+    )
+    _offline_ensure_constraint(
+        "metric_snapshot",
+        "ck_metric_snapshot_single_target",
+        f"CHECK ({METRIC_SINGLE_TARGET_CHECK})",
+        aliases=(
+            "ck_metric_snapshot_ck_metric_snapshot_single_target",
+            "single_target",
+        ),
+    )
+    _offline_ensure_constraint(
+        "metric_snapshot",
+        "ck_metric_snapshot_window_days_positive",
+        "CHECK (window_days IS NULL OR window_days > 0)",
+        aliases=(
+            "ck_metric_snapshot_ck_metric_snapshot_window_days_positive",
+        ),
+    )
+
+    op.execute(
+        sa.text(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'ranking_snapshot'
+                      AND column_name IN ('subject_type', 'subject_id')
+                ) THEN
+                    DELETE FROM ranking_snapshot;
+                END IF;
+            END
+            $$;
+
+            ALTER TABLE ranking_snapshot
+                DROP COLUMN IF EXISTS subject_id;
+            ALTER TABLE ranking_snapshot
+                DROP COLUMN IF EXISTS subject_type;
+            ALTER TABLE ranking_snapshot
+                ADD COLUMN IF NOT EXISTS work_id UUID;
+            ALTER TABLE ranking_snapshot
+                ADD COLUMN IF NOT EXISTS topic_id UUID;
+            ALTER TABLE ranking_snapshot
+                ADD COLUMN IF NOT EXISTS method_id UUID;
+            """
+        )
+    )
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "fk_ranking_snapshot_work_id_work",
-        "ranking_snapshot",
-        "work",
-        ["work_id"],
-        ["id"],
-        ondelete="CASCADE",
+        "FOREIGN KEY (work_id) REFERENCES work (id) ON DELETE CASCADE",
     )
-    op.create_foreign_key(
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "fk_ranking_snapshot_topic_id_topic",
-        "ranking_snapshot",
-        "topic",
-        ["topic_id"],
-        ["id"],
-        ondelete="CASCADE",
+        "FOREIGN KEY (topic_id) REFERENCES topic (id) ON DELETE CASCADE",
     )
-    op.create_foreign_key(
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "fk_ranking_snapshot_method_id_method",
-        "ranking_snapshot",
-        "method",
-        ["method_id"],
-        ["id"],
-        ondelete="CASCADE",
+        "FOREIGN KEY (method_id) REFERENCES method (id) ON DELETE CASCADE",
     )
-    op.create_check_constraint(
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "ck_ranking_snapshot_exactly_one_subject",
-        "ranking_snapshot",
-        RANKING_EXACTLY_ONE_SUBJECT_CHECK,
+        f"CHECK ({RANKING_EXACTLY_ONE_SUBJECT_CHECK})",
+        aliases=("exactly_one_subject",),
     )
-    op.create_check_constraint(
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "ck_ranking_snapshot_rank_position_positive",
-        "ranking_snapshot",
-        "rank_position >= 1",
+        "CHECK (rank_position >= 1)",
+        aliases=(
+            "ck_ranking_snapshot_ck_ranking_snapshot_rank_position_positive",
+        ),
     )
-    op.create_check_constraint(
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "ck_ranking_snapshot_window_days_positive",
-        "ranking_snapshot",
-        "window_days > 0",
+        "CHECK (window_days > 0)",
+        aliases=(
+            "ck_ranking_snapshot_ck_ranking_snapshot_window_days_positive",
+        ),
     )
-    op.create_unique_constraint(
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "uq_ranking_snapshot_work_window_time",
-        "ranking_snapshot",
-        ["ranking_name", "work_id", "window_days", "computed_at"],
+        "UNIQUE (ranking_name, work_id, window_days, computed_at)",
     )
-    op.create_unique_constraint(
+    _offline_ensure_constraint(
+        "ranking_snapshot",
         "uq_ranking_snapshot_topic_window_time",
-        "ranking_snapshot",
-        ["ranking_name", "topic_id", "window_days", "computed_at"],
+        "UNIQUE (ranking_name, topic_id, window_days, computed_at)",
     )
-    op.create_unique_constraint(
-        "uq_ranking_snapshot_method_window_time",
+    _offline_ensure_constraint(
         "ranking_snapshot",
-        ["ranking_name", "method_id", "window_days", "computed_at"],
+        "uq_ranking_snapshot_method_window_time",
+        "UNIQUE (ranking_name, method_id, window_days, computed_at)",
     )
 
 

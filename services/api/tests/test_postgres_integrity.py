@@ -1,13 +1,14 @@
 from datetime import UTC, datetime
 import hashlib
+from io import StringIO
 import json
 from pathlib import Path
-import subprocess
 from uuid import UUID, uuid4
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
+import psycopg
 import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -21,9 +22,9 @@ INITIAL_MIGRATION = (
 INITIAL_MIGRATION_SHA256 = (
     "7771e5358c3679aed87a1299e3aff52ad07bb0e945a2754ccc7c973bccd7c931"
 )
-REPOSITORY_ROOT = SERVICE_ROOT.parents[1]
-HISTORICAL_INITIAL_MIGRATION_PATH = (
-    "services/api/alembic/versions/0001_initial_schema.py"
+FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
+C74476A_SCHEMA_VARIANT = (
+    FIXTURES_ROOT / "c74476a_schema_variant.sql"
 )
 HISTORICAL_ENV_SOURCE = """
 from alembic import context
@@ -166,31 +167,57 @@ def _assert_integrity_error(engine, statement: str, parameters: dict) -> None:
 def _historical_alembic_config(
     tmp_path: Path,
     database_url: str,
-    commit: str,
 ):
     from alembic.config import Config
 
-    script_root = tmp_path / f"{commit}_alembic"
+    script_root = tmp_path / "historical_alembic"
     versions_root = script_root / "versions"
     versions_root.mkdir(parents=True)
-    migration_source = subprocess.run(
-        [
-            "git",
-            "show",
-            f"{commit}:{HISTORICAL_INITIAL_MIGRATION_PATH}",
-        ],
-        cwd=REPOSITORY_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    (script_root / "env.py").write_text(HISTORICAL_ENV_SOURCE)
-    (versions_root / "0001_initial_schema.py").write_text(migration_source)
+    (script_root / "env.py").write_text(
+        HISTORICAL_ENV_SOURCE,
+        encoding="utf-8",
+    )
+    # The checked-in 0001 is byte-for-byte d1aacd8, enforced by its SHA test.
+    (versions_root / "0001_initial_schema.py").write_text(
+        INITIAL_MIGRATION.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     config = Config()
     config.set_main_option("script_location", str(script_root))
     config.set_main_option("sqlalchemy.url", database_url)
     return config
+
+
+def _install_historical_schema(
+    tmp_path: Path,
+    database_url: str,
+    variant: str,
+) -> None:
+    historical_config = _historical_alembic_config(tmp_path, database_url)
+    command.upgrade(historical_config, "0001_initial_schema")
+    if variant == "c74476a":
+        engine = create_engine(database_url)
+        try:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    C74476A_SCHEMA_VARIANT.read_text(encoding="utf-8")
+                )
+        finally:
+            engine.dispose()
+
+
+def _offline_0002_upgrade_sql() -> str:
+    from alembic.config import Config
+
+    output = StringIO()
+    config = Config(SERVICE_ROOT / "alembic.ini", output_buffer=output)
+    command.upgrade(
+        config,
+        "0001_initial_schema:head",
+        sql=True,
+    )
+    return output.getvalue()
 
 
 def _insert_delete_graph(engine, suffix: str) -> dict[str, UUID]:
@@ -405,12 +432,11 @@ def test_0001_to_0002_upgrade_and_downgrade_are_executable(
     clean_postgres_url: str,
     tmp_path: Path,
 ) -> None:
-    historical_config = _historical_alembic_config(
+    _install_historical_schema(
         tmp_path,
         clean_postgres_url,
         "d1aacd8",
     )
-    command.upgrade(historical_config, "0001_initial_schema")
     engine = create_engine(clean_postgres_url)
     try:
         old_columns = {
@@ -530,12 +556,11 @@ def test_c744_physical_0001_upgrades_to_current_head(
     clean_postgres_url: str,
     tmp_path: Path,
 ) -> None:
-    c744_config = _historical_alembic_config(
+    _install_historical_schema(
         tmp_path,
         clean_postgres_url,
         "c74476a",
     )
-    command.upgrade(c744_config, "0001_initial_schema")
     engine = create_engine(clean_postgres_url)
     work_id = uuid4()
     ranking_id = uuid4()
@@ -636,6 +661,52 @@ def test_c744_physical_0001_upgrades_to_current_head(
             assert compare_metadata(context, Base.metadata) == []
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("variant", ["d1aacd8", "c74476a"])
+def test_offline_0002_sql_applies_to_historical_schema_variants(
+    clean_postgres_url: str,
+    tmp_path: Path,
+    variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paper_hub.config import get_settings
+
+    monkeypatch.setenv("DATABASE_URL", clean_postgres_url)
+    get_settings.cache_clear()
+    _install_historical_schema(
+        tmp_path,
+        clean_postgres_url,
+        variant,
+    )
+    offline_sql = _offline_0002_upgrade_sql()
+    psycopg_url = clean_postgres_url.replace(
+        "postgresql+psycopg://",
+        "postgresql://",
+    )
+
+    with psycopg.connect(psycopg_url, autocommit=True) as connection:
+        connection.execute(offline_sql)
+
+    engine = create_engine(clean_postgres_url)
+    try:
+        with engine.connect() as connection:
+            from paper_hub.models import Base
+
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0002_enforce_canonical_integrity"
+            context = MigrationContext.configure(
+                connection,
+                opts={
+                    "compare_type": True,
+                    "compare_server_default": True,
+                },
+            )
+            assert compare_metadata(context, Base.metadata) == []
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
 
 
 def test_0002_rejects_inconsistent_legacy_source_ownership(
