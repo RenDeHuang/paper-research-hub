@@ -2,7 +2,7 @@ ENV_FILE ?= .env
 
 -include $(ENV_FILE)
 
-export NEXT_PUBLIC_API_URL UVICORN_HOST UVICORN_PORT
+export DATABASE_URL NEXT_PUBLIC_API_URL UVICORN_HOST UVICORN_PORT
 
 .PHONY: install dev-api dev-web test test-api test-web build
 
