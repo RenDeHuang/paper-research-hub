@@ -794,3 +794,92 @@ def test_detail_scope_state_uses_visibility_source_tiebreak(
             assert source is not None
             session.delete(source)
             session.commit()
+
+
+def test_detail_scope_state_aggregates_current_logical_source_decisions(
+    papers_api,
+) -> None:
+    from paper_hub.models import ScopeAssessment, SourceRecord
+    from paper_hub.repositories import slug_for_canonical_key
+
+    client, engine = papers_api
+    with Session(engine) as session:
+        work_id = session.scalar(
+            text(
+                """
+                SELECT id
+                FROM work
+                WHERE canonical_key = 'doi:10.1000/alpha'
+                """
+            )
+        )
+        assert work_id is not None
+        excluded_source = SourceRecord(
+            work_id=work_id,
+            source_record_id="CR-alpha",
+            content_hash=hashlib.sha256(
+                b"crossref-alpha-excluded"
+            ).hexdigest(),
+            raw_payload={"id": "CR-alpha"},
+            source_updated_at=NOW + timedelta(minutes=2),
+            http_status=200,
+            **_provenance(source="crossref"),
+        )
+        session.add(excluded_source)
+        session.flush()
+        session.add_all(
+            [
+                ScopeAssessment(
+                    source_record_id=excluded_source.id,
+                    rule_version="scope-crossref-v1",
+                    included=True,
+                    reason=None,
+                    evidence=[],
+                    evaluated_at=NOW + timedelta(minutes=1),
+                    work_id=work_id,
+                ),
+                ScopeAssessment(
+                    source_record_id=excluded_source.id,
+                    rule_version="scope-crossref-v2",
+                    included=False,
+                    reason="excluded_by_crossref_scope",
+                    evidence=[],
+                    evaluated_at=NOW + timedelta(minutes=2),
+                    work_id=work_id,
+                ),
+            ]
+        )
+        session.commit()
+        excluded_source_id = excluded_source.id
+
+    try:
+        slug = slug_for_canonical_key("doi:10.1000/alpha")
+        response = client.get(f"/api/v1/papers/{slug}")
+
+        assert response.status_code == 200
+        scope_state = response.json()["scope_state"]
+        assert scope_state["included"] is True
+        assert scope_state["reason"] is None
+        decisions = {
+            (item["source"], item["source_record_id"]): item
+            for item in scope_state["evidence"]
+        }
+        assert set(decisions) == {
+            ("openalex", "SRC-alpha"),
+            ("crossref", "CR-alpha"),
+        }
+        assert decisions[("openalex", "SRC-alpha")]["included"] is True
+        assert decisions[("crossref", "CR-alpha")] == {
+            "source": "crossref",
+            "source_record_id": "CR-alpha",
+            "rule_version": "scope-crossref-v2",
+            "included": False,
+            "reason": "excluded_by_crossref_scope",
+            "evaluated_at": "2026-07-16T12:02:00Z",
+        }
+    finally:
+        with Session(engine) as session:
+            source = session.get(SourceRecord, excluded_source_id)
+            assert source is not None
+            session.delete(source)
+            session.commit()

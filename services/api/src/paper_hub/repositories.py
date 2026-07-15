@@ -4,7 +4,7 @@ import base64
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import json
 from math import ceil
 from typing import Any
@@ -1201,28 +1201,72 @@ class PaperRepository:
         assessments = list(work.scope_assessments)
         if not assessments:
             return None
-        current = max(
-            assessments,
-            key=lambda item: (
-                item.source_record.source_updated_at is not None,
-                (
-                    item.source_record.source_updated_at
-                    or item.source_record.retrieved_at
-                ),
-                item.source_record.retrieved_at,
-                item.evaluated_at,
-                str(item.source_record.id),
-                item.rule_version,
-                str(item.id),
-            ),
+        current_by_logical_source: dict[
+            tuple[str, str],
+            ScopeAssessment,
+        ] = {}
+        for assessment in assessments:
+            source = assessment.source_record
+            identity = (source.source, source.source_record_id)
+            current = current_by_logical_source.get(identity)
+            if (
+                current is None
+                or PaperRepository._scope_assessment_order_key(assessment)
+                > PaperRepository._scope_assessment_order_key(current)
+            ):
+                current_by_logical_source[identity] = assessment
+
+        current_decisions = tuple(current_by_logical_source.values())
+        summary = max(
+            current_decisions,
+            key=PaperRepository._scope_assessment_order_key,
         )
+        included = any(item.included for item in current_decisions)
         return {
-            "included": current.included,
-            "rule_version": current.rule_version,
-            "reason": current.reason,
-            "evidence": current.evidence,
-            "evaluated_at": current.evaluated_at,
+            "included": included,
+            "rule_version": summary.rule_version,
+            "reason": None if included else "all_logical_sources_excluded",
+            "evidence": [
+                {
+                    "source": item.source_record.source,
+                    "source_record_id": (
+                        item.source_record.source_record_id
+                    ),
+                    "rule_version": item.rule_version,
+                    "included": item.included,
+                    "reason": item.reason,
+                    "evaluated_at": (
+                        item.evaluated_at.isoformat().replace(
+                            "+00:00",
+                            "Z",
+                        )
+                    ),
+                }
+                for item in sorted(
+                    current_decisions,
+                    key=lambda decision: (
+                        decision.source_record.source,
+                        decision.source_record.source_record_id,
+                    ),
+                )
+            ],
+            "evaluated_at": summary.evaluated_at,
         }
+
+    @staticmethod
+    def _scope_assessment_order_key(
+        assessment: ScopeAssessment,
+    ) -> tuple[object, ...]:
+        source = assessment.source_record
+        return (
+            source.source_updated_at is not None,
+            source.source_updated_at or datetime.min.replace(tzinfo=UTC),
+            source.retrieved_at,
+            assessment.evaluated_at,
+            str(source.id),
+            assessment.rule_version,
+            str(assessment.id),
+        )
 
     @staticmethod
     def _associated_source_records(work: Work) -> list[SourceRecord]:
