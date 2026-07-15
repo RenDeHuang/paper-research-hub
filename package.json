@@ -1,0 +1,11 @@
+{
+  "name": "paper-hub",
+  "private": true,
+  "packageManager": "pnpm@10.29.2",
+  "scripts": {
+    "build": "pnpm --dir apps/web build",
+    "test": "pnpm test:api && pnpm test:web",
+    "test:api": "uv run --project services/api pytest -v",
+    "test:web": "pnpm --dir apps/web test"
+  }
+}
