@@ -1,8 +1,10 @@
 package paper
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -20,14 +22,20 @@ const (
 )
 
 var (
+	ErrNoCanonicalIdentity    = errors.New("no canonical identity")
+	ErrConflictingIdentifiers = errors.New("conflicting identifiers")
+)
+
+var (
 	doiURLPrefix      = regexp.MustCompile(`(?i)^https?://(?:dx\.)?doi\.org/`)
 	doiLabelPrefix    = regexp.MustCompile(`(?i)^doi\s*:`)
 	doiValuePattern   = regexp.MustCompile(`^10\.[0-9]{4,9}/\S+$`)
 	arXivURLPrefix    = regexp.MustCompile(`(?i)^https?://arxiv\.org/(?:abs|pdf)/`)
 	arXivLabelPrefix  = regexp.MustCompile(`(?i)^arxiv\s*:`)
-	arXivVersion      = regexp.MustCompile(`(?i)v[0-9]+$`)
-	arXivModernValue  = regexp.MustCompile(`^([0-9]{2})([0-9]{2})\.[0-9]{4,5}$`)
-	arXivLegacyValue  = regexp.MustCompile(`^[a-z][a-z0-9.-]*/([0-9]{2})([0-9]{2})[0-9]{3}$`)
+	arXivVersion      = regexp.MustCompile(`(?i)v([0-9]+)$`)
+	arXivModernValue  = regexp.MustCompile(`^([0-9]{2})([0-9]{2})\.([0-9]+)$`)
+	arXivLegacyValue  = regexp.MustCompile(`^([a-z][a-z0-9.-]*)/([0-9]{2})([0-9]{2})([0-9]{3})$`)
+	arXivSubjectClass = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 	openAlexURLPrefix = regexp.MustCompile(`(?i)^https?://openalex\.org/`)
 	openAlexValue     = regexp.MustCompile(`^W[0-9]+$`)
 	semanticScholarID = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -35,8 +43,8 @@ var (
 )
 
 type Identifier struct {
-	Scheme Scheme
-	Value  string
+	scheme Scheme
+	value  string
 }
 
 type Identifiers struct {
@@ -80,26 +88,34 @@ func NewIdentifier(scheme Scheme, raw string) (Identifier, error) {
 		return Identifier{}, err
 	}
 
-	return Identifier{Scheme: scheme, Value: value}, nil
+	return Identifier{scheme: scheme, value: value}, nil
 }
 
 func (identifier Identifier) Valid() bool {
-	normalized, err := NewIdentifier(identifier.Scheme, identifier.Value)
+	normalized, err := NewIdentifier(identifier.scheme, identifier.value)
 	return err == nil && normalized == identifier
+}
+
+func (identifier Identifier) Scheme() Scheme {
+	return identifier.scheme
+}
+
+func (identifier Identifier) Value() string {
+	return identifier.value
 }
 
 func (identifier Identifier) CanonicalKey() string {
 	if !identifier.Valid() {
 		return ""
 	}
-	return string(identifier.Scheme) + ":" + identifier.Value
+	return string(identifier.scheme) + ":" + identifier.value
 }
 
 func (identifier Identifier) String() string {
 	return identifier.CanonicalKey()
 }
 
-func CanonicalIdentity(identifiers Identifiers, _ string) (Identifier, bool) {
+func CanonicalIdentity(identifiers Identifiers, _ string) (Identifier, error) {
 	candidates := []struct {
 		scheme Scheme
 		values []string
@@ -129,16 +145,41 @@ func CanonicalIdentity(identifiers Identifiers, _ string) (Identifier, bool) {
 		},
 	}
 
-	for _, group := range candidates {
+	resolved := make([]Identifier, len(candidates))
+	for index, group := range candidates {
+		unique := make(map[string]Identifier)
 		for _, raw := range group.values {
 			identifier, err := NewIdentifier(group.scheme, raw)
 			if err == nil {
-				return identifier, true
+				unique[identifier.Value()] = identifier
 			}
+		}
+
+		if len(unique) > 1 {
+			values := make([]string, 0, len(unique))
+			for value := range unique {
+				values = append(values, value)
+			}
+			sort.Strings(values)
+			return Identifier{}, fmt.Errorf(
+				"%w: scheme %s has values %s",
+				ErrConflictingIdentifiers,
+				group.scheme,
+				strings.Join(values, ", "),
+			)
+		}
+		for _, identifier := range unique {
+			resolved[index] = identifier
 		}
 	}
 
-	return Identifier{}, false
+	for _, identifier := range resolved {
+		if identifier.Valid() {
+			return identifier, nil
+		}
+	}
+
+	return Identifier{}, ErrNoCanonicalIdentity
 }
 
 func NormalizeDOI(raw string) (string, error) {
@@ -163,13 +204,22 @@ func NormalizeArXiv(raw string) (string, error) {
 		strings.EqualFold(normalized[len(normalized)-len(".pdf"):], ".pdf") {
 		normalized = normalized[:len(normalized)-len(".pdf")]
 	}
-	normalized = arXivVersion.ReplaceAllString(normalized, "")
 	normalized = strings.ToLower(normalized)
+	normalized, err := removeArXivVersion(normalized)
+	if err != nil {
+		return "", fmt.Errorf("invalid arXiv identifier %q: %w", raw, err)
+	}
 
-	if containsSpaceOrControl(normalized) || !validArXivValue(normalized) {
+	if containsSpaceOrControl(normalized) {
 		return "", fmt.Errorf("invalid arXiv identifier %q", raw)
 	}
-	return normalized, nil
+	if modern, ok := normalizeModernArXiv(normalized); ok {
+		return modern, nil
+	}
+	if legacy, ok := normalizeLegacyArXiv(normalized); ok {
+		return legacy, nil
+	}
+	return "", fmt.Errorf("invalid arXiv identifier %q", raw)
 }
 
 func NormalizeOpenReview(raw string) (string, error) {
@@ -198,14 +248,83 @@ func NormalizeOpenAlex(raw string) (string, error) {
 	return normalized, nil
 }
 
-func validArXivValue(value string) bool {
-	if matches := arXivModernValue.FindStringSubmatch(value); matches != nil {
-		return validMonth(matches[2])
+func removeArXivVersion(value string) (string, error) {
+	matches := arXivVersion.FindStringSubmatchIndex(value)
+	if matches == nil {
+		return value, nil
 	}
-	if matches := arXivLegacyValue.FindStringSubmatch(value); matches != nil {
-		return validMonth(matches[2])
+	version := value[matches[2]:matches[3]]
+	if version == "" || version[0] == '0' {
+		return "", errors.New("version suffix must be v1 or greater")
+	}
+	return value[:matches[0]], nil
+}
+
+func normalizeModernArXiv(value string) (string, bool) {
+	matches := arXivModernValue.FindStringSubmatch(value)
+	if matches == nil || !validMonth(matches[2]) || !positiveDigits(matches[3]) {
+		return "", false
+	}
+
+	dateCode, err := strconv.Atoi(matches[1] + matches[2])
+	if err != nil || dateCode < 704 {
+		return "", false
+	}
+	if dateCode <= 1412 && len(matches[3]) != 4 {
+		return "", false
+	}
+	if dateCode >= 1501 && len(matches[3]) != 5 {
+		return "", false
+	}
+	return value, true
+}
+
+func normalizeLegacyArXiv(value string) (string, bool) {
+	matches := arXivLegacyValue.FindStringSubmatch(value)
+	if matches == nil ||
+		!validLegacyArXivDate(matches[2], matches[3]) ||
+		!positiveDigits(matches[4]) {
+		return "", false
+	}
+
+	archive, ok := normalizeLegacyArXivArchive(matches[1])
+	if !ok {
+		return "", false
+	}
+	return archive + "/" + matches[2] + matches[3] + matches[4], true
+}
+
+func normalizeLegacyArXivArchive(value string) (string, bool) {
+	if archive, ok := legacyArXivArchives[value]; ok {
+		return archive, true
+	}
+
+	archive, subjectClass, found := strings.Cut(value, ".")
+	if !found || strings.Contains(subjectClass, ".") ||
+		!arXivSubjectClass.MatchString(subjectClass) {
+		return "", false
+	}
+	preferred, ok := legacyArXivSubjectArchives[archive]
+	return preferred, ok
+}
+
+func validLegacyArXivDate(yearValue string, monthValue string) bool {
+	year, yearErr := strconv.Atoi(yearValue)
+	month, monthErr := strconv.Atoi(monthValue)
+	if yearErr != nil || monthErr != nil || month < 1 || month > 12 {
+		return false
+	}
+	if year >= 91 {
+		return year > 91 || month >= 8
+	}
+	if year <= 7 {
+		return year < 7 || month <= 3
 	}
 	return false
+}
+
+func positiveDigits(value string) bool {
+	return value != "" && strings.Trim(value, "0") != ""
 }
 
 func validMonth(value string) bool {
@@ -229,4 +348,51 @@ func joinedCandidates(groups ...[]string) []string {
 		values = append(values, group...)
 	}
 	return values
+}
+
+var legacyArXivArchives = map[string]string{
+	"acc-phys": "acc-phys",
+	"adap-org": "adap-org",
+	"alg-geom": "alg-geom",
+	"ao-sci":   "ao-sci",
+	"astro-ph": "astro-ph",
+	"atom-ph":  "atom-ph",
+	"bayes-an": "bayes-an",
+	"chao-dyn": "chao-dyn",
+	"chem-ph":  "chem-ph",
+	"cmp-lg":   "cmp-lg",
+	"comp-gas": "comp-gas",
+	"cond-mat": "cond-mat",
+	"cs":       "cs",
+	"dg-ga":    "dg-ga",
+	"funct-an": "funct-an",
+	"gr-qc":    "gr-qc",
+	"hep-ex":   "hep-ex",
+	"hep-lat":  "hep-lat",
+	"hep-ph":   "hep-ph",
+	"hep-th":   "hep-th",
+	"math":     "math",
+	"math-ph":  "math-ph",
+	"mtrl-th":  "mtrl-th",
+	"nlin":     "nlin",
+	"nucl-ex":  "nucl-ex",
+	"nucl-th":  "nucl-th",
+	"patt-sol": "patt-sol",
+	"physics":  "physics",
+	"plasm-ph": "plasm-ph",
+	"q-alg":    "q-alg",
+	"q-bio":    "q-bio",
+	"quant-ph": "quant-ph",
+	"solv-int": "solv-int",
+	"supr-con": "supr-con",
+}
+
+var legacyArXivSubjectArchives = map[string]string{
+	"astro-ph": "astro-ph",
+	"cond-mat": "cond-mat",
+	"cs":       "cs",
+	"math":     "math",
+	"nlin":     "nlin",
+	"physics":  "physics",
+	"q-bio":    "q-bio",
 }
