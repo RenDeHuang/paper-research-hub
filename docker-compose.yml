@@ -1,0 +1,138 @@
+name: paper-research-hub
+
+x-application-env: &application-env
+  # Core one-shot jobs receive JCR_IMPORT_PATH and JCR_SOURCE_LICENSE from
+  # these files. The authorized CSV itself must be mounted read-only explicitly.
+  - path: ./.env.example
+    required: true
+  - path: ./.env
+    required: false
+
+x-core-service: &core-service
+  image: ${CORE_IMAGE:-paper-research-hub-core:local}
+  env_file: *application-env
+  environment:
+    APP_ENV: ${APP_ENV:-development}
+    DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://paper_hub:paper_hub_local@postgres:5432/paper_hub?sslmode=disable}
+    # Only the API role consumes this value. The default is intentionally local-development-only.
+    CATALOG_CURSOR_SECRET: ${CATALOG_CURSOR_SECRET:-development-only-catalog-cursor-secret-change-me}
+    JCR_IMPORT_PATH: ${JCR_IMPORT_PATH:-}
+    JCR_SOURCE_LICENSE: ${JCR_SOURCE_LICENSE:-}
+  networks:
+    - application
+
+services:
+  postgres:
+    image: postgres:18.4-alpine3.23
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-paper_hub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-paper_hub_local}
+      POSTGRES_USER: ${POSTGRES_USER:-paper_hub}
+    ports:
+      - "${POSTGRES_PUBLISHED_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    networks:
+      - application
+
+  migrate:
+    <<: *core-service
+    build:
+      context: .
+      dockerfile: services/core/Dockerfile
+    command:
+      - /app/paper-hub-migrate
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *core-service
+    command:
+      - /app/paper-hub-api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${API_PUBLISHED_PORT:-8080}:${API_PORT:-8080}"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O - "http://127.0.0.1:$${API_PORT}/health" | grep -q '"service":"paper-hub-api"'
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+    stop_grace_period: ${API_SHUTDOWN_TIMEOUT:-10s}
+
+  worker:
+    <<: *core-service
+    profiles:
+      - jobs
+    command:
+      - /app/paper-hub-worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    image: ${WEB_IMAGE:-paper-research-hub-web:local}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      INTERNAL_API_BASE_URL: http://api:${API_PORT:-8080}
+      NITRO_HOST: 0.0.0.0
+      NITRO_PORT: ${NUXT_PORT:-3000}
+      NUXT_PUBLIC_API_BASE_URL: ${NUXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
+      PORT: ${NUXT_PORT:-3000}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PUBLISHED_PORT:-3000}:${NUXT_PORT:-3000}"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const checks = [
+            ['http://127.0.0.1:' + (process.env.PORT || '3000') + '/health', 'paper-hub-web'],
+            [(process.env.INTERNAL_API_BASE_URL || 'http://api:8080') + '/health', 'paper-hub-api']
+          ];
+          Promise.all(checks.map(async ([url, service]) => {
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(url + ' returned ' + response.status);
+            const body = await response.json();
+            if (body.status !== 'ok' || body.service !== service) {
+              throw new Error(url + ' returned an invalid health payload');
+            }
+          })).catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    networks:
+      - application
+
+volumes:
+  postgres_data:
+
+networks:
+  application:
+    driver: bridge

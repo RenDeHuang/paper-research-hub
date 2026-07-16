@@ -1,0 +1,65 @@
+services:
+  postgres:
+    ports: !reset []
+    volumes: !reset []
+
+  migrate:
+    environment:
+      APP_ENV: test
+
+  api:
+    environment:
+      APP_ENV: test
+    ports: !reset []
+
+  worker:
+    environment:
+      APP_ENV: test
+
+  web:
+    ports: !reset []
+
+  smoke:
+    image: curlimages/curl:8.21.0
+    profiles:
+      - smoke
+    environment:
+      API_HEALTH_URL: http://api:${API_PORT:-8080}/health
+      WEB_HEALTH_URL: http://web:${NUXT_PORT:-3000}/health
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        api_payload="$$(curl --fail --silent --show-error "$${API_HEALTH_URL}")"
+        printf '%s' "$${api_payload}" | grep -q '"status":"ok"'
+        printf '%s' "$${api_payload}" | grep -q '"service":"paper-hub-api"'
+
+        web_payload="$$(curl --fail --silent --show-error "$${WEB_HEALTH_URL}")"
+        printf '%s' "$${web_payload}" | grep -q '"status":"ok"'
+        printf '%s' "$${web_payload}" | grep -q '"service":"paper-hub-web"'
+
+        catalog_headers="$$(mktemp)"
+        catalog_body="$$(mktemp)"
+        catalog_status="$$(curl --silent --show-error \
+          --dump-header "$${catalog_headers}" \
+          --output "$${catalog_body}" \
+          --write-out '%{http_code}' \
+          --header 'Origin: http://localhost:3000' \
+          'http://api:8080/api/v1/stats')"
+        test "$${catalog_status}" = '503'
+        grep -qi '^access-control-allow-origin: http://localhost:3000' "$${catalog_headers}"
+        grep -q '"code":"catalog_not_published"' "$${catalog_body}"
+
+        page_payload="$$(curl --fail --silent --show-error 'http://web:3000/')"
+        printf '%s' "$${page_payload}" | grep -q '等待首次同步'
+    networks:
+      - application

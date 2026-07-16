@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "codex/**"
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to verify
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: services/core/go.mod
+          cache-dependency-path: services/core/go.sum
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l services/core)"
+          if [[ -n "${unformatted}" ]]; then
+            printf 'The following Go files require gofmt:\n%s\n' "${unformatted}"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go -C services/core vet ./...
+
+      - name: Test
+        run: go -C services/core test ./...
+
+      - name: Test with race detector
+        run: go -C services/core test -race ./...
+
+  web:
+    name: Nuxt
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.22.3"
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Nuxt metadata
+        run: make generate
+
+      - name: Verify generation does not change tracked files
+        run: git diff --exit-code
+
+      - name: Validate OpenAPI contract
+        run: pnpm --dir apps/web exec vitest run tests/openapi.test.ts --config vitest.config.ts
+
+      - name: Lint
+        run: make lint-web
+
+      - name: Typecheck
+        run: make typecheck
+
+      - name: Test
+        run: make test-web
+
+      - name: Build
+        run: make build-web
+
+      - name: Install Chromium
+        run: pnpm --dir apps/web exec playwright install --with-deps chromium
+
+      - name: Run Playwright smoke tests
+        run: pnpm --dir apps/web test:e2e
+
+      - name: Upload Playwright report
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report
+          if-no-files-found: ignore
+          retention-days: 7
