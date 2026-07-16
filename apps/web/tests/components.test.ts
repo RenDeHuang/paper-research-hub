@@ -33,9 +33,12 @@ describe("AppHeader", () => {
     expect(links[0]?.attributes("aria-current")).toBe("page")
     expect(wrapper.get(".app-header__route-name").text()).toBe("首页")
     const searchLink = wrapper.get('a[href="/#global-search"]')
+    const dataStatusLink = wrapper.get('a[href="/#sync-status"]')
 
     expect(searchLink.text()).toContain("搜索")
     expect(searchLink.attributes("aria-current")).toBeUndefined()
+    expect(dataStatusLink.text()).toBe("数据状态")
+    expect(dataStatusLink.attributes("aria-label")).toContain("更新时间")
     expect(wrapper.get("button.app-header__menu-button").attributes()).toMatchObject({
       "aria-controls": "primary-navigation",
       "aria-expanded": "false",
@@ -62,44 +65,87 @@ describe("AppHeader", () => {
     expect(button.attributes("aria-expanded")).toBe("false")
     expect(focus).toHaveBeenCalledTimes(1)
   })
+
+  it.each([
+    ["/papers/paper-1", "论文详情"],
+    ["/topics/agent", "Topic"],
+    ["/methods/rag", "Method"],
+    ["/venues/nature", "Venue"],
+  ])("renders the explicit dynamic route label for %s", async (path, label) => {
+    const wrapper = await mountSuspended(AppHeader, { route: path })
+
+    expect(wrapper.get(".app-header__route-name").text()).toBe(label)
+    expect(wrapper.text()).not.toContain("当前页面")
+  })
 })
 
 describe("DiscoveryRail", () => {
-  it("renders only explicit navigation and strategy defaults", async () => {
-    const wrapper = await mountSuspended(DiscoveryRail)
-
-    expect(wrapper.get("aside").attributes("aria-label")).toBe("发现导航")
-    expect(wrapper.findAll("a > span").map((label) => label.text())).toEqual([
-      "浏览论文",
-      "查看趋势",
-      "研究机会",
-      "精选策略",
-    ])
-    expect(wrapper.text()).not.toContain("热门")
-  })
-
-  it("accepts caller-provided sections without retaining default content", async () => {
+  it("renders the four discovery contracts from caller-provided items", async () => {
     const wrapper = await mountSuspended(DiscoveryRail, {
       props: {
-        sections: [
-          {
-            id: "methods",
-            items: [
-              {
-                description: "查看方法采用率",
-                label: "Method 专题",
-                to: "/methods",
-              },
-            ],
-            title: "方法入口",
-          },
+        popularMethods: [
+          { label: "检索增强生成", to: "/methods/rag" },
+        ],
+        popularTopics: [
+          { label: "Agent", to: "/topics/agent" },
+        ],
+        quickFilters: [
+          { label: "JIF ≥ 10", to: "/papers?jif_min=10" },
+        ],
+        savedViews: [
+          { label: "我的高影响力视图", to: "/papers?saved=high-impact" },
         ],
       },
     })
+    const groups = wrapper.findAll("[data-discovery-group]")
 
-    expect(wrapper.get("h2").text()).toBe("方法入口")
-    expect(wrapper.get("a").text()).toContain("Method 专题")
+    expect(wrapper.get("aside").attributes("aria-label")).toBe("发现导航")
+    expect(groups.map((group) => group.attributes("data-discovery-group"))).toEqual([
+      "quick-filters",
+      "popular-topics",
+      "popular-methods",
+      "saved-views",
+    ])
+    expect(groups.map((group) => group.get("h2").text())).toEqual([
+      "快捷筛选",
+      "热门 Topic",
+      "热门 Method",
+      "保存视图",
+    ])
+    expect(wrapper.findAll("a > span").map((label) => label.text())).toEqual([
+      "JIF ≥ 10",
+      "Agent",
+      "检索增强生成",
+      "我的高影响力视图",
+    ])
     expect(wrapper.text()).not.toContain("浏览论文")
+    expect(wrapper.text()).not.toContain("查看趋势")
+    expect(wrapper.text()).not.toContain("研究机会")
+  })
+
+  it("renders a distinct empty state for every discovery contract", async () => {
+    const wrapper = await mountSuspended(DiscoveryRail, {
+      props: {
+        popularMethods: [],
+        popularTopics: [],
+        quickFilters: [],
+        savedViews: [],
+      },
+    })
+    const states = wrapper.findAll("[data-discovery-empty]")
+
+    expect(states.map((state) => state.attributes("data-discovery-empty"))).toEqual([
+      "quick-filters",
+      "popular-topics",
+      "popular-methods",
+      "saved-views",
+    ])
+    expect(states.map((state) => state.text())).toEqual([
+      "暂无快捷筛选",
+      "等待首次同步",
+      "等待首次同步",
+      "暂无保存视图",
+    ])
   })
 })
 
@@ -114,6 +160,7 @@ describe("SyncStatus", () => {
     })
     const values = wrapper.findAll("dd")
 
+    expect(wrapper.attributes("id")).toBe("sync-status")
     expect(wrapper.findAll("dt").map((item) => item.text())).toEqual([
       "更新时间",
       "数据范围",
@@ -211,9 +258,14 @@ describe("SearchCommand", () => {
       expect.stringContaining("methods"),
     ])
     expect(options.map((option) => option.text())).toEqual([
-      "Agent systems论文",
-      "Agentic workflow",
+      "Agent systems论文论文",
+      "Agentic workflowMethod",
     ])
+    expect(
+      options.map((option) =>
+        option.get(".search-command__option-type").text(),
+      ),
+    ).toEqual(["论文", "Method"])
     expect(options.map((option) => option.attributes("data-entity-type"))).toEqual(
       ["paper", "method"],
     )
@@ -225,6 +277,115 @@ describe("SearchCommand", () => {
     ])
     await wrapper.setProps({ modelValue: "caller accepted value" })
     expect(input.element.value).toBe("caller accepted value")
+  })
+
+  it("keeps same-name entities distinguishable through visible type labels", async () => {
+    const wrapper = await mountSuspended(SearchCommand, {
+      props: {
+        modelValue: "Agent",
+        suggestionGroups: [
+          {
+            id: "same-name-entities",
+            items: [
+              {
+                entityType: "paper",
+                id: "paper-agent",
+                label: "Agent",
+              },
+              {
+                entityType: "topic",
+                id: "topic-agent",
+                label: "Agent",
+              },
+            ],
+            label: "同名实体",
+          },
+        ],
+      },
+    })
+    const options = wrapper.findAll('[role="option"]')
+
+    expect(options.map((option) => option.get(
+      ".search-command__option-label",
+    ).text())).toEqual(["Agent", "Agent"])
+    expect(options.map((option) => option.get(
+      ".search-command__option-type",
+    ).text())).toEqual(["论文", "Topic"])
+  })
+
+  it("initializes from the URL query and follows later route query changes", async () => {
+    const wrapper = await mountSuspended(SearchCommand, {
+      route: "/?q=shared%20query",
+    })
+    const input = wrapper.get<HTMLInputElement>('input[name="q"]')
+
+    expect(input.element.value).toBe("shared query")
+
+    await wrapper.vm.$router.push({ path: "/", query: { q: "restored" } })
+    await nextTick()
+
+    expect(input.element.value).toBe("restored")
+    expect(wrapper.emitted("update:modelValue")?.at(-1)).toEqual(["restored"])
+  })
+
+  it("navigates to the default destination with a trimmed shareable query", async () => {
+    const wrapper = await mountSuspended(SearchCommand, { route: "/" })
+    const router = wrapper.vm.$router
+    const push = vi.spyOn(router, "push")
+    router.addRoute({
+      component: { template: "<h1>Paper search</h1>" },
+      path: "/papers",
+    })
+
+    await wrapper.get('input[name="q"]').setValue("  agent systems  ")
+    await wrapper.get("form").trigger("submit")
+    expect(push).toHaveBeenCalledWith({
+      path: "/papers",
+      query: { q: "agent systems" },
+    })
+    await push.mock.results.at(-1)?.value
+    await nextTick()
+
+    expect(router.currentRoute.value.fullPath).toBe(
+      "/papers?q=agent+systems",
+    )
+    expect(wrapper.emitted("search")?.at(-1)).toEqual(["agent systems"])
+  })
+
+  it("supports a configurable destination without navigating an empty query", async () => {
+    const wrapper = await mountSuspended(SearchCommand, {
+      props: {
+        destination: "/topics",
+      },
+      route: "/",
+    })
+    const router = wrapper.vm.$router
+    const push = vi.spyOn(router, "push")
+    router.addRoute({
+      component: { template: "<h1>Topic search</h1>" },
+      path: "/topics",
+    })
+    const input = wrapper.get('input[name="q"]')
+
+    await input.setValue("   ")
+    await wrapper.get("form").trigger("submit")
+    await nextTick()
+
+    expect(router.currentRoute.value.fullPath).toBe("/")
+    expect(wrapper.emitted("search")?.at(-1)).toEqual([""])
+
+    await input.setValue("causal inference")
+    await wrapper.get("form").trigger("submit")
+    expect(push).toHaveBeenLastCalledWith({
+      path: "/topics",
+      query: { q: "causal inference" },
+    })
+    await push.mock.results.at(-1)?.value
+    await nextTick()
+
+    expect(router.currentRoute.value.fullPath).toBe(
+      "/topics?q=causal+inference",
+    )
   })
 
   it("supports option navigation, selection, and Escape dismissal", async () => {
@@ -575,6 +736,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "worth",
             label: "方向 A",
+            missingSignals: [],
             status: "worth-pursuing",
             x: { state: "known", value: 20 },
             y: { state: "known", value: 80 },
@@ -582,6 +744,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "caution",
             label: "方向 B",
+            missingSignals: [],
             status: "proceed-with-caution",
             x: { state: "known", value: 40 },
             y: { state: "known", value: 60 },
@@ -589,6 +752,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "not-now",
             label: "方向 C",
+            missingSignals: [],
             status: "not-recommended-now",
             x: { state: "known", value: 80 },
             y: { state: "known", value: 20 },
@@ -596,6 +760,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "insufficient",
             label: "方向 D",
+            missingSignals: ["外部验证", "长期随访"],
             status: "insufficient-evidence",
             x: { state: "known", value: 55 },
             y: { state: "known", value: 45 },
@@ -660,6 +825,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "missing-both",
             label: "方向 D",
+            missingSignals: ["竞争密度", "增长信号"],
             status: "insufficient-evidence",
             x: { state: "missing" },
             y: { state: "unknown" },
@@ -667,6 +833,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "unknown-x",
             label: "方向 B",
+            missingSignals: ["竞争基线"],
             status: "proceed-with-caution",
             x: { state: "unknown" },
             y: { state: "known", value: 10 },
@@ -674,6 +841,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "known-zero",
             label: "方向 A",
+            missingSignals: [],
             status: "worth-pursuing",
             x: { state: "known", value: 0 },
             y: { state: "known", value: 0 },
@@ -681,6 +849,7 @@ describe("OpportunityMatrix", () => {
           {
             id: "missing-y",
             label: "方向 C",
+            missingSignals: ["增长信号"],
             status: "not-recommended-now",
             x: { state: "known", value: 20 },
             y: { state: "missing" },
@@ -736,6 +905,84 @@ describe("OpportunityMatrix", () => {
       "not-recommended-now",
       "insufficient-evidence",
     ])
+  })
+
+  it("preserves caller signal order across matrix details and accessible alternatives", async () => {
+    const wrapper = await mountSuspended(OpportunityMatrix, {
+      props: {
+        points: [
+          {
+            id: "insufficient-known",
+            label: "方向 E",
+            missingSignals: ["外部验证", "长期随访"],
+            status: "insufficient-evidence",
+            x: { state: "known", value: 30 },
+            y: { state: "known", value: 40 },
+          },
+          {
+            id: "insufficient-unplottable",
+            label: "方向 F",
+            missingSignals: ["竞争密度", "增长信号"],
+            status: "insufficient-evidence",
+            x: { state: "missing" },
+            y: { state: "unknown" },
+          },
+          {
+            id: "complete",
+            label: "方向 G",
+            missingSignals: [],
+            status: "worth-pursuing",
+            x: { state: "known", value: 60 },
+            y: { state: "known", value: 70 },
+          },
+        ],
+        summary: "三个方向包含可核查的缺失信号。",
+        title: "缺失信号测试",
+        xAxisLabel: "竞争密度",
+        yAxisLabel: "增长信号",
+      },
+    })
+
+    expect(
+      wrapper
+        .get(
+          '[data-opportunity-group="insufficient-evidence"] [data-opportunity-id="insufficient-unplottable"] [data-missing-signals]',
+        )
+        .text(),
+    ).toBe("竞争密度；增长信号")
+    expect(
+      wrapper
+        .get(
+          '.opportunity-matrix__overview [data-opportunity-detail="insufficient-unplottable"] [data-missing-signals]',
+        )
+        .text(),
+    ).toBe("竞争密度；增长信号")
+    expect(
+      wrapper
+        .get(
+          '.opportunity-matrix__desktop-details [data-opportunity-detail="insufficient-known"] [data-missing-signals]',
+        )
+        .text(),
+    ).toBe("外部验证；长期随访")
+    expect(wrapper.findAll("thead th").map((cell) => cell.text())).toEqual([
+      "研究方向",
+      "状态",
+      "竞争密度",
+      "增长信号",
+      "缺失信号",
+    ])
+    expect(
+      wrapper
+        .findAll("tbody [data-missing-signals]")
+        .map((cell) => cell.text()),
+    ).toEqual(["外部验证；长期随访", "竞争密度；增长信号", "无"])
+    expect(
+      wrapper
+        .findAll(
+          '.opportunity-matrix__desktop-chart [role="graphics-symbol"]',
+        )[0]
+        ?.attributes("aria-label"),
+    ).toContain("缺失信号 外部验证；长期随访")
   })
 
   it("renders an explicit empty state without a matrix overview", async () => {

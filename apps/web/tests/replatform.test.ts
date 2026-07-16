@@ -17,8 +17,73 @@ describe("default application shell", () => {
     expect(wrapper.get("header").exists()).toBe(true)
     expect(wrapper.get('nav[aria-label="一级导航"]').exists()).toBe(true)
     expect(wrapper.get('aside[aria-label="发现导航"]').exists()).toBe(true)
+    expect(
+      wrapper.get('a[href="/#sync-status"]').attributes("aria-label"),
+    ).toContain("更新时间")
+    expect(
+      wrapper
+        .findAll(
+          'aside[aria-label="发现导航"] [data-discovery-group]',
+        )
+        .map((group) => group.attributes("data-discovery-group")),
+    ).toEqual([
+      "quick-filters",
+      "popular-topics",
+      "popular-methods",
+      "saved-views",
+    ])
+    expect(
+      wrapper
+        .findAll('aside[aria-label="发现导航"] a')
+        .map((link) => link.text()),
+    ).toEqual(["JIF ≥ 10", "JCR Q1"])
+    expect(wrapper.get('aside[aria-label="发现导航"]').text()).not.toContain(
+      "浏览论文",
+    )
+    expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
+      "等待首次同步",
+    )
+    expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
+      "暂无保存视图",
+    )
     expect(wrapper.get("main#main-content").attributes("tabindex")).toBe("-1")
     expect(wrapper.get("footer").exists()).toBe(true)
+  })
+
+  it("prioritizes route meta titles and labels supported dynamic paths", async () => {
+    const wrapper = await mountSuspended(DefaultLayout, {
+      route: "/",
+      slots: {
+        default: "<h1>Route label verification</h1>",
+      },
+    })
+    const router = wrapper.vm.$router
+
+    router.addRoute({
+      component: { template: "<h1>Meta route</h1>" },
+      meta: { title: "自定义研究视图" },
+      path: "/custom-view",
+    })
+    await router.push("/custom-view")
+    await nextTick()
+    expect(wrapper.get(".app-header__route-name").text()).toBe("自定义研究视图")
+
+    for (const [path, expected] of [
+      ["/papers/paper-1", "论文详情"],
+      ["/topics/agent", "Topic"],
+      ["/methods/rag", "Method"],
+      ["/venues/nature", "Venue"],
+    ] as const) {
+      router.addRoute({
+        component: { template: `<h1>${expected}</h1>` },
+        path,
+      })
+      await router.push(path)
+      await nextTick()
+      expect(wrapper.get(".app-header__route-name").text()).toBe(expected)
+    }
+
+    expect(wrapper.text()).not.toContain("当前页面")
   })
 
   it("moves focus only when the pathname changes", async () => {

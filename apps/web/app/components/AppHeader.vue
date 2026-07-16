@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { resolveRouteLabel } from "~/utils/routeLabel"
+
 const route = useRoute()
 const menuOpen = ref(false)
 const menuReady = ref(false)
@@ -16,14 +18,11 @@ const navigation = [
 ] as const
 
 const currentRouteLabel = computed(() => {
-  if (props.routeLabel) {
-    return props.routeLabel
+  if (props.routeLabel?.trim()) {
+    return props.routeLabel.trim()
   }
 
-  return (
-    navigation.find((item) => isCurrent(item.to))?.label
-    ?? "当前页面"
-  )
+  return resolveRouteLabel(route)
 })
 
 function isCurrent(to: string) {
@@ -96,14 +95,24 @@ onBeforeUnmount(() => {
         </ul>
       </nav>
 
-      <a
-        class="app-header__search"
-        href="/#global-search"
-        aria-label="搜索"
-        @click="closeMenu()"
-      >
-        搜索
-      </a>
+      <div class="app-header__utilities">
+        <a
+          class="app-header__utility-link"
+          href="/#sync-status"
+          aria-label="数据状态与更新时间"
+          @click="closeMenu()"
+        >
+          数据状态
+        </a>
+        <a
+          class="app-header__utility-link"
+          href="/#global-search"
+          aria-label="搜索"
+          @click="closeMenu()"
+        >
+          搜索
+        </a>
+      </div>
 
       <button
         ref="menuButton"
@@ -169,10 +178,16 @@ onBeforeUnmount(() => {
   line-height: var(--text-xs-line);
 }
 
-.app-header__search,
+.app-header__utilities {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.app-header__utility-link,
 .app-header__menu-button {
   display: inline-flex;
-  min-width: 52px;
+  min-width: 44px;
   min-height: 44px;
   align-items: center;
   justify-content: center;
@@ -184,7 +199,7 @@ onBeforeUnmount(() => {
   touch-action: manipulation;
 }
 
-.app-header__search {
+.app-header__utility-link {
   color: var(--color-link);
 }
 
@@ -195,12 +210,12 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
-.app-header__search:hover,
+.app-header__utility-link:hover,
 .app-header__menu-button:hover {
   background: var(--color-surface-subtle);
 }
 
-.app-header__search:active,
+.app-header__utility-link:active,
 .app-header__menu-button:active {
   background: var(--color-surface-pressed);
 }
@@ -305,6 +320,12 @@ onBeforeUnmount(() => {
 
   .app-header__menu-button {
     display: none;
+  }
+}
+
+@media (max-width: 479px) {
+  .app-header__utility-link {
+    padding-inline: var(--space-2);
   }
 }
 </style>

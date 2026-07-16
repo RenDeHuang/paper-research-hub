@@ -1,7 +1,17 @@
 <script setup lang="ts">
+type SearchEntityType =
+  | "author"
+  | "benchmark"
+  | "dataset"
+  | "identifier"
+  | "method"
+  | "paper"
+  | "topic"
+  | "venue"
+
 interface SearchSuggestion {
   description?: string
-  entityType: string
+  entityType: SearchEntityType
   id: string
   label: string
   value?: string
@@ -15,7 +25,7 @@ interface SearchSuggestionGroup {
 
 const props = withDefaults(
   defineProps<{
-    action?: string
+    destination?: string
     emptyQueryMessage?: string
     error?: string
     helper?: string
@@ -30,7 +40,7 @@ const props = withDefaults(
     suggestionGroups?: SearchSuggestionGroup[]
   }>(),
   {
-    action: "/papers",
+    destination: "/papers",
     emptyQueryMessage: "请输入关键词",
     error: undefined,
     helper: "支持论文标题、作者、Topic、Method、Dataset、Benchmark、Venue 和标识符。",
@@ -38,7 +48,7 @@ const props = withDefaults(
     label: "搜索论文与研究实体",
     loading: false,
     loadingMessage: "正在加载搜索建议",
-    modelValue: "",
+    modelValue: undefined,
     noMatchMessage: "没有匹配结果",
     placeholder: "例如：agent、single-cell、DOI 或作者名",
     submitLabel: "搜索",
@@ -46,21 +56,56 @@ const props = withDefaults(
   },
 )
 
+const route = useRoute()
+const router = useRouter()
 const emit = defineEmits<{
   search: [query: string]
   select: [suggestion: SearchSuggestion]
   "update:modelValue": [value: string]
 }>()
 
+const entityTypeLabels: Record<SearchEntityType, string> = {
+  author: "作者",
+  benchmark: "Benchmark",
+  dataset: "Dataset",
+  identifier: "标识符",
+  method: "Method",
+  paper: "论文",
+  topic: "Topic",
+  venue: "Venue",
+}
+
+function routeQueryText(value: unknown) {
+  if (Array.isArray(value)) {
+    return typeof value[0] === "string" ? value[0] : ""
+  }
+  return typeof value === "string" ? value : ""
+}
+
+const internalQuery = ref(routeQueryText(route.query.q))
 const query = computed({
-  get: () => props.modelValue,
-  set: (value: string) => emit("update:modelValue", value),
+  get: () => props.modelValue ?? internalQuery.value,
+  set: (value: string) => {
+    internalQuery.value = value
+    emit("update:modelValue", value)
+  },
 })
 const helperId = computed(() => `${props.id}-helper`)
 const listboxId = computed(() => `${props.id}-suggestions`)
 const statusId = computed(() => `${props.id}-status`)
 const activeIndex = ref(-1)
 const isDismissed = ref(false)
+
+watch(
+  () => route.query.q,
+  (value) => {
+    const restoredQuery = routeQueryText(value)
+    internalQuery.value = restoredQuery
+    activeIndex.value = -1
+    isDismissed.value = false
+    emit("update:modelValue", restoredQuery)
+  },
+)
 
 const flattenedSuggestions = computed(() =>
   props.suggestionGroups.flatMap((group, groupIndex) =>
@@ -132,8 +177,17 @@ function updateQuery(event: Event) {
   query.value = value
 }
 
-function submitSearch() {
-  emit("search", query.value)
+async function submitSearch() {
+  const normalizedQuery = query.value.trim()
+  emit("search", normalizedQuery)
+  if (normalizedQuery.length === 0) {
+    return
+  }
+
+  await router.push({
+    path: props.destination,
+    query: { q: normalizedQuery },
+  })
 }
 
 function openSuggestions() {
@@ -196,7 +250,7 @@ function handleKeydown(event: KeyboardEvent) {
   <form
     class="search-command"
     role="search"
-    :action="action"
+    :action="destination"
     method="get"
     @submit.prevent="submitSearch"
   >
@@ -267,11 +321,16 @@ function handleKeydown(event: KeyboardEvent) {
           @click="selectSuggestion(item)"
         >
           <span class="search-command__option-label">{{ item.label }}</span>
-          <span
-            v-if="item.description"
-            class="search-command__option-description"
-          >
-            {{ item.description }}
+          <span class="search-command__option-meta">
+            <span class="search-command__option-type">
+              {{ entityTypeLabels[item.entityType] }}
+            </span>
+            <span
+              v-if="item.description"
+              class="search-command__option-description"
+            >
+              {{ item.description }}
+            </span>
           </span>
         </button>
       </section>
@@ -393,6 +452,19 @@ function handleKeydown(event: KeyboardEvent) {
 .search-command__option-label {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.search-command__option-meta {
+  display: grid;
+  gap: var(--space-1);
+  justify-items: end;
+}
+
+.search-command__option-type {
+  color: var(--color-info);
+  font-size: var(--text-xs-size);
+  font-weight: 750;
+  line-height: var(--text-xs-line);
 }
 
 .search-command__option-description {

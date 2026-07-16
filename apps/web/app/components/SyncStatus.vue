@@ -18,7 +18,7 @@ const items = computed(() => [
 </script>
 
 <template>
-  <section class="sync-status" aria-label="数据状态">
+  <section id="sync-status" class="sync-status" aria-label="数据状态">
     <dl>
       <div v-for="item in items" :key="item.label">
         <dt>{{ item.label }}</dt>

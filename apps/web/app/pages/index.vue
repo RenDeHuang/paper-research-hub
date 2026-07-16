@@ -11,8 +11,6 @@ useHead({
   ],
 })
 
-const searchQuery = ref("")
-
 const syncStatus: {
   coverage: DataValue<number | string>
   dataRange: DataValue<string>
@@ -37,7 +35,6 @@ const syncStatus: {
         搜索论文与研究实体，并在后续数据接入后核查趋势、机会、来源与缺失信号。
       </p>
       <SearchCommand
-        v-model="searchQuery"
         :suggestion-groups="[]"
       />
       <SyncStatus

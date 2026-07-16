@@ -8,6 +8,7 @@ type OpportunityStatus =
 interface OpportunityPlotPoint {
   id: string
   label: string
+  missingSignals: string[]
   status: OpportunityStatus
   x: number
   y: number
@@ -51,7 +52,9 @@ function diamondPoints(point: OpportunityPlotPoint) {
 }
 
 function pointLabel(point: OpportunityPlotPoint) {
-  return `${point.label}，${statusLabels[point.status]}，${props.xAxisLabel} ${point.x}，${props.yAxisLabel} ${point.y}`
+  const missingSignals =
+    point.missingSignals.length > 0 ? point.missingSignals.join("；") : "无"
+  return `${point.label}，${statusLabels[point.status]}，${props.xAxisLabel} ${point.x}，${props.yAxisLabel} ${point.y}，缺失信号 ${missingSignals}`
 }
 </script>
 

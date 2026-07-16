@@ -1,0 +1,44 @@
+interface RouteLabelSource {
+  meta?: Record<string, unknown>
+  path: string
+}
+
+const fixedRouteLabels: Record<string, string> = {
+  "/": "首页",
+  "/opportunities": "研究机会",
+  "/papers": "论文",
+  "/trends": "趋势",
+}
+
+const dynamicRouteLabels: Array<{
+  label: string
+  pattern: RegExp
+}> = [
+  { label: "论文详情", pattern: /^\/papers\/[^/]+$/ },
+  { label: "Topic", pattern: /^\/topics\/[^/]+$/ },
+  { label: "Method", pattern: /^\/methods\/[^/]+$/ },
+  { label: "Venue", pattern: /^\/venues\/[^/]+$/ },
+]
+
+export function resolveRouteLabel(route: RouteLabelSource) {
+  const metaTitle = route.meta?.title
+  if (typeof metaTitle === "string" && metaTitle.trim().length > 0) {
+    return metaTitle.trim()
+  }
+
+  const normalizedPath =
+    route.path.length > 1 ? route.path.replace(/\/+$/, "") : route.path
+  const fixedLabel = fixedRouteLabels[normalizedPath]
+  if (fixedLabel) {
+    return fixedLabel
+  }
+
+  const dynamicLabel = dynamicRouteLabels.find(({ pattern }) =>
+    pattern.test(normalizedPath),
+  )
+  if (dynamicLabel) {
+    return dynamicLabel.label
+  }
+
+  return `页面：${normalizedPath}`
+}

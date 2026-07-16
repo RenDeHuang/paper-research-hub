@@ -1,4 +1,8 @@
-import { expect, test } from "@playwright/test"
+import { expect, test, type Page } from "@playwright/test"
+
+async function waitForNuxtHydration(page: Page) {
+  await expect(page.locator(".app-header__menu-button")).toBeEnabled()
+}
 
 for (const width of [375, 768, 1024, 1440]) {
   test(`keeps the shell accessible and overflow-free at ${width}px`, async ({
@@ -82,15 +86,7 @@ test("restores focus after Escape closes the mobile navigation", async ({
 }) => {
   await page.setViewportSize({ height: 900, width: 375 })
   await page.goto("/")
-  await page.waitForFunction(() =>
-    Boolean(
-      (
-        document.querySelector("#__nuxt") as
-          | (Element & { __vue_app__?: unknown })
-          | null
-      )?.__vue_app__,
-    ),
-  )
+  await waitForNuxtHydration(page)
   const menuButton = page.locator(".app-header__menu-button")
 
   await menuButton.click()
@@ -132,4 +128,44 @@ test("reduces transition and animation durations when motion is reduced", async 
 
   expect(Math.max(...durations.animation)).toBeLessThanOrEqual(0.01)
   expect(Math.max(...durations.transition)).toBeLessThanOrEqual(0.01)
+})
+
+test("loads a shareable search query and submits the trimmed default URL", async ({
+  page,
+}) => {
+  await page.goto("/?q=shared%20query")
+  await waitForNuxtHydration(page)
+  const search = page.getByRole("combobox", {
+    name: "搜索论文与研究实体",
+  })
+
+  await expect(search).toHaveValue("shared query")
+  await search.fill("  agent systems  ")
+  await page.getByRole("button", { name: "搜索" }).click()
+
+  await expect(page).toHaveURL(/\/papers\?q=agent(\+|%20)systems$/)
+})
+
+test("restores the homepage search query through browser history", async ({
+  page,
+}) => {
+  const search = page.getByRole("combobox", {
+    name: "搜索论文与研究实体",
+  })
+
+  await page.goto("/?q=first")
+  await waitForNuxtHydration(page)
+  await expect(search).toHaveValue("first")
+
+  await page.goto("/?q=second")
+  await waitForNuxtHydration(page)
+  await expect(search).toHaveValue("second")
+
+  await page.goBack()
+  await expect(page).toHaveURL(/\/\?q=first$/)
+  await expect(search).toHaveValue("first")
+
+  await page.goForward()
+  await expect(page).toHaveURL(/\/\?q=second$/)
+  await expect(search).toHaveValue("second")
 })

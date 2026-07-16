@@ -5,61 +5,80 @@ export interface DiscoveryRailItem {
   to: string
 }
 
-export interface DiscoveryRailSection {
-  id: string
-  items: DiscoveryRailItem[]
-  title: string
-}
-
-const props = defineProps<{
-  sections?: DiscoveryRailSection[]
-}>()
-
-const defaultSections: DiscoveryRailSection[] = [
+const props = withDefaults(
+  defineProps<{
+    popularMethods?: DiscoveryRailItem[]
+    popularTopics?: DiscoveryRailItem[]
+    quickFilters?: DiscoveryRailItem[]
+    savedViews?: DiscoveryRailItem[]
+  }>(),
   {
-    id: "navigation",
-    items: [
-      { label: "浏览论文", to: "/papers" },
-      { label: "查看趋势", to: "/trends" },
-      { label: "研究机会", to: "/opportunities" },
-    ],
-    title: "发现入口",
+    popularMethods: () => [],
+    popularTopics: () => [],
+    quickFilters: () => [],
+    savedViews: () => [],
+  },
+)
+
+const groups = computed(() => [
+  {
+    emptyMessage: "暂无快捷筛选",
+    id: "quick-filters",
+    items: props.quickFilters,
+    slotName: "quick-filters",
+    title: "快捷筛选",
   },
   {
-    id: "policy",
-    items: [
-      {
-        description: "查看精选范围、证据和限制",
-        label: "精选策略",
-        to: "/papers?view=curated",
-      },
-    ],
-    title: "策略入口",
+    emptyMessage: "等待首次同步",
+    id: "popular-topics",
+    items: props.popularTopics,
+    slotName: "popular-topics",
+    title: "热门 Topic",
   },
-]
-
-const resolvedSections = computed(() => props.sections ?? defaultSections)
+  {
+    emptyMessage: "等待首次同步",
+    id: "popular-methods",
+    items: props.popularMethods,
+    slotName: "popular-methods",
+    title: "热门 Method",
+  },
+  {
+    emptyMessage: "暂无保存视图",
+    id: "saved-views",
+    items: props.savedViews,
+    slotName: "saved-views",
+    title: "保存视图",
+  },
+])
 </script>
 
 <template>
   <aside class="discovery-rail" aria-label="发现导航">
-    <slot :sections="resolvedSections">
-      <section
-        v-for="section in resolvedSections"
-        :key="section.id"
-        class="discovery-rail__section"
-      >
-        <h2>{{ section.title }}</h2>
+    <section
+      v-for="group in groups"
+      :key="group.id"
+      class="discovery-rail__section"
+      :data-discovery-group="group.id"
+    >
+      <h2>{{ group.title }}</h2>
+      <slot :name="group.slotName" :items="group.items">
         <ul>
-          <li v-for="item in section.items" :key="`${section.id}:${item.to}`">
+          <li v-for="item in group.items" :key="`${group.id}:${item.to}`">
             <NuxtLink :to="item.to">
               <span>{{ item.label }}</span>
               <small v-if="item.description">{{ item.description }}</small>
             </NuxtLink>
           </li>
         </ul>
-      </section>
-    </slot>
+        <p
+          v-if="group.items.length === 0"
+          class="discovery-rail__empty"
+          :data-discovery-empty="group.id"
+        >
+          {{ group.emptyMessage }}
+        </p>
+      </slot>
+    </section>
   </aside>
 </template>
 
@@ -95,6 +114,13 @@ ul {
   margin: 0;
   padding: 0;
   list-style: none;
+}
+
+.discovery-rail__empty {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm-size);
+  line-height: var(--text-sm-line);
 }
 
 a {

@@ -13,6 +13,7 @@ type OpportunityStatus =
 interface OpportunityPoint {
   id: string
   label: string
+  missingSignals: string[]
   status: OpportunityStatus
   x: DataValue<number>
   y: DataValue<number>
@@ -32,6 +33,14 @@ const props = withDefaults(
     emptyMessage: "调用方尚未提供研究机会坐标。",
     emptyTitle: "暂无研究机会数据",
   },
+)
+
+const normalizedPoints = computed(() =>
+  props.points.map((point) => ({
+    ...point,
+    // 缺失信号按调用方来源顺序复制，组件不排序也不改写原数组。
+    missingSignals: [...point.missingSignals],
+  })),
 )
 
 const statusOrder: OpportunityStatus[] = [
@@ -66,13 +75,13 @@ const statusDefinitions: Record<
 const groupedPoints = computed(() =>
   statusOrder.map((status) => ({
     definition: statusDefinitions[status],
-    points: props.points.filter((point) => point.status === status),
+    points: normalizedPoints.value.filter((point) => point.status === status),
     status,
   })),
 )
 
 const plottablePoints = computed(() =>
-  props.points.flatMap((point) => {
+  normalizedPoints.value.flatMap((point) => {
     if (point.x.state !== "known" || point.y.state !== "known") {
       return []
     }
@@ -80,6 +89,7 @@ const plottablePoints = computed(() =>
       {
         id: point.id,
         label: point.label,
+        missingSignals: [...point.missingSignals],
         status: point.status,
         x: point.x.value,
         y: point.y.value,
@@ -89,11 +99,11 @@ const plottablePoints = computed(() =>
 )
 
 const unplottableCount = computed(
-  () => props.points.length - plottablePoints.value.length,
+  () => normalizedPoints.value.length - plottablePoints.value.length,
 )
 
 const unavailableCoordinateState = computed<"insufficient" | "missing">(() =>
-  props.points.some(
+  normalizedPoints.value.some(
     (point) => point.x.state === "missing" || point.y.state === "missing",
   )
     ? "missing"
@@ -102,6 +112,10 @@ const unavailableCoordinateState = computed<"insufficient" | "missing">(() =>
 
 function coordinateText(value: DataValue<number>) {
   return presentDataValue(value).text
+}
+
+function missingSignalsText(signals: string[]) {
+  return signals.length > 0 ? signals.join("；") : "无"
 }
 </script>
 
@@ -128,7 +142,7 @@ function coordinateText(value: DataValue<number>) {
     </ul>
 
     <DataState
-      v-if="points.length === 0"
+      v-if="normalizedPoints.length === 0"
       state="empty"
       :title="emptyTitle"
       :message="emptyMessage"
@@ -161,7 +175,11 @@ function coordinateText(value: DataValue<number>) {
             {{ group.definition.label }}
           </h2>
           <ul v-if="group.points.length > 0">
-            <li v-for="point in group.points" :key="point.id">
+            <li
+              v-for="point in group.points"
+              :key="point.id"
+              :data-opportunity-id="point.id"
+            >
               <strong>{{ point.label }}</strong>
               <dl>
                 <div>
@@ -174,6 +192,12 @@ function coordinateText(value: DataValue<number>) {
                   <dt>{{ yAxisLabel }}</dt>
                   <dd :data-value-state="point.y.state">
                     {{ coordinateText(point.y) }}
+                  </dd>
+                </div>
+                <div>
+                  <dt>缺失信号</dt>
+                  <dd data-missing-signals>
+                    {{ missingSignalsText(point.missingSignals) }}
                   </dd>
                 </div>
               </dl>
@@ -201,6 +225,39 @@ function coordinateText(value: DataValue<number>) {
           title="暂无可绘制坐标"
           message="所有方向的坐标均为缺失或未覆盖，矩阵不会推断或填补位置。"
         />
+        <ul
+          class="opportunity-matrix__point-details"
+          aria-label="矩阵点详情"
+        >
+          <li
+            v-for="point in normalizedPoints"
+            :key="point.id"
+            :data-opportunity-detail="point.id"
+          >
+            <strong>{{ point.label }}</strong>
+            <span>{{ statusDefinitions[point.status].label }}</span>
+            <dl>
+              <div>
+                <dt>{{ xAxisLabel }}</dt>
+                <dd :data-value-state="point.x.state">
+                  {{ coordinateText(point.x) }}
+                </dd>
+              </div>
+              <div>
+                <dt>{{ yAxisLabel }}</dt>
+                <dd :data-value-state="point.y.state">
+                  {{ coordinateText(point.y) }}
+                </dd>
+              </div>
+              <div>
+                <dt>缺失信号</dt>
+                <dd data-missing-signals>
+                  {{ missingSignalsText(point.missingSignals) }}
+                </dd>
+              </div>
+            </dl>
+          </li>
+        </ul>
       </details>
 
       <OpportunityPlot
@@ -218,6 +275,39 @@ function coordinateText(value: DataValue<number>) {
         title="暂无可绘制坐标"
         message="所有方向的坐标均为缺失或未覆盖，矩阵不会推断或填补位置。"
       />
+      <ul
+        class="opportunity-matrix__point-details opportunity-matrix__desktop-details"
+        aria-label="矩阵点详情"
+      >
+        <li
+          v-for="point in normalizedPoints"
+          :key="point.id"
+          :data-opportunity-detail="point.id"
+        >
+          <strong>{{ point.label }}</strong>
+          <span>{{ statusDefinitions[point.status].label }}</span>
+          <dl>
+            <div>
+              <dt>{{ xAxisLabel }}</dt>
+              <dd :data-value-state="point.x.state">
+                {{ coordinateText(point.x) }}
+              </dd>
+            </div>
+            <div>
+              <dt>{{ yAxisLabel }}</dt>
+              <dd :data-value-state="point.y.state">
+                {{ coordinateText(point.y) }}
+              </dd>
+            </div>
+            <div>
+              <dt>缺失信号</dt>
+              <dd data-missing-signals>
+                {{ missingSignalsText(point.missingSignals) }}
+              </dd>
+            </div>
+          </dl>
+        </li>
+      </ul>
     </template>
 
     <details class="opportunity-matrix__table data-table-disclosure">
@@ -233,10 +323,11 @@ function coordinateText(value: DataValue<number>) {
               <th scope="col">状态</th>
               <th scope="col">{{ xAxisLabel }}</th>
               <th scope="col">{{ yAxisLabel }}</th>
+              <th scope="col">缺失信号</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="point in points" :key="point.id">
+            <tr v-for="point in normalizedPoints" :key="point.id">
               <th scope="row">{{ point.label }}</th>
               <td class="opportunity-matrix__status">
                 <span
@@ -257,6 +348,9 @@ function coordinateText(value: DataValue<number>) {
                 :data-value-state="point.y.state"
               >
                 {{ coordinateText(point.y) }}
+              </td>
+              <td data-missing-signals>
+                {{ missingSignalsText(point.missingSignals) }}
               </td>
             </tr>
           </tbody>
@@ -424,6 +518,57 @@ figcaption {
   font-variant-numeric: tabular-nums;
 }
 
+.opportunity-matrix__point-details {
+  display: grid;
+  gap: var(--space-3);
+  margin: var(--space-4) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.opportunity-matrix__point-details > li {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-subtle);
+}
+
+.opportunity-matrix__point-details strong {
+  color: var(--color-text-strong);
+}
+
+.opportunity-matrix__point-details > li > span {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm-size);
+  line-height: var(--text-sm-line);
+}
+
+.opportunity-matrix__point-details dl {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+}
+
+.opportunity-matrix__point-details dl > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  gap: var(--space-3);
+}
+
+.opportunity-matrix__point-details dt,
+.opportunity-matrix__point-details dd {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm-size);
+  line-height: var(--text-sm-line);
+}
+
+.opportunity-matrix__point-details dd {
+  text-align: right;
+}
+
 [data-value-state="missing"],
 [data-value-state="unknown"] {
   color: var(--color-text-muted);
@@ -435,6 +580,7 @@ figcaption {
 }
 
 .opportunity-matrix__desktop-chart,
+.opportunity-matrix__desktop-details,
 .opportunity-matrix__desktop-state {
   display: none;
 }
@@ -455,6 +601,12 @@ figcaption {
 
   .opportunity-matrix__desktop-state {
     display: grid;
+  }
+
+  .opportunity-matrix__desktop-details {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(208px, 1fr));
+    margin-top: 0;
   }
 }
 </style>
