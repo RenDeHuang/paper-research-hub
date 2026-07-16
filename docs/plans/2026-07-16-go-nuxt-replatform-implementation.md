@@ -190,6 +190,21 @@ paths:
   /api/v1/papers/{id}:
     get:
       operationId: getPaper
+  /api/v1/stats:
+    get:
+      operationId: getStats
+  /api/v1/topics:
+    get:
+      operationId: listTopics
+  /api/v1/topics/{slug}:
+    get:
+      operationId: getTopic
+  /api/v1/methods:
+    get:
+      operationId: listMethods
+  /api/v1/methods/{slug}:
+    get:
+      operationId: getMethod
   /api/v1/trends/papers:
     get:
       operationId: listPaperTrends
@@ -487,6 +502,9 @@ Verify mapping of:
 - exact raw content hash;
 - scope decision and reason.
 
+The raw content hash is SHA-256 over deterministically sorted compact JSON, not
+over re-serialized domain objects.
+
 **Step 3: Run RED**
 
 ```bash
@@ -547,7 +565,9 @@ Cover:
 - concurrent identical inserts create one source snapshot and one work;
 - concurrent sources cannot regress projections;
 - deleting a work preserves raw source records;
-- failed multi-page batches report no committed counts.
+- a later-page failure preserves raw records already durably confirmed;
+- job summaries report actual committed raw, projected, excluded, and failed
+  counts instead of zeroing earlier durable work.
 
 **Step 2: Run RED**
 
@@ -564,6 +584,9 @@ Required rules:
 - raw source records are append-only.
 - projection selection uses source timestamp plus a deterministic tie-break key.
 - public visibility aggregates current decisions across logical sources.
+- raw persistence, normalization, projection, and ranking are separately
+  restartable stages recorded in `ingestion_jobs`; a downstream failure cannot
+  roll back an already confirmed raw source snapshot.
 
 **Step 4: Implement worker commands**
 
@@ -653,6 +676,10 @@ Paper detail must return:
 - metrics;
 - current source scope decisions;
 - license and update times.
+
+The same public visibility predicate and read-only transaction boundary must be
+used by `/api/v1/stats`, `/api/v1/topics`, `/api/v1/topics/{slug}`,
+`/api/v1/methods`, and `/api/v1/methods/{slug}`.
 
 **Step 4: Implement indexes and repositories**
 
