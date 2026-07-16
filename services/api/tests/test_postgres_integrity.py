@@ -1,8 +1,9 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 from io import StringIO
 import json
 from pathlib import Path
+import time
 from uuid import UUID, uuid4
 
 from alembic import command
@@ -162,6 +163,156 @@ def _assert_integrity_error(engine, statement: str, parameters: dict) -> None:
     with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             connection.execute(text(statement), parameters)
+
+
+def _insert_search_trigger_works(engine) -> tuple[UUID, UUID]:
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    revision = _paper_search_change_revision(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO work (id, canonical_key, title, source)
+                VALUES
+                    (
+                        :first_work_id,
+                        'doi:10.1000/search-trigger-first',
+                        'Search trigger first work',
+                        'test'
+                    ),
+                    (
+                        :second_work_id,
+                        'doi:10.1000/search-trigger-second',
+                        'Search trigger second work',
+                        'test'
+                    )
+                """
+            ),
+            {
+                "first_work_id": first_work_id,
+                "second_work_id": second_work_id,
+            },
+        )
+    assert _paper_search_changes_after(engine, revision) == {
+        (first_work_id, "work"),
+        (second_work_id, "work"),
+    }
+    return first_work_id, second_work_id
+
+
+def _paper_search_change_revision(engine) -> int:
+    with engine.connect() as connection:
+        return int(
+            connection.scalar(
+                text(
+                    """
+                    SELECT COALESCE(max(revision), 0)
+                    FROM paper_search_change
+                    """
+                )
+            )
+            or 0
+        )
+
+
+def _paper_search_changes_after(
+    engine,
+    revision: int,
+) -> set[tuple[UUID, str]]:
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT work_id, source_table, commit_ordered
+                FROM paper_search_change
+                WHERE revision > :revision
+                ORDER BY revision
+                """
+            ),
+            {"revision": revision},
+        ).all()
+    assert rows
+    assert all(row.commit_ordered for row in rows)
+    return {
+        (row.work_id, row.source_table)
+        for row in rows
+    }
+
+
+def _wait_for_relation_lock(
+    engine,
+    *,
+    relation_name: str,
+    mode: str,
+    granted: bool,
+    timeout: float = 5,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with engine.connect() as connection:
+            found = connection.scalar(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks AS relation_lock
+                        JOIN pg_class AS relation
+                          ON relation.oid = relation_lock.relation
+                        JOIN pg_namespace AS namespace
+                          ON namespace.oid = relation.relnamespace
+                        WHERE namespace.nspname = 'public'
+                          AND relation.relname = :relation_name
+                          AND relation_lock.mode = :mode
+                          AND relation_lock.granted = :granted
+                    )
+                    """
+                ),
+                {
+                    "relation_name": relation_name,
+                    "mode": mode,
+                    "granted": granted,
+                },
+            )
+        if bool(found):
+            return
+        time.sleep(0.01)
+    raise AssertionError(
+        f"timed out waiting for {mode} on {relation_name}"
+    )
+
+
+def _wait_for_waiting_relation_lock(
+    engine,
+    *,
+    relation_names: tuple[str, ...],
+    timeout: float = 5,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with engine.connect() as connection:
+            found = connection.scalar(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks AS relation_lock
+                        JOIN pg_class AS relation
+                          ON relation.oid = relation_lock.relation
+                        JOIN pg_namespace AS namespace
+                          ON namespace.oid = relation.relnamespace
+                        WHERE namespace.nspname = 'public'
+                          AND relation.relname = ANY(:relation_names)
+                          AND NOT relation_lock.granted
+                    )
+                    """
+                ),
+                {"relation_names": list(relation_names)},
+            )
+        if bool(found):
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out waiting for relation lock")
 
 
 def _historical_alembic_config(
@@ -711,10 +862,12 @@ def test_0003_to_0004_scope_assessment_upgrade_and_downgrade_are_executable(
             "rule_version",
             "included",
             "reason",
-            "evidence",
-            "evaluated_at",
-            "work_id",
-        } == {
+                "evidence",
+                "evaluated_at",
+                "work_id",
+                "work_linked_at",
+                "work_link_reason",
+            } == {
             column["name"]
             for column in inspector.get_columns("scope_assessment")
         }
@@ -1271,10 +1424,15 @@ def test_0006_resets_unverified_projection_and_replay_repairs_latest_snapshot(
             assert work.abstract == latest_record.parsed.abstract
             assert work.status == RecordStatus.RETRACTED
             assert work.projection_source == latest_record.source
-            assert (
-                work.projection_source_record_id
-                == latest_record.source_record_id
+            projection = session.get(
+                SourceRecord,
+                work.projection_source_record_id,
             )
+            assert projection is not None
+            assert projection.source_record_id == (
+                latest_record.source_record_id
+            )
+            assert projection.content_hash == latest_record.content_hash
             assert (
                 work.projection_source_updated_at
                 == latest_record.source_updated_at
@@ -1621,7 +1779,7 @@ def test_offline_head_sql_applies_to_historical_schema_variants(
 
             assert connection.scalar(
                 text("SELECT version_num FROM alembic_version")
-            ) == "0009_logical_source_scope"
+            ) == "0011_search_snapshot_revision"
             context = MigrationContext.configure(
                 connection,
                 opts={
@@ -2719,6 +2877,4310 @@ def test_scope_assessment_constraints_reject_inconsistent_rows(
                         "source_record_id": source_id,
                     },
                 )
+    finally:
+        engine.dispose()
+
+
+def test_0010_projection_tiebreak_and_scope_trigger_survive_roundtrip(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from paper_hub.repositories import (
+        PaperRepository,
+        PaperSearchFilters,
+        slug_for_canonical_key,
+    )
+
+    command.upgrade(alembic_config, "0009_logical_source_scope")
+    engine = create_engine(clean_postgres_url)
+    work_id = UUID("00000000-0000-0000-0000-000000000100")
+    older_source_id = UUID("00000000-0000-0000-0000-000000000101")
+    newer_source_id = UUID("00000000-0000-0000-0000-000000000102")
+    excluded_source_id = UUID("00000000-0000-0000-0000-000000000103")
+    excluded_assessment_id = UUID(
+        "00000000-0000-0000-0000-000000000104"
+    )
+    older_topic_id = UUID("00000000-0000-0000-0000-000000000105")
+    newer_topic_id = UUID("00000000-0000-0000-0000-000000000106")
+    metric_id = UUID("00000000-0000-0000-0000-000000000107")
+    method_id = UUID("00000000-0000-0000-0000-000000000108")
+    dataset_id = UUID("00000000-0000-0000-0000-000000000109")
+    benchmark_id = UUID("00000000-0000-0000-0000-000000000110")
+    repository_id = UUID("00000000-0000-0000-0000-000000000111")
+    source_updated_at = datetime(2026, 7, 15, 8, tzinfo=UTC)
+    older_retrieved_at = datetime(2026, 7, 15, 9, tzinfo=UTC)
+    newer_retrieved_at = datetime(2026, 7, 15, 10, tzinfo=UTC)
+    parser_upgrade_created_at = datetime.now(UTC) + timedelta(hours=1)
+    canonical_key = "doi:10.1000/projection-roundtrip"
+
+    def assert_exact_projection() -> None:
+        with engine.connect() as connection:
+            projection = connection.execute(
+                text(
+                    """
+                    SELECT
+                        projection_source_record_id,
+                        title,
+                        abstract,
+                        publication_date,
+                        retrieved_at
+                    FROM work
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": work_id},
+            ).one()
+        assert projection == (
+            newer_source_id,
+            "Newest parser title",
+            "Newest parser abstract",
+            datetime(2026, 7, 3).date(),
+            newer_retrieved_at,
+        )
+        with engine.connect() as connection:
+            metric = connection.execute(
+                text(
+                    """
+                    SELECT
+                        source_record_id,
+                        metric_value,
+                        metadata ->> 'source_record_id',
+                        retrieved_at
+                    FROM metric_snapshot
+                    WHERE id = :metric_id
+                    """
+                ),
+                {"metric_id": metric_id},
+            ).one()
+        assert metric.source_record_id == newer_source_id
+        assert int(metric.metric_value) == 20
+        assert metric[2] == str(newer_source_id)
+        assert metric.retrieved_at == newer_retrieved_at
+        with Session(engine) as session:
+            detail = PaperRepository(session).detail(
+                slug_for_canonical_key(canonical_key)
+            )
+        assert detail is not None
+        assert detail["title"] == "Newest parser title"
+        assert detail["type"] == "article"
+        assert detail["authors"] == ["New Author"]
+        assert {
+            topic["normalized_name"] for topic in detail["topics"]
+        } == {"new migration topic"}
+        with Session(engine) as session:
+            repository = PaperRepository(session)
+            old_topic = repository.search(
+                PaperSearchFilters(
+                    topics=("old migration topic",),
+                )
+            )
+            new_topic = repository.search(
+                PaperSearchFilters(
+                    topics=("new migration topic",),
+                )
+            )
+        assert old_topic["total"] == 0
+        assert new_topic["total"] == 1
+        assert {
+            item["value"]
+            for item in new_topic["facets"]["topics"]
+        } == {"new migration topic"}
+        with engine.connect() as connection:
+            association_counts = connection.execute(
+                text(
+                    """
+                    SELECT
+                        (
+                            SELECT count(*)
+                            FROM work_method
+                            WHERE work_id = :work_id
+                        ) AS methods,
+                        (
+                            SELECT count(*)
+                            FROM work_dataset
+                            WHERE work_id = :work_id
+                        ) AS datasets,
+                        (
+                            SELECT count(*)
+                            FROM work_benchmark
+                            WHERE work_id = :work_id
+                        ) AS benchmarks,
+                        (
+                            SELECT count(*)
+                            FROM work_code_repository
+                            WHERE work_id = :work_id
+                        ) AS repositories
+                    """
+                ),
+                {"work_id": work_id},
+            ).one()
+        assert association_counts == (0, 0, 0, 1)
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (
+                        id,
+                        canonical_key,
+                        title,
+                        abstract,
+                        publication_date,
+                        projection_source,
+                        projection_source_record_id,
+                        projection_source_updated_at,
+                        source,
+                        retrieved_at
+                    )
+                    VALUES (
+                        :id,
+                        :canonical_key,
+                        'Legacy projection title',
+                        'Legacy projection abstract',
+                        DATE '2026-07-01',
+                        'openalex',
+                        'W-PROJECTION-ROUNDTRIP',
+                        :source_updated_at,
+                        'openalex',
+                        :older_retrieved_at
+                    )
+                    """
+                ),
+                {
+                    "id": work_id,
+                    "canonical_key": canonical_key,
+                    "source_updated_at": source_updated_at,
+                    "older_retrieved_at": older_retrieved_at,
+                },
+            )
+            for source_id, retrieved_at, content_hash in (
+                (older_source_id, older_retrieved_at, "a" * 64),
+                (newer_source_id, newer_retrieved_at, "b" * 64),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source_updated_at,
+                            source,
+                            retrieved_at
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-PROJECTION-ROUNDTRIP',
+                            :content_hash,
+                            '{}'::jsonb,
+                            :source_updated_at,
+                            'openalex',
+                            :retrieved_at
+                        )
+                        """
+                    ),
+                    {
+                        "id": source_id,
+                        "work_id": work_id,
+                        "content_hash": content_hash,
+                        "source_updated_at": source_updated_at,
+                        "retrieved_at": retrieved_at,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO scope_assessment (
+                            id,
+                            source_record_id,
+                            rule_version,
+                            included,
+                            reason,
+                            evidence,
+                            evaluated_at,
+                            work_id
+                        )
+                        VALUES (
+                            :id,
+                            :source_record_id,
+                            'scope-v1',
+                            true,
+                            NULL,
+                            '[]'::jsonb,
+                            :evaluated_at,
+                            :work_id
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "source_record_id": source_id,
+                        "evaluated_at": retrieved_at,
+                        "work_id": work_id,
+                    },
+                )
+            for topic_id, name, source_url in (
+                (
+                    older_topic_id,
+                    "Old Migration Topic",
+                    "https://openalex.org/T-MIGRATION-OLD",
+                ),
+                (
+                    newer_topic_id,
+                    "New Migration Topic",
+                    "https://openalex.org/T-MIGRATION-NEW",
+                ),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO topic (
+                            id,
+                            name,
+                            normalized_name,
+                            description,
+                            source,
+                            source_url
+                        )
+                        VALUES (
+                            :id,
+                            :name,
+                            :normalized_name,
+                            NULL,
+                            'openalex',
+                            :source_url
+                        )
+                        """
+                    ),
+                    {
+                        "id": topic_id,
+                        "name": name,
+                        "normalized_name": name.casefold(),
+                        "source_url": source_url,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work_topic (work_id, topic_id)
+                        VALUES (:work_id, :topic_id)
+                        """
+                    ),
+                    {"work_id": work_id, "topic_id": topic_id},
+                )
+            for table_name, association_table, entity_id, name in (
+                (
+                    "method",
+                    "work_method",
+                    method_id,
+                    "Legacy Projection Method",
+                ),
+                (
+                    "dataset",
+                    "work_dataset",
+                    dataset_id,
+                    "Legacy Projection Dataset",
+                ),
+                (
+                    "benchmark",
+                    "work_benchmark",
+                    benchmark_id,
+                    "Legacy Projection Benchmark",
+                ),
+            ):
+                connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO {table_name} (
+                            id,
+                            name,
+                            normalized_name,
+                            description,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :name,
+                            :normalized_name,
+                            NULL,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": entity_id,
+                        "name": name,
+                        "normalized_name": name.casefold(),
+                    },
+                )
+                connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO {association_table} (
+                            work_id,
+                            {table_name}_id
+                        )
+                        VALUES (:work_id, :entity_id)
+                        """
+                    ),
+                    {
+                        "work_id": work_id,
+                        "entity_id": entity_id,
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO code_repository (
+                        id,
+                        provider,
+                        repository_name,
+                        repository_url,
+                        normalized_url,
+                        is_official,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        'github',
+                        'example/projection-history',
+                        'https://github.test/example/projection-history',
+                        'https://github.test/example/projection-history',
+                        true,
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": repository_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work_code_repository (
+                        work_id,
+                        code_repository_id
+                    )
+                    VALUES (:work_id, :repository_id)
+                    """
+                ),
+                {
+                    "work_id": work_id,
+                    "repository_id": repository_id,
+                },
+            )
+            for source_id, values in (
+                (
+                    older_source_id,
+                    {
+                        "title": "Old projection title",
+                        "abstract": "Old projection abstract",
+                        "publication_date": "2026-07-01",
+                        "type": "preprint",
+                        "authors": ["Old Author"],
+                        "citation_count": 10,
+                        "topics": [
+                            {
+                                "openalex_id": "T-MIGRATION-OLD",
+                                "display_name": "Old Migration Topic",
+                                "score": 1.0,
+                            }
+                        ],
+                    },
+                ),
+                (
+                    newer_source_id,
+                    {
+                        "title": "New projection title",
+                        "abstract": "New projection abstract",
+                        "publication_date": "2026-07-02",
+                        "type": "article",
+                        "authors": ["New Author"],
+                        "citation_count": 20,
+                        "topics": [
+                            {
+                                "openalex_id": "T-MIGRATION-NEW",
+                                "display_name": "New Migration Topic",
+                                "score": 1.0,
+                            }
+                        ],
+                    },
+                ),
+            ):
+                for field_name, value in values.items():
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO field_assertion (
+                                id,
+                                source_record_id,
+                                field_name,
+                                value,
+                                parser_version,
+                                confidence,
+                                source,
+                                retrieved_at
+                            )
+                            VALUES (
+                                :id,
+                                :source_record_id,
+                                :field_name,
+                                CAST(:value AS jsonb),
+                                'parser-v1',
+                                1.0,
+                                'openalex',
+                                :retrieved_at
+                            )
+                            """
+                        ),
+                        {
+                            "id": uuid4(),
+                            "source_record_id": source_id,
+                            "field_name": field_name,
+                            "value": json.dumps(value),
+                            "retrieved_at": (
+                                older_retrieved_at
+                                if source_id == older_source_id
+                                else newer_retrieved_at
+                            ),
+                        },
+                    )
+            for assertion_id, field_name, value in (
+                (
+                    UUID("00000000-0000-0000-0000-000000000001"),
+                    "title",
+                    "Newest parser title",
+                ),
+                (
+                    UUID("00000000-0000-0000-0000-000000000002"),
+                    "abstract",
+                    "Newest parser abstract",
+                ),
+                (
+                    UUID("00000000-0000-0000-0000-000000000003"),
+                    "publication_date",
+                    "2026-07-03",
+                ),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO field_assertion (
+                            id,
+                            source_record_id,
+                            field_name,
+                            value,
+                            parser_version,
+                            confidence,
+                            source,
+                            retrieved_at,
+                            created_at
+                        )
+                        VALUES (
+                            :id,
+                            :source_record_id,
+                            :field_name,
+                            CAST(:value AS jsonb),
+                            'parser-v2',
+                            1.0,
+                            'openalex',
+                            :retrieved_at,
+                            :created_at
+                        )
+                        """
+                    ),
+                    {
+                        "id": assertion_id,
+                        "source_record_id": newer_source_id,
+                        "field_name": field_name,
+                        "value": json.dumps(value),
+                        "retrieved_at": newer_retrieved_at,
+                        "created_at": parser_upgrade_created_at,
+                        },
+                    )
+
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO metric_snapshot (
+                        id,
+                        work_id,
+                        metric_name,
+                        metric_value,
+                        measured_at,
+                        metadata,
+                        source,
+                        retrieved_at
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'citation_count',
+                        10,
+                        :measured_at,
+                        CAST(:details AS jsonb),
+                        'openalex',
+                        :retrieved_at
+                    )
+                    """
+                ),
+                {
+                    "id": metric_id,
+                    "work_id": work_id,
+                    "measured_at": source_updated_at,
+                    "details": json.dumps(
+                        {
+                            "source_record_id": str(older_source_id),
+                            "content_hash": "a" * 64,
+                        }
+                    ),
+                    "retrieved_at": older_retrieved_at,
+                },
+            )
+
+        command.upgrade(alembic_config, "head")
+        assert_exact_projection()
+
+        command.downgrade(alembic_config, "0009_logical_source_scope")
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    """
+                    SELECT projection_source_record_id
+                    FROM work
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": work_id},
+            ) == "W-PROJECTION-ROUNDTRIP"
+            assert set(
+                connection.scalars(
+                    text(
+                        """
+                        SELECT topic.normalized_name
+                        FROM work_topic
+                        JOIN topic ON topic.id = work_topic.topic_id
+                        WHERE work_topic.work_id = :work_id
+                        """
+                    ),
+                    {"work_id": work_id},
+                )
+            ) == {
+                "old migration topic",
+                "new migration topic",
+            }
+            restored_association_counts = connection.execute(
+                text(
+                    """
+                    SELECT
+                        (
+                            SELECT count(*)
+                            FROM work_method
+                            WHERE work_id = :work_id
+                        ) AS methods,
+                        (
+                            SELECT count(*)
+                            FROM work_dataset
+                            WHERE work_id = :work_id
+                        ) AS datasets,
+                        (
+                            SELECT count(*)
+                            FROM work_benchmark
+                            WHERE work_id = :work_id
+                        ) AS benchmarks,
+                        (
+                            SELECT count(*)
+                            FROM work_code_repository
+                            WHERE work_id = :work_id
+                        ) AS repositories
+                    """
+                ),
+                {"work_id": work_id},
+            ).one()
+        assert restored_association_counts == (1, 1, 1, 1)
+
+        command.upgrade(alembic_config, "head")
+        assert_exact_projection()
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source_updated_at,
+                        source,
+                        retrieved_at
+                    )
+                    VALUES (
+                        :id,
+                        NULL,
+                        'W-PROJECTION-ROUNDTRIP',
+                        :content_hash,
+                        '{}'::jsonb,
+                        :source_updated_at,
+                        'openalex',
+                        :retrieved_at
+                    )
+                    """
+                ),
+                {
+                    "id": excluded_source_id,
+                    "content_hash": "c" * 64,
+                    "source_updated_at": source_updated_at,
+                    "retrieved_at": datetime(2026, 7, 15, 11, tzinfo=UTC),
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v2',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        NULL
+                    )
+                    """
+                ),
+                {
+                    "id": excluded_assessment_id,
+                    "source_record_id": excluded_source_id,
+                    "evaluated_at": datetime(
+                        2026, 7, 15, 11, tzinfo=UTC
+                    ),
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    UPDATE source_record
+                    SET work_id = :work_id
+                    WHERE id = :source_record_id
+                    """
+                ),
+                {
+                    "work_id": work_id,
+                    "source_record_id": excluded_source_id,
+                },
+            )
+            linked = connection.execute(
+                text(
+                    """
+                    SELECT work_id, work_linked_at, work_link_reason
+                    FROM scope_assessment
+                    WHERE id = :assessment_id
+                    """
+                ),
+                {"assessment_id": excluded_assessment_id},
+            ).one()
+        assert linked.work_id == work_id
+        assert linked.work_linked_at is not None
+        assert linked.work_link_reason == "logical_source_owner_trigger"
+    finally:
+        engine.dispose()
+
+
+def test_0010_rejects_unmappable_legacy_projection_without_data_loss(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0009_logical_source_scope")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    projection_updated_at = datetime(2026, 7, 16, 1, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (
+                        id,
+                        canonical_key,
+                        title,
+                        projection_source,
+                        projection_source_record_id,
+                        projection_source_updated_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        'doi:10.1000/unmappable-legacy-projection',
+                        'Unmappable legacy projection',
+                        'openalex',
+                        'W-UNMAPPABLE-LEGACY-PROJECTION',
+                        :projection_updated_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": work_id,
+                    "projection_updated_at": projection_updated_at,
+                },
+            )
+
+        with pytest.raises(
+            DBAPIError,
+            match="cannot map legacy work projection",
+        ):
+            command.upgrade(
+                alembic_config,
+                "0010_exact_projection_scope",
+            )
+
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0009_logical_source_scope"
+            projection = connection.execute(
+                text(
+                    """
+                    SELECT
+                        projection_source,
+                        projection_source_record_id,
+                        projection_source_updated_at
+                    FROM work
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": work_id},
+            ).one()
+        assert projection == (
+            "openalex",
+            "W-UNMAPPABLE-LEGACY-PROJECTION",
+            projection_updated_at,
+        )
+    finally:
+        engine.dispose()
+
+
+def test_0010_rejects_preexisting_cross_table_logical_owner_conflict(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0009_logical_source_scope")
+    engine = create_engine(clean_postgres_url)
+    assessment_work_id = uuid4()
+    source_work_id = uuid4()
+    assessment_source_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (assessment_work_id, source_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Preexisting cross-table owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            "doi:10.1000/preexisting-cross-owner-"
+                            f"{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        NULL,
+                        'W-PREEXISTING-CROSS-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_source_id,
+                    "content_hash": "a" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v1',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "source_record_id": assessment_source_id,
+                    "evaluated_at": datetime.now(UTC),
+                    "work_id": assessment_work_id,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-PREEXISTING-CROSS-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "work_id": source_work_id,
+                    "content_hash": "b" * 64,
+                },
+            )
+
+        with pytest.raises(
+            DBAPIError,
+            match=(
+                "cannot upgrade exact projection scope: "
+                "logical source identity maps to multiple works"
+            ),
+        ):
+            command.upgrade(alembic_config, "head")
+    finally:
+        engine.dispose()
+
+
+def test_0010_links_late_exclusion_to_existing_logical_owner_with_audit(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    owner_source_id = uuid4()
+    excluded_source_id = uuid4()
+    assessment_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/late-exclusion-owner',
+                        'Late exclusion owner',
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            for source_id, owner_id, content_hash in (
+                (owner_source_id, work_id, "d" * 64),
+                (excluded_source_id, None, "e" * 64),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-LATE-EXCLUSION',
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": source_id,
+                        "work_id": owner_id,
+                        "content_hash": content_hash,
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v2',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        NULL
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_id,
+                    "source_record_id": excluded_source_id,
+                    "evaluated_at": datetime.now(UTC),
+                },
+            )
+            linked = connection.execute(
+                text(
+                    """
+                    SELECT work_id, work_linked_at, work_link_reason
+                    FROM scope_assessment
+                    WHERE id = :assessment_id
+                    """
+                ),
+                {"assessment_id": assessment_id},
+            ).one()
+
+        assert linked.work_id == work_id
+        assert linked.work_linked_at is not None
+        assert linked.work_link_reason == "logical_source_owner_trigger"
+    finally:
+        engine.dispose()
+
+
+def test_0010_audits_explicit_excluded_owner_insert(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    assessment_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/explicit-exclusion-owner',
+                        'Explicit exclusion owner',
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        NULL,
+                        'W-EXPLICIT-EXCLUSION-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "content_hash": "e" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v2',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_id,
+                    "source_record_id": source_id,
+                    "evaluated_at": datetime.now(UTC),
+                    "work_id": work_id,
+                },
+            )
+            linked = connection.execute(
+                text(
+                    """
+                    SELECT work_id, work_linked_at, work_link_reason
+                    FROM scope_assessment
+                    WHERE id = :assessment_id
+                    """
+                ),
+                {"assessment_id": assessment_id},
+            ).one()
+
+        assert linked.work_id == work_id
+        assert linked.work_linked_at is not None
+        assert linked.work_link_reason == "explicit_scope_owner_insert"
+    finally:
+        engine.dispose()
+
+
+def test_0010_rejects_second_work_on_logical_source_insert(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (first_work_id, second_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Logical source insert owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            f"doi:10.1000/logical-insert-owner-{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-LOGICAL-INSERT',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "work_id": first_work_id,
+                    "content_hash": "1" * 64,
+                },
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-LOGICAL-INSERT',
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "work_id": second_work_id,
+                        "content_hash": "2" * 64,
+                    },
+                )
+    finally:
+        engine.dispose()
+
+
+def test_0010_rejects_second_work_on_logical_source_update(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    first_source_id = uuid4()
+    second_source_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (first_work_id, second_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Logical source update owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            f"doi:10.1000/logical-update-owner-{index}"
+                        ),
+                    },
+                )
+            for source_id, work_id, logical_id, content_hash in (
+                (
+                    first_source_id,
+                    first_work_id,
+                    "W-LOGICAL-UPDATE",
+                    "3" * 64,
+                ),
+                (
+                    second_source_id,
+                    None,
+                    "W-LOGICAL-UPDATE",
+                    "4" * 64,
+                ),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            :source_record_id,
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": source_id,
+                        "work_id": work_id,
+                        "source_record_id": logical_id,
+                        "content_hash": content_hash,
+                    },
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE source_record
+                        SET work_id = :work_id
+                        WHERE id = :source_record_id
+                        """
+                    ),
+                    {
+                        "work_id": second_work_id,
+                        "source_record_id": second_source_id,
+                    },
+                )
+    finally:
+        engine.dispose()
+
+
+def test_0010_serializes_concurrent_logical_source_owners(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    first_source_id = uuid4()
+    second_source_id = uuid4()
+    first_connection = engine.connect()
+    first_transaction = first_connection.begin()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (first_work_id, second_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Concurrent logical owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            f"doi:10.1000/concurrent-owner-{index}"
+                        ),
+                    },
+                )
+        first_connection.execute(
+            text(
+                """
+                INSERT INTO source_record (
+                    id,
+                    work_id,
+                    source_record_id,
+                    content_hash,
+                    raw_payload,
+                    source
+                )
+                VALUES (
+                    :id,
+                    :work_id,
+                    'W-CONCURRENT-OWNER',
+                    :content_hash,
+                    '{}'::jsonb,
+                    'openalex'
+                )
+                """
+            ),
+            {
+                "id": first_source_id,
+                "work_id": first_work_id,
+                "content_hash": "9" * 64,
+            },
+        )
+
+        def insert_second_owner() -> None:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-CONCURRENT-OWNER',
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": second_source_id,
+                        "work_id": second_work_id,
+                        "content_hash": "0" * 64,
+                    },
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(insert_second_owner)
+            try:
+                future.result(timeout=0.5)
+            except TimeoutError:
+                first_transaction.commit()
+                with pytest.raises(IntegrityError):
+                    future.result(timeout=5)
+            else:
+                first_transaction.commit()
+
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    """
+                    SELECT count(DISTINCT work_id)
+                    FROM source_record
+                    WHERE source = 'openalex'
+                      AND source_record_id = 'W-CONCURRENT-OWNER'
+                      AND work_id IS NOT NULL
+                    """
+                )
+            ) == 1
+    finally:
+        if first_transaction.is_active:
+            first_transaction.rollback()
+        first_connection.close()
+        engine.dispose()
+
+
+def test_0010_upgrade_locks_owner_tables_before_validating(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    command.upgrade(alembic_config, "0009_logical_source_scope")
+    engine = create_engine(clean_postgres_url)
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    blocker_connection = engine.connect()
+    blocker_transaction = blocker_connection.begin()
+    executor = ThreadPoolExecutor(max_workers=2)
+    migration_future = None
+    writer_future = None
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES
+                        (
+                            :first_work_id,
+                            'doi:10.1000/migration-race-first',
+                            'Migration race first',
+                            'test'
+                        ),
+                        (
+                            :second_work_id,
+                            'doi:10.1000/migration-race-second',
+                            'Migration race second',
+                            'test'
+                        )
+                    """
+                ),
+                {
+                    "first_work_id": first_work_id,
+                    "second_work_id": second_work_id,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-MIGRATION-UPGRADE-RACE',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "work_id": first_work_id,
+                    "content_hash": "a" * 64,
+                },
+            )
+
+        blocker_connection.execute(
+            text("LOCK TABLE scope_assessment IN ACCESS SHARE MODE")
+        )
+        migration_future = executor.submit(
+            command.upgrade,
+            alembic_config,
+            "head",
+        )
+        _wait_for_relation_lock(
+            engine,
+            relation_name="scope_assessment",
+            mode="AccessExclusiveLock",
+            granted=False,
+        )
+
+        def insert_conflicting_owner() -> None:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-MIGRATION-UPGRADE-RACE',
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "work_id": second_work_id,
+                        "content_hash": "b" * 64,
+                    },
+                )
+
+        writer_future = executor.submit(insert_conflicting_owner)
+        with pytest.raises(TimeoutError):
+            writer_future.result(timeout=0.5)
+
+        blocker_transaction.commit()
+        migration_future.result(timeout=10)
+        with pytest.raises(IntegrityError):
+            writer_future.result(timeout=10)
+
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    """
+                    SELECT count(DISTINCT work_id)
+                    FROM source_record
+                    WHERE source = 'openalex'
+                      AND source_record_id =
+                          'W-MIGRATION-UPGRADE-RACE'
+                      AND work_id IS NOT NULL
+                    """
+                )
+            ) == 1
+    finally:
+        if blocker_transaction.is_active:
+            blocker_transaction.rollback()
+        blocker_connection.close()
+        if migration_future is not None:
+            try:
+                migration_future.result(timeout=10)
+            except Exception:
+                pass
+        if writer_future is not None:
+            try:
+                writer_future.result(timeout=10)
+            except Exception:
+                pass
+        executor.shutdown(wait=True)
+        engine.dispose()
+
+
+def test_0010_downgrade_locks_audit_tables_before_validating(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    command.upgrade(
+        alembic_config,
+        "0010_exact_projection_scope",
+    )
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    assessment_id = uuid4()
+    writer_connection = engine.connect()
+    writer_transaction = writer_connection.begin()
+    executor = ThreadPoolExecutor(max_workers=1)
+    migration_future = None
+    linked_at = datetime(2026, 7, 16, 12, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/migration-downgrade-race',
+                        'Migration downgrade race',
+                        'test'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-MIGRATION-DOWNGRADE-RACE',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "c" * 64,
+                },
+            )
+
+        writer_connection.execute(
+            text(
+                """
+                INSERT INTO scope_assessment (
+                    id,
+                    source_record_id,
+                    rule_version,
+                    included,
+                    reason,
+                    evidence,
+                    evaluated_at,
+                    work_id,
+                    work_linked_at,
+                    work_link_reason
+                )
+                VALUES (
+                    :id,
+                    :source_record_id,
+                    'migration-downgrade-race',
+                    false,
+                    'excluded',
+                    '[]'::jsonb,
+                    :evaluated_at,
+                    :work_id,
+                    :work_linked_at,
+                    'identity_replay'
+                )
+                """
+            ),
+            {
+                "id": assessment_id,
+                "source_record_id": source_id,
+                "evaluated_at": linked_at,
+                "work_id": work_id,
+                "work_linked_at": linked_at,
+            },
+        )
+        migration_future = executor.submit(
+            command.downgrade,
+            alembic_config,
+            "0009_logical_source_scope",
+        )
+        _wait_for_waiting_relation_lock(
+            engine,
+            relation_names=(
+                "work",
+                "source_record",
+                "scope_assessment",
+            ),
+        )
+
+        with pytest.raises(DBAPIError):
+            writer_transaction.commit()
+            migration_future.result(timeout=10)
+
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0010_exact_projection_scope"
+            assert connection.execute(
+                text(
+                    """
+                    SELECT work_linked_at, work_link_reason
+                    FROM scope_assessment
+                    WHERE id = :assessment_id
+                    """
+                ),
+                {"assessment_id": assessment_id},
+            ).one() == (linked_at, "identity_replay")
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer_connection.close()
+        if migration_future is not None:
+            try:
+                migration_future.result(timeout=10)
+            except Exception:
+                pass
+        executor.shutdown(wait=True)
+        engine.dispose()
+
+
+def test_0010_rejects_source_owner_conflicting_with_assessment_owner(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    assessment_work_id = uuid4()
+    source_work_id = uuid4()
+    unowned_source_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (assessment_work_id, source_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Assessment logical owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            "doi:10.1000/assessment-logical-owner-"
+                            f"{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        NULL,
+                        'W-ASSESSMENT-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": unowned_source_id,
+                    "content_hash": "5" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id,
+                        work_linked_at,
+                        work_link_reason
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v2',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id,
+                        :work_linked_at,
+                        'explicit_logical_owner'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "source_record_id": unowned_source_id,
+                    "evaluated_at": datetime.now(UTC),
+                    "work_id": assessment_work_id,
+                    "work_linked_at": datetime.now(UTC),
+                },
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-ASSESSMENT-OWNER',
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "work_id": source_work_id,
+                        "content_hash": "6" * 64,
+                    },
+                )
+    finally:
+        engine.dispose()
+
+
+def test_0010_serializes_assessment_and_source_logical_owners(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    assessment_work_id = uuid4()
+    source_work_id = uuid4()
+    unowned_source_id = uuid4()
+    first_connection = engine.connect()
+    first_transaction = first_connection.begin()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (assessment_work_id, source_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Concurrent assessment logical owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            "doi:10.1000/concurrent-assessment-owner-"
+                            f"{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        NULL,
+                        'W-CONCURRENT-ASSESSMENT-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": unowned_source_id,
+                    "content_hash": "7" * 64,
+                },
+            )
+
+        first_connection.execute(
+            text(
+                """
+                INSERT INTO scope_assessment (
+                    id,
+                    source_record_id,
+                    rule_version,
+                    included,
+                    reason,
+                    evidence,
+                    evaluated_at,
+                    work_id,
+                    work_linked_at,
+                    work_link_reason
+                )
+                VALUES (
+                    :id,
+                    :source_record_id,
+                    'scope-v2',
+                    false,
+                    'excluded',
+                    '[]'::jsonb,
+                    :evaluated_at,
+                    :work_id,
+                    :work_linked_at,
+                    'explicit_logical_owner'
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "source_record_id": unowned_source_id,
+                "evaluated_at": datetime.now(UTC),
+                "work_id": assessment_work_id,
+                "work_linked_at": datetime.now(UTC),
+            },
+        )
+
+        def insert_source_owner() -> None:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-CONCURRENT-ASSESSMENT-OWNER',
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "work_id": source_work_id,
+                        "content_hash": "8" * 64,
+                    },
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(insert_source_owner)
+            try:
+                future.result(timeout=0.5)
+            except TimeoutError:
+                first_transaction.commit()
+                with pytest.raises(IntegrityError):
+                    future.result(timeout=5)
+            else:
+                first_transaction.commit()
+
+        with engine.connect() as connection:
+            owner_count = connection.scalar(
+                text(
+                    """
+                    SELECT count(DISTINCT owner.work_id)
+                    FROM (
+                        SELECT source.work_id
+                        FROM source_record AS source
+                        WHERE source.source = 'openalex'
+                          AND source.source_record_id =
+                              'W-CONCURRENT-ASSESSMENT-OWNER'
+                          AND source.work_id IS NOT NULL
+
+                        UNION ALL
+
+                        SELECT assessment.work_id
+                        FROM scope_assessment AS assessment
+                        JOIN source_record AS source
+                          ON source.id = assessment.source_record_id
+                        WHERE source.source = 'openalex'
+                          AND source.source_record_id =
+                              'W-CONCURRENT-ASSESSMENT-OWNER'
+                          AND assessment.work_id IS NOT NULL
+                    ) AS owner
+                    """
+                )
+            )
+        assert owner_count == 1
+    finally:
+        if first_transaction.is_active:
+            first_transaction.rollback()
+        first_connection.close()
+        engine.dispose()
+
+
+def test_0010_serializes_assessment_update_before_source_insert(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    assessment_work_id = uuid4()
+    source_work_id = uuid4()
+    assessment_source_id = uuid4()
+    assessment_id = uuid4()
+    first_connection = engine.connect()
+    first_transaction = first_connection.begin()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (assessment_work_id, source_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Assessment update logical owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            "doi:10.1000/assessment-update-owner-"
+                            f"{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        NULL,
+                        'W-ASSESSMENT-UPDATE-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_source_id,
+                    "content_hash": "c" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v1',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        NULL
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_id,
+                    "source_record_id": assessment_source_id,
+                    "evaluated_at": datetime.now(UTC),
+                },
+            )
+
+        first_connection.execute(
+            text(
+                """
+                UPDATE scope_assessment
+                SET
+                    work_id = :work_id,
+                    work_linked_at = :work_linked_at,
+                    work_link_reason = 'explicit_logical_owner'
+                WHERE id = :assessment_id
+                """
+            ),
+            {
+                "work_id": assessment_work_id,
+                "work_linked_at": datetime.now(UTC),
+                "assessment_id": assessment_id,
+            },
+        )
+
+        def insert_source_owner() -> None:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_record (
+                            id,
+                            work_id,
+                            source_record_id,
+                            content_hash,
+                            raw_payload,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            'W-ASSESSMENT-UPDATE-OWNER',
+                            :content_hash,
+                            '{}'::jsonb,
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "work_id": source_work_id,
+                        "content_hash": "d" * 64,
+                    },
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(insert_source_owner)
+            try:
+                future.result(timeout=0.5)
+            except TimeoutError:
+                first_transaction.commit()
+                with pytest.raises(IntegrityError):
+                    future.result(timeout=5)
+            else:
+                first_transaction.commit()
+
+        with engine.connect() as connection:
+            owner_count = connection.scalar(
+                text(
+                    """
+                    SELECT count(DISTINCT owner.work_id)
+                    FROM (
+                        SELECT source.work_id
+                        FROM source_record AS source
+                        WHERE source.source = 'openalex'
+                          AND source.source_record_id =
+                              'W-ASSESSMENT-UPDATE-OWNER'
+                          AND source.work_id IS NOT NULL
+
+                        UNION ALL
+
+                        SELECT assessment.work_id
+                        FROM scope_assessment AS assessment
+                        JOIN source_record AS source
+                          ON source.id = assessment.source_record_id
+                        WHERE source.source = 'openalex'
+                          AND source.source_record_id =
+                              'W-ASSESSMENT-UPDATE-OWNER'
+                          AND assessment.work_id IS NOT NULL
+                    ) AS owner
+                    """
+                )
+            )
+        assert owner_count == 1
+    finally:
+        if first_transaction.is_active:
+            first_transaction.rollback()
+        first_connection.close()
+        engine.dispose()
+
+
+def test_0010_serializes_source_insert_before_assessment_update(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    assessment_work_id = uuid4()
+    source_work_id = uuid4()
+    assessment_source_id = uuid4()
+    assessment_id = uuid4()
+    first_connection = engine.connect()
+    first_transaction = first_connection.begin()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (assessment_work_id, source_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Source insert logical owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            "doi:10.1000/source-insert-owner-"
+                            f"{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        NULL,
+                        'W-SOURCE-INSERT-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_source_id,
+                    "content_hash": "e" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v1',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        NULL
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_id,
+                    "source_record_id": assessment_source_id,
+                    "evaluated_at": datetime.now(UTC),
+                },
+            )
+
+        first_connection.execute(
+            text(
+                """
+                INSERT INTO source_record (
+                    id,
+                    work_id,
+                    source_record_id,
+                    content_hash,
+                    raw_payload,
+                    source
+                )
+                VALUES (
+                    :id,
+                    :work_id,
+                    'W-SOURCE-INSERT-OWNER',
+                    :content_hash,
+                    '{}'::jsonb,
+                    'openalex'
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "work_id": source_work_id,
+                "content_hash": "f" * 64,
+            },
+        )
+
+        def update_assessment_owner() -> None:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE scope_assessment
+                        SET
+                            work_id = :work_id,
+                            work_linked_at = :work_linked_at,
+                            work_link_reason = 'explicit_logical_owner'
+                        WHERE id = :assessment_id
+                        """
+                    ),
+                    {
+                        "work_id": assessment_work_id,
+                        "work_linked_at": datetime.now(UTC),
+                        "assessment_id": assessment_id,
+                    },
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(update_assessment_owner)
+            try:
+                future.result(timeout=0.5)
+            except TimeoutError:
+                first_transaction.commit()
+                with pytest.raises(DBAPIError):
+                    future.result(timeout=5)
+            else:
+                first_transaction.commit()
+
+        with engine.connect() as connection:
+            owner_count = connection.scalar(
+                text(
+                    """
+                    SELECT count(DISTINCT owner.work_id)
+                    FROM (
+                        SELECT source.work_id
+                        FROM source_record AS source
+                        WHERE source.source = 'openalex'
+                          AND source.source_record_id =
+                              'W-SOURCE-INSERT-OWNER'
+                          AND source.work_id IS NOT NULL
+
+                        UNION ALL
+
+                        SELECT assessment.work_id
+                        FROM scope_assessment AS assessment
+                        JOIN source_record AS source
+                          ON source.id = assessment.source_record_id
+                        WHERE source.source = 'openalex'
+                          AND source.source_record_id =
+                              'W-SOURCE-INSERT-OWNER'
+                          AND assessment.work_id IS NOT NULL
+                    ) AS owner
+                    """
+                )
+            )
+        assert owner_count == 1
+    finally:
+        if first_transaction.is_active:
+            first_transaction.rollback()
+        first_connection.close()
+        engine.dispose()
+
+
+def test_0010_rejects_projection_snapshot_from_another_work(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    second_source_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (first_work_id, second_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (id, canonical_key, title, source)
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Projection owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            f"doi:10.1000/projection-owner-{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-PROJECTION-OTHER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": second_source_id,
+                    "work_id": second_work_id,
+                    "content_hash": "5" * 64,
+                },
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE work
+                        SET projection_source_record_id = :source_record_id
+                        WHERE id = :work_id
+                        """
+                    ),
+                    {
+                        "source_record_id": second_source_id,
+                        "work_id": first_work_id,
+                    },
+                )
+    finally:
+        engine.dispose()
+
+
+def test_0010_rejects_moving_metric_source_to_another_work(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id = uuid4()
+    second_work_id = uuid4()
+    source_id = uuid4()
+    measured_at = datetime(2026, 7, 16, 8, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            for index, work_id in enumerate(
+                (first_work_id, second_work_id),
+                start=1,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO work (
+                            id,
+                            canonical_key,
+                            title,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :canonical_key,
+                            'Metric source owner',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": work_id,
+                        "canonical_key": (
+                            f"doi:10.1000/metric-source-owner-{index}"
+                        ),
+                    },
+                )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source_updated_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-METRIC-SOURCE-OWNER',
+                        :content_hash,
+                        '{}'::jsonb,
+                        :measured_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": first_work_id,
+                    "content_hash": "6" * 64,
+                    "measured_at": measured_at,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO metric_snapshot (
+                        id,
+                        work_id,
+                        source_record_id,
+                        metric_name,
+                        metric_value,
+                        measured_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        :source_record_id,
+                        'citation_count',
+                        10,
+                        :measured_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "work_id": first_work_id,
+                    "source_record_id": source_id,
+                    "measured_at": measured_at,
+                },
+            )
+
+        with pytest.raises(
+            DBAPIError,
+            match="metric source record provenance is inconsistent",
+        ):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE source_record
+                        SET work_id = :work_id
+                        WHERE id = :source_record_id
+                        """
+                    ),
+                    {
+                        "work_id": second_work_id,
+                        "source_record_id": source_id,
+                    },
+                )
+    finally:
+        engine.dispose()
+
+
+def test_0010_restricts_deleting_projection_source_snapshot(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/projection-delete-restrict',
+                        'Projection delete restrict',
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-PROJECTION-DELETE',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "6" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    UPDATE work
+                    SET projection_source_record_id = :source_record_id
+                    WHERE id = :work_id
+                    """
+                ),
+                {
+                    "source_record_id": source_id,
+                    "work_id": work_id,
+                },
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text("DELETE FROM source_record WHERE id = :id"),
+                    {"id": source_id},
+                )
+    finally:
+        engine.dispose()
+
+
+def test_0010_json_null_exact_assertions_clear_nullable_projection_fields(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0009_logical_source_scope")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    source_updated_at = datetime(2026, 7, 16, 8, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (
+                        id,
+                        canonical_key,
+                        title,
+                        abstract,
+                        publication_date,
+                        projection_source,
+                        projection_source_record_id,
+                        projection_source_updated_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        'doi:10.1000/json-null-projection',
+                        'JSON null projection',
+                        'Stale abstract',
+                        DATE '2026-07-01',
+                        'openalex',
+                        'W-JSON-NULL',
+                        :source_updated_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": work_id,
+                    "source_updated_at": source_updated_at,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source_updated_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-JSON-NULL',
+                        :content_hash,
+                        '{}'::jsonb,
+                        :source_updated_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "7" * 64,
+                    "source_updated_at": source_updated_at,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v1',
+                        true,
+                        NULL,
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "source_record_id": source_id,
+                    "evaluated_at": source_updated_at,
+                    "work_id": work_id,
+                },
+            )
+            for field_name in ("abstract", "publication_date"):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO field_assertion (
+                            id,
+                            source_record_id,
+                            field_name,
+                            value,
+                            parser_version,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :source_record_id,
+                            :field_name,
+                            'null'::jsonb,
+                            'parser-v1',
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "source_record_id": source_id,
+                        "field_name": field_name,
+                    },
+                )
+
+        command.upgrade(alembic_config, "head")
+
+        with engine.connect() as connection:
+            projection = connection.execute(
+                text(
+                    """
+                    SELECT
+                        projection_source_record_id,
+                        abstract,
+                        publication_date
+                    FROM work
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": work_id},
+            ).one()
+        assert projection == (source_id, None, None)
+    finally:
+        engine.dispose()
+
+
+def test_0010_downgrade_preserves_authoritative_metric_provenance(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0010_exact_projection_scope")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    missing_metadata_metric_id = uuid4()
+    conflicting_metadata_metric_id = uuid4()
+    measured_at = datetime(2026, 7, 16, 8, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/metric-downgrade-provenance',
+                        'Metric downgrade provenance',
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source_updated_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-METRIC-DOWNGRADE',
+                        :content_hash,
+                        '{}'::jsonb,
+                        :measured_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "9" * 64,
+                    "measured_at": measured_at,
+                },
+            )
+            for metric_id, metric_name, metadata in (
+                (
+                    missing_metadata_metric_id,
+                    "citation_count",
+                    {"custom": "missing"},
+                ),
+                (
+                    conflicting_metadata_metric_id,
+                    "reference_count",
+                    {
+                        "custom": "conflicting",
+                        "source_record_id": str(uuid4()),
+                    },
+                ),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO metric_snapshot (
+                            id,
+                            work_id,
+                            source_record_id,
+                            metric_name,
+                            metric_value,
+                            measured_at,
+                            metadata,
+                            source
+                        )
+                        VALUES (
+                            :id,
+                            :work_id,
+                            :source_record_id,
+                            :metric_name,
+                            10,
+                            :measured_at,
+                            CAST(:metadata AS jsonb),
+                            'openalex'
+                        )
+                        """
+                    ),
+                    {
+                        "id": metric_id,
+                        "work_id": work_id,
+                        "source_record_id": source_id,
+                        "metric_name": metric_name,
+                        "measured_at": measured_at,
+                        "metadata": json.dumps(metadata),
+                    },
+                )
+
+        command.downgrade(
+            alembic_config,
+            "0009_logical_source_scope",
+        )
+        with engine.connect() as connection:
+            metadata_rows = connection.execute(
+                text(
+                    """
+                    SELECT id, metadata
+                    FROM metric_snapshot
+                    WHERE id IN (
+                        :missing_metadata_metric_id,
+                        :conflicting_metadata_metric_id
+                    )
+                    ORDER BY id
+                    """
+                ),
+                {
+                    "missing_metadata_metric_id": (
+                        missing_metadata_metric_id
+                    ),
+                    "conflicting_metadata_metric_id": (
+                        conflicting_metadata_metric_id
+                    ),
+                },
+            ).all()
+        metadata_by_id = {
+            row.id: row.metadata for row in metadata_rows
+        }
+        assert metadata_by_id[missing_metadata_metric_id] == {
+            "custom": "missing",
+            "source_record_id": str(source_id),
+        }
+        assert metadata_by_id[conflicting_metadata_metric_id] == {
+            "custom": "conflicting",
+            "source_record_id": str(source_id),
+        }
+
+        command.upgrade(
+            alembic_config,
+            "0010_exact_projection_scope",
+        )
+        with engine.connect() as connection:
+            restored_source_ids = set(
+                connection.scalars(
+                    text(
+                        """
+                        SELECT source_record_id
+                        FROM metric_snapshot
+                        WHERE id IN (
+                            :missing_metadata_metric_id,
+                            :conflicting_metadata_metric_id
+                        )
+                        """
+                    ),
+                    {
+                        "missing_metadata_metric_id": (
+                            missing_metadata_metric_id
+                        ),
+                        "conflicting_metadata_metric_id": (
+                            conflicting_metadata_metric_id
+                        ),
+                    },
+                )
+            )
+        assert restored_source_ids == {source_id}
+    finally:
+        engine.dispose()
+
+
+def test_0010_downgrade_rejects_non_object_metric_metadata(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0010_exact_projection_scope")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    metric_id = uuid4()
+    measured_at = datetime(2026, 7, 16, 8, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/non-object-metric-metadata',
+                        'Non-object metric metadata',
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source_updated_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-NON-OBJECT-METRIC-METADATA',
+                        :content_hash,
+                        '{}'::jsonb,
+                        :measured_at,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "a" * 64,
+                    "measured_at": measured_at,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO metric_snapshot (
+                        id,
+                        work_id,
+                        source_record_id,
+                        metric_name,
+                        metric_value,
+                        measured_at,
+                        metadata,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        :source_record_id,
+                        'citation_count',
+                        10,
+                        :measured_at,
+                        '[]'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": metric_id,
+                    "work_id": work_id,
+                    "source_record_id": source_id,
+                    "measured_at": measured_at,
+                },
+            )
+
+        with pytest.raises(
+            DBAPIError,
+            match=(
+                "cannot downgrade metric provenance: "
+                "metadata must be an object"
+            ),
+        ):
+            command.downgrade(
+                alembic_config,
+                "0009_logical_source_scope",
+            )
+
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0010_exact_projection_scope"
+            assert connection.scalar(
+                text(
+                    """
+                    SELECT metadata
+                    FROM metric_snapshot
+                    WHERE id = :metric_id
+                    """
+                ),
+                {"metric_id": metric_id},
+            ) == []
+    finally:
+        engine.dispose()
+
+
+def test_0010_downgrade_removes_stale_null_metric_provenance(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "0010_exact_projection_scope")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    metric_id = uuid4()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/stale-null-metric-provenance',
+                        'Stale null metric provenance',
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO metric_snapshot (
+                        id,
+                        work_id,
+                        source_record_id,
+                        metric_name,
+                        metric_value,
+                        measured_at,
+                        metadata,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        NULL,
+                        'reference_count',
+                        10,
+                        :measured_at,
+                        CAST(:metadata AS jsonb),
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": metric_id,
+                    "work_id": work_id,
+                    "measured_at": datetime(
+                        2026,
+                        7,
+                        16,
+                        8,
+                        tzinfo=UTC,
+                    ),
+                    "metadata": json.dumps(
+                        {
+                            "custom": "preserve",
+                            "source_record_id": str(uuid4()),
+                        }
+                    ),
+                },
+            )
+
+        command.downgrade(
+            alembic_config,
+            "0009_logical_source_scope",
+        )
+        with engine.connect() as connection:
+            metadata = connection.scalar(
+                text(
+                    """
+                    SELECT metadata
+                    FROM metric_snapshot
+                    WHERE id = :metric_id
+                    """
+                ),
+                {"metric_id": metric_id},
+            )
+        assert metadata == {"custom": "preserve"}
+    finally:
+        engine.dispose()
+
+
+def test_0010_downgrade_rejects_non_migration_scope_link_audit(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    work_id = uuid4()
+    source_id = uuid4()
+    assessment_id = uuid4()
+    linked_at = datetime(2026, 7, 16, 9, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work (id, canonical_key, title, source)
+                    VALUES (
+                        :id,
+                        'doi:10.1000/non-migration-audit',
+                        'Non-migration audit',
+                        'openalex'
+                    )
+                    """
+                ),
+                {"id": work_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'W-NON-MIGRATION-AUDIT',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "id": source_id,
+                    "work_id": work_id,
+                    "content_hash": "8" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id,
+                        work_linked_at,
+                        work_link_reason
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'scope-v2',
+                        false,
+                        'excluded',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id,
+                        :work_linked_at,
+                        'identity_replay'
+                    )
+                    """
+                ),
+                {
+                    "id": assessment_id,
+                    "source_record_id": source_id,
+                    "evaluated_at": linked_at,
+                    "work_id": work_id,
+                    "work_linked_at": linked_at,
+                },
+            )
+
+        with pytest.raises(
+            DBAPIError,
+            match="cannot downgrade scope link audit",
+        ):
+            command.downgrade(
+                alembic_config,
+                "0009_logical_source_scope",
+            )
+
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text("SELECT version_num FROM alembic_version")
+            ) == "0011_search_snapshot_revision"
+            assert connection.execute(
+                text(
+                    """
+                    SELECT work_linked_at, work_link_reason
+                    FROM scope_assessment
+                    WHERE id = :assessment_id
+                    """
+                ),
+                {"assessment_id": assessment_id},
+            ).one() == (linked_at, "identity_replay")
+    finally:
+        engine.dispose()
+
+
+def test_search_change_triggers_record_work_delete_and_identifier_lifecycle(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id, second_work_id = _insert_search_trigger_works(engine)
+    identifier_id = uuid4()
+    moved_work_id = uuid4()
+    earlier_created_at = datetime(2026, 7, 14, 8, tzinfo=UTC)
+    later_created_at = datetime(2026, 7, 18, 8, tzinfo=UTC)
+    try:
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE work
+                    SET created_at = :later_created_at
+                    WHERE id = :work_id
+                    """
+                ),
+                {
+                    "work_id": first_work_id,
+                    "later_created_at": later_created_at,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    UPDATE work
+                    SET created_at = :earlier_created_at
+                    WHERE id = :work_id
+                    """
+                ),
+                {
+                    "work_id": first_work_id,
+                    "earlier_created_at": earlier_created_at,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "work")
+        }
+        with engine.connect() as connection:
+            assert connection.scalar(
+                text(
+                    """
+                    SELECT work_created_at
+                    FROM paper_search_change
+                    WHERE revision > :revision
+                      AND work_id = :work_id
+                    """
+                ),
+                {
+                    "revision": revision,
+                    "work_id": first_work_id,
+                },
+            ) == earlier_created_at
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE work
+                    SET title = title
+                    WHERE id = :work_id
+                    """
+                ),
+                {"work_id": first_work_id},
+            )
+        assert _paper_search_change_revision(engine) == revision
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO external_identifier (
+                        id,
+                        work_id,
+                        scheme,
+                        normalized_value,
+                        raw_value,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'doi',
+                        '10.1000/search-trigger-identifier',
+                        '10.1000/search-trigger-identifier',
+                        'test'
+                    )
+                    """
+                ),
+                {
+                    "id": identifier_id,
+                    "work_id": first_work_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "external_identifier")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE external_identifier
+                    SET raw_value =
+                        'https://doi.org/10.1000/search-trigger-identifier'
+                    WHERE id = :id
+                    """
+                ),
+                {"id": identifier_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "external_identifier")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE external_identifier
+                    SET work_id = :second_work_id
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": identifier_id,
+                    "second_work_id": second_work_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "external_identifier"),
+            (second_work_id, "external_identifier"),
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM external_identifier
+                    WHERE id = :id
+                    """
+                ),
+                {"id": identifier_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "external_identifier")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE work
+                    SET id = :moved_work_id
+                    WHERE id = :work_id
+                    """
+                ),
+                {
+                    "work_id": first_work_id,
+                    "moved_work_id": moved_work_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "work"),
+            (moved_work_id, "work"),
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM work WHERE id = :work_id"),
+                {"work_id": moved_work_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (moved_work_id, "work")
+        }
+    finally:
+        engine.dispose()
+
+
+def test_search_change_triggers_record_source_and_assertion_lifecycles(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id, second_work_id = _insert_search_trigger_works(engine)
+    first_source_id = uuid4()
+    second_source_id = uuid4()
+    assertion_id = uuid4()
+    try:
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES
+                        (
+                            :first_source_id,
+                            :first_work_id,
+                            'search-trigger-source-first',
+                            :first_content_hash,
+                            '{}'::jsonb,
+                            'test'
+                        ),
+                        (
+                            :second_source_id,
+                            :first_work_id,
+                            'search-trigger-source-second',
+                            :second_content_hash,
+                            '{}'::jsonb,
+                            'test'
+                        )
+                    """
+                ),
+                {
+                    "first_source_id": first_source_id,
+                    "first_work_id": first_work_id,
+                    "first_content_hash": "a" * 64,
+                    "second_source_id": second_source_id,
+                    "second_content_hash": "b" * 64,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "source_record")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE source_record
+                    SET work_id = :second_work_id
+                    WHERE id = :first_source_id
+                    """
+                ),
+                {
+                    "first_source_id": first_source_id,
+                    "second_work_id": second_work_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "source_record"),
+            (second_work_id, "source_record"),
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE source_record
+                    SET work_id = work_id
+                    WHERE id = :first_source_id
+                    """
+                ),
+                {"first_source_id": first_source_id},
+            )
+        assert _paper_search_change_revision(engine) == revision
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE source_record
+                    SET work_id = NULL
+                    WHERE id = :first_source_id
+                    """
+                ),
+                {"first_source_id": first_source_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "source_record")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE source_record
+                    SET work_id = :second_work_id
+                    WHERE id = :first_source_id
+                    """
+                ),
+                {
+                    "first_source_id": first_source_id,
+                    "second_work_id": second_work_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "source_record")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO field_assertion (
+                        id,
+                        source_record_id,
+                        field_name,
+                        value,
+                        parser_version,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'authors',
+                        '["Search Trigger Author"]'::jsonb,
+                        'search-trigger-v1',
+                        'test'
+                    )
+                    """
+                ),
+                {
+                    "id": assertion_id,
+                    "source_record_id": first_source_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "field_assertion")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE field_assertion
+                    SET value = value
+                    WHERE id = :id
+                    """
+                ),
+                {"id": assertion_id},
+            )
+        assert _paper_search_change_revision(engine) == revision
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE field_assertion
+                    SET value = '["Updated Search Trigger Author"]'::jsonb
+                    WHERE id = :id
+                    """
+                ),
+                {"id": assertion_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "field_assertion")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE field_assertion
+                    SET source_record_id = :second_source_id
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": assertion_id,
+                    "second_source_id": second_source_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "field_assertion"),
+            (second_work_id, "field_assertion"),
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM field_assertion
+                    WHERE id = :id
+                    """
+                ),
+                {"id": assertion_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "field_assertion")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM source_record
+                    WHERE id = :first_source_id
+                    """
+                ),
+                {"first_source_id": first_source_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "source_record")
+        }
+    finally:
+        engine.dispose()
+
+
+def test_search_change_trigger_records_scope_insert_delete_and_late_owner(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id, _ = _insert_search_trigger_works(engine)
+    unowned_source_id = uuid4()
+    owned_source_id = uuid4()
+    unowned_assertion_id = uuid4()
+    delayed_assessment_id = uuid4()
+    inserted_assessment_id = uuid4()
+    evaluated_at = datetime(2026, 7, 16, 10, tzinfo=UTC)
+    try:
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :source_id,
+                        NULL,
+                        'search-trigger-logical-source',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "source_id": unowned_source_id,
+                    "content_hash": "c" * 64,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO field_assertion (
+                        id,
+                        source_record_id,
+                        field_name,
+                        value,
+                        parser_version,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'title',
+                        '"Unowned Search Trigger Assertion"'::jsonb,
+                        'search-trigger-unowned',
+                        'test'
+                    )
+                    """
+                ),
+                {
+                    "id": unowned_assertion_id,
+                    "source_record_id": unowned_source_id,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'search-trigger-delayed',
+                        false,
+                        'not-yet-linked',
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        NULL
+                    )
+                    """
+                ),
+                {
+                    "id": delayed_assessment_id,
+                    "source_record_id": unowned_source_id,
+                    "evaluated_at": evaluated_at,
+                },
+            )
+        assert _paper_search_change_revision(engine) == revision
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO source_record (
+                        id,
+                        work_id,
+                        source_record_id,
+                        content_hash,
+                        raw_payload,
+                        source
+                    )
+                    VALUES (
+                        :source_id,
+                        :work_id,
+                        'search-trigger-logical-source',
+                        :content_hash,
+                        '{}'::jsonb,
+                        'openalex'
+                    )
+                    """
+                ),
+                {
+                    "source_id": owned_source_id,
+                    "work_id": first_work_id,
+                    "content_hash": "d" * 64,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "scope_assessment")
+        }
+
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    """
+                    SELECT work_id, work_link_reason
+                    FROM scope_assessment
+                    WHERE id = :id
+                    """
+                ),
+                {"id": delayed_assessment_id},
+            ).one() == (
+                first_work_id,
+                "logical_source_owner_trigger",
+            )
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO scope_assessment (
+                        id,
+                        source_record_id,
+                        rule_version,
+                        included,
+                        reason,
+                        evidence,
+                        evaluated_at,
+                        work_id
+                    )
+                    VALUES (
+                        :id,
+                        :source_record_id,
+                        'search-trigger-insert',
+                        true,
+                        NULL,
+                        '[]'::jsonb,
+                        :evaluated_at,
+                        :work_id
+                    )
+                    """
+                ),
+                {
+                    "id": inserted_assessment_id,
+                    "source_record_id": owned_source_id,
+                    "evaluated_at": evaluated_at + timedelta(minutes=1),
+                    "work_id": first_work_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "scope_assessment")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM scope_assessment
+                    WHERE id = :id
+                    """
+                ),
+                {"id": inserted_assessment_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "scope_assessment")
+        }
+    finally:
+        engine.dispose()
+
+
+def test_search_change_triggers_record_association_and_metric_lifecycles(
+    alembic_config,
+    clean_postgres_url: str,
+) -> None:
+    command.upgrade(alembic_config, "head")
+    engine = create_engine(clean_postgres_url)
+    first_work_id, second_work_id = _insert_search_trigger_works(engine)
+    topic_id = uuid4()
+    method_id = uuid4()
+    metric_id = uuid4()
+    measured_at = datetime(2026, 7, 16, 11, tzinfo=UTC)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO topic (
+                        id,
+                        name,
+                        normalized_name,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        'Search Trigger Topic',
+                        'search-trigger-topic',
+                        'test'
+                    )
+                    """
+                ),
+                {"id": topic_id},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO method (
+                        id,
+                        name,
+                        normalized_name,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        'Search Trigger Method',
+                        'search-trigger-method',
+                        'test'
+                    )
+                    """
+                ),
+                {"id": method_id},
+            )
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work_topic (work_id, topic_id)
+                    VALUES (:work_id, :topic_id)
+                    """
+                ),
+                {
+                    "work_id": first_work_id,
+                    "topic_id": topic_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "work_topic")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE topic
+                    SET name = 'Search Trigger Topic Revised'
+                    WHERE id = :topic_id
+                    """
+                ),
+                {"topic_id": topic_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "topic")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE topic
+                    SET name = name
+                    WHERE id = :topic_id
+                    """
+                ),
+                {"topic_id": topic_id},
+            )
+        assert _paper_search_change_revision(engine) == revision
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE work_topic
+                    SET work_id = :second_work_id
+                    WHERE work_id = :first_work_id
+                      AND topic_id = :topic_id
+                    """
+                ),
+                {
+                    "first_work_id": first_work_id,
+                    "second_work_id": second_work_id,
+                    "topic_id": topic_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "work_topic"),
+            (second_work_id, "work_topic"),
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM work_topic
+                    WHERE work_id = :work_id
+                      AND topic_id = :topic_id
+                    """
+                ),
+                {
+                    "work_id": second_work_id,
+                    "topic_id": topic_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "work_topic")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO work_method (work_id, method_id)
+                    VALUES (:work_id, :method_id)
+                    """
+                ),
+                {
+                    "work_id": first_work_id,
+                    "method_id": method_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "work_method")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE method
+                    SET normalized_name = 'search-trigger-method-revised'
+                    WHERE id = :method_id
+                    """
+                ),
+                {"method_id": method_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "method")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE work_method
+                    SET work_id = :second_work_id
+                    WHERE work_id = :first_work_id
+                      AND method_id = :method_id
+                    """
+                ),
+                {
+                    "first_work_id": first_work_id,
+                    "second_work_id": second_work_id,
+                    "method_id": method_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "work_method"),
+            (second_work_id, "work_method"),
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM work_method
+                    WHERE work_id = :work_id
+                      AND method_id = :method_id
+                    """
+                ),
+                {
+                    "work_id": second_work_id,
+                    "method_id": method_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "work_method")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO metric_snapshot (
+                        id,
+                        work_id,
+                        metric_name,
+                        metric_value,
+                        measured_at,
+                        source
+                    )
+                    VALUES (
+                        :id,
+                        :work_id,
+                        'search_trigger_metric',
+                        1,
+                        :measured_at,
+                        'test'
+                    )
+                    """
+                ),
+                {
+                    "id": metric_id,
+                    "work_id": first_work_id,
+                    "measured_at": measured_at,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "metric_snapshot")
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE metric_snapshot
+                    SET work_id = :second_work_id
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": metric_id,
+                    "second_work_id": second_work_id,
+                },
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (first_work_id, "metric_snapshot"),
+            (second_work_id, "metric_snapshot"),
+        }
+
+        revision = _paper_search_change_revision(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM metric_snapshot
+                    WHERE id = :id
+                    """
+                ),
+                {"id": metric_id},
+            )
+        assert _paper_search_changes_after(engine, revision) == {
+            (second_work_id, "metric_snapshot")
+        }
     finally:
         engine.dispose()
 

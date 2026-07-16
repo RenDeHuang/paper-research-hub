@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     Enum as SqlEnum,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     Numeric,
@@ -190,22 +192,46 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
             postgresql_ops={"title": "gin_trgm_ops"},
         ),
         Index(
+            "ix_work_canonical_key_trgm",
+            "canonical_key",
+            postgresql_using="gin",
+            postgresql_ops={"canonical_key": "gin_trgm_ops"},
+        ),
+        Index(
             "ix_work_publication_date_canonical_key",
             "publication_date",
             "canonical_key",
         ),
     )
 
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    )
     canonical_key: Mapped[str] = mapped_column(String(512), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     abstract: Mapped[str | None] = mapped_column(Text)
     publication_date: Mapped[date | None] = mapped_column(Date)
     projection_source: Mapped[str | None] = mapped_column(String(64))
-    projection_source_record_id: Mapped[str | None] = mapped_column(
-        String(255)
+    projection_source_record_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey(
+            "source_record.id",
+            name="fk_work_projection_source_record_id_source_record",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
     )
     projection_source_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
+    )
+    projection_taxonomy_migration_backup: Mapped[
+        dict[str, Any] | None
+    ] = mapped_column(JSONB)
+    projection_source_record: Mapped[SourceRecord | None] = relationship(
+        foreign_keys=[projection_source_record_id],
+        passive_deletes=True,
+        post_update=True,
     )
 
     versions: Mapped[list[PaperVersion]] = relationship(
@@ -262,6 +288,18 @@ class Work(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
         back_populates="work",
         passive_deletes="all",
     )
+
+
+Index(
+    "ix_work_publication_date_desc_canonical_key",
+    Work.publication_date.desc().nullslast(),
+    Work.canonical_key.asc(),
+)
+Index("ix_work_created_at", Work.created_at)
+Index(
+    "ix_work_projection_source_record_id",
+    Work.projection_source_record_id,
+)
 
 
 class PaperVersion(UUIDPrimaryKeyMixin, ProvenanceMixin, TimestampMixin, Base):
@@ -373,6 +411,22 @@ class ScopeAssessment(UUIDPrimaryKeyMixin, Base):
             "jsonb_typeof(evidence) = 'array'",
             name="ck_scope_assessment_evidence_array",
         ),
+        CheckConstraint(
+            "("
+            "included "
+            "AND work_linked_at IS NULL "
+            "AND work_link_reason IS NULL"
+            ") OR ("
+            "NOT included AND work_id IS NULL "
+            "AND work_linked_at IS NULL "
+            "AND work_link_reason IS NULL"
+            ") OR ("
+            "NOT included AND work_id IS NOT NULL "
+            "AND work_linked_at IS NOT NULL "
+            "AND btrim(work_link_reason) <> ''"
+            ")",
+            name="ck_scope_assessment_work_link_metadata",
+        ),
         UniqueConstraint(
             "source_record_id",
             "rule_version",
@@ -410,6 +464,10 @@ class ScopeAssessment(UUIDPrimaryKeyMixin, Base):
     work_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("work.id", ondelete="CASCADE"),
     )
+    work_linked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    work_link_reason: Mapped[str | None] = mapped_column(String(64))
 
     source_record: Mapped[SourceRecord] = relationship(
         back_populates="scope_assessments",
@@ -433,6 +491,18 @@ class ExternalIdentifier(
             "scheme",
             "normalized_value",
             name="uq_external_identifier_scheme_value",
+        ),
+        Index(
+            "ix_external_identifier_normalized_value_trgm",
+            "normalized_value",
+            postgresql_using="gin",
+            postgresql_ops={"normalized_value": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_external_identifier_raw_value_trgm",
+            "raw_value",
+            postgresql_using="gin",
+            postgresql_ops={"raw_value": "gin_trgm_ops"},
         ),
     )
 
@@ -647,6 +717,16 @@ class MetricSnapshot(
             "metric_name",
             "measured_at",
         ),
+        Index(
+            "ix_metric_snapshot_repo_metric_time",
+            "code_repository_id",
+            "metric_name",
+            "measured_at",
+        ),
+        Index(
+            "ix_metric_snapshot_source_record_id",
+            "source_record_id",
+        ),
     )
 
     work_id: Mapped[UUID | None] = mapped_column(
@@ -654,6 +734,9 @@ class MetricSnapshot(
     )
     code_repository_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("code_repository.id", ondelete="CASCADE"),
+    )
+    source_record_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("source_record.id", ondelete="RESTRICT"),
     )
     metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
     metric_value: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
@@ -671,6 +754,75 @@ class MetricSnapshot(
     code_repository: Mapped[CodeRepository | None] = relationship(
         back_populates="metric_snapshots",
         passive_deletes=True,
+    )
+
+
+class PaperSearchSnapshotState(Base):
+    __tablename__ = "paper_search_snapshot_state"
+    __table_args__ = (
+        CheckConstraint(
+            "id",
+            name="ck_paper_search_snapshot_state_singleton",
+        ),
+    )
+
+    id: Mapped[bool] = mapped_column(
+        Boolean,
+        primary_key=True,
+        default=True,
+        server_default="true",
+    )
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    )
+
+
+class PaperSearchChange(Base):
+    __tablename__ = "paper_search_change"
+    __table_args__ = (
+        UniqueConstraint(
+            "transaction_id",
+            "work_id",
+            name="uq_paper_search_change_transaction_work",
+        ),
+        Index(
+            "ix_paper_search_change_revision_work_created",
+            "revision",
+            "work_created_at",
+        ),
+        Index(
+            "ix_paper_search_change_changed_revision",
+            "changed_at",
+            "revision",
+        ),
+    )
+
+    revision: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(),
+        primary_key=True,
+    )
+    transaction_id: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    work_id: Mapped[UUID] = mapped_column(Uuid, nullable=False)
+    work_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    )
+    source_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    commit_ordered: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default="false",
     )
 
 

@@ -3,7 +3,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from threading import Barrier, Lock
+from threading import Barrier, Event, Lock
 from uuid import UUID
 
 from alembic import command
@@ -292,7 +292,16 @@ def test_older_snapshot_does_not_overwrite_newer_work_projection(
         assert work.title == newer_raw["title"]
         assert work.status == RecordStatus.RETRACTED
         assert work.projection_source == "openalex"
-        assert work.projection_source_record_id == "W2741809807"
+        projection = session.get(
+            SourceRecord,
+            work.projection_source_record_id,
+        )
+        assert projection is not None
+        assert projection.source_record_id == "W2741809807"
+        assert projection.retrieved_at == _record(
+            newer_raw,
+            minute=5,
+        ).retrieved_at
         assert work.projection_source_updated_at == datetime(
             2026,
             7,
@@ -305,6 +314,250 @@ def test_older_snapshot_does_not_overwrite_newer_work_projection(
             session.scalar(select(func.count()).select_from(SourceRecord))
             == 2
         )
+
+
+def test_replay_with_nullable_projection_timestamp_keeps_newer_projection(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import SourceRecord, Work
+
+    older_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    older_raw["title"] = "Older Nullable Timestamp Agent"
+    older_raw["display_name"] = older_raw["title"]
+    older_raw["updated_date"] = "2026-07-14T08:00:00"
+    older_raw["topics"] = [
+        {
+            "id": "https://openalex.org/T90002",
+            "display_name": "Older Nullable Topic",
+            "score": 0.8,
+        }
+    ]
+    newer_raw = json.loads(json.dumps(older_raw))
+    newer_raw["title"] = "Newer Nullable Timestamp Agent"
+    newer_raw["display_name"] = newer_raw["title"]
+    newer_raw["updated_date"] = "2026-07-16T08:00:00"
+    newer_raw["cited_by_count"] = (
+        int(newer_raw.get("cited_by_count") or 0) + 1
+    )
+    newer_raw["topics"] = [
+        {
+            "id": "https://openalex.org/T90003",
+            "display_name": "Newer Nullable Topic",
+            "score": 0.9,
+        }
+    ]
+    older_record = _record(older_raw, minute=1)
+    newer_record = _record(newer_raw, minute=2)
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(newer_record)
+        session.commit()
+        IngestionService(session).ingest(older_record)
+        session.commit()
+
+        work = session.get(Work, first.work_id)
+        assert work is not None
+        newer_projection_id = work.projection_source_record_id
+        newer_projection = session.get(SourceRecord, newer_projection_id)
+        assert newer_projection is not None
+        assert newer_projection.retrieved_at == newer_record.retrieved_at
+
+        session.execute(
+            text(
+                """
+                UPDATE work
+                SET projection_source_updated_at = NULL
+                WHERE id = :work_id
+                """
+            ),
+            {"work_id": first.work_id},
+        )
+        session.commit()
+        session.expire_all()
+
+        replay = IngestionService(session).ingest(older_record)
+        session.commit()
+        session.expire_all()
+
+        work = session.get(Work, first.work_id)
+        assert work is not None
+        assert replay.status == "unchanged"
+        assert work.projection_source_record_id == newer_projection_id
+        assert work.projection_source_updated_at is None
+        assert work.title == newer_raw["title"]
+        assert {topic.normalized_name for topic in work.topics} == {
+            "newer nullable topic"
+        }
+
+
+def test_new_projection_replaces_work_taxonomy_with_exact_snapshot(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import Benchmark, Dataset, Method, Work
+
+    older_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    newer_raw = json.loads(json.dumps(older_raw))
+    newer_raw["updated_date"] = "2026-07-16T08:00:00"
+    newer_raw["cited_by_count"] = (
+        int(newer_raw.get("cited_by_count") or 0) + 1
+    )
+    newer_raw["topics"] = [
+        {
+            "id": "https://openalex.org/T90001",
+            "display_name": "Exact Projection Topic",
+            "score": 0.999,
+        }
+    ]
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(_record(older_raw))
+        session.commit()
+
+        work = session.get(Work, first.work_id)
+        assert work is not None
+        work.methods.append(
+            Method(
+                name="Stale Projection Method",
+                normalized_name="stale-projection-method",
+                description=None,
+                source="test",
+                retrieved_at=datetime(2026, 7, 15, tzinfo=UTC),
+            )
+        )
+        work.datasets.append(
+            Dataset(
+                name="Stale Projection Dataset",
+                normalized_name="stale-projection-dataset",
+                description=None,
+                homepage_url=None,
+                source="test",
+                retrieved_at=datetime(2026, 7, 15, tzinfo=UTC),
+            )
+        )
+        work.benchmarks.append(
+            Benchmark(
+                name="Stale Projection Benchmark",
+                normalized_name="stale-projection-benchmark",
+                description=None,
+                homepage_url=None,
+                source="test",
+                retrieved_at=datetime(2026, 7, 15, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        second = IngestionService(session).ingest(
+            _record(newer_raw, minute=5)
+        )
+        session.commit()
+        session.expire_all()
+
+        work = session.get(Work, first.work_id)
+        assert work is not None
+        assert second.status == "updated"
+        assert work.projection_source_record_id == second.source_record_id
+        assert {topic.name for topic in work.topics} == {
+            "Exact Projection Topic"
+        }
+        assert work.methods == []
+        assert work.datasets == []
+        assert work.benchmarks == []
+
+
+def test_non_projection_snapshot_does_not_change_work_taxonomy(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import Benchmark, Dataset, Method, Work
+
+    current_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    current_raw["updated_date"] = "2026-07-16T08:00:00"
+    current_raw["topics"] = [
+        {
+            "id": "https://openalex.org/T90002",
+            "display_name": "Current Projection Topic",
+            "score": 0.999,
+        }
+    ]
+    lower_priority_raw = json.loads(json.dumps(current_raw))
+    lower_priority_raw["updated_date"] = "2026-07-15T08:00:00"
+    lower_priority_raw["cited_by_count"] = (
+        int(lower_priority_raw.get("cited_by_count") or 0) + 1
+    )
+    lower_priority_raw["topics"] = [
+        {
+            "id": "https://openalex.org/T90003",
+            "display_name": "Rejected Lower Priority Topic",
+            "score": 0.999,
+        }
+    ]
+
+    with Session(migrated_engine) as session:
+        current = IngestionService(session).ingest(
+            _record(current_raw)
+        )
+        session.commit()
+
+        work = session.get(Work, current.work_id)
+        assert work is not None
+        work.methods.append(
+            Method(
+                name="Current Projection Method",
+                normalized_name="current-projection-method",
+                description=None,
+                source="test",
+                retrieved_at=datetime(2026, 7, 16, tzinfo=UTC),
+            )
+        )
+        work.datasets.append(
+            Dataset(
+                name="Current Projection Dataset",
+                normalized_name="current-projection-dataset",
+                description=None,
+                homepage_url=None,
+                source="test",
+                retrieved_at=datetime(2026, 7, 16, tzinfo=UTC),
+            )
+        )
+        work.benchmarks.append(
+            Benchmark(
+                name="Current Projection Benchmark",
+                normalized_name="current-projection-benchmark",
+                description=None,
+                homepage_url=None,
+                source="test",
+                retrieved_at=datetime(2026, 7, 16, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+        lower_priority = IngestionService(session).ingest(
+            _record(lower_priority_raw, minute=5)
+        )
+        session.commit()
+        session.expire_all()
+
+        work = session.get(Work, current.work_id)
+        assert work is not None
+        assert lower_priority.status == "updated"
+        assert (
+            work.projection_source_record_id
+            == current.source_record_id
+        )
+        assert {topic.name for topic in work.topics} == {
+            "Current Projection Topic"
+        }
+        assert {method.name for method in work.methods} == {
+            "Current Projection Method"
+        }
+        assert {dataset.name for dataset in work.datasets} == {
+            "Current Projection Dataset"
+        }
+        assert {benchmark.name for benchmark in work.benchmarks} == {
+            "Current Projection Benchmark"
+        }
 
 
 @pytest.mark.parametrize(
@@ -388,7 +641,13 @@ def test_same_rule_replay_after_projection_reset_converges_to_latest_snapshot(
         assert work.abstract == "Newest retracted LLM agent abstract"
         assert work.status == RecordStatus.RETRACTED
         assert work.projection_source == "openalex"
-        assert work.projection_source_record_id == "W2741809807"
+        projection = session.get(
+            SourceRecord,
+            work.projection_source_record_id,
+        )
+        assert projection is not None
+        assert projection.source_record_id == "W2741809807"
+        assert projection.retrieved_at == records["newer"].retrieved_at
         assert (
             work.projection_source_updated_at
             == records["newer"].source_updated_at
@@ -484,6 +743,148 @@ def test_concurrent_shared_canonical_identity_creates_one_work(
         assert (
             session.scalar(select(func.count()).select_from(SourceRecord))
             == 2
+        )
+
+
+def test_concurrent_disjoint_identifiers_cannot_regress_work_projection(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import SourceRecord, Work
+
+    seed_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    seed_raw["updated_date"] = "2026-07-13T08:00:00"
+    seed_record = _record(seed_raw)
+    identifiers = {
+        identifier.scheme: identifier
+        for identifier in seed_record.parsed.external_identifiers
+    }
+    doi_identifier = identifiers["doi"]
+    openalex_identifier = identifiers["openalex"]
+
+    older_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    older_raw["id"] = "https://openalex.org/W9000000001"
+    older_raw["ids"]["openalex"] = older_raw["id"]
+    older_raw["title"] = "Stale Older Disjoint Identity Projection"
+    older_raw["display_name"] = older_raw["title"]
+    older_raw["updated_date"] = "2026-07-14T08:00:00"
+    older = _record(older_raw, minute=1)
+    older = replace(
+        older,
+        parsed=replace(
+            older.parsed,
+            canonical_key=(
+                f"{doi_identifier.scheme}:"
+                f"{doi_identifier.normalized_value}"
+            ),
+            external_identifiers=(doi_identifier,),
+        ),
+    )
+
+    newer_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    newer_raw["id"] = "https://openalex.org/W9000000002"
+    newer_raw["ids"]["openalex"] = newer_raw["id"]
+    newer_raw["title"] = "Fresh Newer Disjoint Identity Projection"
+    newer_raw["display_name"] = newer_raw["title"]
+    newer_raw["updated_date"] = "2026-07-16T08:00:00"
+    newer = _record(newer_raw, minute=2)
+    newer = replace(
+        newer,
+        parsed=replace(
+            newer.parsed,
+            canonical_key=(
+                f"{openalex_identifier.scheme}:"
+                f"{openalex_identifier.normalized_value}"
+            ),
+            external_identifiers=(openalex_identifier,),
+        ),
+    )
+    assert {
+        identifier.scheme
+        for identifier in older.parsed.external_identifiers
+    } == {"doi"}
+    assert {
+        identifier.scheme
+        for identifier in newer.parsed.external_identifiers
+    } == {"openalex"}
+    assert older.source_record_id != newer.source_record_id
+    assert older.content_hash != newer.content_hash
+    assert older.source_updated_at < newer.source_updated_at
+
+    with Session(migrated_engine) as session:
+        seed = IngestionService(session).ingest(seed_record)
+        session.commit()
+
+    resolution_barrier = Barrier(2)
+    newer_committed = Event()
+
+    class CoordinatedIngestionService(IngestionService):
+        def __init__(self, session, *, label: str) -> None:
+            super().__init__(session)
+            self.label = label
+
+        def _resolve_work(self, parsed):
+            work = super()._resolve_work(parsed)
+            resolution_barrier.wait(timeout=10)
+            if self.label == "older":
+                assert newer_committed.wait(timeout=10)
+            return work
+
+    def ingest_once(label: str, record) -> tuple[str, UUID, UUID, str]:
+        with Session(migrated_engine) as session:
+            result = CoordinatedIngestionService(
+                session,
+                label=label,
+            ).ingest(record)
+            observed = session.get(Work, seed.work_id)
+            assert observed is not None
+            observed_projection_id = observed.projection_source_record_id
+            observed_title = observed.title
+            session.commit()
+            if label == "newer":
+                newer_committed.set()
+            assert result.work_id is not None
+            assert observed_projection_id is not None
+            return (
+                result.status,
+                result.work_id,
+                observed_projection_id,
+                observed_title,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            future.result(timeout=30)
+            for future in (
+                executor.submit(ingest_once, "older", older),
+                executor.submit(ingest_once, "newer", newer),
+            )
+        )
+
+    assert sorted(result[0] for result in results) == [
+        "updated",
+        "updated",
+    ]
+    assert {result[1] for result in results} == {seed.work_id}
+    with Session(migrated_engine) as session:
+        work = session.get(Work, seed.work_id)
+        assert work is not None
+        projection = session.get(
+            SourceRecord,
+            work.projection_source_record_id,
+        )
+        assert projection is not None
+        assert work.title == newer_raw["title"]
+        assert work.projection_source_updated_at == newer.source_updated_at
+        assert projection.source_record_id == newer.source_record_id
+        assert {
+            result[2] for result in results
+        } == {work.projection_source_record_id}
+        assert {result[3] for result in results} == {newer_raw["title"]}
+        assert session.scalar(select(func.count()).select_from(Work)) == 1
+        assert (
+            session.scalar(select(func.count()).select_from(SourceRecord))
+            == 3
         )
 
 
@@ -943,7 +1344,9 @@ def test_scope_rule_upgrade_from_excluded_to_included_reuses_snapshot(
                     reason,
                     evidence,
                     evaluated_at,
-                    work_id
+                    work_id,
+                    work_linked_at,
+                    work_link_reason
                 FROM scope_assessment
                 WHERE source_record_id = :source_record_id
                 ORDER BY rule_version
@@ -959,7 +1362,11 @@ def test_scope_rule_upgrade_from_excluded_to_included_reuses_snapshot(
         )
         assert assessments[0]["evidence"] == []
         assert assessments[0]["evaluated_at"] is not None
-        assert assessments[0]["work_id"] is None
+        assert assessments[0]["work_id"] == second.work_id
+        assert assessments[0]["work_linked_at"] is not None
+        assert assessments[0]["work_link_reason"] == (
+            "logical_source_owner_trigger"
+        )
         assert assessments[1]["rule_version"] == "agent-llm-scope-v2"
         assert assessments[1]["included"] is True
         assert assessments[1]["reason"] is None
@@ -1240,13 +1647,155 @@ def test_new_included_hash_overrides_prior_unassociated_exclusion(
             )
         )
         assert old_assessment is not None
-        assert old_assessment.work_id is None
+        assert old_assessment.work_id == included.work_id
         assert included.work_id is not None
         assert session.scalar(
             select(func.count())
             .select_from(Work)
             .where(public_work_predicate())
         ) == 1
+
+
+def test_newer_exclusion_ingested_first_is_linked_when_older_include_creates_work(
+    migrated_engine,
+) -> None:
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.models import ScopeAssessment, Work
+    from paper_hub.repositories import public_work_predicate
+
+    older_included = _with_scope(
+        _record(_fixture()["results"][0], minute=0),
+        rule_version="agent-llm-scope-v1",
+        included=True,
+    )
+    newer_excluded = _new_hash_with_scope(
+        older_included,
+        minute=1,
+        included=False,
+        rule_version="agent-llm-scope-v1",
+    )
+
+    with Session(migrated_engine) as session:
+        excluded = IngestionService(session).ingest(newer_excluded)
+        session.commit()
+        included = IngestionService(session).ingest(older_included)
+        session.commit()
+        session.expire_all()
+
+        assessment = session.scalar(
+            select(ScopeAssessment).where(
+                ScopeAssessment.source_record_id
+                == excluded.source_record_id
+            )
+        )
+        assert assessment is not None
+        assert included.work_id is not None
+        assert assessment.work_id == included.work_id
+        assert assessment.work_linked_at is not None
+        assert assessment.work_link_reason == (
+            "logical_source_owner_trigger"
+        )
+        assert session.scalar(
+            select(func.count())
+            .select_from(Work)
+            .where(public_work_predicate())
+        ) == 0
+
+
+def test_projection_uses_exact_latest_snapshot_when_source_times_match(
+    migrated_engine,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from paper_hub.db import get_session
+    from paper_hub.ingestion import IngestionService
+    from paper_hub.main import app
+    from paper_hub.models import MetricSnapshot, SourceRecord, Work
+
+    older_raw = json.loads(json.dumps(_fixture()["results"][0]))
+    older_raw["title"] = "Older LLM Agent Projection"
+    older_raw["display_name"] = older_raw["title"]
+    older_raw["type"] = "preprint"
+    older_raw["authorships"][0]["author"]["display_name"] = (
+        "Old Projection Author"
+    )
+    newer_raw = json.loads(json.dumps(older_raw))
+    newer_raw["title"] = "Newer LLM Agent Projection"
+    newer_raw["display_name"] = newer_raw["title"]
+    newer_raw["type"] = "article"
+    newer_raw["authorships"][0]["author"]["display_name"] = (
+        "New Projection Author"
+    )
+    newer_raw["cited_by_count"] = (
+        int(newer_raw.get("cited_by_count") or 0) + 1
+    )
+    older_record = _record(older_raw, minute=0)
+    newer_record = _record(newer_raw, minute=5)
+    assert older_record.source_updated_at == newer_record.source_updated_at
+
+    with Session(migrated_engine) as session:
+        first = IngestionService(session).ingest(older_record)
+        session.commit()
+        second = IngestionService(session).ingest(newer_record)
+        session.commit()
+        session.expire_all()
+
+        work = session.get(Work, first.work_id)
+        assert work is not None
+        newer_source = session.get(SourceRecord, second.source_record_id)
+        assert newer_source is not None
+        assert work.projection_source_record_id == newer_source.id
+        assert work.title == newer_raw["title"]
+        metric = session.scalar(
+            select(MetricSnapshot).where(
+                MetricSnapshot.work_id == first.work_id,
+                MetricSnapshot.metric_name == "citation_count",
+                MetricSnapshot.measured_at
+                == newer_record.source_updated_at,
+                MetricSnapshot.source == newer_record.source,
+            )
+        )
+        assert metric is not None
+        assert int(metric.metric_value) == (
+            newer_record.parsed.citation_count
+        )
+        assert metric.details["source_record_id"] == str(
+            second.source_record_id
+        )
+
+    def override_session():
+        with Session(migrated_engine) as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        with TestClient(app) as client:
+            old_author = client.get(
+                "/api/v1/papers",
+                params={"q": "Old Projection Author"},
+            )
+            new_author = client.get(
+                "/api/v1/papers",
+                params={"q": "New Projection Author"},
+            )
+            old_type = client.get(
+                "/api/v1/papers",
+                params={"type": "preprint"},
+            )
+            new_type = client.get(
+                "/api/v1/papers",
+                params={"type": "article"},
+            )
+
+        assert old_author.json()["total"] == 0
+        assert new_author.json()["total"] == 1
+        assert new_author.json()["items"][0]["authors"][0][
+            "display_name"
+        ] == "New Projection Author"
+        assert old_type.json()["total"] == 0
+        assert new_type.json()["total"] == 1
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_replayed_exclusion_links_to_work_created_by_independent_source(
@@ -1564,6 +2113,77 @@ def test_cli_reports_committed_inserted_and_excluded_counts(
             )
         )
         assert scope_assessment.included is False
+    get_settings.cache_clear()
+
+
+def test_cli_holds_global_batch_lock_before_first_ingest(
+    migrated_engine,
+    monkeypatch,
+    capsys,
+) -> None:
+    from paper_hub import cli
+    from paper_hub.config import get_settings
+
+    class OneRecordConnector:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def fetch_records(self, **_: object):
+            yield _record(_fixture()["results"][0])
+
+    real_ingestion_service = cli.IngestionService
+    competing_lock_results: list[bool] = []
+
+    class LockObservingIngestionService:
+        def __init__(self, session) -> None:
+            self.delegate = real_ingestion_service(session)
+
+        def ingest(self, record):
+            with migrated_engine.connect() as connection:
+                competing_lock_results.append(
+                    bool(
+                        connection.scalar(
+                            text(
+                                """
+                                SELECT pg_try_advisory_xact_lock(
+                                    hashtextextended(
+                                        'paper-hub:sync-openalex:batch:v1',
+                                        0
+                                    )
+                                )
+                                """
+                            )
+                        )
+                    )
+                )
+            return self.delegate.ingest(record)
+
+    database_url = migrated_engine.url.render_as_string(
+        hide_password=False
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("OPENALEX_CONTACT_EMAIL", "research@example.com")
+    monkeypatch.setattr(cli, "OpenAlexConnector", OneRecordConnector)
+    monkeypatch.setattr(
+        cli,
+        "IngestionService",
+        LockObservingIngestionService,
+    )
+    get_settings.cache_clear()
+
+    exit_code = cli.main(
+        ["sync-openalex", "--query", "agents", "--max-results", "1"]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0, captured.err
+    assert competing_lock_results == [False]
     get_settings.cache_clear()
 
 

@@ -41,6 +41,11 @@ class Settings(BaseSettings):
         ge=0,
         le=300,
     )
+    current_scope_rule_version: str = Field(
+        default="agent-llm-v1",
+        min_length=1,
+        max_length=128,
+    )
 
     @field_validator("database_url")
     @classmethod
@@ -65,6 +70,16 @@ class Settings(BaseSettings):
         if not EMAIL_PATTERN.fullmatch(normalized):
             raise ValueError(
                 "OPENALEX_CONTACT_EMAIL must be a valid email address"
+            )
+        return normalized
+
+    @field_validator("current_scope_rule_version")
+    @classmethod
+    def normalize_current_scope_rule_version(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(
+                "CURRENT_SCOPE_RULE_VERSION must not be blank"
             )
         return normalized
 

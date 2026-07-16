@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from statistics import median
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -36,7 +37,15 @@ class CitationSeries:
     subject_id: UUID
     publication_month: str
     work_type: str
+    topics: tuple[str, ...]
     observations: tuple[MetricObservation, ...]
+
+
+@dataclass(frozen=True)
+class CitationTopicCohort:
+    topic: str
+    percentile: Decimal
+    cohort_size: int
 
 
 @dataclass(frozen=True)
@@ -44,9 +53,9 @@ class CitationVelocity:
     subject_id: UUID
     velocity_per_day: Decimal
     percentile: Decimal
-    cohort_size: int
     publication_month: str
     work_type: str
+    topic_cohorts: tuple[CitationTopicCohort, ...]
 
 
 @dataclass(frozen=True)
@@ -58,16 +67,41 @@ class CitationVelocityResult:
 @dataclass(frozen=True)
 class Confidence:
     level: str
+    sample_size: int
     explanation: str
 
 
 def metric_velocity(
     observations: Sequence[MetricObservation],
+    *,
+    window_start: datetime | None = None,
+    as_of: datetime | None = None,
 ) -> Decimal | None:
+    if (window_start is None) != (as_of is None):
+        raise ValueError(
+            "window_start and as_of must be provided together"
+        )
     ordered = sorted(
         observations,
         key=lambda observation: observation.measured_at,
     )
+    if window_start is not None and as_of is not None:
+        baseline_candidates = [
+            observation
+            for observation in ordered
+            if observation.measured_at <= window_start
+        ]
+        current_candidates = [
+            observation
+            for observation in ordered
+            if observation.measured_at <= as_of
+        ]
+        if not baseline_candidates or not current_candidates:
+            return None
+        ordered = [
+            baseline_candidates[-1],
+            current_candidates[-1],
+        ]
     distinct_times = {observation.measured_at for observation in ordered}
     if len(ordered) < 2 or len(distinct_times) < 2:
         return None
@@ -87,6 +121,15 @@ def calculate_citation_velocity(
     measured: list[tuple[CitationSeries, Decimal]] = []
     missing: list[dict[str, str]] = []
     for candidate in series:
+        if not candidate.topics:
+            missing.append(
+                {
+                    "subject_id": str(candidate.subject_id),
+                    "signal": "topics",
+                    "reason": "at_least_one_topic_is_required_for_cohort",
+                }
+            )
+            continue
         velocity = metric_velocity(candidate.observations)
         if velocity is None:
             missing.append(
@@ -101,28 +144,49 @@ def calculate_citation_velocity(
             continue
         measured.append((candidate, velocity))
 
-    cohorts: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
+    cohorts: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     for candidate, velocity in measured:
-        cohorts[
-            (candidate.publication_month, candidate.work_type)
-        ].append(velocity)
+        for topic in candidate.topics:
+            cohorts[
+                (
+                    topic,
+                    candidate.publication_month,
+                    candidate.work_type,
+                )
+            ].append(velocity)
 
     items = []
     for candidate, velocity in measured:
-        cohort = cohorts[
-            (candidate.publication_month, candidate.work_type)
-        ]
-        percentile = Decimal(
-            sum(value <= velocity for value in cohort)
-        ) / Decimal(len(cohort))
+        topic_cohorts = []
+        for topic in sorted(set(candidate.topics)):
+            cohort = cohorts[
+                (
+                    topic,
+                    candidate.publication_month,
+                    candidate.work_type,
+                )
+            ]
+            topic_cohorts.append(
+                CitationTopicCohort(
+                    topic=topic,
+                    percentile=Decimal(
+                        sum(value <= velocity for value in cohort)
+                    )
+                    / Decimal(len(cohort)),
+                    cohort_size=len(cohort),
+                )
+            )
+        percentile = median(
+            item.percentile for item in topic_cohorts
+        )
         items.append(
             CitationVelocity(
                 subject_id=candidate.subject_id,
                 velocity_per_day=velocity,
                 percentile=percentile,
-                cohort_size=len(cohort),
                 publication_month=candidate.publication_month,
                 work_type=candidate.work_type,
+                topic_cohorts=tuple(topic_cohorts),
             )
         )
 
@@ -166,6 +230,7 @@ def sample_confidence(*, sample_size: int) -> Confidence:
     if sample_size < 20:
         return Confidence(
             level="low",
+            sample_size=sample_size,
             explanation=(
                 "Low confidence: small sample; the score is descriptive "
                 "and is not a significance claim."
@@ -174,6 +239,7 @@ def sample_confidence(*, sample_size: int) -> Confidence:
     if sample_size < 100:
         return Confidence(
             level="medium",
+            sample_size=sample_size,
             explanation=(
                 "Medium confidence: moderate sample; interpret rank "
                 "differences cautiously."
@@ -181,6 +247,7 @@ def sample_confidence(*, sample_size: int) -> Confidence:
         )
     return Confidence(
         level="high",
+        sample_size=sample_size,
         explanation=(
             "High descriptive coverage; this still does not imply "
             "causal or statistical significance."
@@ -230,65 +297,42 @@ class RankingService:
         generated_at: datetime | None = None,
     ) -> dict[str, object]:
         now = generated_at or datetime.now(UTC)
-        counts = self.repository.taxonomy_window_counts(
+        ranking = self.repository.taxonomy_window_ranking(
             subject=subject,
             generated_at=now,
             window_days=window_days,
+            limit=limit,
             excluded_statuses=RANKING_EXCLUDED_STATUSES,
         )
-        current_total = counts.current_total
-        baseline_total = counts.baseline_total
+        current_total = ranking.current_total
+        baseline_total = ranking.baseline_total
         items: list[dict[str, object]] = []
-        missing: list[dict[str, str]] = []
 
-        for row in counts.items:
-            sample_size = row.current_count + row.baseline_count
+        for row in ranking.items:
+            sample_size = (
+                row.current_total + row.baseline_total
+                if subject == "method"
+                else row.current_count + row.baseline_count
+            )
             confidence = sample_confidence(sample_size=sample_size)
-            if subject == "topic":
-                score = growth_rate_delta(
-                    current_count=row.current_count,
-                    baseline_count=row.baseline_count,
-                    window_days=window_days,
-                )
-            else:
-                score = adoption_share_delta(
-                    current_count=row.current_count,
-                    current_total=current_total,
-                    baseline_count=row.baseline_count,
-                    baseline_total=baseline_total,
-                )
-                if score is None:
-                    missing.append(
-                        {
-                            "normalized_name": row.normalized_name,
-                            "signal": "publication_window_denominator",
-                            "reason": (
-                                "current_and_baseline_windows_require_data"
-                            ),
-                        }
-                    )
-                    continue
             items.append(
                 {
                     "id": row.id,
                     "name": row.name,
                     "normalized_name": row.normalized_name,
-                    "score": float(score),
+                    "score": float(row.score),
                     "current_count": row.current_count,
                     "baseline_count": row.baseline_count,
+                    "current_total": row.current_total,
+                    "baseline_total": row.baseline_total,
                     "confidence": {
                         "level": confidence.level,
+                        "sample_size": confidence.sample_size,
                         "explanation": confidence.explanation,
                     },
                 }
             )
 
-        items.sort(
-            key=lambda item: (
-                -float(item["score"]),
-                str(item["normalized_name"]),
-            )
-        )
         overall_confidence = sample_confidence(
             sample_size=current_total + baseline_total
         )
@@ -314,18 +358,26 @@ class RankingService:
             "window_days": window_days,
             "generated_at": now,
             "coverage": {
-                "eligible_subjects": len(counts.items),
-                "ranked_subjects": len(items),
+                "total_eligible": ranking.eligible_subjects,
+                "subjects_with_signal": ranking.ranked_subjects,
+                "ranked_subjects": ranking.ranked_subjects,
+                "returned_subjects": len(items),
+                "signal_coverage": (
+                    ranking.ranked_subjects / ranking.eligible_subjects
+                    if ranking.eligible_subjects
+                    else 1.0
+                ),
                 "current_total": current_total,
                 "baseline_total": baseline_total,
-                "confidence": overall_confidence.level,
-                "confidence_explanation": (
-                    overall_confidence.explanation
-                ),
+                "confidence": {
+                    "level": overall_confidence.level,
+                    "sample_size": overall_confidence.sample_size,
+                    "explanation": overall_confidence.explanation,
+                },
             },
-            "missing_signals": missing,
+            "missing_signals": list(ranking.missing_signals),
             "explanation": explanation,
-            "items": items[:limit],
+            "items": items,
         }
 
     def _latest(
@@ -335,55 +387,76 @@ class RankingService:
         window_days: int,
         limit: int,
     ) -> dict[str, object]:
-        works = self.repository.rankable_works(
+        ranking = self.repository.latest_work_ranking(
+            generated_at=now,
+            window_days=window_days,
+            limit=limit,
             excluded_statuses=RANKING_EXCLUDED_STATUSES,
         )
-        cutoff = (now - timedelta(days=window_days)).date()
-        candidates = [
-            work
-            for work in works
-            if work.publication_date is not None
-            and cutoff <= work.publication_date <= now.date()
-        ]
-        candidates.sort(
-            key=lambda work: (
-                -work.publication_date.toordinal(),
-                work.canonical_key,
+        items = []
+        for item in ranking.items:
+            sources = [
+                name
+                for name, value in (
+                    ("publication", item.publication_at),
+                    ("version", item.version_at),
+                    ("projection", item.projection_at),
+                )
+                if value == item.effective_at
+            ]
+            items.append(
+                self.repository.paper_trend_item(
+                    item.work,
+                    score=item.effective_at.timestamp(),
+                    details={
+                        "effective_at": item.effective_at.isoformat(),
+                        "effective_source": (
+                            sources[0] if len(sources) == 1 else "multiple"
+                        ),
+                        "effective_sources": sources,
+                        "publication_at": (
+                            item.publication_at.isoformat()
+                            if item.publication_at is not None
+                            else None
+                        ),
+                        "version_at": (
+                            item.version_at.isoformat()
+                            if item.version_at is not None
+                            else None
+                        ),
+                        "projection_at": (
+                            item.projection_at.isoformat()
+                            if item.projection_at is not None
+                            else None
+                        ),
+                    },
+                )
             )
-        )
-        items = [
-            self.repository.paper_trend_item(
-                work,
-                score=float(work.publication_date.toordinal()),
-                details={"publication_date": work.publication_date.isoformat()},
-            )
-            for work in candidates[:limit]
-        ]
         return {
             "ranking_name": "latest",
             "formula_version": LATEST_FORMULA_VERSION,
             "window_days": window_days,
             "generated_at": now,
             "coverage": {
-                "eligible_subjects": len(candidates),
-                "ranked_subjects": len(items),
-                "total_in_scope": len(works),
+                "total_eligible": ranking.total_in_scope,
+                "subjects_with_signal": ranking.subjects_with_signal,
+                "ranked_subjects": ranking.ranked_subjects,
+                "returned_subjects": len(items),
                 "signal_coverage": (
-                    len(candidates) / len(works) if works else 1.0
+                    ranking.subjects_with_signal / ranking.total_in_scope
+                    if ranking.total_in_scope
+                    else 1.0
+                ),
+                "confidence": self._confidence_payload(
+                    sample_size=ranking.ranked_subjects
                 ),
             },
-            "missing_signals": [
-                self.repository.paper_missing_signal(
-                    work,
-                    signal="publication_date",
-                    reason="publication_date_is_missing",
-                )
-                for work in works
-                if work.publication_date is None
-            ],
+            "missing_signals": [],
             "explanation": (
-                "Ordered by publication date descending, then canonical "
-                "key ascending. No quality or popularity score is mixed in."
+                "Ordered by the maximum of publication time, version update "
+                "time and exact projection update time within the requested "
+                "duration, then canonical key ascending. No quality or "
+                "popularity score is mixed in."
             ),
             "items": items,
         }
@@ -395,97 +468,39 @@ class RankingService:
         window_days: int,
         limit: int,
     ) -> dict[str, object]:
-        works = self.repository.rankable_works(
+        ranking = self.repository.citation_velocity_ranking(
+            generated_at=now,
+            window_days=window_days,
+            limit=limit,
             excluded_statuses=RANKING_EXCLUDED_STATUSES,
         )
-        by_id = {work.id: work for work in works}
-        types = self.repository.projection_assertion_values(
-            tuple(by_id),
-            field_name="type",
-        )
-        observations = self.repository.work_metric_observations(
-            work_ids=tuple(by_id),
-            metric_name="citation_count",
-            start=now - timedelta(days=window_days),
-            end=now,
-        )
-        series: list[CitationSeries] = []
-        missing: list[dict[str, object]] = []
-        for work in works:
-            work_type = types.get(work.id)
-            if work.publication_date is None:
-                missing.append(
-                    self.repository.paper_missing_signal(
-                        work,
-                        signal="publication_date",
-                        reason="publication_month_is_required_for_cohort",
-                    )
-                )
-                continue
-            if not isinstance(work_type, str) or not work_type:
-                missing.append(
-                    self.repository.paper_missing_signal(
-                        work,
-                        signal="work_type",
-                        reason="work_type_is_required_for_cohort",
-                    )
-                )
-                continue
-            series.append(
-                CitationSeries(
-                    subject_id=work.id,
-                    publication_month=work.publication_date.strftime("%Y-%m"),
-                    work_type=work_type,
-                    observations=tuple(
-                        MetricObservation(
-                            measured_at=item.measured_at,
-                            value=item.value,
-                        )
-                        for item in observations.get(work.id, ())
-                    ),
-                )
-            )
-        calculation = calculate_citation_velocity(series)
-        for item in calculation.missing_signals:
-            work = by_id[UUID(item["subject_id"])]
-            missing.append(
-                self.repository.paper_missing_signal(
-                    work,
-                    signal=item["signal"],
-                    reason=item["reason"],
-                )
-            )
-        items = [
-            self.repository.paper_trend_item(
-                by_id[item.subject_id],
-                score=float(item.velocity_per_day),
-                percentile=float(item.percentile),
-                details={
-                    "cohort_size": item.cohort_size,
-                    "publication_month": item.publication_month,
-                    "work_type": item.work_type,
-                },
-            )
-            for item in calculation.items[:limit]
-        ]
+        items = list(ranking.items)
         return {
             "ranking_name": "citation_velocity",
             "formula_version": CITATION_VELOCITY_FORMULA_VERSION,
             "window_days": window_days,
             "generated_at": now,
             "coverage": {
-                "eligible_subjects": len(works),
-                "ranked_subjects": len(calculation.items),
+                "total_eligible": ranking.total_in_scope,
+                "subjects_with_signal": ranking.ranked_subjects,
+                "ranked_subjects": ranking.ranked_subjects,
+                "returned_subjects": len(items),
                 "signal_coverage": (
-                    len(calculation.items) / len(works) if works else 1.0
+                    ranking.ranked_subjects / ranking.total_in_scope
+                    if ranking.total_in_scope
+                    else 1.0
+                ),
+                "confidence": self._confidence_payload(
+                    sample_size=ranking.ranked_subjects
                 ),
             },
-            "missing_signals": missing,
+            "missing_signals": list(ranking.missing_signals),
             "explanation": (
-                "Score is (latest citation count - earliest citation count) "
-                "/ elapsed days using at least two snapshots in the window. "
-                "Percentile is the empirical CDF within publication month "
-                "and work type."
+                "Score uses the last citation snapshot at or before the "
+                "window start and the last snapshot at or before generation "
+                "time, divided by their exact elapsed days. Percentile is "
+                "the median empirical CDF across Topic, publication month "
+                "and work type cohorts."
             ),
             "items": items,
         }
@@ -497,98 +512,46 @@ class RankingService:
         window_days: int,
         limit: int,
     ) -> dict[str, object]:
-        works = self.repository.rankable_works(
+        ranking = self.repository.code_growth_ranking(
+            generated_at=now,
+            window_days=window_days,
+            limit=limit,
             excluded_statuses=RANKING_EXCLUDED_STATUSES,
-            load_code=True,
         )
-        repository_ids = tuple(
-            repository.id
-            for work in works
-            for repository in work.code_repositories
-        )
-        observations = self.repository.repository_metric_observations(
-            repository_ids=repository_ids,
-            metric_name="stars",
-            start=now - timedelta(days=window_days),
-            end=now,
-        )
-        ranked: list[tuple[object, Decimal, int, int]] = []
-        missing: list[dict[str, object]] = []
-        for work in works:
-            if not work.code_repositories:
-                missing.append(
-                    self.repository.paper_missing_signal(
-                        work,
-                        signal="code_repository",
-                        reason="no_code_repository",
-                    )
-                )
-                continue
-            velocities = [
-                velocity
-                for repository in work.code_repositories
-                if (
-                    velocity := metric_velocity(
-                        tuple(
-                            MetricObservation(
-                                measured_at=item.measured_at,
-                                value=item.value,
-                            )
-                            for item in observations.get(repository.id, ())
-                        )
-                    )
-                )
-                is not None
-            ]
-            if not velocities:
-                missing.append(
-                    self.repository.paper_missing_signal(
-                        work,
-                        signal="stars",
-                        reason=(
-                            "requires_at_least_two_distinct_snapshots"
-                        ),
-                    )
-                )
-                continue
-            ranked.append(
-                (
-                    work,
-                    sum(velocities, Decimal("0")),
-                    len(velocities),
-                    len(work.code_repositories),
-                )
-            )
-        ranked.sort(key=lambda row: (-row[1], row[0].canonical_key))
-        items = [
-            self.repository.paper_trend_item(
-                work,
-                score=float(score),
-                details={
-                    "repositories_with_signal": paired,
-                    "repositories_total": total,
-                    "metric": "stars",
-                },
-            )
-            for work, score, paired, total in ranked[:limit]
-        ]
+        items = list(ranking.items)
         return {
             "ranking_name": "code_growth",
             "formula_version": CODE_GROWTH_FORMULA_VERSION,
             "window_days": window_days,
             "generated_at": now,
             "coverage": {
-                "eligible_subjects": len(works),
-                "ranked_subjects": len(ranked),
+                "total_eligible": ranking.total_in_scope,
+                "subjects_with_signal": ranking.ranked_subjects,
+                "ranked_subjects": ranking.ranked_subjects,
+                "returned_subjects": len(items),
                 "signal_coverage": (
-                    len(ranked) / len(works) if works else 1.0
+                    ranking.ranked_subjects / ranking.total_in_scope
+                    if ranking.total_in_scope
+                    else 1.0
+                ),
+                "confidence": self._confidence_payload(
+                    sample_size=ranking.ranked_subjects
                 ),
             },
-            "missing_signals": missing,
+            "missing_signals": list(ranking.missing_signals),
             "explanation": (
                 "Score is the sum of per-repository star deltas per elapsed "
                 "day. Each repository requires at least two snapshots; "
                 "missing signals are never replaced by zero."
             ),
             "items": items,
+        }
+
+    @staticmethod
+    def _confidence_payload(*, sample_size: int) -> dict[str, object]:
+        confidence = sample_confidence(sample_size=sample_size)
+        return {
+            "level": confidence.level,
+            "sample_size": confidence.sample_size,
+            "explanation": confidence.explanation,
         }

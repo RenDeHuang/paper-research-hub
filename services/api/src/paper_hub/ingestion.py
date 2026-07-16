@@ -37,6 +37,7 @@ IngestionStatus = Literal[
     "unchanged",
     "excluded",
 ]
+INGESTION_BATCH_LOCK_KEY = "paper-hub:sync-openalex:batch:v1"
 
 
 class IngestionError(RuntimeError):
@@ -76,6 +77,19 @@ class IngestionSummary:
             "failed": self.failed,
             "unchanged": self.unchanged,
         }
+
+
+def acquire_ingestion_batch_lock(session: Session) -> None:
+    session.execute(
+        text(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtextextended(:lock_key, 0)
+            )
+            """
+        ),
+        {"lock_key": INGESTION_BATCH_LOCK_KEY},
+    )
 
 
 class IngestionService:
@@ -121,7 +135,7 @@ class IngestionService:
                     existing_assessment.included
                     and self._projection_requires_rebuild(
                         existing_assessment,
-                        record,
+                        existing_snapshot,
                     )
                 ):
                     return self._include_snapshot(
@@ -220,6 +234,15 @@ class IngestionService:
                     "source record and controlled identifiers point "
                     "to different works"
                 )
+        if work is not None:
+            work = self._lock_work(work.id)
+        if source_record is None:
+            source_record = self._create_source_record(
+                work=None,
+                record=record,
+                parsed=parsed,
+            )
+
         is_new_work = work is None
         if work is None:
             work = Work(
@@ -228,29 +251,25 @@ class IngestionService:
                 abstract=parsed.abstract,
                 publication_date=parsed.publication_date,
                 projection_source=record.source,
-                projection_source_record_id=record.source_record_id,
+                projection_source_record_id=source_record.id,
                 projection_source_updated_at=record.source_updated_at,
                 status=self._work_status(parsed),
                 **self._provenance(record, parsed),
             )
             self.session.add(work)
             self.session.flush()
+            is_projection = True
         else:
             self._upgrade_canonical_key(work, parsed)
-            self._update_work_projection(
+            is_projection = self._update_work_projection(
                 work,
+                source_record,
                 record,
                 parsed,
                 force=force_projection,
             )
 
-        if source_record is None:
-            source_record = self._create_source_record(
-                work=work,
-                record=record,
-                parsed=parsed,
-            )
-        elif source_record.work_id is None:
+        if source_record.work_id is None:
             source_record.work_id = work.id
             self.session.flush()
         elif source_record.work_id != work.id:
@@ -260,7 +279,8 @@ class IngestionService:
 
         self._persist_external_identifiers(work, record, parsed)
         self._persist_field_assertions(source_record, record, parsed)
-        self._persist_topics(work, record, parsed)
+        if is_projection:
+            self._replace_projection_taxonomy(work, record, parsed)
         self._persist_code_repositories(work, record, parsed)
         self._persist_citation_metric(work, source_record, record, parsed)
         if persist_scope_assessment:
@@ -393,6 +413,8 @@ class IngestionService:
             return assessment_work
         if work is not None:
             assessment.work_id = work.id
+            assessment.work_linked_at = datetime.now(UTC)
+            assessment.work_link_reason = "identity_replay"
             self.session.flush()
         return work
 
@@ -424,34 +446,43 @@ class IngestionService:
             )
         return next(iter(matched_works.values()), None)
 
+    def _lock_work(self, work_id: UUID) -> Work:
+        work = self.session.scalar(
+            select(Work)
+            .where(Work.id == work_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if work is None:
+            raise IdentityConflictError(
+                "canonical work disappeared during ingestion"
+            )
+        return work
+
     def _projection_requires_rebuild(
         self,
         assessment: ScopeAssessment,
-        record: ConnectorRecord[ParsedWork],
+        source_record: SourceRecord,
     ) -> bool:
         if assessment.work_id is None:
             raise IdentityConflictError(
                 "included scope assessment has no canonical work"
             )
-        work = self.session.get(Work, assessment.work_id)
-        if work is None:
-            raise IdentityConflictError(
-                "included scope assessment references a missing work"
-            )
-        if any(
-            value is None
-            for value in (
-                work.projection_source,
-                work.projection_source_record_id,
-                work.projection_source_updated_at,
-            )
+        work = self._lock_work(assessment.work_id)
+        if (
+            work.projection_source is None
+            or work.projection_source_record_id is None
         ):
             return True
-        return (
-            record.source_updated_at is not None
-            and record.source_updated_at
-            > work.projection_source_updated_at
+        current = self.session.get(
+            SourceRecord,
+            work.projection_source_record_id,
         )
+        if current is None:
+            return True
+        return self._source_record_order_key(
+            source_record
+        ) > self._source_record_order_key(current)
 
     def _acquire_identity_locks(
         self,
@@ -506,18 +537,23 @@ class IngestionService:
     def _update_work_projection(
         self,
         work: Work,
+        source_record: SourceRecord,
         record: ConnectorRecord[ParsedWork],
         parsed: ParsedWork,
         *,
         force: bool = False,
-    ) -> None:
-        if (
-            not force
-            and work.projection_source_updated_at is not None
-            and record.source_updated_at
-            <= work.projection_source_updated_at
-        ):
-            return
+    ) -> bool:
+        if not force and work.projection_source_record_id is not None:
+            current = self.session.get(
+                SourceRecord,
+                work.projection_source_record_id,
+            )
+            if (
+                current is not None
+                and self._source_record_order_key(source_record)
+                <= self._source_record_order_key(current)
+            ):
+                return False
         work.title = parsed.title
         work.abstract = parsed.abstract
         work.publication_date = parsed.publication_date
@@ -528,8 +564,21 @@ class IngestionService:
         work.content_license = parsed.license
         work.status = self._work_status(parsed)
         work.projection_source = record.source
-        work.projection_source_record_id = record.source_record_id
+        work.projection_source_record_id = source_record.id
         work.projection_source_updated_at = record.source_updated_at
+        return True
+
+    @staticmethod
+    def _source_record_order_key(
+        source_record: SourceRecord,
+    ) -> tuple[object, ...]:
+        return (
+            source_record.source_updated_at is not None,
+            source_record.source_updated_at
+            or datetime.min.replace(tzinfo=UTC),
+            source_record.retrieved_at,
+            str(source_record.id),
+        )
 
     def _persist_external_identifiers(
         self,
@@ -606,13 +655,14 @@ class IngestionService:
                 )
             )
 
-    def _persist_topics(
+    def _replace_projection_taxonomy(
         self,
         work: Work,
         record: ConnectorRecord[ParsedWork],
         parsed: ParsedWork,
     ) -> None:
-        existing_topic_ids = {topic.id for topic in work.topics}
+        projected_topics: list[Topic] = []
+        projected_topic_ids: set[UUID] = set()
         for parsed_topic in sorted(
             parsed.topics,
             key=lambda topic: _normalize_name(topic.display_name),
@@ -651,9 +701,13 @@ class IngestionService:
                 raise IngestionError(
                     "topic upsert did not return or resolve a row"
                 )
-            if topic.id not in existing_topic_ids:
-                work.topics.append(topic)
-                existing_topic_ids.add(topic.id)
+            if topic.id not in projected_topic_ids:
+                projected_topics.append(topic)
+                projected_topic_ids.add(topic.id)
+        work.topics[:] = projected_topics
+        work.methods.clear()
+        work.datasets.clear()
+        work.benchmarks.clear()
 
     def _persist_code_repositories(
         self,
@@ -722,11 +776,45 @@ class IngestionService:
             )
         )
         if existing is not None:
+            existing_source_record_id = existing.source_record_id
+            if existing_source_record_id is None:
+                raise IngestionError(
+                    "citation metric lacks source record provenance"
+                )
+            existing_source_record = self.session.get(
+                SourceRecord,
+                existing_source_record_id,
+            )
+            if (
+                existing_source_record is None
+                or existing_source_record.work_id != work.id
+                or existing_source_record.source != record.source
+                or existing_source_record.source_updated_at
+                != record.source_updated_at
+            ):
+                raise IngestionError(
+                    "citation metric source record provenance is inconsistent"
+                )
+            if self._source_record_order_key(
+                source_record
+            ) <= self._source_record_order_key(existing_source_record):
+                return
+            existing.metric_value = Decimal(parsed.citation_count)
+            existing.source_record_id = source_record.id
+            existing.details = {
+                "source_record_id": str(source_record.id),
+                "content_hash": record.content_hash,
+            }
+            existing.source_url = _source_url(record)
+            existing.retrieved_at = record.retrieved_at
+            existing.source_license = OPENALEX_SOURCE_LICENSE
+            existing.content_license = parsed.license
             return
         self.session.add(
             MetricSnapshot(
                 work_id=work.id,
                 code_repository_id=None,
+                source_record_id=source_record.id,
                 metric_name="citation_count",
                 metric_value=Decimal(parsed.citation_count),
                 measured_at=record.source_updated_at,

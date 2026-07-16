@@ -6,6 +6,7 @@ from decimal import Decimal
 import hashlib
 import os
 from pathlib import Path
+from uuid import UUID
 
 from alembic import command
 from fastapi.testclient import TestClient
@@ -15,13 +16,17 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 
-def _provenance(status=None) -> dict[str, object]:
+def _provenance(
+    status=None,
+    *,
+    retrieved_at: datetime | None = None,
+) -> dict[str, object]:
     from paper_hub.models import RecordStatus
 
     return {
         "source": "test",
         "source_url": "https://source.test",
-        "retrieved_at": datetime.now(UTC),
+        "retrieved_at": retrieved_at or datetime.now(UTC),
         "source_license": "CC0",
         "content_license": "cc-by",
         "status": status or RecordStatus.ACTIVE,
@@ -49,14 +54,16 @@ def _add_rankable_work(
     *,
     suffix: str,
     published_days_ago: int,
-    work_type: str = "preprint",
-    topic: str = "Agent Planning",
+    work_type: object = "preprint",
+    topics: tuple[str, ...] = ("Agent Planning",),
     method: str = "Tool Use",
     citation_values: tuple[int, ...] = (),
     star_values: tuple[int, ...] = (),
     status=None,
     included: bool = True,
-) -> None:
+    repositories_without_signal: int = 0,
+    source_updated_days_ago: int | None = None,
+) -> UUID:
     from paper_hub.models import (
         CodeRepository,
         FieldAssertion,
@@ -70,27 +77,35 @@ def _add_rankable_work(
 
     now = datetime.now(UTC).replace(microsecond=0)
     source_record_id = f"SRC-{suffix}"
-    provenance = _provenance(status)
+    projection_days_ago = (
+        published_days_ago
+        if source_updated_days_ago is None
+        else source_updated_days_ago
+    )
+    projection_time = now - timedelta(days=projection_days_ago)
+    provenance = _provenance(status, retrieved_at=projection_time)
+    source = SourceRecord(
+        work_id=None,
+        source_record_id=source_record_id,
+        content_hash=hashlib.sha256(suffix.encode()).hexdigest(),
+        raw_payload={"id": source_record_id},
+        source_updated_at=projection_time,
+        **provenance,
+    )
+    session.add(source)
+    session.flush()
     work = Work(
         canonical_key=f"doi:10.2000/{suffix}",
         title=f"Agent Trend {suffix}",
         publication_date=(now - timedelta(days=published_days_ago)).date(),
         projection_source="test",
-        projection_source_record_id=source_record_id,
-        projection_source_updated_at=now,
+        projection_source_record_id=source.id,
+        projection_source_updated_at=projection_time,
         **provenance,
     )
     session.add(work)
     session.flush()
-    source = SourceRecord(
-        work_id=work.id,
-        source_record_id=source_record_id,
-        content_hash=hashlib.sha256(suffix.encode()).hexdigest(),
-        raw_payload={"id": source_record_id},
-        source_updated_at=now,
-        **provenance,
-    )
-    session.add(source)
+    source.work_id = work.id
     session.flush()
     session.add(
         ScopeAssessment(
@@ -112,11 +127,15 @@ def _add_rankable_work(
             **provenance,
         )
     )
-    work.topics.append(_get_entity(session, Topic, cache, topic))
+    work.topics.extend(
+        _get_entity(session, Topic, cache, topic) for topic in topics
+    )
     work.methods.append(_get_entity(session, Method, cache, method))
 
     for index, value in enumerate(citation_values):
-        measured_at = now - timedelta(days=10 * (len(citation_values) - 1 - index))
+        measured_at = now - timedelta(
+            days=30 * (len(citation_values) - 1 - index)
+        )
         session.add(
             MetricSnapshot(
                 work_id=work.id,
@@ -140,7 +159,7 @@ def _add_rankable_work(
         session.flush()
         for index, value in enumerate(star_values):
             measured_at = now - timedelta(
-                days=10 * (len(star_values) - 1 - index)
+                days=30 * (len(star_values) - 1 - index)
             )
             session.add(
                 MetricSnapshot(
@@ -152,6 +171,25 @@ def _add_rankable_work(
                     **provenance,
                 )
             )
+        for index in range(repositories_without_signal):
+            work.code_repositories.append(
+                CodeRepository(
+                    provider="github",
+                    repository_name=f"example/{suffix}-missing-{index}",
+                    repository_url=(
+                        "https://github.test/example/"
+                        f"{suffix}-missing-{index}"
+                    ),
+                    normalized_url=(
+                        "https://github.test/example/"
+                        f"{suffix}-missing-{index}"
+                    ),
+                    **provenance,
+                )
+            )
+
+    session.flush()
+    return work.id
 
 
 @pytest.fixture(scope="module")
@@ -186,8 +224,14 @@ def trends_api(
             cache,
             suffix="fast",
             published_days_ago=2,
+            topics=(
+                "Agent Planning",
+                "Reasoning Agents",
+                "Tool Agents",
+            ),
             citation_values=(10, 30),
             star_values=(100, 130),
+            repositories_without_signal=2,
         )
         _add_rankable_work(
             session,
@@ -208,9 +252,95 @@ def trends_api(
         _add_rankable_work(
             session,
             cache,
+            suffix="tool-peer",
+            published_days_ago=2,
+            topics=("Tool Agents",),
+            citation_values=(0, 30),
+        )
+        _add_rankable_work(
+            session,
+            cache,
+            suffix="reasoning-peer",
+            published_days_ago=2,
+            topics=("Reasoning Agents",),
+            method="Citation Cohort",
+            citation_values=(0, 30),
+        )
+        _add_rankable_work(
+            session,
+            cache,
+            suffix="reasoning-fast-peer",
+            published_days_ago=2,
+            topics=("Reasoning Agents",),
+            method="Citation Cohort",
+            citation_values=(0, 60),
+        )
+        _add_rankable_work(
+            session,
+            cache,
+            suffix="invalid-work-type",
+            published_days_ago=2,
+            work_type=123,
+            method="Citation Cohort",
+            citation_values=(0, 300),
+        )
+        parser_upgrade_id = _add_rankable_work(
+            session,
+            cache,
+            suffix="parser-upgrade-type",
+            published_days_ago=2,
+            work_type={"legacy": "invalid"},
+            topics=("Parser Cohort",),
+            method="Parser Method",
+            citation_values=(0, 90),
+        )
+        from paper_hub.models import FieldAssertion, Work
+
+        parser_upgrade = session.get(Work, parser_upgrade_id)
+        assert parser_upgrade is not None
+        session.add(
+            FieldAssertion(
+                id=UUID(int=0),
+                source_record_id=(
+                    parser_upgrade.projection_source_record_id
+                ),
+                field_name="type",
+                value="preprint",
+                parser_version="test-v2",
+                created_at=datetime.now(UTC) + timedelta(seconds=1),
+                **_provenance(),
+            )
+        )
+        for index in range(5):
+            _add_rankable_work(
+                session,
+                cache,
+                suffix=f"method-no-topic-{index}",
+                published_days_ago=2,
+                topics=(),
+            )
+        _add_rankable_work(
+            session,
+            cache,
+            suffix="unrelated",
+            published_days_ago=2,
+            topics=("Computer Vision",),
+            method="Vision Method",
+        )
+        _add_rankable_work(
+            session,
+            cache,
             suffix="baseline",
             published_days_ago=10,
             citation_values=(),
+        )
+        _add_rankable_work(
+            session,
+            cache,
+            suffix="dormant-method-history",
+            published_days_ago=365,
+            topics=("Agent Planning",),
+            method="Dormant Method",
         )
         _add_rankable_work(
             session,
@@ -236,6 +366,34 @@ def trends_api(
             published_days_ago=1,
             citation_values=(0, 800),
             included=False,
+        )
+        version_fresh_id = _add_rankable_work(
+            session,
+            cache,
+            suffix="version-fresh",
+            published_days_ago=100,
+        )
+        _add_rankable_work(
+            session,
+            cache,
+            suffix="projection-fresh",
+            published_days_ago=100,
+            source_updated_days_ago=1,
+        )
+        from paper_hub.models import PaperVersion, Work
+
+        version_fresh = session.get(Work, version_fresh_id)
+        assert version_fresh is not None
+        version_fresh.versions.append(
+            PaperVersion(
+                version_label="v2",
+                version_number=2,
+                version_type="revised",
+                published_at=datetime.now(UTC) - timedelta(hours=1),
+                **_provenance(
+                    retrieved_at=datetime.now(UTC) - timedelta(hours=1)
+                ),
+            )
         )
         session.commit()
 
@@ -279,7 +437,14 @@ def test_paper_rankings_are_separate_and_transparent(
     assert payload["formula_version"] == formula_version
     assert payload["window_days"] == 30
     assert payload["generated_at"].endswith(("Z", "+00:00"))
-    assert payload["coverage"]["eligible_subjects"] >= len(payload["items"])
+    assert payload["coverage"]["total_eligible"] >= len(payload["items"])
+    assert (
+        payload["coverage"]["subjects_with_signal"]
+        >= len(payload["items"])
+    )
+    assert payload["coverage"]["ranked_subjects"] >= len(payload["items"])
+    assert payload["coverage"]["returned_subjects"] == len(payload["items"])
+    assert payload["coverage"]["confidence"]["sample_size"] >= 0
     assert isinstance(payload["missing_signals"], list)
     assert payload["explanation"]
     keys = {item["canonical_key"] for item in payload["items"]}
@@ -297,12 +462,35 @@ def test_citation_velocity_reports_percentiles_and_missing_signals(
     ).json()
 
     by_key = {item["canonical_key"]: item for item in payload["items"]}
-    assert by_key["doi:10.2000/fast"]["score"] == 2.0
-    assert by_key["doi:10.2000/fast"]["percentile"] == 1.0
+    assert by_key["doi:10.2000/fast"]["score"] == pytest.approx(2 / 3)
+    assert by_key["doi:10.2000/fast"]["percentile"] == 0.5
     assert by_key["doi:10.2000/slow"]["percentile"] == 0.5
+    assert by_key["doi:10.2000/fast"]["details"][
+        "percentile_aggregation"
+    ] == "median_across_topics"
+    assert {
+        item["topic"]: (item["cohort_size"], item["percentile"])
+        for item in by_key["doi:10.2000/fast"]["details"][
+            "topic_cohorts"
+        ]
+    } == {
+        "agent-planning": (2, 1.0),
+        "reasoning-agents": (3, pytest.approx(1 / 3)),
+        "tool-agents": (2, 0.5),
+    }
     assert any(
         item["canonical_key"] == "doi:10.2000/missing"
         and item["reason"] == "requires_at_least_two_distinct_snapshots"
+        for item in payload["missing_signals"]
+    )
+    assert "doi:10.2000/invalid-work-type" not in by_key
+    assert by_key["doi:10.2000/parser-upgrade-type"]["details"][
+        "work_type"
+    ] == "preprint"
+    assert any(
+        item["canonical_key"] == "doi:10.2000/invalid-work-type"
+        and item["signal"] == "work_type"
+        and item["reason"] == "work_type_is_required_for_cohort"
         for item in payload["missing_signals"]
     )
 
@@ -316,12 +504,43 @@ def test_code_growth_does_not_turn_one_snapshot_into_zero(
     ).json()
 
     assert payload["items"][0]["canonical_key"] == "doi:10.2000/fast"
-    assert payload["items"][0]["score"] == 3.0
+    assert payload["items"][0]["score"] == 1.0
+    assert payload["items"][0]["details"]["signal_status"] == "partial"
+    assert payload["items"][0]["details"]["repositories_missing"] == 2
+    fast_missing = [
+        item
+        for item in payload["missing_signals"]
+        if item["canonical_key"] == "doi:10.2000/fast"
+        and item["reason"] == "partial_repository_metric_coverage"
+    ]
+    assert len(fast_missing) == 2
+    assert all(item["repository_id"] for item in fast_missing)
+    assert all(item["repository_url"] for item in fast_missing)
     assert any(
         item["canonical_key"] == "doi:10.2000/slow"
         and item["reason"] == "requires_at_least_two_distinct_snapshots"
         for item in payload["missing_signals"]
     )
+
+    limited = trends_api.get(
+        "/api/v1/trends/papers",
+        params={
+            "ranking": "code_growth",
+            "window_days": 30,
+            "limit": 1,
+        },
+    ).json()
+    limited_fast_missing = [
+        item
+        for item in limited["missing_signals"]
+        if item["canonical_key"] == "doi:10.2000/fast"
+        and item["reason"] == "partial_repository_metric_coverage"
+    ]
+    assert len(limited_fast_missing) == 2
+    assert {
+        item["canonical_key"]
+        for item in limited["missing_signals"]
+    } == {"doi:10.2000/fast"}
 
 
 @pytest.mark.parametrize("window_days", [7, 30, 90])
@@ -339,7 +558,11 @@ def test_topic_growth_uses_current_and_baseline_windows_with_confidence(
     assert payload["ranking_name"] == "topic_growth"
     assert payload["formula_version"] == "topic-growth-v1"
     assert payload["window_days"] == window_days
-    assert payload["coverage"]["confidence"] in {"low", "medium", "high"}
+    assert payload["coverage"]["confidence"]["level"] in {
+        "low",
+        "medium",
+        "high",
+    }
     assert "baseline" in payload["explanation"].casefold()
     if payload["items"]:
         assert payload["items"][0]["confidence"]["level"] == "low"
@@ -362,6 +585,78 @@ def test_method_adoption_is_share_delta_not_topic_growth(
     assert "share" in payload["explanation"].casefold()
     assert payload["coverage"]["current_total"] >= 0
     assert payload["coverage"]["baseline_total"] >= 0
+    if window_days == 7:
+        by_name = {
+            item["normalized_name"]: item for item in payload["items"]
+        }
+        tool_use = by_name["tool-use"]
+        assert tool_use["current_count"] <= tool_use["current_total"]
+        assert tool_use["baseline_count"] <= tool_use["baseline_total"]
+        assert tool_use["current_count"] == 3
+        assert tool_use["current_total"] == 7
+        assert tool_use["baseline_total"] == 1
+        assert tool_use["score"] == pytest.approx(-4 / 7)
+        assert tool_use["confidence"]["sample_size"] == 8
+        dormant = by_name["dormant-method"]
+        assert dormant["current_count"] == 0
+        assert dormant["baseline_count"] == 0
+        assert dormant["current_total"] == 4
+        assert dormant["baseline_total"] == 1
+        assert dormant["score"] == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "ranking_name"),
+    [
+        ("/api/v1/trends/topics", "topic_growth"),
+        ("/api/v1/trends/methods", "method_adoption"),
+    ],
+)
+def test_taxonomy_rankings_separate_database_limit_from_coverage(
+    trends_api: TestClient,
+    path: str,
+    ranking_name: str,
+) -> None:
+    response = trends_api.get(
+        path,
+        params={"window_days": 7, "limit": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ranking_name"] == ranking_name
+    assert payload["coverage"]["ranked_subjects"] > 1
+    assert payload["coverage"]["returned_subjects"] == 1
+    assert len(payload["items"]) == 1
+
+
+def test_latest_uses_effective_time_and_separates_limit_from_coverage(
+    trends_api: TestClient,
+) -> None:
+    response = trends_api.get(
+        "/api/v1/trends/papers",
+        params={"ranking": "latest", "window_days": 7, "limit": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["coverage"]["ranked_subjects"] > 1
+    assert payload["coverage"]["returned_subjects"] == 1
+
+    all_latest = trends_api.get(
+        "/api/v1/trends/papers",
+        params={"ranking": "latest", "window_days": 7, "limit": 100},
+    ).json()
+    by_key = {
+        item["canonical_key"]: item for item in all_latest["items"]
+    }
+    assert by_key["doi:10.2000/version-fresh"]["details"][
+        "effective_source"
+    ] == "version"
+    assert by_key["doi:10.2000/projection-fresh"]["details"][
+        "effective_source"
+    ] == "projection"
+    assert by_key["doi:10.2000/version-fresh"]["details"]["effective_at"]
 
 
 @pytest.mark.parametrize(
@@ -405,3 +700,13 @@ def test_openapi_has_resolved_response_schemas(trends_api: TestClient) -> None:
                 "application/json"
             ]["schema"]
         )
+    percentile = schema["components"]["schemas"][
+        "PaperTrendItemResponse"
+    ]["properties"]["percentile"]["anyOf"][0]
+    assert percentile["minimum"] == 0
+    assert percentile["maximum"] == 1
+    coverage = schema["components"]["schemas"][
+        "PaperRankingCoverageResponse"
+    ]["properties"]["signal_coverage"]
+    assert coverage["minimum"] == 0
+    assert coverage["maximum"] == 1

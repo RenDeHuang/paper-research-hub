@@ -83,7 +83,7 @@ class PaperVersionRead(PaperVersionCreate):
 
 
 class ApiSchema(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class ErrorDetailSchema(ApiSchema):
@@ -160,6 +160,8 @@ class PaperListResponse(ApiSchema):
     page: int = Field(ge=1)
     page_size: int = Field(ge=1, le=100)
     total_pages: int = Field(ge=0)
+    snapshot_at: AwareDatetime
+    snapshot_revision: int = Field(ge=0)
     facets: PaperFacetsResponse
 
 
@@ -211,7 +213,7 @@ class WorkProvenanceResponse(ApiSchema):
     source_license: str | None = None
     content_license: str | None = None
     projection_source: str | None = None
-    projection_source_record_id: str | None = None
+    projection_source_record_id: UUID | None = None
     projection_source_updated_at: AwareDatetime | None = None
     updated_at: AwareDatetime
 
@@ -298,13 +300,36 @@ class MissingSignalResponse(ApiSchema):
     canonical_key: str | None = None
     slug: str | None = None
     normalized_name: str | None = None
+    repository_id: UUID | None = None
+    repository_url: str | None = None
     signal: str
     reason: str
 
 
 class ConfidenceResponse(ApiSchema):
     level: Literal["low", "medium", "high"]
+    sample_size: int = Field(ge=0)
     explanation: str
+
+
+class PaperRankingCoverageResponse(ApiSchema):
+    total_eligible: int = Field(ge=0)
+    subjects_with_signal: int = Field(ge=0)
+    ranked_subjects: int = Field(ge=0)
+    returned_subjects: int = Field(ge=0)
+    signal_coverage: float = Field(ge=0, le=1)
+    confidence: ConfidenceResponse
+
+
+class TaxonomyRankingCoverageResponse(ApiSchema):
+    total_eligible: int = Field(ge=0)
+    subjects_with_signal: int = Field(ge=0)
+    ranked_subjects: int = Field(ge=0)
+    returned_subjects: int = Field(ge=0)
+    signal_coverage: float = Field(ge=0, le=1)
+    confidence: ConfidenceResponse
+    current_total: int = Field(ge=0)
+    baseline_total: int = Field(ge=0)
 
 
 class PaperTrendItemResponse(ApiSchema):
@@ -314,7 +339,7 @@ class PaperTrendItemResponse(ApiSchema):
     publication_date: date | None = None
     status: RecordStatus
     score: float
-    percentile: float | None = None
+    percentile: float | None = Field(default=None, ge=0, le=1)
     details: dict[str, JsonValue] = Field(default_factory=dict)
 
 
@@ -325,6 +350,8 @@ class TaxonomyTrendItemResponse(ApiSchema):
     score: float
     current_count: int = Field(ge=0)
     baseline_count: int = Field(ge=0)
+    current_total: int = Field(ge=0)
+    baseline_total: int = Field(ge=0)
     confidence: ConfidenceResponse
 
 
@@ -333,7 +360,7 @@ class PaperTrendResponse(ApiSchema):
     formula_version: str
     window_days: Literal[7, 30, 90]
     generated_at: AwareDatetime
-    coverage: dict[str, JsonValue]
+    coverage: PaperRankingCoverageResponse
     missing_signals: list[MissingSignalResponse]
     explanation: str
     items: list[PaperTrendItemResponse]
@@ -344,7 +371,7 @@ class TaxonomyTrendResponse(ApiSchema):
     formula_version: str
     window_days: Literal[7, 30, 90]
     generated_at: AwareDatetime
-    coverage: dict[str, JsonValue]
+    coverage: TaxonomyRankingCoverageResponse
     missing_signals: list[MissingSignalResponse]
     explanation: str
     items: list[TaxonomyTrendItemResponse]

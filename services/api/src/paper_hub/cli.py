@@ -22,6 +22,7 @@ from paper_hub.ingestion import (
     IngestionError,
     IngestionService,
     IngestionSummary,
+    acquire_ingestion_batch_lock,
 )
 
 
@@ -103,12 +104,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         ) as connector:
             with Session(engine) as session:
                 pending_summary = IngestionSummary()
+                batch_lock_acquired = False
                 try:
                     for record in connector.fetch_records(
                         query=args.query,
                         from_date=args.from_date,
                         max_results=args.max_results,
                     ):
+                        if not batch_lock_acquired:
+                            acquire_ingestion_batch_lock(session)
+                            batch_lock_acquired = True
                         result = IngestionService(session).ingest(record)
                         pending_summary.add(result)
                     try:
