@@ -92,9 +92,12 @@ func main() {
   "scripts": {
     "dev": "nuxt dev",
     "build": "nuxt build",
+    "preview": "nuxt preview",
+    "lint": "eslint .",
     "typecheck": "nuxt typecheck",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "postinstall": "nuxt prepare"
   },
   "dependencies": {
     "nuxt": "^4.0.0",
@@ -142,7 +145,7 @@ git commit -m "chore: replace legacy runtimes with Go and Nuxt baseline"
 - Create: `services/core/internal/httpapi/server_test.go`
 - Modify: `services/core/cmd/api/main.go`
 - Create: `apps/web/tests/health.test.ts`
-- Create: `apps/web/server/api/health.get.ts`
+- Create: `apps/web/server/routes/health.get.ts`
 - Modify: `apps/web/nuxt.config.ts`
 
 **Step 1: Write the failing Go health test**
@@ -233,7 +236,7 @@ The server must:
 **Step 5: Write and pass the Nuxt health test**
 
 ```ts
-import handler from "../server/api/health.get"
+import handler from "../server/routes/health.get"
 
 it("reports the web service identity", async () => {
   expect(await handler({} as never)).toEqual({
@@ -886,7 +889,8 @@ The generated file is committed. CI later verifies regeneration creates no diff.
 
 Verify:
 
-- runtime-configured API base URL;
+- server-side requests use private `apiBase`;
+- browser-side requests use `public.apiBase`;
 - query parameters are serialized once;
 - non-2xx Problem Details become typed errors;
 - no mock data is used when the real endpoint fails.
@@ -990,6 +994,7 @@ git commit -m "feat: add paper discovery and trend exploration pages"
 **Files:**
 - Create: `deploy/docker/api.Dockerfile`
 - Create: `deploy/docker/web.Dockerfile`
+- Create: `.dockerignore`
 - Create: `deploy/compose/docker-compose.yml`
 - Create: `deploy/compose/docker-compose.test.yml`
 - Create: `deploy/production/README.md`
@@ -1065,6 +1070,7 @@ git commit -m "chore: add decoupled container deployment"
 **Files:**
 - Create: `.github/workflows/ci.yml`
 - Create: `.github/workflows/container.yml`
+- Create: `.github/workflows/publish.yml`
 - Create: `.github/dependabot.yml`
 - Create: `README.md`
 - Create: `CONTRIBUTING.md`
@@ -1091,6 +1097,14 @@ git commit -m "chore: add decoupled container deployment"
 - build Web image;
 - run Compose smoke test;
 - no registry push until repository secrets are configured.
+
+`publish.yml`:
+
+- runs only for a version tag or GitHub Release;
+- publishes separate Core and Web images to GHCR;
+- uses `GITHUB_TOKEN` with `packages: write`;
+- emits provenance and SBOM attestations;
+- never publishes unverified pull-request images.
 
 **Step 2: Write operational documentation**
 
