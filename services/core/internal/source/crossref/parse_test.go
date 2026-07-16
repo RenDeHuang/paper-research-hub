@@ -3,6 +3,7 @@ package crossref_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -439,6 +440,129 @@ func TestParseAcceptsPlainTextOrStrictJATSAbstractOnly(t *testing.T) {
 	}
 }
 
+func TestParseAbstractClassifiesOnlyAnAllowedLeadingJATSRootAsXML(t *testing.T) {
+	t.Parallel()
+
+	for _, abstract := range []string{
+		"p < 0.05",
+		"Effect size was 2 < 3 and remained significant.",
+		"& leading ampersand remains plain text",
+		"Summary before <jats:p>literal text that is not a leading root</jats:p>",
+	} {
+		abstract := abstract
+		t.Run(abstract, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := json.Marshal(map[string]any{
+				"DOI":      "10.1000/plain-less-than",
+				"abstract": abstract,
+			})
+			if err != nil {
+				t.Fatalf("Marshal() error = %v", err)
+			}
+			record, err := crossref.Parse(raw)
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if record.Abstract != strings.Join(strings.Fields(abstract), " ") {
+				t.Fatalf("Abstract = %q, want plain text preserved", record.Abstract)
+			}
+		})
+	}
+}
+
+func TestParseJATSPreservesInlineTextPunctuationEntitiesAndBlockOrder(t *testing.T) {
+	t.Parallel()
+
+	abstract := `<jats:sec xmlns:jats="http://www.ncbi.nlm.nih.gov/JATS1">` +
+		`<jats:title>Back<jats:italic>ground</jats:italic></jats:title>` +
+		`<jats:p>inter<jats:bold>oper</jats:bold>ability` +
+		`<jats:italic>,</jats:italic> A &amp; B.</jats:p>` +
+		`<jats:p>Not frag<jats:italic>mented</jats:italic>.</jats:p>` +
+		`</jats:sec>`
+	raw, err := json.Marshal(map[string]any{
+		"DOI":      "10.1000/jats-inline",
+		"abstract": abstract,
+	})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	record, err := crossref.Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	const want = "Background interoperability, A & B. Not fragmented."
+	if record.Abstract != want {
+		t.Fatalf("Abstract = %q, want document-order text %q", record.Abstract, want)
+	}
+}
+
+func TestParseJATSHasIndependentTypedResourceLimits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		kind     crossref.JATSLimitKind
+		abstract func() string
+	}{
+		{
+			name: "depth",
+			kind: crossref.JATSLimitDepth,
+			abstract: func() string {
+				return `<jats:sec xmlns:jats="http://www.ncbi.nlm.nih.gov/JATS1">` +
+					strings.Repeat("<jats:sec>", crossref.MaxJATSDepth) +
+					"text" +
+					strings.Repeat("</jats:sec>", crossref.MaxJATSDepth) +
+					`</jats:sec>`
+			},
+		},
+		{
+			name: "elements",
+			kind: crossref.JATSLimitElements,
+			abstract: func() string {
+				return `<jats:sec xmlns:jats="http://www.ncbi.nlm.nih.gov/JATS1">` +
+					strings.Repeat("<jats:p/>", crossref.MaxJATSElements) +
+					`</jats:sec>`
+			},
+		},
+		{
+			name: "text bytes",
+			kind: crossref.JATSLimitTextBytes,
+			abstract: func() string {
+				return `<jats:p xmlns:jats="http://www.ncbi.nlm.nih.gov/JATS1">` +
+					strings.Repeat("x", crossref.MaxJATSTextBytes+1) +
+					`</jats:p>`
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := json.Marshal(map[string]any{
+				"DOI":      "10.1000/jats-limit",
+				"abstract": test.abstract(),
+			})
+			if err != nil {
+				t.Fatalf("Marshal() error = %v", err)
+			}
+			_, err = crossref.Parse(raw)
+			if err == nil {
+				t.Fatal("Parse() accepted JATS beyond explicit resource limit")
+			}
+			var limitErr *crossref.JATSLimitError
+			if !errors.As(err, &limitErr) {
+				t.Fatalf("Parse() error = %T %v, want *JATSLimitError", err, err)
+			}
+			if limitErr.Kind != test.kind {
+				t.Fatalf("JATSLimitError.Kind = %q, want %q", limitErr.Kind, test.kind)
+			}
+		})
+	}
+}
+
 func TestParseStrictlyValidatesISSNAndISSNType(t *testing.T) {
 	t.Parallel()
 
@@ -584,6 +708,92 @@ func TestParseRawHashIsStableForEquivalentJSONAndChangesWithUnknownFields(t *tes
 	if !bytes.Equal(firstRecord.Raw.Payload, first) ||
 		!bytes.Equal(reorderedRecord.Raw.Payload, reordered) {
 		t.Fatal("Raw.Payload did not preserve exact item JSON including unknown fields")
+	}
+}
+
+func TestParseRejectsDuplicateJSONKeysAtEveryNestedObjectLevel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		key  string
+	}{
+		{
+			name: "item DOI",
+			raw:  `{"DOI":"10.1000/first","DOI":"10.1000/second"}`,
+			key:  "DOI",
+		},
+		{
+			name: "author",
+			raw: `{
+				"DOI":"10.1000/duplicate",
+				"author":[{"given":"Ada","given":"Grace"}]
+			}`,
+			key: "given",
+		},
+		{
+			name: "affiliation",
+			raw: `{
+				"DOI":"10.1000/duplicate",
+				"author":[{"affiliation":[{"name":"First","name":"Second"}]}]
+			}`,
+			key: "name",
+		},
+		{
+			name: "license",
+			raw: `{
+				"DOI":"10.1000/duplicate",
+				"license":[{
+					"URL":"https://example.test/first",
+					"URL":"https://example.test/second"
+				}]
+			}`,
+			key: "URL",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			record, err := crossref.Parse([]byte(test.raw))
+			if err == nil {
+				t.Fatalf("Parse() = %#v, want duplicate-key rejection", record)
+			}
+			if record.Raw.SHA256 != "" {
+				t.Fatalf("Parse() constructed Raw hash %q before duplicate-key rejection", record.Raw.SHA256)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), "duplicate") ||
+				!strings.Contains(err.Error(), test.key) {
+				t.Fatalf("Parse() error = %v, want duplicate key %q", err, test.key)
+			}
+		})
+	}
+}
+
+func TestParseDuplicateKeysCannotCollapseToCanonicalSuccessfulHash(t *testing.T) {
+	t.Parallel()
+
+	canonical, err := crossref.Parse([]byte(
+		`{"DOI":"10.1000/final","future":{"value":2}}`,
+	))
+	if err != nil {
+		t.Fatalf("Parse(canonical) error = %v", err)
+	}
+	duplicate, err := crossref.Parse([]byte(
+		`{"DOI":"10.1000/ignored","DOI":"10.1000/final","future":{"value":1,"value":2}}`,
+	))
+	if err == nil {
+		t.Fatalf(
+			"Parse(duplicate) succeeded with hash %q matching canonical %q",
+			duplicate.Raw.SHA256,
+			canonical.Raw.SHA256,
+		)
+	}
+	if duplicate.Raw.SHA256 != "" {
+		t.Fatalf("duplicate payload received Raw hash %q before rejection", duplicate.Raw.SHA256)
 	}
 }
 

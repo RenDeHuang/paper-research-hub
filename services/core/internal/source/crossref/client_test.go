@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -149,6 +150,129 @@ func TestFetchBuildsDeterministicValidatedFilterAndEncodesCursor(t *testing.T) {
 	}
 }
 
+func TestFetchRejectsDOIFilterDelimiterInjectionButAllowsDOIPunctuation(t *testing.T) {
+	t.Parallel()
+
+	var (
+		requests atomic.Int32
+		filter   string
+		rawQuery string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		filter = request.URL.Query().Get("filter")
+		rawQuery = request.URL.RawQuery
+		writeEnvelope(t, writer, noCursor())
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+	records, errs := collect(client.Fetch(context.Background(), crossref.Query{
+		DOIs:       []string{"10.1000/A:B%2CC/D"},
+		MaxResults: 1,
+	}))
+	if len(records) != 0 || len(errs) != 0 {
+		t.Fatalf("valid punctuation Fetch() = %d records, errors %v", len(records), errs)
+	}
+	if filter != "doi:10.1000/a:b%2cc/d" {
+		t.Fatalf("filter = %q, want colon and percent preserved inside one DOI token", filter)
+	}
+	if strings.Count(filter, ",") != 0 {
+		t.Fatalf("filter = %q, percent-encoded comma must not create another token", filter)
+	}
+	if !strings.Contains(rawQuery, "%252c") {
+		t.Fatalf("RawQuery = %q, want literal DOI percent encoded exactly once by url.Values", rawQuery)
+	}
+
+	records, errs = collect(client.Fetch(context.Background(), crossref.Query{
+		DOIs:       []string{"10.1000/safe,issn:0028-0836"},
+		MaxResults: 1,
+	}))
+	if len(records) != 0 || len(errs) != 1 {
+		t.Fatalf("injection Fetch() = %d records, %d errors; want validation error", len(records), len(errs))
+	}
+	if !strings.Contains(strings.ToLower(errs[0].Error()), "filter") ||
+		!strings.Contains(strings.ToLower(errs[0].Error()), "comma") {
+		t.Fatalf("Fetch() error = %v, want explicit unsafe filter comma", errs[0])
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, injected DOI must be rejected before network", requests.Load())
+	}
+}
+
+func TestFetchSnapshotsQueryBeforeReturningLazySequence(t *testing.T) {
+	t.Parallel()
+
+	var captured url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		captured = request.URL.Query()
+		writeEnvelope(t, writer, noCursor())
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+	query := crossref.Query{
+		DOIs:  []string{"10.1000/original"},
+		ISSNs: []string{"0028-0836"},
+		IndexedDateWindow: crossref.DateWindow{
+			From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+			To:   time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),
+		},
+		MaxResults: 1,
+	}
+	sequence := client.Fetch(context.Background(), query)
+	query.DOIs[0] = "10.1000/mutated"
+	query.ISSNs[0] = "2049-3630"
+
+	records, errs := collect(sequence)
+	if len(records) != 0 || len(errs) != 0 {
+		t.Fatalf("Fetch() = %d records, errors %v", len(records), errs)
+	}
+	const want = "doi:10.1000/original,issn:0028-0836,from-index-date:2026-07-01,until-index-date:2026-07-02"
+	if got := captured.Get("filter"); got != want {
+		t.Fatalf("filter = %q, want immutable Fetch snapshot %q", got, want)
+	}
+}
+
+func TestFetchSnapshotHasNoRaceWithCallerMutation(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeEnvelope(t, writer, noCursor())
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+	query := crossref.Query{
+		DOIs:       []string{"10.1000/original"},
+		ISSNs:      []string{"0028-0836"},
+		MaxResults: 1,
+	}
+	sequence := client.Fetch(context.Background(), query)
+
+	start := make(chan struct{})
+	mutated := make(chan struct{})
+	go func() {
+		defer close(mutated)
+		close(start)
+		for index := range 10_000 {
+			if index%2 == 0 {
+				query.DOIs[0] = "10.1000/mutated-a"
+				query.ISSNs[0] = "2049-3630"
+			} else {
+				query.DOIs[0] = "10.1000/mutated-b"
+				query.ISSNs[0] = "0028-0836"
+			}
+		}
+	}()
+	<-start
+	records, errs := collect(sequence)
+	<-mutated
+	if len(records) != 0 || len(errs) != 0 {
+		t.Fatalf("Fetch() = %d records, errors %v", len(records), errs)
+	}
+}
+
 func TestFetchRejectsUnboundedOrMalformedQueryBeforeNetwork(t *testing.T) {
 	t.Parallel()
 
@@ -185,6 +309,20 @@ func TestFetchRejectsUnboundedOrMalformedQueryBeforeNetwork(t *testing.T) {
 		{name: "invalid DOI", query: crossref.Query{DOIs: []string{"not-a-doi"}, MaxResults: 1}, want: "DOI"},
 		{name: "invalid ISSN format", query: crossref.Query{ISSNs: []string{"Nature"}, MaxResults: 1}, want: "ISSN"},
 		{name: "invalid ISSN checksum", query: crossref.Query{ISSNs: []string{"0028-0837"}, MaxResults: 1}, want: "ISSN"},
+		{name: "indexed year zero", query: crossref.Query{
+			IndexedDateWindow: crossref.DateWindow{
+				From: time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC),
+				To:   time.Date(1, time.January, 2, 0, 0, 0, 0, time.UTC),
+			},
+			MaxResults: 1,
+		}, want: "year"},
+		{name: "indexed year above four digits", query: crossref.Query{
+			IndexedDateWindow: crossref.DateWindow{
+				From: time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC),
+				To:   time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
+			},
+			MaxResults: 1,
+		}, want: "year"},
 	}
 
 	for _, test := range tests {
@@ -203,6 +341,52 @@ func TestFetchRejectsUnboundedOrMalformedQueryBeforeNetwork(t *testing.T) {
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("requests = %d, want validation before network", requests.Load())
+	}
+}
+
+func TestFetchAcceptsIndexedDateYearBoundaries(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu      sync.Mutex
+		filters []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		filters = append(filters, request.URL.Query().Get("filter"))
+		mu.Unlock()
+		writeEnvelope(t, writer, noCursor())
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+	for _, window := range []crossref.DateWindow{
+		{
+			From: time.Date(1, time.January, 2, 0, 0, 0, 0, time.UTC),
+			To:   time.Date(1, time.December, 31, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			From: time.Date(9999, time.January, 1, 0, 0, 0, 0, time.UTC),
+			To:   time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC),
+		},
+	} {
+		records, errs := collect(client.Fetch(context.Background(), crossref.Query{
+			IndexedDateWindow: window,
+			MaxResults:        1,
+		}))
+		if len(records) != 0 || len(errs) != 0 {
+			t.Fatalf("Fetch(%v) = %d records, errors %v", window, len(records), errs)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{
+		"from-index-date:0001-01-02,until-index-date:0001-12-31",
+		"from-index-date:9999-01-01,until-index-date:9999-12-31",
+	}
+	if !slices.Equal(filters, want) {
+		t.Fatalf("filters = %v, want exact supported year boundaries %v", filters, want)
 	}
 }
 
@@ -402,6 +586,63 @@ func TestFetchRejectsStrictEnvelopeViolations(t *testing.T) {
 	}
 }
 
+func TestFetchRejectsDuplicateJSONKeysInEnvelopeAndItemsBeforeYield(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		payload string
+		key     string
+	}{
+		{
+			name: "top-level status",
+			payload: `{
+				"status":"ok",
+				"status":"ok",
+				"message-type":"work-list",
+				"message":{"items":[]}
+			}`,
+			key: "status",
+		},
+		{
+			name: "item DOI",
+			payload: `{
+				"status":"ok",
+				"message-type":"work-list",
+				"message":{"items":[{
+					"DOI":"10.1000/first",
+					"DOI":"10.1000/second"
+				}]}
+			}`,
+			key: "DOI",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write([]byte(test.payload))
+			}))
+			defer server.Close()
+
+			client := newClient(t, server, nil, httpclient.Dependencies{})
+			records, errs := collect(client.Fetch(context.Background(), boundedQuery(1)))
+			if len(records) != 0 || len(errs) != 1 {
+				t.Fatalf("Fetch() = %d records, %d errors; want duplicate-key error before yield", len(records), len(errs))
+			}
+			message := errs[0].Error()
+			if !strings.Contains(strings.ToLower(message), "duplicate") ||
+				!strings.Contains(message, test.key) {
+				t.Fatalf("Fetch() error = %v, want duplicate key %q", errs[0], test.key)
+			}
+		})
+	}
+}
+
 func TestFetchYieldsPriorRecordsThenStopsAtGlobalMalformedItemOrdinal(t *testing.T) {
 	t.Parallel()
 
@@ -532,6 +773,173 @@ func TestFetchInheritsRetryCancellationAndBodyLimit(t *testing.T) {
 	})
 }
 
+func TestFetchRedactsMailtoFromStatusBodyAndTransportErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		transport roundTripperFunc
+		want      string
+	}{
+		{
+			name: "HTTP status URL",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("bad request")),
+				}, nil
+			},
+			want: "400",
+		},
+		{
+			name: "response body echo",
+			transport: func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Header:     make(http.Header),
+					Body: io.NopCloser(strings.NewReader(
+						"contact research@example.test was rejected",
+					)),
+				}, nil
+			},
+			want: "[REDACTED]",
+		},
+		{
+			name: "transport echo",
+			transport: func(request *http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf(
+					"dial failed for %s contact=%s",
+					request.URL.String(),
+					request.URL.Query().Get("mailto"),
+				)
+			},
+			want: "[REDACTED]",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			config := validConfig("https://api.crossref.test")
+			config.MaxRetries = 0
+			client, err := crossref.NewClient(
+				&http.Client{Transport: test.transport},
+				config,
+				httpclient.Dependencies{},
+			)
+			if err != nil {
+				t.Fatalf("NewClient() error = %v", err)
+			}
+			records, errs := collect(client.Fetch(context.Background(), boundedQuery(1)))
+			if len(records) != 0 || len(errs) != 1 {
+				t.Fatalf("Fetch() = %d records, %d errors", len(records), len(errs))
+			}
+			message := errs[0].Error()
+			if strings.Contains(message, "research@example.test") {
+				t.Fatalf("Fetch() error leaked mailto: %v", errs[0])
+			}
+			if !strings.Contains(message, test.want) {
+				t.Fatalf("Fetch() error = %v, want containing %q", errs[0], test.want)
+			}
+		})
+	}
+}
+
+func TestFetchClosesResponseBodyOnEveryExitPath(t *testing.T) {
+	t.Parallel()
+
+	successPayload := envelopePayload(
+		t,
+		noCursor(),
+		item("10.1000/one"),
+	)
+	parseFailurePayload := envelopePayload(
+		t,
+		noCursor(),
+		json.RawMessage(`{"title":["missing DOI"]}`),
+	)
+	earlyStopPayload := envelopePayload(
+		t,
+		noCursor(),
+		item("10.1000/one"),
+		item("10.1000/two"),
+	)
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+
+		client, closes := newTrackingBodyClient(t, successPayload, nil)
+		records, errs := collect(client.Fetch(context.Background(), boundedQuery(1)))
+		if len(records) != 1 || len(errs) != 0 {
+			t.Fatalf("Fetch() = %d records, errors %v", len(records), errs)
+		}
+		if got := closes.Load(); got != 1 {
+			t.Fatalf("response body Close() calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("parse failure", func(t *testing.T) {
+		t.Parallel()
+
+		client, closes := newTrackingBodyClient(t, parseFailurePayload, nil)
+		records, errs := collect(client.Fetch(context.Background(), boundedQuery(1)))
+		if len(records) != 0 || len(errs) != 1 {
+			t.Fatalf("Fetch() = %d records, errors %v; want parse error", len(records), errs)
+		}
+		if got := closes.Load(); got != 1 {
+			t.Fatalf("response body Close() calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("body limit", func(t *testing.T) {
+		t.Parallel()
+
+		client, closes := newTrackingBodyClient(
+			t,
+			[]byte(strings.Repeat("x", 128)),
+			func(config *crossref.Config) {
+				config.MaxResponseBytes = 32
+			},
+		)
+		records, errs := collect(client.Fetch(context.Background(), boundedQuery(1)))
+		if len(records) != 0 || len(errs) != 1 ||
+			!errors.Is(errs[0], httpclient.ErrResponseTooLarge) {
+			t.Fatalf("Fetch() = %d records, errors %v; want body limit error", len(records), errs)
+		}
+		if got := closes.Load(); got != 1 {
+			t.Fatalf("response body Close() calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("consumer stops after first record", func(t *testing.T) {
+		t.Parallel()
+
+		client, closes := newTrackingBodyClient(t, earlyStopPayload, func(config *crossref.Config) {
+			config.BatchSize = 2
+		})
+		yields := 0
+		client.Fetch(context.Background(), boundedQuery(2))(func(record source.Record, err error) bool {
+			yields++
+			if err != nil {
+				t.Fatalf("Fetch() yielded unexpected error: %v", err)
+			}
+			if record.SourceRecordID != "10.1000/one" {
+				t.Fatalf("first record DOI = %q, want 10.1000/one", record.SourceRecordID)
+			}
+			return false
+		})
+		if yields != 1 {
+			t.Fatalf("Fetch() yields = %d, want consumer stop after 1", yields)
+		}
+		if got := closes.Load(); got != 1 {
+			t.Fatalf("response body Close() calls = %d, want 1", got)
+		}
+	})
+}
+
 func TestSingleFetchRequestsCursorPagesSerially(t *testing.T) {
 	t.Parallel()
 
@@ -638,6 +1046,50 @@ func recordDOIs(records []source.Record) []string {
 	return result
 }
 
+func newTrackingBodyClient(
+	t *testing.T,
+	payload []byte,
+	mutate func(*crossref.Config),
+) (*crossref.Client, *atomic.Int32) {
+	t.Helper()
+
+	var closes atomic.Int32
+	transport := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: &trackingBody{
+				Reader: strings.NewReader(string(payload)),
+				closes: &closes,
+			},
+		}, nil
+	})
+	config := validConfig("https://api.crossref.test")
+	config.MaxRetries = 0
+	if mutate != nil {
+		mutate(&config)
+	}
+	client, err := crossref.NewClient(
+		&http.Client{Transport: transport},
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	return client, &closes
+}
+
+type trackingBody struct {
+	io.Reader
+	closes *atomic.Int32
+}
+
+func (body *trackingBody) Close() error {
+	body.closes.Add(1)
+	return nil
+}
+
 func item(doi string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"DOI":%q}`, doi))
 }
@@ -682,4 +1134,22 @@ func writeEnvelope(
 	if err := json.NewEncoder(writer).Encode(payload); err != nil {
 		t.Errorf("Encode() error = %v", err)
 	}
+}
+
+func envelopePayload(
+	t *testing.T,
+	cursor cursorField,
+	items ...json.RawMessage,
+) []byte {
+	t.Helper()
+
+	recorder := httptest.NewRecorder()
+	writeEnvelope(t, recorder, cursor, items...)
+	return append([]byte(nil), recorder.Body.Bytes()...)
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
 }

@@ -69,7 +69,39 @@ type updateToPayload struct {
 	Label string `json:"label"`
 }
 
+const (
+	MaxJATSDepth     = 64
+	MaxJATSElements  = 10_000
+	MaxJATSTextBytes = 1 << 20
+)
+
+type JATSLimitKind string
+
+const (
+	JATSLimitDepth     JATSLimitKind = "depth"
+	JATSLimitElements  JATSLimitKind = "elements"
+	JATSLimitTextBytes JATSLimitKind = "text_bytes"
+)
+
+type JATSLimitError struct {
+	Kind   JATSLimitKind
+	Limit  int
+	Actual int
+}
+
+func (err *JATSLimitError) Error() string {
+	return fmt.Sprintf(
+		"JATS %s limit exceeded: actual %d, limit %d",
+		err.Kind,
+		err.Actual,
+		err.Limit,
+	)
+}
+
 func Parse(raw json.RawMessage) (source.Record, error) {
+	if err := validateUniqueJSONObjects(raw); err != nil {
+		return source.Record{}, fmt.Errorf("validate Crossref item JSON: %w", err)
+	}
 	rawRecord, err := source.NewRawRecord(raw)
 	if err != nil {
 		return source.Record{}, fmt.Errorf("parse Crossref item JSON: %w", err)
@@ -408,15 +440,59 @@ func parseAbstract(raw string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
-	if !strings.Contains(value, "<") {
+	isJATS, err := hasAllowedLeadingJATSRoot(value)
+	if err != nil {
+		return "", err
+	}
+	if !isJATS {
 		return normalizeText(value), nil
+	}
+	return parseJATSAbstract(value)
+}
+
+func hasAllowedLeadingJATSRoot(value string) (bool, error) {
+	if !strings.HasPrefix(value, "<") {
+		return false, nil
 	}
 
 	decoder := xml.NewDecoder(strings.NewReader(value))
 	decoder.Strict = true
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("decode leading abstract XML token: %w", err)
+		}
+		switch typed := token.(type) {
+		case xml.CharData:
+			if strings.TrimSpace(string(typed)) == "" {
+				continue
+			}
+			return false, nil
+		case xml.StartElement:
+			if !validJATSRoot(typed.Name) {
+				return false, fmt.Errorf(
+					"abstract XML root %q is not an allowed JATS root",
+					typed.Name.Local,
+				)
+			}
+			return true, nil
+		case xml.Comment, xml.Directive, xml.ProcInst:
+			return false, errors.New("abstract contains markup before an allowed JATS root")
+		}
+	}
+}
+
+func parseJATSAbstract(value string) (string, error) {
+	decoder := xml.NewDecoder(strings.NewReader(value))
+	decoder.Strict = true
 	depth := 0
 	roots := 0
-	parts := make([]string, 0)
+	elements := 0
+	textBytes := 0
+	var text strings.Builder
 
 	for {
 		token, err := decoder.Token()
@@ -441,19 +517,45 @@ func parseAbstract(raw string) (string, error) {
 				)
 			}
 			depth++
+			if depth > MaxJATSDepth {
+				return "", &JATSLimitError{
+					Kind:   JATSLimitDepth,
+					Limit:  MaxJATSDepth,
+					Actual: depth,
+				}
+			}
+			elements++
+			if elements > MaxJATSElements {
+				return "", &JATSLimitError{
+					Kind:   JATSLimitElements,
+					Limit:  MaxJATSElements,
+					Actual: elements,
+				}
+			}
+			if isJATSBlockElement(typed.Name.Local) && text.Len() > 0 {
+				text.WriteByte(' ')
+			}
 		case xml.EndElement:
+			if isJATSBlockElement(typed.Name.Local) && text.Len() > 0 {
+				text.WriteByte(' ')
+			}
 			depth--
 		case xml.CharData:
-			text := normalizeText(string(typed))
+			textBytes += len(typed)
+			if textBytes > MaxJATSTextBytes {
+				return "", &JATSLimitError{
+					Kind:   JATSLimitTextBytes,
+					Limit:  MaxJATSTextBytes,
+					Actual: textBytes,
+				}
+			}
 			if depth == 0 {
-				if text != "" {
+				if strings.TrimSpace(string(typed)) != "" {
 					return "", errors.New("JATS abstract contains text outside its root element")
 				}
 				continue
 			}
-			if text != "" {
-				parts = append(parts, text)
-			}
+			text.Write([]byte(typed))
 		case xml.Comment, xml.Directive, xml.ProcInst:
 			return "", errors.New("JATS abstract contains unsupported markup")
 		}
@@ -461,7 +563,36 @@ func parseAbstract(raw string) (string, error) {
 	if roots != 1 || depth != 0 {
 		return "", errors.New("JATS abstract must contain exactly one complete root element")
 	}
-	return strings.Join(parts, " "), nil
+	return normalizeText(text.String()), nil
+}
+
+func validJATSRoot(name xml.Name) bool {
+	if !validJATSElement(name) {
+		return false
+	}
+	switch name.Local {
+	case "abstract", "p", "sec":
+		return true
+	default:
+		return false
+	}
+}
+
+func isJATSBlockElement(local string) bool {
+	switch local {
+	case "abstract",
+		"break",
+		"disp-formula",
+		"label",
+		"list",
+		"list-item",
+		"p",
+		"sec",
+		"title":
+		return true
+	default:
+		return false
+	}
 }
 
 func validJATSElement(name xml.Name) bool {

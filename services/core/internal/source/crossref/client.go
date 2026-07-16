@@ -74,14 +74,15 @@ func NewClient(
 	}
 
 	policy, err := httpclient.New(base, httpclient.Config{
-		Timeout:          config.Timeout,
-		UserAgent:        config.UserAgent,
-		RateLimit:        config.RateLimit,
-		MaxRetries:       config.MaxRetries,
-		MaxWait:          config.MaxWait,
-		InitialBackoff:   config.InitialBackoff,
-		MaxBackoff:       config.MaxBackoff,
-		MaxResponseBytes: config.MaxResponseBytes,
+		Timeout:                  config.Timeout,
+		UserAgent:                config.UserAgent,
+		RateLimit:                config.RateLimit,
+		MaxRetries:               config.MaxRetries,
+		MaxWait:                  config.MaxWait,
+		InitialBackoff:           config.InitialBackoff,
+		MaxBackoff:               config.MaxBackoff,
+		MaxResponseBytes:         config.MaxResponseBytes,
+		SensitiveQueryParameters: []string{"mailto"},
 	}, dependencies)
 	if err != nil {
 		return nil, fmt.Errorf("create Crossref HTTP policy: %w", err)
@@ -96,6 +97,7 @@ func NewClient(
 }
 
 func (client *Client) Fetch(ctx context.Context, query Query) source.ClientSequence {
+	query = query.clone()
 	return func(yield func(source.Record, error) bool) {
 		if client == nil {
 			yield(source.Record{}, errors.New("Crossref client is nil"))
@@ -250,6 +252,10 @@ func (query Query) filter() (string, error) {
 	if hasFrom {
 		from := dateOnly(query.IndexedDateWindow.From)
 		to := dateOnly(query.IndexedDateWindow.To)
+		if from.Year() < 1 || from.Year() > 9999 ||
+			to.Year() < 1 || to.Year() > 9999 {
+			return "", errors.New("Crossref indexed date window year must be between 1 and 9999")
+		}
 		if from.After(to) {
 			return "", errors.New("Crossref indexed date window from date must not follow to date")
 		}
@@ -265,6 +271,12 @@ func (query Query) filter() (string, error) {
 	return strings.Join(tokens, ","), nil
 }
 
+func (query Query) clone() Query {
+	query.DOIs = append([]string(nil), query.DOIs...)
+	query.ISSNs = append([]string(nil), query.ISSNs...)
+	return query
+}
+
 func normalizeDOIs(values []string) ([]string, error) {
 	result := make([]string, 0, len(values))
 	seen := make(map[string]struct{}, len(values))
@@ -272,6 +284,12 @@ func normalizeDOIs(values []string) ([]string, error) {
 		identifier, err := paper.NewIdentifier(paper.SchemeDOI, raw)
 		if err != nil {
 			return nil, fmt.Errorf("invalid Crossref DOI at position %d: %w", index+1, err)
+		}
+		if strings.Contains(identifier.Value(), ",") {
+			return nil, fmt.Errorf(
+				"Crossref DOI at position %d contains a comma and cannot be represented safely in a filter token",
+				index+1,
+			)
 		}
 		if _, exists := seen[identifier.Value()]; exists {
 			continue
@@ -338,6 +356,10 @@ type page struct {
 }
 
 func decodePage(payload []byte) (page, error) {
+	if err := validateUniqueJSONObjects(payload); err != nil {
+		return page{}, fmt.Errorf("validate Crossref works page JSON: %w", err)
+	}
+
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	var envelope map[string]json.RawMessage
 	if err := decoder.Decode(&envelope); err != nil {
