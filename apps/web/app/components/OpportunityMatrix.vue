@@ -1,4 +1,9 @@
 <script setup lang="ts">
+import {
+  presentDataValue,
+  type DataValue,
+} from "~/utils/dataValue"
+
 type OpportunityStatus =
   | "insufficient-evidence"
   | "not-recommended-now"
@@ -9,8 +14,8 @@ interface OpportunityPoint {
   id: string
   label: string
   status: OpportunityStatus
-  x: number
-  y: number
+  x: DataValue<number>
+  y: DataValue<number>
 }
 
 const props = withDefaults(
@@ -28,6 +33,13 @@ const props = withDefaults(
     emptyTitle: "暂无研究机会数据",
   },
 )
+
+const statusOrder: OpportunityStatus[] = [
+  "worth-pursuing",
+  "proceed-with-caution",
+  "not-recommended-now",
+  "insufficient-evidence",
+]
 
 const statusDefinitions: Record<
   OpportunityStatus,
@@ -51,31 +63,45 @@ const statusDefinitions: Record<
   },
 }
 
-const chart = {
-  bottom: 270,
-  left: 48,
-  right: 500,
-  top: 20,
-} as const
+const groupedPoints = computed(() =>
+  statusOrder.map((status) => ({
+    definition: statusDefinitions[status],
+    points: props.points.filter((point) => point.status === status),
+    status,
+  })),
+)
 
-function coordinate(point: OpportunityPoint) {
-  if (point.x < 0 || point.x > 100 || point.y < 0 || point.y > 100) {
-    throw new Error("OpportunityMatrix coordinates must be between 0 and 100.")
-  }
+const plottablePoints = computed(() =>
+  props.points.flatMap((point) => {
+    if (point.x.state !== "known" || point.y.state !== "known") {
+      return []
+    }
+    return [
+      {
+        id: point.id,
+        label: point.label,
+        status: point.status,
+        x: point.x.value,
+        y: point.y.value,
+      },
+    ]
+  }),
+)
 
-  return {
-    x: chart.left + (point.x / 100) * (chart.right - chart.left),
-    y: chart.bottom - (point.y / 100) * (chart.bottom - chart.top),
-  }
-}
+const unplottableCount = computed(
+  () => props.points.length - plottablePoints.value.length,
+)
 
-function diamondPoints(point: OpportunityPoint) {
-  const { x, y } = coordinate(point)
-  return `${x},${y - 7} ${x + 7},${y} ${x},${y + 7} ${x - 7},${y}`
-}
+const unavailableCoordinateState = computed<"insufficient" | "missing">(() =>
+  props.points.some(
+    (point) => point.x.state === "missing" || point.y.state === "missing",
+  )
+    ? "missing"
+    : "insufficient",
+)
 
-function pointLabel(point: OpportunityPoint) {
-  return `${point.label}，${statusDefinitions[point.status].label}，${props.xAxisLabel} ${point.x}，${props.yAxisLabel} ${point.y}`
+function coordinateText(value: DataValue<number>) {
+  return presentDataValue(value).text
 }
 </script>
 
@@ -88,16 +114,16 @@ function pointLabel(point: OpportunityPoint) {
 
     <ul class="opportunity-matrix__legend" aria-label="研究机会状态图例">
       <li
-        v-for="(definition, status) in statusDefinitions"
+        v-for="status in statusOrder"
         :key="status"
         :data-status="status"
       >
         <span
           class="opportunity-matrix__legend-shape"
-          :data-shape="definition.shape"
+          :data-shape="statusDefinitions[status].shape"
           aria-hidden="true"
         />
-        {{ definition.label }}
+        {{ statusDefinitions[status].label }}
       </li>
     </ul>
 
@@ -107,118 +133,94 @@ function pointLabel(point: OpportunityPoint) {
       :title="emptyTitle"
       :message="emptyMessage"
     />
-    <ul
-      v-else
-      class="opportunity-matrix__mobile-list"
-      aria-label="研究机会列表"
-    >
-      <li v-for="point in points" :key="point.id">
-        <strong>{{ point.label }}</strong>
-        <span class="opportunity-matrix__status">
-          <span
-            class="opportunity-matrix__legend-shape"
-            :data-shape="statusDefinitions[point.status].shape"
-            aria-hidden="true"
-          />
-          {{ statusDefinitions[point.status].label }}
-        </span>
-        <span>{{ xAxisLabel }} {{ point.x }}</span>
-        <span>{{ yAxisLabel }} {{ point.y }}</span>
-      </li>
-    </ul>
-    <svg
-      v-if="points.length > 0"
-      class="opportunity-matrix__chart"
-      viewBox="0 0 520 320"
-      role="img"
-      :aria-label="summary"
-    >
-      <line
-        :x1="chart.left"
-        :y1="chart.bottom"
-        :x2="chart.right"
-        :y2="chart.bottom"
-        class="opportunity-matrix__axis"
-      />
-      <line
-        :x1="chart.left"
-        :y1="chart.top"
-        :x2="chart.left"
-        :y2="chart.bottom"
-        class="opportunity-matrix__axis"
-      />
-      <line
-        :x1="(chart.left + chart.right) / 2"
-        :y1="chart.top"
-        :x2="(chart.left + chart.right) / 2"
-        :y2="chart.bottom"
-        class="opportunity-matrix__gridline"
-      />
-      <line
-        :x1="chart.left"
-        :y1="(chart.top + chart.bottom) / 2"
-        :x2="chart.right"
-        :y2="(chart.top + chart.bottom) / 2"
-        class="opportunity-matrix__gridline"
-      />
 
-      <text x="274" y="310" class="opportunity-matrix__axis-label">
-        {{ xAxisLabel }}
-      </text>
-      <text
-        x="16"
-        y="145"
-        class="opportunity-matrix__axis-label"
-        transform="rotate(-90 16 145)"
+    <template v-else>
+      <p
+        v-if="unplottableCount > 0"
+        class="opportunity-matrix__coverage-note"
+        data-unplottable-count
       >
-        {{ yAxisLabel }}
-      </text>
+        {{ unplottableCount }} 个方向因坐标缺失或未覆盖而未绘制，仍保留在分组列表和数据表中。
+      </p>
 
-      <g
-        v-for="point in points"
-        :key="point.id"
-        role="graphics-symbol"
-        :aria-label="pointLabel(point)"
+      <div
+        class="opportunity-matrix__mobile-groups"
+        aria-label="按推荐状态分组的研究机会"
       >
-        <circle
-          v-if="point.status === 'worth-pursuing'"
-          :cx="coordinate(point).x"
-          :cy="coordinate(point).y"
-          r="7"
-          class="opportunity-matrix__point opportunity-matrix__point--worth"
-          data-opportunity-shape="circle"
-          :data-status="point.status"
+        <section
+          v-for="group in groupedPoints"
+          :key="group.status"
+          :data-opportunity-group="group.status"
+        >
+          <h2>
+            <span
+              class="opportunity-matrix__legend-shape"
+              :data-shape="group.definition.shape"
+              aria-hidden="true"
+            />
+            {{ group.definition.label }}
+          </h2>
+          <ul v-if="group.points.length > 0">
+            <li v-for="point in group.points" :key="point.id">
+              <strong>{{ point.label }}</strong>
+              <dl>
+                <div>
+                  <dt>{{ xAxisLabel }}</dt>
+                  <dd :data-value-state="point.x.state">
+                    {{ coordinateText(point.x) }}
+                  </dd>
+                </div>
+                <div>
+                  <dt>{{ yAxisLabel }}</dt>
+                  <dd :data-value-state="point.y.state">
+                    {{ coordinateText(point.y) }}
+                  </dd>
+                </div>
+              </dl>
+            </li>
+          </ul>
+          <p v-else>
+            暂无
+          </p>
+        </section>
+      </div>
+
+      <details class="opportunity-matrix__overview data-table-disclosure">
+        <summary>查看矩阵概览</summary>
+        <OpportunityPlot
+          v-if="plottablePoints.length > 0"
+          class="opportunity-matrix__mobile-chart"
+          :points="plottablePoints"
+          :summary="summary"
+          :x-axis-label="xAxisLabel"
+          :y-axis-label="yAxisLabel"
         />
-        <polygon
-          v-else-if="point.status === 'proceed-with-caution'"
-          :points="diamondPoints(point)"
-          class="opportunity-matrix__point opportunity-matrix__point--caution"
-          data-opportunity-shape="diamond"
-          :data-status="point.status"
-        />
-        <rect
-          v-else-if="point.status === 'not-recommended-now'"
-          :x="coordinate(point).x - 7"
-          :y="coordinate(point).y - 7"
-          width="14"
-          height="14"
-          class="opportunity-matrix__point opportunity-matrix__point--negative"
-          data-opportunity-shape="square"
-          :data-status="point.status"
-        />
-        <circle
+        <DataState
           v-else
-          :cx="coordinate(point).x"
-          :cy="coordinate(point).y"
-          r="7"
-          class="opportunity-matrix__point opportunity-matrix__point--insufficient"
-          data-opportunity-shape="hollow-circle"
-          :data-status="point.status"
+          :state="unavailableCoordinateState"
+          title="暂无可绘制坐标"
+          message="所有方向的坐标均为缺失或未覆盖，矩阵不会推断或填补位置。"
         />
-      </g>
-    </svg>
+      </details>
 
-    <details class="data-table-disclosure">
+      <OpportunityPlot
+        v-if="plottablePoints.length > 0"
+        class="opportunity-matrix__desktop-chart"
+        :points="plottablePoints"
+        :summary="summary"
+        :x-axis-label="xAxisLabel"
+        :y-axis-label="yAxisLabel"
+      />
+      <DataState
+        v-else
+        class="opportunity-matrix__desktop-state"
+        :state="unavailableCoordinateState"
+        title="暂无可绘制坐标"
+        message="所有方向的坐标均为缺失或未覆盖，矩阵不会推断或填补位置。"
+      />
+    </template>
+
+    <details class="opportunity-matrix__table data-table-disclosure">
       <summary>查看数据表</summary>
       <div class="data-table-scroll" tabindex="0">
         <table>
@@ -244,8 +246,18 @@ function pointLabel(point: OpportunityPoint) {
                 />
                 {{ statusDefinitions[point.status].label }}
               </td>
-              <td>{{ point.x }}</td>
-              <td>{{ point.y }}</td>
+              <td
+                data-coordinate-value
+                :data-value-state="point.x.state"
+              >
+                {{ coordinateText(point.x) }}
+              </td>
+              <td
+                data-coordinate-value
+                :data-value-state="point.y.state"
+              >
+                {{ coordinateText(point.y) }}
+              </td>
             </tr>
           </tbody>
         </table>
@@ -286,7 +298,7 @@ figcaption {
 }
 
 .opportunity-matrix__legend {
-  display: flex;
+  display: none;
   flex-wrap: wrap;
   gap: var(--space-2) var(--space-4);
   margin: 0;
@@ -335,14 +347,37 @@ figcaption {
   border-radius: 50%;
 }
 
-.opportunity-matrix__chart {
-  display: none;
-  width: 100%;
-  min-height: 260px;
-  overflow: visible;
+.opportunity-matrix__coverage-note {
+  margin: 0;
+  padding: var(--space-3);
+  border-left: 4px solid var(--color-caution);
+  background: var(--color-caution-bg);
+  color: var(--color-text);
+  font-size: var(--text-sm-size);
+  line-height: var(--text-sm-line);
 }
 
-.opportunity-matrix__mobile-list {
+.opportunity-matrix__mobile-groups {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.opportunity-matrix__mobile-groups > section {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.opportunity-matrix__mobile-groups h2 {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin: 0;
+  color: var(--color-text-strong);
+  font-size: var(--text-base-size);
+  line-height: var(--text-base-line);
+}
+
+.opportunity-matrix__mobile-groups ul {
   display: grid;
   gap: var(--space-3);
   margin: 0;
@@ -350,80 +385,76 @@ figcaption {
   list-style: none;
 }
 
-.opportunity-matrix__mobile-list li {
+.opportunity-matrix__mobile-groups li {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: var(--space-2) var(--space-3);
+  gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--color-border);
   border-left: 4px solid var(--color-border-control);
   border-radius: var(--radius-md);
   background: var(--color-surface-subtle);
+}
+
+.opportunity-matrix__mobile-groups strong {
+  color: var(--color-text-strong);
+}
+
+.opportunity-matrix__mobile-groups dl {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+}
+
+.opportunity-matrix__mobile-groups dl > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-3);
+}
+
+.opportunity-matrix__mobile-groups dt,
+.opportunity-matrix__mobile-groups dd,
+.opportunity-matrix__mobile-groups > section > p {
+  margin: 0;
   color: var(--color-text-muted);
   font-size: var(--text-sm-size);
   line-height: var(--text-sm-line);
 }
 
-.opportunity-matrix__mobile-list strong {
-  color: var(--color-text-strong);
+.opportunity-matrix__mobile-groups dd {
+  font-variant-numeric: tabular-nums;
 }
 
-.opportunity-matrix__axis {
-  stroke: var(--color-border-control);
-  stroke-width: 1.5;
+[data-value-state="missing"],
+[data-value-state="unknown"] {
+  color: var(--color-text-muted);
+  font-style: italic;
 }
 
-.opportunity-matrix__gridline {
-  stroke: var(--color-border);
-  stroke-dasharray: 4 5;
-  stroke-width: 1;
+.opportunity-matrix__overview {
+  display: block;
 }
 
-.opportunity-matrix__axis-label {
-  fill: var(--color-text-muted);
-  font-family: var(--font-ui);
-  font-size: 12px;
-  text-anchor: middle;
-}
-
-.opportunity-matrix__point {
-  stroke-width: 2;
-}
-
-.opportunity-matrix__point--worth {
-  fill: var(--color-positive);
-  stroke: var(--color-positive);
-}
-
-.opportunity-matrix__point--caution {
-  fill: var(--color-caution-bg);
-  stroke: var(--color-caution);
-}
-
-.opportunity-matrix__point--negative {
-  fill: var(--color-negative);
-  stroke: var(--color-negative);
-}
-
-.opportunity-matrix__point--insufficient {
-  fill: var(--color-surface);
-  stroke: var(--color-text-muted);
-  stroke-dasharray: 3 2;
-}
-
-@media (max-width: 767px) {
-  .opportunity-matrix__legend {
-    display: none;
-  }
+.opportunity-matrix__desktop-chart,
+.opportunity-matrix__desktop-state {
+  display: none;
 }
 
 @media (min-width: 768px) {
-  .opportunity-matrix__chart {
+  .opportunity-matrix__legend {
+    display: flex;
+  }
+
+  .opportunity-matrix__mobile-groups,
+  .opportunity-matrix__overview {
+    display: none;
+  }
+
+  .opportunity-matrix__desktop-chart {
     display: block;
   }
 
-  .opportunity-matrix__mobile-list {
-    display: none;
+  .opportunity-matrix__desktop-state {
+    display: grid;
   }
 }
 </style>

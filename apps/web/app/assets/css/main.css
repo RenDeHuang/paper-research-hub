@@ -35,8 +35,11 @@
   --color-border-control: var(--border-strong);
   --color-primary: var(--navy-900);
   --color-primary-hover: var(--navy-950);
+  --color-primary-pressed: var(--navy-800);
+  --color-on-primary: var(--surface);
   --color-link: var(--teal-700);
   --color-focus: var(--teal-700);
+  --color-focus-contrast: var(--surface);
   --color-positive: var(--teal-700);
   --color-positive-bg: var(--teal-100);
   --color-caution: var(--ochre-700);
@@ -45,6 +48,13 @@
   --color-negative-bg: var(--coral-100);
   --color-info: var(--navy-800);
   --color-info-bg: var(--navy-100);
+  --color-surface-pressed: var(--warm-100);
+  --color-placeholder: var(--warm-500);
+  --color-negative-subtle: var(--coral-50);
+  --color-chart-primary: var(--teal-600);
+  --color-chart-primary-strong: var(--teal-700);
+  --color-track: var(--warm-100);
+  --color-neutral-bg: var(--warm-100);
 
   --font-ui:
     "Inter", "Noto Sans SC", "Source Han Sans SC", "PingFang SC",
@@ -102,6 +112,7 @@
 
   --shell-max: 1360px;
   --shell-gutter: 16px;
+  --discovery-rail-width: 216px;
 
   color: var(--color-text);
   background: var(--color-bg);
@@ -187,6 +198,16 @@ svg {
   min-width: 0;
 }
 
+.app-shell__content {
+  min-width: 0;
+  padding-top: var(--space-10);
+  padding-bottom: var(--space-16);
+}
+
+.app-shell__content > .discovery-rail {
+  display: none;
+}
+
 .shell-container {
   width: min(100%, var(--shell-max));
   margin-inline: auto;
@@ -202,7 +223,7 @@ svg {
   padding: var(--space-3) var(--space-4);
   border-radius: var(--radius-md);
   background: var(--color-primary);
-  color: var(--surface);
+  color: var(--color-on-primary);
   font-weight: 700;
   text-decoration: none;
   transform: translateY(calc(-100% - var(--space-4)));
@@ -235,7 +256,7 @@ svg {
 .button--primary {
   border-color: var(--color-primary);
   background: var(--color-primary);
-  color: var(--surface);
+  color: var(--color-on-primary);
 }
 
 .button--primary:hover {
@@ -244,12 +265,12 @@ svg {
 }
 
 .button--primary:active {
-  border-color: var(--navy-800);
-  background: var(--navy-800);
+  border-color: var(--color-primary-pressed);
+  background: var(--color-primary-pressed);
 }
 
 .button--primary:focus-visible {
-  box-shadow: 0 0 0 2px var(--surface);
+  box-shadow: 0 0 0 2px var(--color-focus-contrast);
 }
 
 .button--secondary {
@@ -263,7 +284,7 @@ svg {
 }
 
 .button--secondary:active {
-  background: var(--warm-100);
+  background: var(--color-surface-pressed);
 }
 
 .data-table-disclosure {
@@ -338,11 +359,28 @@ td {
   :root {
     --shell-gutter: 28px;
   }
+
+  .app-shell__content {
+    display: grid;
+    grid-template-columns: var(--discovery-rail-width) minmax(0, 1fr);
+    gap: var(--space-6);
+    align-items: start;
+  }
+
+  .app-shell__content > .discovery-rail {
+    position: sticky;
+    top: 96px;
+    display: grid;
+    width: var(--discovery-rail-width);
+    max-height: none;
+    overflow: visible;
+  }
 }
 
 @media (min-width: 1440px) {
   :root {
     --shell-gutter: 32px;
+    --discovery-rail-width: 232px;
   }
 }
 

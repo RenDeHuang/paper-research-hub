@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import type { DataValue } from "~/utils/dataValue"
+
 useHead({
   title: "Paper Research Hub",
   meta: [
@@ -8,10 +10,22 @@ useHead({
     },
   ],
 })
+
+const searchQuery = ref("")
+
+const syncStatus: {
+  coverage: DataValue<number | string>
+  dataRange: DataValue<string>
+  updatedAt: DataValue<string>
+} = {
+  coverage: { label: "等待首次同步", state: "unknown" },
+  dataRange: { label: "等待首次同步", state: "missing" },
+  updatedAt: { label: "尚未生成", state: "missing" },
+}
 </script>
 
 <template>
-  <div class="home-page shell-container">
+  <div class="home-page">
     <section class="home-page__intro" aria-labelledby="home-heading">
       <p class="eyebrow">
         Paper Research Hub
@@ -22,7 +36,15 @@ useHead({
       <p class="home-page__description">
         搜索论文与研究实体，并在后续数据接入后核查趋势、机会、来源与缺失信号。
       </p>
-      <SearchCommand />
+      <SearchCommand
+        v-model="searchQuery"
+        :suggestion-groups="[]"
+      />
+      <SyncStatus
+        :updated-at="syncStatus.updatedAt"
+        :data-range="syncStatus.dataRange"
+        :coverage="syncStatus.coverage"
+      />
     </section>
 
     <section class="home-page__data" aria-labelledby="data-heading">
@@ -31,8 +53,8 @@ useHead({
       </p>
       <DataState
         state="empty"
-        title="等待 API 数据"
-        message="当前页面只验证稳定视觉 shell；后续 API agent 将接入真实论文与分析结果，不展示模拟或补位数据。"
+        title="等待首次同步"
+        message="同步尚未生成。首次同步完成后，此处才会展示真实论文与分析结果。"
       />
     </section>
   </div>

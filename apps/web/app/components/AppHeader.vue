@@ -1,7 +1,12 @@
 <script setup lang="ts">
 const route = useRoute()
 const menuOpen = ref(false)
+const menuReady = ref(false)
 const menuButton = useTemplateRef<HTMLButtonElement>("menuButton")
+
+const props = defineProps<{
+  routeLabel?: string
+}>()
 
 const navigation = [
   { label: "首页", to: "/" },
@@ -9,6 +14,17 @@ const navigation = [
   { label: "趋势", to: "/trends" },
   { label: "研究机会", to: "/opportunities" },
 ] as const
+
+const currentRouteLabel = computed(() => {
+  if (props.routeLabel) {
+    return props.routeLabel
+  }
+
+  return (
+    navigation.find((item) => isCurrent(item.to))?.label
+    ?? "当前页面"
+  )
+})
 
 function isCurrent(to: string) {
   if (to === "/") {
@@ -32,12 +48,16 @@ function closeMenu({ restoreFocus = false } = {}) {
 }
 
 watch(
-  () => route.fullPath,
+  () => route.path,
   () => closeMenu(),
 )
 
 watch(menuOpen, (open) => {
   document.documentElement.classList.toggle("menu-open", open)
+})
+
+onMounted(() => {
+  menuReady.value = true
 })
 
 onBeforeUnmount(() => {
@@ -48,9 +68,14 @@ onBeforeUnmount(() => {
 <template>
   <header class="app-header" @keydown.esc="closeMenu({ restoreFocus: true })">
     <div class="app-header__inner shell-container">
-      <NuxtLink class="app-header__brand" to="/" aria-label="Paper Research Hub 首页">
-        Paper Research Hub
-      </NuxtLink>
+      <div class="app-header__identity">
+        <NuxtLink class="app-header__brand" to="/" aria-label="Paper Research Hub 首页">
+          Paper Research Hub
+        </NuxtLink>
+        <span class="app-header__route-name">
+          {{ currentRouteLabel }}
+        </span>
+      </div>
 
       <nav
         id="primary-navigation"
@@ -60,13 +85,13 @@ onBeforeUnmount(() => {
       >
         <ul>
           <li v-for="item in navigation" :key="item.to">
-            <a
-              :href="item.to"
+            <NuxtLink
+              :to="item.to"
               :aria-current="isCurrent(item.to) ? 'page' : undefined"
               @click="closeMenu()"
             >
               {{ item.label }}
-            </a>
+            </NuxtLink>
           </li>
         </ul>
       </nav>
@@ -87,6 +112,7 @@ onBeforeUnmount(() => {
         aria-controls="primary-navigation"
         :aria-expanded="menuOpen"
         :aria-label="menuOpen ? '关闭一级导航' : '打开一级导航'"
+        :disabled="!menuReady"
         @click="toggleMenu"
       >
         菜单
@@ -116,7 +142,10 @@ onBeforeUnmount(() => {
 }
 
 .app-header__brand {
+  display: inline-flex;
   min-width: 0;
+  min-height: 44px;
+  align-items: center;
   overflow: hidden;
   color: var(--color-primary);
   font-size: var(--text-sm-size);
@@ -125,6 +154,19 @@ onBeforeUnmount(() => {
   text-decoration: none;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.app-header__identity {
+  display: grid;
+  min-width: 0;
+}
+
+.app-header__route-name {
+  margin-top: -8px;
+  color: var(--color-text-muted);
+  font-size: var(--text-xs-size);
+  font-weight: 650;
+  line-height: var(--text-xs-line);
 }
 
 .app-header__search,
@@ -160,7 +202,7 @@ onBeforeUnmount(() => {
 
 .app-header__search:active,
 .app-header__menu-button:active {
-  background: var(--warm-100);
+  background: var(--color-surface-pressed);
 }
 
 .app-header__navigation {
@@ -207,7 +249,7 @@ onBeforeUnmount(() => {
 }
 
 .app-header__navigation a:active {
-  background: var(--warm-100);
+  background: var(--color-surface-pressed);
 }
 
 .app-header__navigation a[aria-current="page"] {

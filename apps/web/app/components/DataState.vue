@@ -4,8 +4,10 @@ type DataStateKind =
   | "error"
   | "insufficient"
   | "loading"
+  | "missing"
   | "restricted"
   | "stale"
+  | "unknown"
 
 const props = defineProps<{
   actionLabel?: string
@@ -20,6 +22,16 @@ const emit = defineEmits<{
 }>()
 
 const headingId = `data-state-${useId()}`
+const stateLabels: Record<DataStateKind, string> = {
+  empty: "尚无数据",
+  error: "加载失败",
+  insufficient: "证据不足",
+  loading: "加载中",
+  missing: "数据缺失",
+  restricted: "访问受限",
+  stale: "数据可能过时",
+  unknown: "覆盖未知",
+}
 const role = computed(() => {
   if (props.state === "error") {
     return "alert"
@@ -41,6 +53,9 @@ const role = computed(() => {
   >
     <span class="data-state__mark" aria-hidden="true" />
     <div class="data-state__content">
+      <span class="data-state__label">
+        {{ stateLabels[state] }}
+      </span>
       <h2 :id="headingId">
         {{ title }}
       </h2>
@@ -81,10 +96,11 @@ const role = computed(() => {
 
 .data-state[data-state="error"] {
   border-left-color: var(--color-negative);
-  background: var(--coral-50);
+  background: var(--color-negative-subtle);
 }
 
 .data-state[data-state="insufficient"],
+.data-state[data-state="missing"],
 .data-state[data-state="restricted"],
 .data-state[data-state="stale"] {
   border-left-color: var(--color-caution);
@@ -105,14 +121,37 @@ const role = computed(() => {
 }
 
 [data-state="insufficient"] .data-state__mark,
+[data-state="missing"] .data-state__mark,
 [data-state="restricted"] .data-state__mark,
 [data-state="stale"] .data-state__mark {
   border-style: dashed;
   color: var(--color-caution);
 }
 
+[data-state="missing"] .data-state__mark {
+  border-radius: var(--radius-sm);
+}
+
+[data-state="unknown"] .data-state__mark {
+  border-style: dashed;
+}
+
 .data-state__content {
   min-width: 0;
+}
+
+.data-state__label {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  margin-bottom: var(--space-1);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--color-neutral-bg);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs-size);
+  font-weight: 750;
+  line-height: var(--text-xs-line);
 }
 
 h2 {

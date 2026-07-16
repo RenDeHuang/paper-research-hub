@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
 import { describe, expect, it } from "vitest"
@@ -13,10 +13,13 @@ const requiredFiles = [
   "app/components/AppHeader.vue",
   "app/components/AppFooter.vue",
   "app/components/SearchCommand.vue",
+  "app/components/DiscoveryRail.vue",
+  "app/components/SyncStatus.vue",
   "app/components/PaperCard.vue",
   "app/components/TrendSparkline.vue",
   "app/components/EvidenceBar.vue",
   "app/components/OpportunityMatrix.vue",
+  "app/components/OpportunityPlot.vue",
   "app/components/DataState.vue",
   "app/pages/index.vue",
 ]
@@ -76,5 +79,41 @@ describe("Nuxt visual foundation contract", () => {
     for (const breakpoint of ["768px", "1024px", "1440px"]) {
       expect(source).toContain(`min-width: ${breakpoint}`)
     }
+  })
+
+  it("keeps raw palette tokens inside the global token layer", () => {
+    const componentRoot = `${webRoot}/app/components`
+    const componentFiles = readdirSync(componentRoot).filter((file) =>
+      file.endsWith(".vue"),
+    )
+    const rawPaletteToken =
+      /var\(--(?:border-strong|coral|ink|navy|ochre|paper|surface|teal|warm)-?\d*/
+
+    for (const file of componentFiles) {
+      const source = readFileSync(`${componentRoot}/${file}`, "utf8")
+      expect(source, `${file} must only consume semantic tokens`).not.toMatch(
+        rawPaletteToken,
+      )
+    }
+
+    const globalSource = readFileSync(
+      `${webRoot}/app/assets/css/main.css`,
+      "utf8",
+    )
+    const globalUtilities = globalSource.slice(
+      globalSource.indexOf("*,\n*::before"),
+    )
+
+    expect(globalUtilities).not.toMatch(rawPaletteToken)
+  })
+
+  it("uses NuxtLink for every primary navigation destination", () => {
+    const source = readFileSync(
+      `${webRoot}/app/components/AppHeader.vue`,
+      "utf8",
+    )
+
+    expect(source).toMatch(/<NuxtLink\s+:to="item\.to"/)
+    expect(source).not.toMatch(/<a\s+:href="item\.to"/)
   })
 })

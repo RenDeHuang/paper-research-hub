@@ -8,6 +8,10 @@ const props = withDefaults(
   defineProps<{
     emptyMessage?: string
     emptyTitle?: string
+    insufficientMessage?: string
+    insufficientTitle?: string
+    missingMessage?: string
+    missingTitle?: string
     points: TrendPoint[]
     summary: string
     title: string
@@ -16,6 +20,10 @@ const props = withDefaults(
   {
     emptyMessage: "调用方尚未提供可绘制的时间点。",
     emptyTitle: "暂无趋势数据",
+    insufficientMessage: "时间点存在，但当前覆盖不足，无法绘制趋势。",
+    insufficientTitle: "趋势证据不足",
+    missingMessage: "时间点存在，但预期数据缺失，无法绘制趋势。",
+    missingTitle: "趋势数据缺失",
     unit: "",
   },
 )
@@ -32,6 +40,40 @@ const knownValues = computed(() =>
     point.state === "known" ? [point.value] : [],
   ),
 )
+
+const displayState = computed<"chart" | "empty" | "insufficient" | "missing">(
+  () => {
+    if (props.points.length === 0) {
+      return "empty"
+    }
+    if (knownValues.value.length > 0) {
+      return "chart"
+    }
+    if (props.points.some((point) => point.state === "missing")) {
+      return "missing"
+    }
+    return "insufficient"
+  },
+)
+
+const stateCopy = computed(() => {
+  if (displayState.value === "missing") {
+    return {
+      message: props.missingMessage,
+      title: props.missingTitle,
+    }
+  }
+  if (displayState.value === "insufficient") {
+    return {
+      message: props.insufficientMessage,
+      title: props.insufficientTitle,
+    }
+  }
+  return {
+    message: props.emptyMessage,
+    title: props.emptyTitle,
+  }
+})
 
 const coordinates = computed(() => {
   if (knownValues.value.length === 0) {
@@ -103,10 +145,10 @@ function pointText(point: TrendPoint) {
     </figcaption>
 
     <DataState
-      v-if="knownValues.length === 0"
-      state="empty"
-      :title="emptyTitle"
-      :message="emptyMessage"
+      v-if="displayState !== 'chart'"
+      :state="displayState"
+      :title="stateCopy.title"
+      :message="stateCopy.message"
     />
     <svg
       v-else
@@ -214,7 +256,7 @@ figcaption {
 
 .trend-sparkline__line {
   fill: none;
-  stroke: var(--teal-600);
+  stroke: var(--color-chart-primary);
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 2.5;
@@ -222,7 +264,7 @@ figcaption {
 
 .trend-sparkline__point {
   fill: var(--color-surface);
-  stroke: var(--teal-700);
+  stroke: var(--color-chart-primary-strong);
   stroke-width: 2;
 }
 

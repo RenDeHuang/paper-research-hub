@@ -140,7 +140,7 @@ const accessibleLabel = computed(() => {
   height: 12px;
   overflow: hidden;
   border-radius: var(--radius-sm);
-  background: var(--warm-100);
+  background: var(--color-track);
 }
 
 .evidence-bar__fill {

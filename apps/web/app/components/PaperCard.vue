@@ -5,6 +5,13 @@ import {
 } from "~/utils/dataValue"
 
 type StatusTone = "caution" | "info" | "negative" | "neutral" | "positive"
+type PaperLifecycleStatus =
+  | "active"
+  | "excluded"
+  | "rejected"
+  | "retracted"
+  | "superseded"
+  | "withdrawn"
 
 interface LabelledValue {
   label: string
@@ -16,7 +23,7 @@ interface PaperTag {
   label: string
 }
 
-defineProps<{
+const props = defineProps<{
   authors?: DataValue<string[]>
   detailLabel?: string
   detailTo?: string
@@ -25,6 +32,7 @@ defineProps<{
   publishedAt?: DataValue<string>
   sourceType?: DataValue<string>
   status?: {
+    code?: PaperLifecycleStatus
     description?: string
     label: string
     tone: StatusTone
@@ -34,16 +42,33 @@ defineProps<{
   title: string
   venue?: DataValue<string>
 }>()
+
+const unavailableStatuses = new Set<PaperLifecycleStatus>([
+  "excluded",
+  "rejected",
+  "retracted",
+  "superseded",
+  "withdrawn",
+])
+
+const isNotRecommendable = computed(
+  () =>
+    props.status?.code !== undefined
+    && unavailableStatuses.has(props.status.code),
+)
 </script>
 
 <template>
-  <article class="paper-card">
+  <article
+    class="paper-card"
+    :class="{ 'paper-card--not-recommendable': isNotRecommendable }"
+    :data-paper-status="status?.code"
+  >
     <div v-if="status || sourceType" class="paper-card__topline">
       <span
         v-if="status"
         class="status-badge"
         :class="`status-badge--${status.tone}`"
-        :title="status.description"
       >
         <span class="status-badge__shape" aria-hidden="true" />
         {{ status.label }}
@@ -55,6 +80,21 @@ defineProps<{
       >
         {{ presentDataValue(sourceType).text }}
       </span>
+    </div>
+
+    <div
+      v-if="status?.description || isNotRecommendable"
+      class="paper-card__status-copy"
+    >
+      <p v-if="status?.description" class="paper-card__status-description">
+        {{ status.description }}
+      </p>
+      <p
+        v-if="isNotRecommendable"
+        class="paper-card__recommendation-note"
+      >
+        不会进入推荐榜；当前不可推荐。
+      </p>
     </div>
 
     <h2 class="paper-card__title">
@@ -150,6 +190,10 @@ defineProps<{
   border-color: var(--color-border-control);
 }
 
+.paper-card--not-recommendable {
+  border-left: 4px solid var(--color-negative);
+}
+
 .paper-card__topline {
   display: flex;
   flex-wrap: wrap;
@@ -171,7 +215,7 @@ defineProps<{
 }
 
 .status-badge {
-  background: var(--warm-100);
+  background: var(--color-neutral-bg);
   color: var(--color-text-strong);
 }
 
@@ -212,6 +256,27 @@ defineProps<{
   color: var(--color-text-muted);
 }
 
+.paper-card__status-copy {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-negative-subtle);
+}
+
+.paper-card__status-description,
+.paper-card__recommendation-note {
+  margin: 0;
+  color: var(--color-text);
+  font-size: var(--text-sm-size);
+  line-height: var(--text-sm-line);
+}
+
+.paper-card__recommendation-note {
+  color: var(--color-negative);
+  font-weight: 750;
+}
+
 .paper-card__title {
   margin: 0;
   color: var(--color-text-strong);
@@ -221,6 +286,9 @@ defineProps<{
 }
 
 .paper-card__title a {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
   color: inherit;
   text-decoration-thickness: 1px;
   text-underline-offset: 3px;

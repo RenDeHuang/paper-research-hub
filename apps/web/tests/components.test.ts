@@ -1,13 +1,16 @@
 import { mountSuspended } from "@nuxt/test-utils/runtime"
-import { describe, expect, it } from "vitest"
+import { nextTick } from "vue"
+import { describe, expect, it, vi } from "vitest"
 
 import AppFooter from "../app/components/AppFooter.vue"
 import AppHeader from "../app/components/AppHeader.vue"
 import DataState from "../app/components/DataState.vue"
+import DiscoveryRail from "../app/components/DiscoveryRail.vue"
 import EvidenceBar from "../app/components/EvidenceBar.vue"
 import OpportunityMatrix from "../app/components/OpportunityMatrix.vue"
 import PaperCard from "../app/components/PaperCard.vue"
 import SearchCommand from "../app/components/SearchCommand.vue"
+import SyncStatus from "../app/components/SyncStatus.vue"
 import TrendSparkline from "../app/components/TrendSparkline.vue"
 
 describe("AppHeader", () => {
@@ -28,6 +31,7 @@ describe("AppHeader", () => {
       "/opportunities",
     ])
     expect(links[0]?.attributes("aria-current")).toBe("page")
+    expect(wrapper.get(".app-header__route-name").text()).toBe("首页")
     const searchLink = wrapper.get('a[href="/#global-search"]')
 
     expect(searchLink.text()).toContain("搜索")
@@ -50,10 +54,81 @@ describe("AppHeader", () => {
     expect(wrapper.get("#primary-navigation").classes()).toContain("is-open")
     expect(document.documentElement.classList.contains("menu-open")).toBe(true)
 
+    const focus = vi.spyOn(button.element, "focus")
     await wrapper.trigger("keydown", { key: "Escape" })
+    await nextTick()
 
     expect(document.documentElement.classList.contains("menu-open")).toBe(false)
     expect(button.attributes("aria-expanded")).toBe("false")
+    expect(focus).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("DiscoveryRail", () => {
+  it("renders only explicit navigation and strategy defaults", async () => {
+    const wrapper = await mountSuspended(DiscoveryRail)
+
+    expect(wrapper.get("aside").attributes("aria-label")).toBe("发现导航")
+    expect(wrapper.findAll("a > span").map((label) => label.text())).toEqual([
+      "浏览论文",
+      "查看趋势",
+      "研究机会",
+      "精选策略",
+    ])
+    expect(wrapper.text()).not.toContain("热门")
+  })
+
+  it("accepts caller-provided sections without retaining default content", async () => {
+    const wrapper = await mountSuspended(DiscoveryRail, {
+      props: {
+        sections: [
+          {
+            id: "methods",
+            items: [
+              {
+                description: "查看方法采用率",
+                label: "Method 专题",
+                to: "/methods",
+              },
+            ],
+            title: "方法入口",
+          },
+        ],
+      },
+    })
+
+    expect(wrapper.get("h2").text()).toBe("方法入口")
+    expect(wrapper.get("a").text()).toContain("Method 专题")
+    expect(wrapper.text()).not.toContain("浏览论文")
+  })
+})
+
+describe("SyncStatus", () => {
+  it("renders updated time, data range, and coverage from explicit data states", async () => {
+    const wrapper = await mountSuspended(SyncStatus, {
+      props: {
+        coverage: { label: "等待首次同步", state: "unknown" },
+        dataRange: { label: "等待首次同步", state: "missing" },
+        updatedAt: { label: "尚未生成", state: "missing" },
+      },
+    })
+    const values = wrapper.findAll("dd")
+
+    expect(wrapper.findAll("dt").map((item) => item.text())).toEqual([
+      "更新时间",
+      "数据范围",
+      "覆盖率",
+    ])
+    expect(values.map((item) => item.text())).toEqual([
+      "尚未生成",
+      "等待首次同步",
+      "等待首次同步",
+    ])
+    expect(values.map((item) => item.attributes("data-value-state"))).toEqual([
+      "missing",
+      "missing",
+      "unknown",
+    ])
   })
 })
 
@@ -81,9 +156,185 @@ describe("SearchCommand", () => {
       "搜索论文与研究实体",
     )
     expect(input.attributes("id")).toBe("global-search")
-    expect(input.attributes("aria-describedby")).toBe("global-search-helper")
+    expect(input.attributes("aria-describedby")?.split(" ")).toEqual([
+      "global-search-helper",
+      "global-search-status",
+    ])
     expect(wrapper.get("#global-search-helper").text()).toContain("可搜索标题")
     expect(wrapper.get('button[type="submit"]').text()).toBe("搜索")
+  })
+
+  it("exposes caller-provided entity groups through combobox semantics", async () => {
+    const wrapper = await mountSuspended(SearchCommand, {
+      props: {
+        modelValue: "agent",
+        suggestionGroups: [
+          {
+            id: "papers",
+            items: [
+              {
+                description: "论文",
+                entityType: "paper",
+                id: "paper-1",
+                label: "Agent systems",
+                value: "Agent systems",
+              },
+            ],
+            label: "论文",
+          },
+          {
+            id: "methods",
+            items: [
+              {
+                entityType: "method",
+                id: "method-1",
+                label: "Agentic workflow",
+              },
+            ],
+            label: "方法",
+          },
+        ],
+      },
+    })
+    const input = wrapper.get('[role="combobox"]')
+    const listbox = wrapper.get('[role="listbox"]')
+    const groups = wrapper.findAll('[role="group"]')
+    const options = wrapper.findAll('[role="option"]')
+
+    expect(input.attributes()).toMatchObject({
+      "aria-autocomplete": "list",
+      "aria-controls": listbox.attributes("id"),
+      "aria-expanded": "true",
+    })
+    expect(groups.map((group) => group.attributes("aria-labelledby"))).toEqual([
+      expect.stringContaining("papers"),
+      expect.stringContaining("methods"),
+    ])
+    expect(options.map((option) => option.text())).toEqual([
+      "Agent systems论文",
+      "Agentic workflow",
+    ])
+    expect(options.map((option) => option.attributes("data-entity-type"))).toEqual(
+      ["paper", "method"],
+    )
+
+    await input.setValue("agent systems")
+
+    expect(wrapper.emitted("update:modelValue")?.at(-1)).toEqual([
+      "agent systems",
+    ])
+    await wrapper.setProps({ modelValue: "caller accepted value" })
+    expect(input.element.value).toBe("caller accepted value")
+  })
+
+  it("supports option navigation, selection, and Escape dismissal", async () => {
+    const wrapper = await mountSuspended(SearchCommand, {
+      attachTo: document.body,
+      props: {
+        modelValue: "agent",
+        suggestionGroups: [
+          {
+            id: "entities",
+            items: [
+              {
+                entityType: "topic",
+                id: "topic-1",
+                label: "Agent",
+              },
+              {
+                entityType: "method",
+                id: "method-1",
+                label: "Agentic RAG",
+                value: "agentic-rag",
+              },
+            ],
+            label: "研究实体",
+          },
+        ],
+      },
+    })
+    const input = wrapper.get('[role="combobox"]')
+    const options = wrapper.findAll('[role="option"]')
+
+    ;(input.element as HTMLInputElement).focus()
+    await input.trigger("keydown", { key: "ArrowDown" })
+    expect(input.attributes("aria-activedescendant")).toBe(
+      options[0]?.attributes("id"),
+    )
+    expect(options[0]?.attributes("aria-selected")).toBe("true")
+
+    await input.trigger("keydown", { key: "ArrowDown" })
+    expect(input.attributes("aria-activedescendant")).toBe(
+      options[1]?.attributes("id"),
+    )
+
+    await input.trigger("keydown", { key: "ArrowUp" })
+    expect(input.attributes("aria-activedescendant")).toBe(
+      options[0]?.attributes("id"),
+    )
+
+    await input.trigger("keydown", { key: "ArrowDown" })
+    await input.trigger("keydown", { key: "Enter" })
+
+    expect(wrapper.emitted("select")?.at(-1)?.[0]).toMatchObject({
+      entityType: "method",
+      id: "method-1",
+    })
+    expect(wrapper.emitted("update:modelValue")?.at(-1)).toEqual([
+      "agentic-rag",
+    ])
+    expect(input.attributes("aria-expanded")).toBe("false")
+
+    await input.trigger("focus")
+    await input.trigger("keydown", { key: "ArrowDown" })
+    await input.trigger("keydown", { key: "Escape" })
+
+    expect(input.attributes("aria-expanded")).toBe("false")
+    expect(input.attributes("aria-activedescendant")).toBeUndefined()
+    expect(document.activeElement).toBe(input.element)
+    wrapper.unmount()
+  })
+
+  it.each([
+    {
+      expected: "请输入关键词",
+      props: { modelValue: "", suggestionGroups: [] },
+      state: "empty-query",
+    },
+    {
+      expected: "正在加载搜索建议",
+      props: { loading: true, modelValue: "agent", suggestionGroups: [] },
+      state: "loading",
+    },
+    {
+      expected: "搜索服务暂不可用",
+      props: {
+        error: "搜索服务暂不可用",
+        modelValue: "agent",
+        suggestionGroups: [],
+      },
+      state: "error",
+    },
+    {
+      expected: "没有匹配结果",
+      props: { modelValue: "agent", suggestionGroups: [] },
+      state: "no-match",
+    },
+  ])("renders the $state command state independently", async ({
+    expected,
+    props,
+    state,
+  }) => {
+    const wrapper = await mountSuspended(SearchCommand, { props })
+    const status = wrapper.get(`[data-search-state="${state}"]`)
+
+    expect(status.text()).toContain(expected)
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(false)
+    if (state === "error") {
+      expect(status.attributes("role")).toBe("alert")
+    } else {
+      expect(status.attributes("role")).toBe("status")
+    }
   })
 })
 
@@ -138,6 +389,56 @@ describe("PaperCard", () => {
       "number",
       "unknown",
       "missing",
+    ])
+  })
+
+  it.each([
+    ["retracted", "已撤稿"],
+    ["withdrawn", "已撤回"],
+    ["rejected", "已拒绝"],
+    ["superseded", "已被替代"],
+    ["excluded", "已排除"],
+  ] as const)(
+    "makes the %s lifecycle visibly unavailable for recommendation",
+    async (code, label) => {
+      const wrapper = await mountSuspended(PaperCard, {
+        props: {
+          status: {
+            code,
+            description: `${label}的来源说明`,
+            label,
+            tone: "negative",
+          },
+          title: `${label}论文`,
+        },
+      })
+
+      expect(wrapper.attributes("data-paper-status")).toBe(code)
+      expect(wrapper.classes()).toContain("paper-card--not-recommendable")
+      expect(wrapper.get(".paper-card__status-description").text()).toBe(
+        `${label}的来源说明`,
+      )
+      expect(wrapper.get(".paper-card__recommendation-note").text()).toMatch(
+        /不会进入推荐榜|当前不可推荐/,
+      )
+      expect(wrapper.get(".status-badge").attributes("title")).toBeUndefined()
+    },
+  )
+
+  it("renders both title and detail destinations as explicit links", async () => {
+    const wrapper = await mountSuspended(PaperCard, {
+      props: {
+        detailLabel: "核查论文证据",
+        detailTo: "/papers/paper-1",
+        title: "有详情入口的论文",
+      },
+    })
+    const links = wrapper.findAll("a")
+
+    expect(links).toHaveLength(2)
+    expect(links.map((link) => link.attributes("href"))).toEqual([
+      "/papers/paper-1",
+      "/papers/paper-1",
     ])
   })
 })
@@ -200,10 +501,69 @@ describe("TrendSparkline", () => {
     expect(wrapper.get("svg").attributes("aria-label")).toBe(
       "该序列从 4 降至 0，后续一天未覆盖、一天缺失。",
     )
-    expect(wrapper.get("details summary").text()).toBe("查看数据表")
+    expect(wrapper.get(".data-table-disclosure summary").text()).toBe(
+      "查看数据表",
+    )
     expect(
       wrapper.findAll("tbody [data-value-state]").map((cell) => cell.text()),
     ).toEqual(["4篇", "0篇", "未覆盖", "缺失"])
+  })
+
+  it("uses empty only when no time points exist and keeps the table entry", async () => {
+    const wrapper = await mountSuspended(TrendSparkline, {
+      props: {
+        points: [],
+        summary: "尚无时间点。",
+        title: "空趋势",
+      },
+    })
+
+    expect(wrapper.get('.data-state[data-state="empty"]').exists()).toBe(true)
+    expect(wrapper.find("svg").exists()).toBe(false)
+    expect(wrapper.get(".data-table-disclosure summary").text()).toBe(
+      "查看数据表",
+    )
+    expect(wrapper.findAll("tbody tr")).toHaveLength(0)
+  })
+
+  it("reports insufficient coverage when every time point is unknown", async () => {
+    const wrapper = await mountSuspended(TrendSparkline, {
+      props: {
+        points: [
+          { label: "第一期", state: "unknown" },
+          { label: "第二期", state: "unknown" },
+        ],
+        summary: "两个时间点均未覆盖。",
+        title: "未覆盖趋势",
+      },
+    })
+
+    expect(
+      wrapper.get('.data-state[data-state="insufficient"]').exists(),
+    ).toBe(true)
+    expect(wrapper.find("svg").exists()).toBe(false)
+    expect(
+      wrapper.findAll("tbody [data-value-state]").map((cell) => cell.text()),
+    ).toEqual(["未覆盖", "未覆盖"])
+  })
+
+  it("reports missing data when unplottable points include an expected value", async () => {
+    const wrapper = await mountSuspended(TrendSparkline, {
+      props: {
+        points: [
+          { label: "第一期", state: "unknown" },
+          { label: "第二期", state: "missing" },
+        ],
+        summary: "一期未覆盖，一期数据缺失。",
+        title: "缺失趋势",
+      },
+    })
+
+    expect(wrapper.get('.data-state[data-state="missing"]').exists()).toBe(true)
+    expect(wrapper.find("svg").exists()).toBe(false)
+    expect(
+      wrapper.findAll("tbody [data-value-state]").map((cell) => cell.text()),
+    ).toEqual(["未覆盖", "缺失"])
   })
 })
 
@@ -216,29 +576,29 @@ describe("OpportunityMatrix", () => {
             id: "worth",
             label: "方向 A",
             status: "worth-pursuing",
-            x: 20,
-            y: 80,
+            x: { state: "known", value: 20 },
+            y: { state: "known", value: 80 },
           },
           {
             id: "caution",
             label: "方向 B",
             status: "proceed-with-caution",
-            x: 40,
-            y: 60,
+            x: { state: "known", value: 40 },
+            y: { state: "known", value: 60 },
           },
           {
             id: "not-now",
             label: "方向 C",
             status: "not-recommended-now",
-            x: 80,
-            y: 20,
+            x: { state: "known", value: 80 },
+            y: { state: "known", value: 20 },
           },
           {
             id: "insufficient",
             label: "方向 D",
             status: "insufficient-evidence",
-            x: 55,
-            y: 45,
+            x: { state: "known", value: 55 },
+            y: { state: "known", value: 45 },
           },
         ],
         summary: "四个方向分别覆盖四种独立机会状态。",
@@ -248,40 +608,211 @@ describe("OpportunityMatrix", () => {
       },
     })
 
-    expect(wrapper.get("svg").attributes("aria-label")).toBe(
+    expect(
+      wrapper
+        .get(".opportunity-matrix__desktop-chart")
+        .attributes("aria-label"),
+    ).toBe(
       "四个方向分别覆盖四种独立机会状态。",
     )
     expect(
-      wrapper.findAll("[data-opportunity-shape]").map((node) => ({
-        shape: node.attributes("data-opportunity-shape"),
-        status: node.attributes("data-status"),
-      })),
+      wrapper
+        .findAll(
+          ".opportunity-matrix__desktop-chart [data-opportunity-shape]",
+        )
+        .map((node) => ({
+          shape: node.attributes("data-opportunity-shape"),
+          status: node.attributes("data-status"),
+        })),
     ).toEqual([
       { shape: "circle", status: "worth-pursuing" },
       { shape: "diamond", status: "proceed-with-caution" },
       { shape: "square", status: "not-recommended-now" },
       { shape: "hollow-circle", status: "insufficient-evidence" },
     ])
-    expect(wrapper.get("details summary").text()).toBe("查看数据表")
+    expect(wrapper.get(".opportunity-matrix__overview summary").text()).toBe(
+      "查看矩阵概览",
+    )
+    expect(wrapper.get(".opportunity-matrix__table summary").text()).toBe(
+      "查看数据表",
+    )
     expect(
       wrapper.findAll("tbody .opportunity-matrix__status").map((cell) =>
         cell.text(),
       ),
     ).toEqual(["值得做", "谨慎做", "当前不建议做", "证据不足"])
     expect(
-      wrapper.findAll(".opportunity-matrix__mobile-list li").map((item) =>
-        item.text(),
-      ),
+      wrapper
+        .findAll(".opportunity-matrix__mobile-groups > section")
+        .map((group) => group.attributes("data-opportunity-group")),
     ).toEqual([
-      "方向 A 值得做竞争密度 20增长信号 80",
-      "方向 B 谨慎做竞争密度 40增长信号 60",
-      "方向 C 当前不建议做竞争密度 80增长信号 20",
-      "方向 D 证据不足竞争密度 55增长信号 45",
+      "worth-pursuing",
+      "proceed-with-caution",
+      "not-recommended-now",
+      "insufficient-evidence",
     ])
+  })
+
+  it("plots known zero but never invents unknown or missing coordinates", async () => {
+    const wrapper = await mountSuspended(OpportunityMatrix, {
+      props: {
+        points: [
+          {
+            id: "missing-both",
+            label: "方向 D",
+            status: "insufficient-evidence",
+            x: { state: "missing" },
+            y: { state: "unknown" },
+          },
+          {
+            id: "unknown-x",
+            label: "方向 B",
+            status: "proceed-with-caution",
+            x: { state: "unknown" },
+            y: { state: "known", value: 10 },
+          },
+          {
+            id: "known-zero",
+            label: "方向 A",
+            status: "worth-pursuing",
+            x: { state: "known", value: 0 },
+            y: { state: "known", value: 0 },
+          },
+          {
+            id: "missing-y",
+            label: "方向 C",
+            status: "not-recommended-now",
+            x: { state: "known", value: 20 },
+            y: { state: "missing" },
+          },
+        ],
+        summary: "仅方向 A 具备完整坐标。",
+        title: "坐标覆盖测试",
+        xAxisLabel: "竞争密度",
+        yAxisLabel: "增长信号",
+      },
+    })
+    const plotted = wrapper.findAll(
+      ".opportunity-matrix__desktop-chart [data-opportunity-shape]",
+    )
+    const coordinateCells = wrapper.findAll(
+      "tbody [data-coordinate-value]",
+    )
+
+    expect(plotted).toHaveLength(1)
+    expect(plotted[0]?.attributes("data-status")).toBe("worth-pursuing")
+    expect(wrapper.get("[data-unplottable-count]").text()).toContain(
+      "3 个方向",
+    )
+    expect(coordinateCells.map((cell) => cell.text())).toEqual([
+      "缺失",
+      "未覆盖",
+      "未覆盖",
+      "10",
+      "0",
+      "0",
+      "20",
+      "缺失",
+    ])
+    expect(
+      coordinateCells.map((cell) => cell.attributes("data-value-state")),
+    ).toEqual([
+      "missing",
+      "unknown",
+      "unknown",
+      "known",
+      "known",
+      "known",
+      "known",
+      "missing",
+    ])
+    expect(
+      wrapper
+        .findAll(".opportunity-matrix__mobile-groups > section")
+        .map((group) => group.attributes("data-opportunity-group")),
+    ).toEqual([
+      "worth-pursuing",
+      "proceed-with-caution",
+      "not-recommended-now",
+      "insufficient-evidence",
+    ])
+  })
+
+  it("renders an explicit empty state without a matrix overview", async () => {
+    const wrapper = await mountSuspended(OpportunityMatrix, {
+      props: {
+        points: [],
+        summary: "尚无方向。",
+        title: "空机会矩阵",
+        xAxisLabel: "竞争密度",
+        yAxisLabel: "增长信号",
+      },
+    })
+
+    expect(wrapper.get('.data-state[data-state="empty"]').exists()).toBe(true)
+    expect(wrapper.find(".opportunity-matrix__overview").exists()).toBe(false)
+    expect(wrapper.find("svg").exists()).toBe(false)
+    expect(wrapper.get(".opportunity-matrix__table summary").text()).toBe(
+      "查看数据表",
+    )
   })
 })
 
 describe("DataState", () => {
+  it.each([
+    { label: "尚无数据", role: "region", state: "empty" },
+    { label: "加载失败", role: "alert", state: "error" },
+    { label: "证据不足", role: "region", state: "insufficient" },
+    { label: "加载中", role: "status", state: "loading" },
+    { label: "数据缺失", role: "region", state: "missing" },
+    { label: "访问受限", role: "region", state: "restricted" },
+    { label: "数据可能过时", role: "region", state: "stale" },
+    { label: "覆盖未知", role: "region", state: "unknown" },
+  ] as const)("renders the $state state with explicit semantics", async ({
+    label,
+    role,
+    state,
+  }) => {
+    const wrapper = await mountSuspended(DataState, {
+      props: {
+        message: `${state} message`,
+        state,
+        title: `${state} title`,
+      },
+    })
+
+    expect(wrapper.attributes("data-state")).toBe(state)
+    expect(wrapper.attributes("role")).toBe(role)
+    expect(wrapper.get("h2").text()).toBe(`${state} title`)
+    expect(wrapper.text()).toContain(`${state} message`)
+    expect(wrapper.get(".data-state__label").text()).toBe(label)
+    expect(wrapper.attributes("aria-live")).toBe(
+      state === "loading" ? "polite" : undefined,
+    )
+  })
+
+  it("supports either a navigation action or a caller-handled action", async () => {
+    const linkState = await mountSuspended(DataState, {
+      props: {
+        actionLabel: "查看同步说明",
+        actionTo: "/sync",
+        state: "missing",
+        title: "尚未同步",
+      },
+    })
+    const buttonState = await mountSuspended(DataState, {
+      props: {
+        actionLabel: "重试",
+        state: "error",
+        title: "同步失败",
+      },
+    })
+
+    expect(linkState.get("a").attributes("href")).toBe("/sync")
+    await buttonState.get("button").trigger("click")
+    expect(buttonState.emitted("action")).toHaveLength(1)
+  })
+
   it("renders an explicit empty state without inventing records", async () => {
     const wrapper = await mountSuspended(DataState, {
       props: {

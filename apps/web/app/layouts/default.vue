@@ -3,7 +3,7 @@ const route = useRoute()
 const main = useTemplateRef<HTMLElement>("main")
 
 watch(
-  () => route.fullPath,
+  () => route.path,
   async () => {
     await nextTick()
     main.value?.focus({ preventScroll: true })
@@ -17,9 +17,12 @@ watch(
       跳到主要内容
     </a>
     <AppHeader />
-    <main id="main-content" ref="main" class="app-shell__main" tabindex="-1">
-      <slot />
-    </main>
+    <div class="app-shell__content shell-container">
+      <DiscoveryRail />
+      <main id="main-content" ref="main" class="app-shell__main" tabindex="-1">
+        <slot />
+      </main>
+    </div>
     <AppFooter />
   </div>
 </template>
