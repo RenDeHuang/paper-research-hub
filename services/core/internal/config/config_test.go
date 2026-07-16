@@ -9,8 +9,9 @@ import (
 )
 
 const testDatabaseURL = "postgres://paper_user:database-password@localhost:5432/paper_hub?sslmode=disable"
+const testCatalogCursorSecret = "test-catalog-cursor-secret-32-bytes"
 
-func TestLoadForAPIRequiresOnlySharedConfiguration(t *testing.T) {
+func TestLoadForAPIRequiresDatabaseAndCatalogCursorSecret(t *testing.T) {
 	cfg, err := LoadFrom(RoleAPI, envMap(
 		"DATABASE_URL", testDatabaseURL,
 	))
@@ -24,9 +25,116 @@ func TestLoadForAPIRequiresOnlySharedConfiguration(t *testing.T) {
 	if cfg.HTTP.Address() != "0.0.0.0:8080" {
 		t.Errorf("HTTP.Address() = %q, want %q", cfg.HTTP.Address(), "0.0.0.0:8080")
 	}
+	if cfg.Catalog.CursorSecret != testCatalogCursorSecret {
+		t.Fatal("API configuration did not preserve CATALOG_CURSOR_SECRET")
+	}
 	if cfg.OpenAlex.ContactEmail != "" || cfg.PubMed.Email != "" ||
 		cfg.Crossref.ContactEmail != "" || cfg.Publishers.SpringerNature.APIKey != "" {
 		t.Fatal("API configuration unexpectedly required or populated ingestion credentials")
+	}
+}
+
+func TestLoadForAPIParsesExplicitCORSAllowedOrigins(t *testing.T) {
+	cfg, err := LoadFrom(RoleAPI, envMap(
+		"DATABASE_URL", testDatabaseURL,
+		"API_CORS_ALLOWED_ORIGINS", "http://localhost:3000,https://papers.example.test",
+	))
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+
+	want := []string{"http://localhost:3000", "https://papers.example.test"}
+	if len(cfg.HTTP.CORSAllowedOrigins) != len(want) {
+		t.Fatalf("HTTP.CORSAllowedOrigins = %#v, want %#v", cfg.HTTP.CORSAllowedOrigins, want)
+	}
+	for index := range want {
+		if cfg.HTTP.CORSAllowedOrigins[index] != want[index] {
+			t.Fatalf("HTTP.CORSAllowedOrigins = %#v, want %#v", cfg.HTTP.CORSAllowedOrigins, want)
+		}
+	}
+}
+
+func TestLoadForAPIRejectsInvalidCORSAllowedOrigin(t *testing.T) {
+	tests := []string{
+		"*",
+		"localhost:3000",
+		"http://localhost:3000/path",
+		"https://user@example.test",
+	}
+
+	for _, origin := range tests {
+		t.Run(origin, func(t *testing.T) {
+			_, err := LoadFrom(RoleAPI, envMap(
+				"DATABASE_URL", testDatabaseURL,
+				"API_CORS_ALLOWED_ORIGINS", origin,
+			))
+			if err == nil || !strings.Contains(err.Error(), "API_CORS_ALLOWED_ORIGINS") {
+				t.Fatalf("LoadFrom() error = %v, want invalid CORS origin error", err)
+			}
+		})
+	}
+}
+
+func TestLoadForAPIRejectsInvalidCatalogCursorSecretWithoutLeakingIt(t *testing.T) {
+	tests := []struct {
+		name    string
+		secret  string
+		present bool
+		want    string
+	}{
+		{
+			name: "missing",
+			want: "CATALOG_CURSOR_SECRET is required",
+		},
+		{
+			name:    "blank",
+			secret:  " \t ",
+			present: true,
+			want:    "CATALOG_CURSOR_SECRET is required",
+		},
+		{
+			name:    "short",
+			secret:  strings.Repeat("s", 31),
+			present: true,
+			want:    "CATALOG_CURSOR_SECRET must contain at least 32 bytes",
+		},
+		{
+			name:    "not trimmed",
+			secret:  " " + strings.Repeat("s", 32),
+			present: true,
+			want:    "CATALOG_CURSOR_SECRET must be trimmed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]string{"DATABASE_URL": testDatabaseURL}
+			if tt.present {
+				values["CATALOG_CURSOR_SECRET"] = tt.secret
+			}
+
+			_, err := LoadFrom(RoleAPI, mapLookup(values))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("LoadFrom() error = %v, want containing %q", err, tt.want)
+			}
+			if tt.secret != "" && strings.Contains(err.Error(), tt.secret) {
+				t.Fatalf("LoadFrom() error leaked CATALOG_CURSOR_SECRET: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadForAPIMeasuresCatalogCursorSecretInBytes(t *testing.T) {
+	secret := strings.Repeat("密", 11)
+	cfg, err := LoadFrom(RoleAPI, mapLookup(map[string]string{
+		"DATABASE_URL":          testDatabaseURL,
+		"CATALOG_CURSOR_SECRET": secret,
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if cfg.Catalog.CursorSecret != secret {
+		t.Fatal("Catalog.CursorSecret did not preserve the supplied UTF-8 bytes")
 	}
 }
 
@@ -39,6 +147,27 @@ func TestLoadForMigrateDoesNotRequireOpenAlexCredentials(t *testing.T) {
 	}
 	if cfg.OpenAlex.APIKey != "" || cfg.OpenAlex.ContactEmail != "" {
 		t.Fatalf("migrate configuration unexpectedly populated OpenAlex credentials: %+v", cfg.Redacted())
+	}
+}
+
+func TestLoadForCatalogPublishRequiresOnlyDatabase(t *testing.T) {
+	cfg, err := LoadFrom(RoleCatalogPublish, mapLookup(map[string]string{
+		"DATABASE_URL": testDatabaseURL,
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if cfg.Database.URL != testDatabaseURL {
+		t.Errorf("Database.URL = %q, want supplied URL", cfg.Database.URL)
+	}
+	if cfg.Catalog.CursorSecret != "" {
+		t.Fatal("catalog publish unexpectedly required CATALOG_CURSOR_SECRET")
+	}
+	if cfg.OpenAlex.APIKey != "" ||
+		cfg.PubMed.APIKey != "" ||
+		cfg.Publishers.SpringerNature.APIKey != "" ||
+		cfg.Publishers.Elsevier.APIKey != "" {
+		t.Fatalf("catalog publish unexpectedly populated source credentials: %+v", cfg.Redacted())
 	}
 }
 
@@ -97,6 +226,11 @@ func TestLoadValidatesCredentialsOnlyForSelectedRole(t *testing.T) {
 			want: "ELSEVIER_CONTACT_EMAIL",
 		},
 		{role: RoleJCRImport, want: "JCR_IMPORT_PATH"},
+		{
+			role: RoleJCRImport,
+			env:  map[string]string{"JCR_IMPORT_PATH": "/authorized/jcr-export.csv"},
+			want: "JCR_SOURCE_LICENSE",
+		},
 	}
 
 	for _, tt := range tests {
@@ -162,7 +296,13 @@ func TestLoadAcceptsRoleSpecificCredentials(t *testing.T) {
 				"ELSEVIER_CONTACT_EMAIL": "elsevier@example.test",
 			},
 		},
-		{role: RoleJCRImport, env: map[string]string{"JCR_IMPORT_PATH": "/authorized/jcr-export.csv"}},
+		{
+			role: RoleJCRImport,
+			env: map[string]string{
+				"JCR_IMPORT_PATH":    "/authorized/jcr-export.csv",
+				"JCR_SOURCE_LICENSE": "institutional-jcr-license",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -364,6 +504,7 @@ func TestFormattedAndJSONConfigurationRedactSecrets(t *testing.T) {
 		"OPENALEX_API_KEY", "openalex-api-secret",
 		"SPRINGER_NATURE_API_KEY", "springer-api-secret",
 		"ELSEVIER_API_KEY", "elsevier-api-secret",
+		"CATALOG_CURSOR_SECRET", "catalog-cursor-secret-that-must-not-leak",
 	))
 	if err != nil {
 		t.Fatalf("LoadFrom() error = %v", err)
@@ -382,6 +523,7 @@ func TestFormattedAndJSONConfigurationRedactSecrets(t *testing.T) {
 			"openalex-api-secret",
 			"springer-api-secret",
 			"elsevier-api-secret",
+			"catalog-cursor-secret-that-must-not-leak",
 		} {
 			if strings.Contains(output, secret) {
 				t.Fatalf("formatted config leaked %q: %s", secret, output)
@@ -391,13 +533,17 @@ func TestFormattedAndJSONConfigurationRedactSecrets(t *testing.T) {
 	if !strings.Contains(formatted, "postgres://paper_user:%5BREDACTED%5D@localhost:5432/paper_hub") {
 		t.Fatalf("String() = %s, want redacted database URL", formatted)
 	}
+	if !strings.Contains(formatted, `"cursor_secret":"[REDACTED]"`) {
+		t.Fatalf("String() = %s, want explicitly redacted catalog cursor secret", formatted)
+	}
 }
 
 func envMap(pairs ...string) LookupEnv {
 	if len(pairs)%2 != 0 {
 		panic("envMap requires key/value pairs")
 	}
-	values := make(map[string]string, len(pairs)/2)
+	values := make(map[string]string, len(pairs)/2+1)
+	values["CATALOG_CURSOR_SECRET"] = testCatalogCursorSecret
 	for index := 0; index < len(pairs); index += 2 {
 		values[pairs[index]] = pairs[index+1]
 	}

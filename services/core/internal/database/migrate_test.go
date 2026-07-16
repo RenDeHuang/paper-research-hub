@@ -108,6 +108,11 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 3, name: "jcr_import_receipts"},
 		{version: 4, name: "venue_policy_semantics"},
 		{version: 5, name: "jcr_integrity_followup"},
+		{version: 6, name: "ingestion_provenance"},
+		{version: 7, name: "public_catalog"},
+		{version: 8, name: "public_search"},
+		{version: 9, name: "analysis_runs"},
+		{version: 10, name: "repeatable_ingestion_jobs"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -143,7 +148,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 	}
 }
 
-func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRIntegrityFollowup(t *testing.T) {
+func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrations(t *testing.T) {
 	migrations, err := EmbeddedMigrations()
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
@@ -151,8 +156,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRIntegrityFollowup(t *t
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 5 {
-		t.Fatalf("embedded migration count = %d, want 5", len(migrations))
+	if len(migrations) != 10 {
+		t.Fatalf("embedded migration count = %d, want 10", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -168,6 +173,24 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRIntegrityFollowup(t *t
 	}
 	if migrations[4].Version != 5 || migrations[4].Name != "jcr_integrity_followup" {
 		t.Fatalf("fifth migration = %#v, want 000005_jcr_integrity_followup", migrations[4])
+	}
+	if migrations[5].Version != 6 || migrations[5].Name != "ingestion_provenance" {
+		t.Fatalf("sixth migration = %#v, want 000006_ingestion_provenance", migrations[5])
+	}
+	if migrations[6].Version != 7 || migrations[6].Name != "public_catalog" {
+		t.Fatalf("seventh migration = %#v, want 000007_public_catalog", migrations[6])
+	}
+	if migrations[7].Version != 8 || migrations[7].Name != "public_search" {
+		t.Fatalf("eighth migration = %#v, want 000008_public_search", migrations[7])
+	}
+	if migrations[8].Version != 9 || migrations[8].Name != "analysis_runs" {
+		t.Fatalf("ninth migration = %#v, want 000009_analysis_runs", migrations[8])
+	}
+	if migrations[9].Version != 10 || migrations[9].Name != "repeatable_ingestion_jobs" {
+		t.Fatalf(
+			"tenth migration = %#v, want 000010_repeatable_ingestion_jobs",
+			migrations[9],
+		)
 	}
 }
 
@@ -286,6 +309,7 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"idx_metric_snapshots_work_observed_at",
 		"idx_ranking_snapshots_generated_at",
 		"idx_ingestion_jobs_dequeue",
+		"ingestion_jobs_active_idempotency_key",
 		"idx_venue_metric_snapshots_lookup",
 		"idx_venue_metric_snapshots_import_receipt",
 		"idx_jcr_import_receipt_aliases_alias",
@@ -1756,21 +1780,60 @@ func TestMigrationSecondRunIsIdempotent(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
 
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
 	var beforeCount int
-	var beforeChecksum string
-	if err := pool.QueryRow(ctx, "SELECT count(*), min(checksum) FROM schema_migrations").Scan(&beforeCount, &beforeChecksum); err != nil {
+	var beforeState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(*),
+			jsonb_agg(
+				jsonb_build_object(
+					'version', version,
+					'name', name,
+					'checksum', checksum,
+					'applied_at', applied_at
+				)
+				ORDER BY version
+			)::text
+		FROM schema_migrations
+	`).Scan(&beforeCount, &beforeState); err != nil {
 		t.Fatalf("query migration state before second run: %v", err)
 	}
 	if err := Up(ctx, pool); err != nil {
 		t.Fatalf("second Up() error = %v", err)
 	}
 	var afterCount int
-	var afterChecksum string
-	if err := pool.QueryRow(ctx, "SELECT count(*), min(checksum) FROM schema_migrations").Scan(&afterCount, &afterChecksum); err != nil {
+	var afterState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(*),
+			jsonb_agg(
+				jsonb_build_object(
+					'version', version,
+					'name', name,
+					'checksum', checksum,
+					'applied_at', applied_at
+				)
+				ORDER BY version
+			)::text
+		FROM schema_migrations
+	`).Scan(&afterCount, &afterState); err != nil {
 		t.Fatalf("query migration state after second run: %v", err)
 	}
-	if beforeCount != 5 || afterCount != beforeCount || afterChecksum != beforeChecksum {
-		t.Fatalf("migration state changed: before=(%d,%s) after=(%d,%s)", beforeCount, beforeChecksum, afterCount, afterChecksum)
+	if beforeCount != len(migrations) ||
+		afterCount != beforeCount ||
+		afterState != beforeState {
+		t.Fatalf(
+			"migration state changed: before=(%d,%s) after=(%d,%s), want %d immutable records",
+			beforeCount,
+			beforeState,
+			afterCount,
+			afterState,
+			len(migrations),
+		)
 	}
 }
 
@@ -1842,8 +1905,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 5 {
-		t.Fatalf("embedded migration count = %d, want 5", len(migrations))
+	if len(migrations) != 10 {
+		t.Fatalf("embedded migration count = %d, want 10", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -1957,11 +2020,12 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	`).Scan(&appliedCount, &preservedChecksum); err != nil {
 		t.Fatalf("query upgraded migration records: %v", err)
 	}
-	if appliedCount != 5 || preservedChecksum != initialMigrationChecksum {
+	if appliedCount != len(migrations) || preservedChecksum != initialMigrationChecksum {
 		t.Fatalf(
-			"upgraded migrations = count %d, initial checksum %s; want 5, %s",
+			"upgraded migrations = count %d, initial checksum %s; want %d, %s",
 			appliedCount,
 			preservedChecksum,
+			len(migrations),
 			initialMigrationChecksum,
 		)
 	}

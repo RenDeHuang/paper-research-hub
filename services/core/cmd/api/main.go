@@ -11,6 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/catalog"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/config"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/httpapi"
@@ -22,10 +25,12 @@ type httpServer interface {
 }
 
 type databasePool interface {
+	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
 	Close()
 }
 
 type databaseOpener func(context.Context, config.DatabaseConfig) (databasePool, error)
+type httpServerFactory func(config.HTTPConfig, httpapi.Dependencies) httpServer
 
 func main() {
 	cfg, err := config.Load(config.RoleAPI)
@@ -36,14 +41,15 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	server := newHTTPServer(cfg.HTTP, httpapi.NewServer(httpapi.Dependencies{}))
 
 	if err := runApplication(
 		ctx,
 		cfg,
-		server,
 		func(ctx context.Context, databaseConfig config.DatabaseConfig) (databasePool, error) {
 			return database.Open(ctx, databaseConfig)
+		},
+		func(httpConfig config.HTTPConfig, dependencies httpapi.Dependencies) httpServer {
+			return newHTTPServer(httpConfig, httpapi.NewServer(dependencies))
 		},
 	); err != nil {
 		log.Printf("api server: %v", err)
@@ -54,14 +60,23 @@ func main() {
 func runApplication(
 	ctx context.Context,
 	cfg config.Config,
-	server httpServer,
 	openDatabase databaseOpener,
+	newServer httpServerFactory,
 ) error {
 	pool, err := openDatabase(ctx, cfg.Database)
 	if err != nil {
 		return fmt.Errorf("open database pool: %w", err)
 	}
 	defer pool.Close()
+
+	repository, err := catalog.NewRepository(pool, []byte(cfg.Catalog.CursorSecret))
+	if err != nil {
+		return fmt.Errorf("create catalog repository: %w", err)
+	}
+	server := newServer(cfg.HTTP, httpapi.Dependencies{
+		Catalog:            repository,
+		CORSAllowedOrigins: cfg.HTTP.CORSAllowedOrigins,
+	})
 	return run(ctx, server, cfg.HTTP.ShutdownTimeout)
 }
 

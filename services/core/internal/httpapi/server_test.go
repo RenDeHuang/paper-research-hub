@@ -49,6 +49,99 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestCORSAllowsConfiguredOriginOnAPIResponses(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/not-a-real-resource", nil)
+	request.Header.Set("Origin", "http://localhost:3000")
+	response := httptest.NewRecorder()
+
+	NewServer(Dependencies{
+		CORSAllowedOrigins: []string{"http://localhost:3000"},
+	}).ServeHTTP(response, request)
+
+	if actual := response.Header().Get("Access-Control-Allow-Origin"); actual != "http://localhost:3000" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want configured origin", actual)
+	}
+	if actual := response.Header().Values("Vary"); !containsHeaderToken(actual, "Origin") {
+		t.Fatalf("Vary = %#v, want Origin", actual)
+	}
+	exposed := response.Header().Values("Access-Control-Expose-Headers")
+	for _, token := range []string{requestIDHeader, catalogGenerationHeader} {
+		if !containsHeaderToken(exposed, token) {
+			t.Fatalf("Access-Control-Expose-Headers = %#v, want %q", exposed, token)
+		}
+	}
+}
+
+func TestCORSPreflightAllowsConfiguredOriginAndGET(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(http.MethodOptions, "/api/v1/papers?q=agent", nil)
+	request.Header.Set("Origin", "http://localhost:3000")
+	request.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	request.Header.Set("Access-Control-Request-Headers", "X-Request-ID")
+	response := httptest.NewRecorder()
+
+	NewServer(Dependencies{
+		CORSAllowedOrigins: []string{"http://localhost:3000"},
+	}).ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	if actual := response.Header().Get("Access-Control-Allow-Origin"); actual != "http://localhost:3000" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want configured origin", actual)
+	}
+	if actual := response.Header().Get("Access-Control-Allow-Methods"); actual != http.MethodGet {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want %q", actual, http.MethodGet)
+	}
+	if actual := response.Header().Get("Access-Control-Allow-Headers"); actual != requestIDHeader {
+		t.Fatalf("Access-Control-Allow-Headers = %q, want %q", actual, requestIDHeader)
+	}
+	for _, token := range []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} {
+		if actual := response.Header().Values("Vary"); !containsHeaderToken(actual, token) {
+			t.Fatalf("Vary = %#v, want %q", actual, token)
+		}
+	}
+}
+
+func TestCORSDoesNotAuthorizeUnconfiguredOrigin(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	request.Header.Set("Origin", "https://untrusted.example.test")
+	response := httptest.NewRecorder()
+
+	NewServer(Dependencies{
+		CORSAllowedOrigins: []string{"http://localhost:3000"},
+	}).ServeHTTP(response, request)
+
+	if actual := response.Header().Get("Access-Control-Allow-Origin"); actual != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want empty", actual)
+	}
+}
+
+func TestCORSHeadersRemainPresentOnInvalidRequestIDProblem(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	request.Header.Set("Origin", "http://localhost:3000")
+	request.Header.Set(requestIDHeader, "invalid request id")
+	response := httptest.NewRecorder()
+
+	NewServer(Dependencies{
+		CORSAllowedOrigins: []string{"http://localhost:3000"},
+	}).ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if actual := response.Header().Get("Access-Control-Allow-Origin"); actual != "http://localhost:3000" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want configured origin", actual)
+	}
+}
+
 func TestRequestIDReusesNonBlankIncomingValue(t *testing.T) {
 	t.Parallel()
 
@@ -125,6 +218,7 @@ func TestUnmatchedAPIRouteReturnsProblemDetails(t *testing.T) {
 		Type      string `json:"type"`
 		Title     string `json:"title"`
 		Status    int    `json:"status"`
+		Code      string `json:"code"`
 		Detail    string `json:"detail"`
 		Instance  string `json:"instance"`
 		RequestID string `json:"request_id"`
@@ -139,6 +233,9 @@ func TestUnmatchedAPIRouteReturnsProblemDetails(t *testing.T) {
 	}
 	if problem.Status != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", problem.Status, http.StatusNotFound)
+	}
+	if problem.Code != "route_not_found" {
+		t.Errorf("code = %q, want %q", problem.Code, "route_not_found")
 	}
 	if problem.Detail != "The requested API resource was not found." {
 		t.Errorf("detail = %q, want generic not-found detail", problem.Detail)
@@ -177,6 +274,7 @@ func TestAPIRootReturnsProblemDetailsWithoutRedirect(t *testing.T) {
 		Type      string `json:"type"`
 		Title     string `json:"title"`
 		Status    int    `json:"status"`
+		Code      string `json:"code"`
 		Detail    string `json:"detail"`
 		Instance  string `json:"instance"`
 		RequestID string `json:"request_id"`
@@ -191,6 +289,9 @@ func TestAPIRootReturnsProblemDetailsWithoutRedirect(t *testing.T) {
 	}
 	if problem.Status != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", problem.Status, http.StatusNotFound)
+	}
+	if problem.Code != "route_not_found" {
+		t.Errorf("code = %q, want %q", problem.Code, "route_not_found")
 	}
 	if problem.Detail != "The requested API resource was not found." {
 		t.Errorf("detail = %q, want generic not-found detail", problem.Detail)
@@ -260,6 +361,9 @@ func assertInvalidRequestIDResponse(
 	if problem.Status != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", problem.Status, http.StatusBadRequest)
 	}
+	if problem.Code != "invalid_request_id" {
+		t.Errorf("code = %q, want %q", problem.Code, "invalid_request_id")
+	}
 	if problem.Detail != "X-Request-ID must match [A-Za-z0-9._:-]{1,255}." {
 		t.Errorf("detail = %q, want Request ID format requirement", problem.Detail)
 	}
@@ -279,4 +383,15 @@ func decodeJSON(t *testing.T, response *httptest.ResponseRecorder, destination a
 	if err := decoder.Decode(destination); err != nil {
 		t.Fatalf("decode response JSON: %v", err)
 	}
+}
+
+func containsHeaderToken(values []string, token string) bool {
+	for _, value := range values {
+		for _, field := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(field), token) {
+				return true
+			}
+		}
+	}
+	return false
 }

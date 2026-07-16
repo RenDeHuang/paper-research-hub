@@ -19,6 +19,7 @@ type Role string
 const (
 	RoleAPI                Role = "api"
 	RoleMigrate            Role = "migrate"
+	RoleCatalogPublish     Role = "catalog-publish"
 	RoleOpenAlexSync       Role = "openalex-sync"
 	RolePubMedSync         Role = "pubmed-sync"
 	RolePubMedImport       Role = "pubmed-import"
@@ -39,6 +40,7 @@ type Config struct {
 	Environment string          `json:"environment"`
 	HTTP        HTTPConfig      `json:"http"`
 	Database    DatabaseConfig  `json:"database"`
+	Catalog     CatalogConfig   `json:"catalog"`
 	Worker      WorkerConfig    `json:"worker"`
 	OpenAlex    OpenAlexConfig  `json:"openalex"`
 	PubMed      PubMedConfig    `json:"pubmed"`
@@ -49,14 +51,15 @@ type Config struct {
 }
 
 type HTTPConfig struct {
-	Host              string        `json:"host"`
-	Port              int           `json:"port"`
-	ReadHeaderTimeout time.Duration `json:"read_header_timeout"`
-	ReadTimeout       time.Duration `json:"read_timeout"`
-	WriteTimeout      time.Duration `json:"write_timeout"`
-	IdleTimeout       time.Duration `json:"idle_timeout"`
-	ShutdownTimeout   time.Duration `json:"shutdown_timeout"`
-	MaxHeaderBytes    int           `json:"max_header_bytes"`
+	Host               string        `json:"host"`
+	Port               int           `json:"port"`
+	ReadHeaderTimeout  time.Duration `json:"read_header_timeout"`
+	ReadTimeout        time.Duration `json:"read_timeout"`
+	WriteTimeout       time.Duration `json:"write_timeout"`
+	IdleTimeout        time.Duration `json:"idle_timeout"`
+	ShutdownTimeout    time.Duration `json:"shutdown_timeout"`
+	MaxHeaderBytes     int           `json:"max_header_bytes"`
+	CORSAllowedOrigins []string      `json:"cors_allowed_origins,omitempty"`
 }
 
 func (cfg HTTPConfig) Address() string {
@@ -71,6 +74,10 @@ type DatabaseConfig struct {
 	MaxConnLifetime   time.Duration `json:"max_conn_lifetime"`
 	MaxConnIdleTime   time.Duration `json:"max_conn_idle_time"`
 	HealthCheckPeriod time.Duration `json:"health_check_period"`
+}
+
+type CatalogConfig struct {
+	CursorSecret string `json:"-"`
 }
 
 type WorkerConfig struct {
@@ -124,13 +131,15 @@ type PublisherSourceConfig struct {
 }
 
 type VenueConfig struct {
-	JCRImportPath string `json:"jcr_import_path,omitempty"`
+	JCRImportPath    string `json:"jcr_import_path,omitempty"`
+	JCRSourceLicense string `json:"jcr_source_license,omitempty"`
 }
 
 type RedactedConfig struct {
 	Environment string                  `json:"environment"`
 	HTTP        HTTPConfig              `json:"http"`
 	Database    RedactedDatabaseConfig  `json:"database"`
+	Catalog     RedactedCatalogConfig   `json:"catalog"`
 	Worker      WorkerConfig            `json:"worker"`
 	OpenAlex    RedactedOpenAlexConfig  `json:"openalex"`
 	PubMed      RedactedPubMedConfig    `json:"pubmed"`
@@ -148,6 +157,10 @@ type RedactedDatabaseConfig struct {
 	MaxConnLifetime   time.Duration `json:"max_conn_lifetime"`
 	MaxConnIdleTime   time.Duration `json:"max_conn_idle_time"`
 	HealthCheckPeriod time.Duration `json:"health_check_period"`
+}
+
+type RedactedCatalogConfig struct {
+	CursorSecret string `json:"cursor_secret,omitempty"`
 }
 
 type RedactedOpenAlexConfig struct {
@@ -246,7 +259,10 @@ func LoadFrom(role Role, lookup LookupEnv) (Config, error) {
 		Environment: environment,
 		HTTP:        httpConfig,
 		Database:    databaseConfig,
-		Worker:      workerConfig,
+		Catalog: CatalogConfig{
+			CursorSecret: optional(lookup, "CATALOG_CURSOR_SECRET"),
+		},
+		Worker: workerConfig,
 		OpenAlex: OpenAlexConfig{
 			Request:      openAlexRequest,
 			ContactEmail: optional(lookup, "OPENALEX_CONTACT_EMAIL"),
@@ -278,7 +294,10 @@ func LoadFrom(role Role, lookup LookupEnv) (Config, error) {
 				APIKey:       optional(lookup, "ELSEVIER_API_KEY"),
 			},
 		},
-		Venues: VenueConfig{JCRImportPath: optional(lookup, "JCR_IMPORT_PATH")},
+		Venues: VenueConfig{
+			JCRImportPath:    optional(lookup, "JCR_IMPORT_PATH"),
+			JCRSourceLicense: optional(lookup, "JCR_SOURCE_LICENSE"),
+		},
 	}
 
 	if cfg.Venues.JCRImportPath != "" && !isExplicitCSV(cfg.Venues.JCRImportPath) {
@@ -292,7 +311,9 @@ func LoadFrom(role Role, lookup LookupEnv) (Config, error) {
 
 func (cfg Config) validateRole(role Role) error {
 	switch role {
-	case RoleAPI, RoleMigrate:
+	case RoleAPI:
+		return validateCatalogCursorSecret(cfg.Catalog.CursorSecret)
+	case RoleMigrate, RoleCatalogPublish:
 		return nil
 	case RoleOpenAlexSync:
 		if strings.TrimSpace(cfg.OpenAlex.APIKey) == "" {
@@ -325,6 +346,9 @@ func (cfg Config) validateRole(role Role) error {
 		if cfg.Venues.JCRImportPath == "" {
 			return errors.New("JCR_IMPORT_PATH is required")
 		}
+		if strings.TrimSpace(cfg.Venues.JCRSourceLicense) == "" {
+			return errors.New("JCR_SOURCE_LICENSE is required")
+		}
 		return nil
 	default:
 		return fmt.Errorf("unsupported configuration role %q", role)
@@ -335,6 +359,7 @@ func supportedRole(role Role) bool {
 	switch role {
 	case RoleAPI,
 		RoleMigrate,
+		RoleCatalogPublish,
 		RoleOpenAlexSync,
 		RolePubMedSync,
 		RolePubMedImport,
@@ -347,6 +372,19 @@ func supportedRole(role Role) bool {
 	default:
 		return false
 	}
+}
+
+func validateCatalogCursorSecret(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("CATALOG_CURSOR_SECRET is required")
+	}
+	if value != strings.TrimSpace(value) {
+		return errors.New("CATALOG_CURSOR_SECRET must be trimmed")
+	}
+	if len([]byte(value)) < 32 {
+		return errors.New("CATALOG_CURSOR_SECRET must contain at least 32 bytes")
+	}
+	return nil
 }
 
 func loadHTTP(lookup LookupEnv) (HTTPConfig, error) {
@@ -385,16 +423,56 @@ func loadHTTP(lookup LookupEnv) (HTTPConfig, error) {
 	if err != nil {
 		return HTTPConfig{}, err
 	}
+	corsAllowedOrigins, err := parseCORSAllowedOrigins(optional(lookup, "API_CORS_ALLOWED_ORIGINS"))
+	if err != nil {
+		return HTTPConfig{}, err
+	}
 	return HTTPConfig{
-		Host:              host,
-		Port:              port,
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
-		ShutdownTimeout:   shutdownTimeout,
-		MaxHeaderBytes:    maxHeaderBytes,
+		Host:               host,
+		Port:               port,
+		ReadHeaderTimeout:  readHeaderTimeout,
+		ReadTimeout:        readTimeout,
+		WriteTimeout:       writeTimeout,
+		IdleTimeout:        idleTimeout,
+		ShutdownTimeout:    shutdownTimeout,
+		MaxHeaderBytes:     maxHeaderBytes,
+		CORSAllowedOrigins: corsAllowedOrigins,
 	}, nil
+}
+
+func parseCORSAllowedOrigins(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	origins := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		origin := strings.TrimSpace(part)
+		if origin == "" {
+			return nil, errors.New("API_CORS_ALLOWED_ORIGINS must not contain an empty origin")
+		}
+		parsed, err := url.Parse(origin)
+		if err != nil ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Hostname() == "" ||
+			parsed.User != nil ||
+			parsed.Path != "" ||
+			parsed.RawQuery != "" ||
+			parsed.Fragment != "" {
+			return nil, fmt.Errorf(
+				"API_CORS_ALLOWED_ORIGINS origin %q must be an exact http:// or https:// origin without credentials, path, query, or fragment",
+				origin,
+			)
+		}
+		if _, exists := seen[origin]; exists {
+			return nil, fmt.Errorf("API_CORS_ALLOWED_ORIGINS contains duplicate origin %q", origin)
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	return origins, nil
 }
 
 func loadDatabase(lookup LookupEnv, databaseURL string) (DatabaseConfig, error) {
@@ -641,6 +719,9 @@ func (cfg Config) Redacted() RedactedConfig {
 			MaxConnLifetime:   cfg.Database.MaxConnLifetime,
 			MaxConnIdleTime:   cfg.Database.MaxConnIdleTime,
 			HealthCheckPeriod: cfg.Database.HealthCheckPeriod,
+		},
+		Catalog: RedactedCatalogConfig{
+			CursorSecret: redactedSecret(cfg.Catalog.CursorSecret),
 		},
 		Worker: cfg.Worker,
 		OpenAlex: RedactedOpenAlexConfig{

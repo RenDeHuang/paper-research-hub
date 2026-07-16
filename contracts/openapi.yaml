@@ -4,9 +4,16 @@ info:
   title: Paper Research Hub Public API
   version: 1.0.0
   description: |
-    Public read-only contract for Paper Research Hub. List cursors are stable,
-    opaque values and must be replayed with the same filters and sort order that
-    produced them.
+    Public read-only contract for the currently published catalog generation.
+    Catalog endpoints return 503 with `catalog_not_published` until an operator
+    explicitly publishes a generation. List cursors are signed opaque values and
+    must be replayed with the same generation, filters, ranking window, and sort.
+
+    Catalog fields that can lack evidence use an explicit `state` object:
+    `known` includes `value`; `unknown` and `missing` never include `value`.
+    Unknown `/api` routes return a 404 `route_not_found` Problem Details response.
+    Non-GET requests to known routes return a 405 `method_not_allowed` Problem
+    Details response with `Allow: GET`.
 tags:
   - name: System
   - name: Papers
@@ -19,33 +26,45 @@ paths:
       tags:
         - System
       operationId: getHealth
-      summary: Check API health
+      summary: Check API process health
       parameters:
         - $ref: "#/components/parameters/RequestID"
       responses:
         "200":
           $ref: "#/components/responses/HealthOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/stats:
     get:
       tags:
         - System
       operationId: getStats
-      summary: Get portal-wide statistics
+      summary: Get statistics from the current catalog generation
       parameters:
         - $ref: "#/components/parameters/RequestID"
       responses:
         "200":
           $ref: "#/components/responses/StatsOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/papers:
     get:
       tags:
         - Papers
       operationId: listPapers
-      summary: Search and filter papers
+      summary: Search and filter papers in the current generation
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/PaperQuery"
@@ -65,36 +84,51 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/PaperListOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "409":
           $ref: "#/components/responses/CursorConflictProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/papers/{id}:
     get:
       tags:
         - Papers
       operationId: getPaper
-      summary: Get one paper
+      summary: Get one visible paper from the current generation
+      description: |
+        Malformed UUIDs, absent papers, and papers not visible in the published
+        generation intentionally share the same 404 response.
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/PaperID"
       responses:
         "200":
           $ref: "#/components/responses/PaperDetailOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
         "404":
           $ref: "#/components/responses/NotFoundProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/topics:
     get:
       tags:
         - Taxonomy
       operationId: listTopics
-      summary: List research topics
+      summary: List topics in the current generation
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/Limit"
@@ -102,36 +136,48 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/TopicListOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "409":
           $ref: "#/components/responses/CursorConflictProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/topics/{slug}:
     get:
       tags:
         - Taxonomy
       operationId: getTopic
-      summary: Get one research topic
+      summary: Get one visible topic from the current generation
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/Slug"
       responses:
         "200":
           $ref: "#/components/responses/TopicOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
         "404":
           $ref: "#/components/responses/NotFoundProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/methods:
     get:
       tags:
         - Taxonomy
       operationId: listMethods
-      summary: List research methods
+      summary: List methods in the current generation
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/Limit"
@@ -139,36 +185,48 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/MethodListOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "409":
           $ref: "#/components/responses/CursorConflictProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/methods/{slug}:
     get:
       tags:
         - Taxonomy
       operationId: getMethod
-      summary: Get one research method
+      summary: Get one visible method from the current generation
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/Slug"
       responses:
         "200":
           $ref: "#/components/responses/MethodOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
         "404":
           $ref: "#/components/responses/NotFoundProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/trends/papers:
     get:
       tags:
         - Trends
       operationId: listPaperTrends
-      summary: Rank trending papers
+      summary: List persisted paper trend analysis
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/TrendWindowDays"
@@ -177,18 +235,24 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/PaperTrendsOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "409":
           $ref: "#/components/responses/CursorConflictProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/trends/topics:
     get:
       tags:
         - Trends
       operationId: listTopicTrends
-      summary: Rank trending topics
+      summary: List persisted topic trend analysis
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/TrendWindowDays"
@@ -197,18 +261,24 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/TopicTrendsOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "409":
           $ref: "#/components/responses/CursorConflictProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/trends/methods:
     get:
       tags:
         - Trends
       operationId: listMethodTrends
-      summary: Rank trending methods
+      summary: List persisted method trend analysis
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/TrendWindowDays"
@@ -217,18 +287,24 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/MethodTrendsOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "409":
           $ref: "#/components/responses/CursorConflictProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
   /api/v1/research-opportunities:
     get:
       tags:
         - Research Opportunities
       operationId: listResearchOpportunities
-      summary: List evidence-backed research opportunities
+      summary: List persisted research opportunity analysis
       parameters:
         - $ref: "#/components/parameters/RequestID"
         - $ref: "#/components/parameters/OpportunityStatus"
@@ -237,26 +313,32 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/ResearchOpportunitiesOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
         "409":
           $ref: "#/components/responses/CursorConflictProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
-          $ref: "#/components/responses/DefaultProblem"
+          $ref: "#/components/responses/InternalProblem"
 components:
   parameters:
     RequestID:
       name: X-Request-ID
       in: header
       required: false
-      description: Optional client request correlation identifier.
+      description: Optional correlation ID matching the service's strict character set.
       schema:
         $ref: "#/components/schemas/RequestID"
     PaperID:
       name: id
       in: path
       required: true
-      description: Paper UUID.
+      description: Paper UUID. Invalid UUID text is deliberately reported as resource_not_found.
       schema:
         type: string
         format: uuid
@@ -271,7 +353,7 @@ components:
       name: q
       in: query
       required: false
-      description: Full-text query across titles, abstracts, authors, and identifiers.
+      description: Trimmed full-text query. Relevance sort requires this parameter.
       schema:
         type: string
         minLength: 1
@@ -280,7 +362,7 @@ components:
       name: published_from
       in: query
       required: false
-      description: Inclusive lower bound for publication time.
+      description: Inclusive RFC3339Nano lower bound.
       schema:
         type: string
         format: date-time
@@ -288,7 +370,7 @@ components:
       name: published_to
       in: query
       required: false
-      description: Inclusive upper bound for publication time.
+      description: Inclusive RFC3339Nano upper bound.
       schema:
         type: string
         format: date-time
@@ -302,14 +384,12 @@ components:
       name: topic
       in: query
       required: false
-      description: Topic slug.
       schema:
         $ref: "#/components/schemas/TaxonomySlug"
     MethodFilter:
       name: method
       in: query
       required: false
-      description: Method slug.
       schema:
         $ref: "#/components/schemas/TaxonomySlug"
     HasCode:
@@ -367,9 +447,7 @@ components:
       name: cursor
       in: query
       required: false
-      description: |
-        Stable opaque pagination cursor. Clients must not parse or alter it and
-        must replay it with the same filters, ranking window, and sort order.
+      description: Signed opaque cursor, at most 2048 bytes.
       schema:
         type: string
         minLength: 1
@@ -395,9 +473,21 @@ components:
       required: true
       schema:
         $ref: "#/components/schemas/RequestID"
+    XCatalogGeneration:
+      description: UUID of the immutable catalog generation used for the response.
+      required: true
+      schema:
+        type: string
+        format: uuid
+    AllowGET:
+      description: The only method supported by the requested route.
+      required: true
+      schema:
+        type: string
+        const: GET
   responses:
     HealthOK:
-      description: API is healthy.
+      description: The API process is healthy. This does not imply a catalog is published.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
@@ -406,106 +496,128 @@ components:
           schema:
             $ref: "#/components/schemas/HealthResponse"
     StatsOK:
-      description: Portal statistics.
+      description: Statistics from the current catalog generation.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/StatsResponse"
     PaperListOK:
-      description: Matching papers.
+      description: Matching visible papers.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/PaperListResponse"
     PaperDetailOK:
-      description: Paper details.
+      description: One visible paper.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/PaperDetail"
     TopicListOK:
-      description: Research topics.
+      description: Topics from the current catalog generation.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/TopicListResponse"
     TopicOK:
-      description: Research topic.
+      description: One visible topic.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Topic"
     MethodListOK:
-      description: Research methods.
+      description: Methods from the current catalog generation.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/MethodListResponse"
     MethodOK:
-      description: Research method.
+      description: One visible method.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Method"
     PaperTrendsOK:
-      description: Ranked paper trends.
+      description: Persisted paper trend rows for the selected window.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/PaperTrendListResponse"
+            $ref: "#/components/schemas/TrendListResponse"
     TopicTrendsOK:
-      description: Ranked topic trends.
+      description: Persisted topic trend rows for the selected window.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/TopicTrendListResponse"
+            $ref: "#/components/schemas/TrendListResponse"
     MethodTrendsOK:
-      description: Ranked method trends.
+      description: Persisted method trend rows for the selected window.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/MethodTrendListResponse"
+            $ref: "#/components/schemas/TrendListResponse"
     ResearchOpportunitiesOK:
-      description: Evidence-backed research opportunities.
+      description: Persisted research opportunities from the current generation.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ResearchOpportunityListResponse"
-    ValidationProblem:
-      description: Request parameters failed validation.
+    InvalidRequestIDProblem:
+      description: X-Request-ID was present but invalid.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
@@ -513,8 +625,18 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetails"
+          examples:
+            invalidRequestID:
+              value:
+                type: urn:paper-hub:problem:invalid-request-id
+                title: Bad Request
+                status: 400
+                code: invalid_request_id
+                detail: X-Request-ID must match [A-Za-z0-9._:-]{1,255}.
+                instance: /health
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
     NotFoundProblem:
-      description: The requested resource does not exist.
+      description: The resource is absent or not visible in the current generation.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
@@ -522,8 +644,58 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetails"
+          examples:
+            resourceNotFound:
+              value:
+                type: urn:paper-hub:problem:resource-not-found
+                title: Not Found
+                status: 404
+                code: resource_not_found
+                detail: The requested public catalog resource was not found.
+                instance: /api/v1/papers/00000000-0000-0000-0000-000000000000
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
+    RouteNotFoundProblem:
+      description: The requested /api route is not registered.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+          examples:
+            routeNotFound:
+              value:
+                type: urn:paper-hub:problem:not-found
+                title: Not Found
+                status: 404
+                code: route_not_found
+                detail: The requested API resource was not found.
+                instance: /api/v1/not-a-real-resource
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
+    MethodNotAllowedProblem:
+      description: The known route only supports GET.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+        Allow:
+          $ref: "#/components/headers/AllowGET"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+          examples:
+            methodNotAllowed:
+              value:
+                type: urn:paper-hub:problem:method-not-allowed
+                title: Method Not Allowed
+                status: 405
+                code: method_not_allowed
+                detail: The requested resource only supports GET.
+                instance: /api/v1/papers
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
     CursorConflictProblem:
-      description: The cursor cannot be used with the supplied filters, window, or sort order.
+      description: The cursor belongs to different filters, sort, window, or generation.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
@@ -531,8 +703,18 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetails"
-    DefaultProblem:
-      description: RFC 9457 problem response.
+          examples:
+            cursorConflict:
+              value:
+                type: urn:paper-hub:problem:cursor-context-mismatch
+                title: Conflict
+                status: 409
+                code: cursor_context_mismatch
+                detail: The pagination cursor does not belong to the current generation and filters.
+                instance: /api/v1/papers
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
+    ValidationProblem:
+      description: Query validation failed or a cursor was malformed or had an invalid signature.
       headers:
         X-Request-ID:
           $ref: "#/components/headers/XRequestID"
@@ -540,6 +722,63 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetails"
+          examples:
+            validationError:
+              value:
+                type: urn:paper-hub:problem:validation-error
+                title: Unprocessable Content
+                status: 422
+                code: validation_error
+                detail: The request parameters are invalid.
+                instance: /api/v1/papers
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
+            invalidCursor:
+              value:
+                type: urn:paper-hub:problem:invalid-cursor
+                title: Unprocessable Content
+                status: 422
+                code: invalid_cursor
+                detail: The pagination cursor is malformed or has an invalid signature.
+                instance: /api/v1/papers
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
+    CatalogUnavailableProblem:
+      description: No catalog generation has been published.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+          examples:
+            catalogNotPublished:
+              value:
+                type: urn:paper-hub:problem:catalog-not-published
+                title: Service Unavailable
+                status: 503
+                code: catalog_not_published
+                detail: The public catalog has not been published.
+                instance: /api/v1/papers
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
+    InternalProblem:
+      description: The server could not complete the request.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+          examples:
+            internalError:
+              value:
+                type: urn:paper-hub:problem:internal-error
+                title: Internal Server Error
+                status: 500
+                code: internal_error
+                detail: The server could not complete the request.
+                instance: /api/v1/papers
+                request_id: 6f9619ff8b86d011bb2d9ba3dfbcd2fd
   schemas:
     RequestID:
       type: string
@@ -551,37 +790,139 @@ components:
       minLength: 1
       maxLength: 120
       pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
-    TaxonomyItem:
+    CatalogValueState:
+      type: string
+      enum:
+        - known
+        - unknown
+        - missing
+    UnknownCatalogValue:
       type: object
       additionalProperties: false
       required:
-        - id
-        - slug
-        - name
-        - description
-        - paper_count
-        - created_at
-        - updated_at
+        - state
       properties:
-        id:
+        state:
           type: string
-          format: uuid
-        slug:
-          $ref: "#/components/schemas/TaxonomySlug"
-        name:
+          const: unknown
+    MissingCatalogValue:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+      properties:
+        state:
           type: string
-          minLength: 1
-        description:
-          type: string
-        paper_count:
-          type: integer
-          minimum: 0
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
+          const: missing
+    StringCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: string
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    DateTimeCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: string
+              format: date-time
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    BooleanCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: boolean
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    IntegerCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: integer
+              minimum: 0
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    RatioCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: number
+              minimum: 0
+              maximum: 1
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    NumberCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: number
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    PaperTypeCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              $ref: "#/components/schemas/PaperType"
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
     HealthResponse:
       type: object
       additionalProperties: false
@@ -600,6 +941,7 @@ components:
       additionalProperties: false
       required:
         - generated_at
+        - formula_version
         - papers_total
         - papers_last_7_days
         - topics_total
@@ -611,24 +953,23 @@ components:
         generated_at:
           type: string
           format: date-time
+        formula_version:
+          type: string
+          minLength: 1
         papers_total:
-          type: integer
-          minimum: 0
+          $ref: "#/components/schemas/IntegerCatalogValue"
         papers_last_7_days:
-          type: integer
-          minimum: 0
+          $ref: "#/components/schemas/IntegerCatalogValue"
         topics_total:
-          type: integer
-          minimum: 0
+          $ref: "#/components/schemas/IntegerCatalogValue"
         methods_total:
-          type: integer
-          minimum: 0
+          $ref: "#/components/schemas/IntegerCatalogValue"
         with_code_ratio:
-          $ref: "#/components/schemas/Ratio"
+          $ref: "#/components/schemas/RatioCatalogValue"
         with_data_ratio:
-          $ref: "#/components/schemas/Ratio"
+          $ref: "#/components/schemas/RatioCatalogValue"
         with_benchmark_ratio:
-          $ref: "#/components/schemas/Ratio"
+          $ref: "#/components/schemas/RatioCatalogValue"
     PaperListResponse:
       type: object
       additionalProperties: false
@@ -671,7 +1012,7 @@ components:
             $ref: "#/components/schemas/Method"
         pagination:
           $ref: "#/components/schemas/Pagination"
-    PaperTrendListResponse:
+    TrendListResponse:
       type: object
       additionalProperties: false
       required:
@@ -686,52 +1027,11 @@ components:
         window_days:
           type: integer
           minimum: 1
+          maximum: 365
         items:
           type: array
           items:
-            $ref: "#/components/schemas/PaperTrend"
-        pagination:
-          $ref: "#/components/schemas/Pagination"
-    TopicTrendListResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - generated_at
-        - window_days
-        - items
-        - pagination
-      properties:
-        generated_at:
-          type: string
-          format: date-time
-        window_days:
-          type: integer
-          minimum: 1
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/TopicTrend"
-        pagination:
-          $ref: "#/components/schemas/Pagination"
-    MethodTrendListResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - generated_at
-        - window_days
-        - items
-        - pagination
-      properties:
-        generated_at:
-          type: string
-          format: date-time
-        window_days:
-          type: integer
-          minimum: 1
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/MethodTrend"
+            $ref: "#/components/schemas/TrendItem"
         pagination:
           $ref: "#/components/schemas/Pagination"
     ResearchOpportunityListResponse:
@@ -761,190 +1061,115 @@ components:
       required:
         - id
         - title
-        - abstract_snippet
+        - status
         - published_at
         - type
-        - status
-        - authors
-        - topics
-        - methods
-        - external_identifiers
-        - source_provenance
         - has_code
         - has_data
         - has_benchmark
-        - ranking
       properties:
         id:
           type: string
           format: uuid
+        canonical_key:
+          type: string
+          minLength: 1
         title:
           type: string
           minLength: 1
-        abstract_snippet:
-          type: string
-        published_at:
-          type: string
-          format: date-time
-        type:
-          $ref: "#/components/schemas/PaperType"
         status:
           $ref: "#/components/schemas/PaperStatus"
-        authors:
-          type: array
-          minItems: 1
-          items:
-            $ref: "#/components/schemas/Author"
-        topics:
-          type: array
-          items:
-            $ref: "#/components/schemas/Topic"
-        methods:
-          type: array
-          items:
-            $ref: "#/components/schemas/Method"
-        external_identifiers:
-          type: array
-          items:
-            $ref: "#/components/schemas/ExternalIdentifier"
-        source_provenance:
-          type: array
-          minItems: 1
-          items:
-            $ref: "#/components/schemas/SourceProvenance"
-        has_code:
-          type: boolean
-        has_data:
-          type: boolean
-        has_benchmark:
-          type: boolean
-        ranking:
-          $ref: "#/components/schemas/RankingMetadata"
-    PaperDetail:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - title
-        - abstract
-        - published_at
-        - type
-        - status
-        - authors
-        - institutions
-        - topics
-        - methods
-        - external_identifiers
-        - source_provenance
-        - datasets
-        - benchmarks
-        - models
-        - code_repositories
-        - metric_snapshots
-        - ranking
-        - created_at
-        - updated_at
-      properties:
-        id:
-          type: string
-          format: uuid
-        title:
-          type: string
-          minLength: 1
+        published_at:
+          $ref: "#/components/schemas/DateTimeCatalogValue"
+        type:
+          $ref: "#/components/schemas/PaperTypeCatalogValue"
         abstract:
-          type: string
-        published_at:
-          type: string
-          format: date-time
-        type:
-          $ref: "#/components/schemas/PaperType"
-        status:
-          $ref: "#/components/schemas/PaperStatus"
-        authors:
-          type: array
-          minItems: 1
-          items:
-            $ref: "#/components/schemas/Author"
-        institutions:
-          type: array
-          items:
-            $ref: "#/components/schemas/Institution"
+          $ref: "#/components/schemas/StringCatalogValue"
+        has_code:
+          $ref: "#/components/schemas/BooleanCatalogValue"
+        has_data:
+          $ref: "#/components/schemas/BooleanCatalogValue"
+        has_benchmark:
+          $ref: "#/components/schemas/BooleanCatalogValue"
+        citation_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        trend_score:
+          $ref: "#/components/schemas/NumberCatalogValue"
         topics:
           type: array
           items:
-            $ref: "#/components/schemas/Topic"
+            $ref: "#/components/schemas/TaxonomyReference"
         methods:
           type: array
           items:
-            $ref: "#/components/schemas/Method"
-        external_identifiers:
+            $ref: "#/components/schemas/TaxonomyReference"
+        authors:
           type: array
           items:
-            $ref: "#/components/schemas/ExternalIdentifier"
+            $ref: "#/components/schemas/AuthorReference"
+        curation:
+          $ref: "#/components/schemas/CurationCatalogValue"
         source_provenance:
-          type: array
-          minItems: 1
-          items:
-            $ref: "#/components/schemas/SourceProvenance"
-        datasets:
-          type: array
-          items:
-            $ref: "#/components/schemas/Dataset"
-        benchmarks:
-          type: array
-          items:
-            $ref: "#/components/schemas/Benchmark"
-        models:
-          type: array
-          items:
-            $ref: "#/components/schemas/Model"
-        code_repositories:
-          type: array
-          items:
-            $ref: "#/components/schemas/CodeRepository"
-        metric_snapshots:
-          type: array
-          items:
-            $ref: "#/components/schemas/MetricSnapshot"
-        ranking:
-          $ref: "#/components/schemas/RankingMetadata"
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-    Author:
+          $ref: "#/components/schemas/SourceProvenanceCatalogValue"
+    PaperDetail:
+      $ref: "#/components/schemas/PaperSummary"
+    TaxonomyReference:
       type: object
       additionalProperties: false
       required:
         - id
-        - display_name
-        - institutions
+        - slug
+        - name
       properties:
         id:
           type: string
           format: uuid
-        display_name:
+        slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        name:
           type: string
           minLength: 1
-        given_name:
+    TaxonomyItem:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - slug
+        - name
+        - description
+        - paper_count
+      properties:
+        id:
           type: string
-        family_name:
+          format: uuid
+        slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        name:
           type: string
-        orcid:
-          type: string
-          pattern: "^0000-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]$"
-        institutions:
+          minLength: 1
+        description:
+          $ref: "#/components/schemas/StringCatalogValue"
+        paper_count:
+          type: integer
+          minimum: 0
+        paper_ids:
           type: array
+          uniqueItems: true
           items:
-            $ref: "#/components/schemas/Institution"
-    Institution:
+            type: string
+            format: uuid
+    Topic:
+      $ref: "#/components/schemas/TaxonomyItem"
+    Method:
+      $ref: "#/components/schemas/TaxonomyItem"
+    AuthorReference:
       type: object
       additionalProperties: false
       required:
         - id
         - name
+        - position
+        - is_corresponding
       properties:
         id:
           type: string
@@ -952,260 +1177,124 @@ components:
         name:
           type: string
           minLength: 1
-        ror_id:
-          type: string
-          pattern: "^0[a-hj-km-np-tv-z0-9]{6}[0-9]{2}$"
-        country_code:
-          type: string
-          pattern: "^[A-Z]{2}$"
-        website:
-          type: string
-          format: uri
-    ExternalIdentifier:
-      type: object
-      additionalProperties: false
-      required:
-        - scheme
-        - value
-      properties:
-        scheme:
-          type: string
-          enum:
-            - doi
-            - arxiv
-            - pmid
-            - openalex
-            - semantic_scholar
-        value:
+        orcid:
           type: string
           minLength: 1
-        url:
+        institution_id:
           type: string
-          format: uri
+          format: uuid
+        institution_name:
+          type: string
+          minLength: 1
+        position:
+          type: integer
+          minimum: 1
+        is_corresponding:
+          type: boolean
     SourceProvenance:
       type: object
       additionalProperties: false
       required:
         - source
+        - event_key
         - source_record_id
-        - ingested_at
-        - last_seen_at
+        - source_time
+        - normalization_policy_version
+        - scope_policy_version
+        - projection_policy_version
       properties:
         source:
-          $ref: "#/components/schemas/SourceName"
+          type: string
+          minLength: 1
+        event_key:
+          type: string
+          minLength: 1
         source_record_id:
           type: string
+          format: uuid
+        source_time:
+          type: string
+          format: date-time
+        normalization_policy_version:
+          type: string
           minLength: 1
-        source_url:
+        scope_policy_version:
           type: string
-          format: uri
-        ingested_at:
+          minLength: 1
+        projection_policy_version:
           type: string
-          format: date-time
-        last_seen_at:
-          type: string
-          format: date-time
-    Topic:
-      $ref: "#/components/schemas/TaxonomyItem"
-    Method:
-      $ref: "#/components/schemas/TaxonomyItem"
-    Dataset:
+          minLength: 1
+    SourceProvenanceCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/SourceProvenance"
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    CurationPayload:
       type: object
       additionalProperties: false
       required:
-        - id
-        - name
-        - description
-        - access
-        - external_identifiers
+        - decision
+        - matched_rules
+        - evidence
+        - metric_year
+        - policy_name
+        - policy_version
+        - assessed_at
       properties:
-        id:
-          type: string
-          format: uuid
-        name:
-          type: string
-          minLength: 1
-        description:
-          type: string
-        url:
-          type: string
-          format: uri
-        license:
-          type: string
-        access:
+        decision:
           type: string
           enum:
-            - open
-            - restricted
-            - closed
-            - unknown
-        external_identifiers:
-          type: array
-          items:
-            $ref: "#/components/schemas/ExternalIdentifier"
-    Benchmark:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - name
-        - description
-        - task
-        - dataset_ids
-        - metrics
-      properties:
-        id:
-          type: string
-          format: uuid
-        name:
-          type: string
-          minLength: 1
-        description:
-          type: string
-        task:
-          type: string
-          minLength: 1
-        dataset_ids:
-          type: array
-          items:
-            type: string
-            format: uuid
-        metrics:
-          type: array
-          items:
-            type: string
-            minLength: 1
-        url:
-          type: string
-          format: uri
-    Model:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - name
-        - family
-        - description
-      properties:
-        id:
-          type: string
-          format: uuid
-        name:
-          type: string
-          minLength: 1
-        family:
-          type: string
-          minLength: 1
-        description:
-          type: string
-        url:
-          type: string
-          format: uri
-        parameter_count:
+            - accepted
+            - rejected
+            - not_applicable
+        matched_rules: {}
+        evidence: {}
+        metric_year:
           type: integer
-          minimum: 0
-        license:
-          type: string
-    CodeRepository:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - provider
-        - url
-        - owner
-        - name
-        - default_branch
-        - stars
-        - forks
-        - last_synced_at
-      properties:
-        id:
-          type: string
-          format: uuid
-        provider:
-          type: string
-          enum:
-            - github
-            - gitlab
-            - bitbucket
-            - other
-        url:
-          type: string
-          format: uri
-        owner:
+          minimum: 1
+        policy_name:
           type: string
           minLength: 1
-        name:
-          type: string
-          minLength: 1
-        default_branch:
-          type: string
-          minLength: 1
-        license:
-          type: string
-        stars:
+        policy_version:
           type: integer
-          minimum: 0
-        forks:
-          type: integer
-          minimum: 0
-        last_synced_at:
+          minimum: 1
+        assessed_at:
           type: string
           format: date-time
-    MetricSnapshot:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - entity_id
-        - entity_type
-        - metric
-        - value
-        - unit
-        - observed_at
-        - source
-      properties:
-        id:
-          type: string
-          format: uuid
-        entity_id:
-          type: string
-          format: uuid
-        entity_type:
-          type: string
-          enum:
-            - paper
-            - topic
-            - method
-            - research_opportunity
-        metric:
-          type: string
-          enum:
-            - citation_count
-            - download_count
-            - code_stars
-            - dataset_reuse_count
-            - benchmark_score
-            - trend_score
-            - opportunity_score
-        value:
-          type: number
-        normalized_value:
-          $ref: "#/components/schemas/Ratio"
-        unit:
-          type: string
-          minLength: 1
-        observed_at:
-          type: string
-          format: date-time
-        source:
-          $ref: "#/components/schemas/SourceName"
+    CurationCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              $ref: "#/components/schemas/CurationPayload"
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
     Pagination:
       type: object
       additionalProperties: false
       required:
         - limit
+        - total
         - next_cursor
         - has_more
       properties:
@@ -1213,8 +1302,11 @@ components:
           type: integer
           minimum: 1
           maximum: 100
+        total:
+          type: integer
+          minimum: 0
         next_cursor:
-          description: Stable opaque cursor for the next page, or null at the end.
+          description: Signed opaque cursor for the next page, or null at the end.
           type:
             - string
             - "null"
@@ -1269,16 +1361,38 @@ components:
         count:
           type: integer
           minimum: 0
+    TrendItem:
+      type: object
+      additionalProperties: false
+      required:
+        - rank
+        - score
+        - subject_id
+        - ranking
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+        score:
+          type: number
+        rank_change:
+          type: integer
+        subject_id:
+          type: string
+          format: uuid
+        paper:
+          $ref: "#/components/schemas/PaperSummary"
+        topic:
+          $ref: "#/components/schemas/Topic"
+        method:
+          $ref: "#/components/schemas/Method"
+        ranking:
+          $ref: "#/components/schemas/RankingMetadata"
     RankingMetadata:
       type: object
       additionalProperties: false
       required:
-        - formula_version
-        - window_days
-        - generated_at
-        - coverage
         - missing_signals
-        - confidence
       properties:
         formula_version:
           type: string
@@ -1290,150 +1404,42 @@ components:
           type: string
           format: date-time
         coverage:
-          $ref: "#/components/schemas/RankingCoverage"
+          $ref: "#/components/schemas/RatioCatalogValue"
         missing_signals:
           type: array
           items:
-            $ref: "#/components/schemas/MissingSignal"
+            oneOf:
+              - type: string
+                minLength: 1
+              - $ref: "#/components/schemas/MissingSignal"
         confidence:
-          $ref: "#/components/schemas/Ratio"
-    RankingCoverage:
-      type: object
-      additionalProperties: false
-      required:
-        - eligible_count
-        - ranked_count
-        - coverage_ratio
-        - citation_signal_ratio
-        - code_signal_ratio
-        - data_signal_ratio
-        - benchmark_signal_ratio
-      properties:
-        eligible_count:
-          type: integer
-          minimum: 0
-        ranked_count:
-          type: integer
-          minimum: 0
-        coverage_ratio:
-          $ref: "#/components/schemas/Ratio"
-        citation_signal_ratio:
-          $ref: "#/components/schemas/Ratio"
-        code_signal_ratio:
-          $ref: "#/components/schemas/Ratio"
-        data_signal_ratio:
-          $ref: "#/components/schemas/Ratio"
-        benchmark_signal_ratio:
-          $ref: "#/components/schemas/Ratio"
+          $ref: "#/components/schemas/RatioCatalogValue"
     MissingSignal:
       type: object
       additionalProperties: false
       required:
         - signal
-        - reason
-        - affected_entity_ids
       properties:
         signal:
           type: string
-          enum:
-            - citations
-            - downloads
-            - code
-            - data
-            - benchmark
-            - publication_history
+          minLength: 1
         reason:
           type: string
-          enum:
-            - not_available
-            - not_applicable
-            - stale
-            - insufficient_history
+          minLength: 1
         affected_entity_ids:
           type: array
           items:
             type: string
             format: uuid
-    PaperTrend:
-      type: object
-      additionalProperties: false
-      required:
-        - rank
-        - score
-        - rank_change
-        - paper
-        - ranking
-      properties:
-        rank:
-          type: integer
-          minimum: 1
-        score:
-          $ref: "#/components/schemas/Ratio"
-        rank_change:
-          type: integer
-        paper:
-          $ref: "#/components/schemas/PaperSummary"
-        ranking:
-          $ref: "#/components/schemas/RankingMetadata"
-    TopicTrend:
-      type: object
-      additionalProperties: false
-      required:
-        - rank
-        - score
-        - rank_change
-        - topic
-        - ranking
-      properties:
-        rank:
-          type: integer
-          minimum: 1
-        score:
-          $ref: "#/components/schemas/Ratio"
-        rank_change:
-          type: integer
-        topic:
-          $ref: "#/components/schemas/Topic"
-        ranking:
-          $ref: "#/components/schemas/RankingMetadata"
-    MethodTrend:
-      type: object
-      additionalProperties: false
-      required:
-        - rank
-        - score
-        - rank_change
-        - method
-        - ranking
-      properties:
-        rank:
-          type: integer
-          minimum: 1
-        score:
-          $ref: "#/components/schemas/Ratio"
-        rank_change:
-          type: integer
-        method:
-          $ref: "#/components/schemas/Method"
-        ranking:
-          $ref: "#/components/schemas/RankingMetadata"
     ResearchOpportunity:
       type: object
       additionalProperties: false
       required:
         - id
         - title
-        - summary
         - status
         - evidence_ids
-        - limitations
         - formula_version
-        - evaluated_at
-        - window_start
-        - window_end
-        - metrics
-        - ranking
-        - recommended_next_steps
       properties:
         id:
           type: string
@@ -1453,6 +1459,20 @@ components:
           items:
             type: string
             format: uuid
+        growth_score:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        competition_density:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        data_availability:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        reproducibility:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        missing_signals:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
         limitations:
           type: array
           items:
@@ -1461,6 +1481,9 @@ components:
         formula_version:
           type: string
           minLength: 1
+        generated_at:
+          type: string
+          format: date-time
         evaluated_at:
           type: string
           format: date-time
@@ -1470,12 +1493,6 @@ components:
         window_end:
           type: string
           format: date-time
-        metrics:
-          type: array
-          items:
-            $ref: "#/components/schemas/MetricSnapshot"
-        ranking:
-          $ref: "#/components/schemas/RankingMetadata"
         recommended_next_steps:
           type: array
           items:
@@ -1488,6 +1505,7 @@ components:
         - type
         - title
         - status
+        - code
         - detail
         - instance
         - request_id
@@ -1502,6 +1520,18 @@ components:
           type: integer
           minimum: 400
           maximum: 599
+        code:
+          type: string
+          enum:
+            - invalid_request_id
+            - route_not_found
+            - method_not_allowed
+            - catalog_not_published
+            - resource_not_found
+            - invalid_cursor
+            - cursor_context_mismatch
+            - validation_error
+            - internal_error
         detail:
           type: string
           minLength: 1
@@ -1521,19 +1551,23 @@ components:
     PaperStatus:
       type: string
       enum:
-        - published
-        - preprint
-        - corrected
-        - retracted
+        - active
         - withdrawn
+        - retracted
+        - rejected
+        - superseded
     SourceName:
       type: string
       enum:
         - crossref
         - arxiv
+        - openreview
+        - s2
         - pubmed
+        - pmc
         - openalex
-        - semantic_scholar
+        - springer_nature
+        - elsevier
         - manual
     ResearchOpportunityStatus:
       type: string
@@ -1542,7 +1576,3 @@ components:
         - proceed_with_caution
         - not_recommended_now
         - insufficient_evidence
-    Ratio:
-      type: number
-      minimum: 0
-      maximum: 1

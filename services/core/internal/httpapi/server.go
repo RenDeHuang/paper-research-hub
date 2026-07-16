@@ -7,21 +7,66 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/catalog"
 )
 
 const requestIDHeader = "X-Request-ID"
 
 type requestIDContextKey struct{}
 
-type Dependencies struct{}
+type Dependencies struct {
+	Catalog            *catalog.Repository
+	CORSAllowedOrigins []string
+}
 
-func NewServer(_ Dependencies) http.Handler {
+func NewServer(dependencies Dependencies) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", health)
+	mux.HandleFunc("/health", getOnly(health))
+	registerCatalogRoutes(mux, dependencies.Catalog)
 	mux.HandleFunc("/api", apiNotFound)
 	mux.HandleFunc("/api/", apiNotFound)
 
-	return requestIDMiddleware(mux)
+	return corsMiddleware(dependencies.CORSAllowedOrigins, requestIDMiddleware(mux))
+}
+
+func corsMiddleware(allowedOrigins []string, next http.Handler) http.Handler {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		allowed[origin] = struct{}{}
+	}
+
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		origin := request.Header.Get("Origin")
+		if origin == "" {
+			next.ServeHTTP(writer, request)
+			return
+		}
+
+		writer.Header().Add("Vary", "Origin")
+		if _, ok := allowed[origin]; !ok {
+			next.ServeHTTP(writer, request)
+			return
+		}
+
+		writer.Header().Set("Access-Control-Allow-Origin", origin)
+		writer.Header().Set(
+			"Access-Control-Expose-Headers",
+			requestIDHeader+", "+catalogGenerationHeader,
+		)
+
+		if request.Method == http.MethodOptions &&
+			request.Header.Get("Access-Control-Request-Method") != "" {
+			writer.Header().Add("Vary", "Access-Control-Request-Method")
+			writer.Header().Add("Vary", "Access-Control-Request-Headers")
+			writer.Header().Set("Access-Control-Allow-Methods", http.MethodGet)
+			writer.Header().Set("Access-Control-Allow-Headers", requestIDHeader)
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(writer, request)
+	})
 }
 
 func health(writer http.ResponseWriter, _ *http.Request) {
@@ -42,8 +87,28 @@ func apiNotFound(writer http.ResponseWriter, request *http.Request) {
 		http.StatusNotFound,
 		"urn:paper-hub:problem:not-found",
 		"Not Found",
+		"route_not_found",
 		"The requested API resource was not found.",
 	)
+}
+
+func getOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			writer.Header().Set("Allow", http.MethodGet)
+			writeProblem(
+				writer,
+				request,
+				http.StatusMethodNotAllowed,
+				"urn:paper-hub:problem:method-not-allowed",
+				"Method Not Allowed",
+				"method_not_allowed",
+				"The requested resource only supports GET.",
+			)
+			return
+		}
+		next(writer, request)
+	}
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {
@@ -69,6 +134,7 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 				http.StatusBadRequest,
 				"urn:paper-hub:problem:invalid-request-id",
 				"Bad Request",
+				"invalid_request_id",
 				"X-Request-ID must match [A-Za-z0-9._:-]{1,255}.",
 			)
 			return
