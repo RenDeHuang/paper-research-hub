@@ -1681,11 +1681,13 @@ func TestSyntheticJCRFixtureMatchesPreexistingVenuesByExactISSN(t *testing.T) {
 	if venuesAfter != venuesBefore {
 		t.Fatalf("fixture import created venues: before=%d after=%d", venuesBefore, venuesAfter)
 	}
-	var q1Categories, highJIF, unknown int
+	var alphaCategories, alphaQ1Categories, highJIF, highJIFWithoutQ1, unknown int
 	if err := pool.QueryRow(ctx, `
 		SELECT
+			count(*) FILTER (WHERE venue_id = $1),
 			count(*) FILTER (WHERE quartile = 'Q1' AND venue_id = $1),
 			count(*) FILTER (WHERE jif >= 10),
+			count(*) FILTER (WHERE jif >= 10 AND quartile <> 'Q1'),
 			count(*) FILTER (
 				WHERE metric_status = 'unknown'
 				  AND jif IS NULL
@@ -1693,14 +1695,26 @@ func TestSyntheticJCRFixtureMatchesPreexistingVenuesByExactISSN(t *testing.T) {
 				  AND venue_id = $2
 			)
 		FROM venue_metric_snapshots
-	`, alphaVenueID, unknownVenueID).Scan(&q1Categories, &highJIF, &unknown); err != nil {
+	`, alphaVenueID, unknownVenueID).Scan(
+		&alphaCategories,
+		&alphaQ1Categories,
+		&highJIF,
+		&highJIFWithoutQ1,
+		&unknown,
+	); err != nil {
 		t.Fatalf("query synthetic JCR semantics: %v", err)
 	}
-	if q1Categories < 2 || highJIF < 1 || unknown < 1 {
+	if alphaCategories != 2 ||
+		alphaQ1Categories < 1 ||
+		highJIF < 1 ||
+		highJIFWithoutQ1 < 1 ||
+		unknown < 1 {
 		t.Fatalf(
-			"fixture semantics = Q1 categories %d, JIF>=10 %d, unknown %d",
-			q1Categories,
+			"fixture semantics = alpha categories %d, alpha Q1 %d, JIF>=10 %d, JIF>=10 without Q1 %d, unknown %d",
+			alphaCategories,
+			alphaQ1Categories,
 			highJIF,
+			highJIFWithoutQ1,
 			unknown,
 		)
 	}
