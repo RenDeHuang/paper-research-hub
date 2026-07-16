@@ -11,45 +11,73 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/config"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/httpapi"
 )
-
-const shutdownTimeout = 10 * time.Second
 
 type httpServer interface {
 	ListenAndServe() error
 	Shutdown(context.Context) error
 }
 
+type databasePool interface {
+	Close()
+}
+
+type databaseOpener func(context.Context, config.DatabaseConfig) (databasePool, error)
+
 func main() {
-	addr := os.Getenv("API_ADDR")
-	if addr == "" {
-		addr = ":8080"
+	cfg, err := config.Load(config.RoleAPI)
+	if err != nil {
+		log.Printf("load API configuration: %v", err)
+		os.Exit(1)
 	}
 
-	server := newHTTPServer(addr, httpapi.NewServer(httpapi.Dependencies{}))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	server := newHTTPServer(cfg.HTTP, httpapi.NewServer(httpapi.Dependencies{}))
 
-	if err := run(ctx, server); err != nil {
+	if err := runApplication(
+		ctx,
+		cfg,
+		server,
+		func(ctx context.Context, databaseConfig config.DatabaseConfig) (databasePool, error) {
+			return database.Open(ctx, databaseConfig)
+		},
+	); err != nil {
 		log.Printf("api server: %v", err)
 		os.Exit(1)
 	}
 }
 
-func newHTTPServer(addr string, handler http.Handler) *http.Server {
+func runApplication(
+	ctx context.Context,
+	cfg config.Config,
+	server httpServer,
+	openDatabase databaseOpener,
+) error {
+	pool, err := openDatabase(ctx, cfg.Database)
+	if err != nil {
+		return fmt.Errorf("open database pool: %w", err)
+	}
+	defer pool.Close()
+	return run(ctx, server, cfg.HTTP.ShutdownTimeout)
+}
+
+func newHTTPServer(cfg config.HTTPConfig, handler http.Handler) *http.Server {
 	return &http.Server{
-		Addr:              addr,
+		Addr:              cfg.Address(),
 		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 }
 
-func run(ctx context.Context, server httpServer) error {
+func run(ctx context.Context, server httpServer, shutdownTimeout time.Duration) error {
 	if ctx.Err() != nil {
 		return nil
 	}

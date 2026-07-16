@@ -7,38 +7,116 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/config"
 )
 
-func TestNewHTTPServerConfiguresFiniteHTTPBoundaries(t *testing.T) {
+func TestNewHTTPServerUsesSharedConfiguration(t *testing.T) {
 	t.Parallel()
 
 	handlerCalled := false
 	handler := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		handlerCalled = true
 	})
-	server := newHTTPServer(":9090", handler)
+	httpConfig := config.HTTPConfig{
+		Host:              "127.0.0.1",
+		Port:              9090,
+		ReadHeaderTimeout: 7 * time.Second,
+		ReadTimeout:       17 * time.Second,
+		WriteTimeout:      31 * time.Second,
+		IdleTimeout:       71 * time.Second,
+		MaxHeaderBytes:    2 << 20,
+	}
+	server := newHTTPServer(httpConfig, handler)
 
-	if server.Addr != ":9090" {
-		t.Errorf("Addr = %q, want %q", server.Addr, ":9090")
+	if server.Addr != "127.0.0.1:9090" {
+		t.Errorf("Addr = %q, want %q", server.Addr, "127.0.0.1:9090")
 	}
 	server.Handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 	if !handlerCalled {
 		t.Error("configured Handler did not call the supplied handler")
 	}
-	if server.ReadHeaderTimeout != 5*time.Second {
-		t.Errorf("ReadHeaderTimeout = %s, want %s", server.ReadHeaderTimeout, 5*time.Second)
+	if server.ReadHeaderTimeout != httpConfig.ReadHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %s, want %s", server.ReadHeaderTimeout, httpConfig.ReadHeaderTimeout)
 	}
-	if server.ReadTimeout != 15*time.Second {
-		t.Errorf("ReadTimeout = %s, want %s", server.ReadTimeout, 15*time.Second)
+	if server.ReadTimeout != httpConfig.ReadTimeout {
+		t.Errorf("ReadTimeout = %s, want %s", server.ReadTimeout, httpConfig.ReadTimeout)
 	}
-	if server.WriteTimeout != 30*time.Second {
-		t.Errorf("WriteTimeout = %s, want %s", server.WriteTimeout, 30*time.Second)
+	if server.WriteTimeout != httpConfig.WriteTimeout {
+		t.Errorf("WriteTimeout = %s, want %s", server.WriteTimeout, httpConfig.WriteTimeout)
 	}
-	if server.IdleTimeout != 60*time.Second {
-		t.Errorf("IdleTimeout = %s, want %s", server.IdleTimeout, 60*time.Second)
+	if server.IdleTimeout != httpConfig.IdleTimeout {
+		t.Errorf("IdleTimeout = %s, want %s", server.IdleTimeout, httpConfig.IdleTimeout)
 	}
-	if server.MaxHeaderBytes != 1<<20 {
-		t.Errorf("MaxHeaderBytes = %d, want %d", server.MaxHeaderBytes, 1<<20)
+	if server.MaxHeaderBytes != httpConfig.MaxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", server.MaxHeaderBytes, httpConfig.MaxHeaderBytes)
+	}
+}
+
+func TestRunApplicationOpensAndClosesConfiguredDatabasePool(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		HTTP: config.HTTPConfig{ShutdownTimeout: time.Second},
+		Database: config.DatabaseConfig{
+			URL:      "postgres://paper:secret@localhost/papers",
+			MaxConns: 9,
+		},
+	}
+	pool := &stubDatabasePool{}
+	var opened config.DatabaseConfig
+	server := &stubHTTPServer{
+		listenAndServe: func() error { return http.ErrServerClosed },
+		shutdown: func(context.Context) error {
+			t.Fatal("Shutdown called after clean server exit")
+			return nil
+		},
+	}
+
+	err := runApplication(
+		context.Background(),
+		cfg,
+		server,
+		func(_ context.Context, databaseConfig config.DatabaseConfig) (databasePool, error) {
+			opened = databaseConfig
+			return pool, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("runApplication() error = %v", err)
+	}
+	if opened.URL != cfg.Database.URL || opened.MaxConns != cfg.Database.MaxConns {
+		t.Fatalf("opened database config = %+v, want shared config", opened)
+	}
+	if !pool.closed {
+		t.Fatal("database pool was not closed")
+	}
+}
+
+func TestRunApplicationReturnsDatabaseOpenErrorWithoutStartingHTTP(t *testing.T) {
+	t.Parallel()
+
+	openError := errors.New("database unavailable")
+	server := &stubHTTPServer{
+		listenAndServe: func() error {
+			t.Fatal("HTTP server started after database open failure")
+			return nil
+		},
+		shutdown: func(context.Context) error {
+			t.Fatal("Shutdown called after database open failure")
+			return nil
+		},
+	}
+	err := runApplication(
+		context.Background(),
+		config.Config{},
+		server,
+		func(context.Context, config.DatabaseConfig) (databasePool, error) {
+			return nil, openError
+		},
+	)
+	if !errors.Is(err, openError) {
+		t.Fatalf("runApplication() error = %v, want wrapped %v", err, openError)
 	}
 }
 
@@ -56,7 +134,7 @@ func TestRunReturnsUnexpectedListenError(t *testing.T) {
 		},
 	}
 
-	err := run(context.Background(), server)
+	err := run(context.Background(), server, time.Second)
 	if !errors.Is(err, listenError) {
 		t.Fatalf("run error = %v, want wrapped %v", err, listenError)
 	}
@@ -75,7 +153,7 @@ func TestRunTreatsErrServerClosedAsCleanExit(t *testing.T) {
 		},
 	}
 
-	if err := run(context.Background(), server); err != nil {
+	if err := run(context.Background(), server, time.Second); err != nil {
 		t.Fatalf("run error = %v, want nil", err)
 	}
 }
@@ -102,7 +180,7 @@ func TestRunShutsDownWithDeadlineWhenContextIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- run(ctx, server)
+		result <- run(ctx, server, 10*time.Second)
 	}()
 
 	<-listening
@@ -153,7 +231,7 @@ func TestRunReturnsShutdownError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- run(ctx, server)
+		result <- run(ctx, server, time.Second)
 	}()
 
 	<-listening
@@ -172,6 +250,14 @@ func TestRunReturnsShutdownError(t *testing.T) {
 type stubHTTPServer struct {
 	listenAndServe func() error
 	shutdown       func(context.Context) error
+}
+
+type stubDatabasePool struct {
+	closed bool
+}
+
+func (pool *stubDatabasePool) Close() {
+	pool.closed = true
 }
 
 func (server *stubHTTPServer) ListenAndServe() error {

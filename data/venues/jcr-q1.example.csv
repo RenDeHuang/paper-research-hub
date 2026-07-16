@@ -1,0 +1,4 @@
+controlled_source_scheme,controlled_source_id,title,issn_l,issn,eissn,metric_year,category,jif,quartile,status
+doaj,synthetic-source-alpha,Synthetic Journal of Agent Systems,1234-567X,1234-567X,2049-3630,2025,Artificial Intelligence,12.5,Q1,known
+doaj,synthetic-source-alpha,Synthetic Journal of Agent Systems,1234-567X,1234-567X,2049-3630,2025,Robotics,12.5,Q1,known
+doaj,synthetic-source-unknown,Synthetic Journal with Unknown Metrics,9876-543X,9876-543X,1357-246X,2025,"Computer Science, Interdisciplinary Applications",,,unknown
