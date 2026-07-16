@@ -16,6 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	paperdomain "github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
 )
 
 const initialMigrationChecksum = "3568e26689b33d651fe0ee5089587ba2d3efd74517eb430b83766f9907881404"
@@ -483,6 +485,184 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	}
 }
 
+func TestMigrationReconcilesNormalizedDuplicateWorksAndPreservesEvidence(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:1]); err != nil {
+		t.Fatalf("apply original 000001_initial: %v", err)
+	}
+
+	const (
+		survivorWorkID  = "00000000-0000-0000-0000-000000000001"
+		duplicateWorkID = "00000000-0000-0000-0000-000000000002"
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO works (id, canonical_key, status, title, created_at, updated_at)
+		VALUES
+			($1, 'doi:10.1000/Merge-Me', 'active', 'Merge Work', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'),
+			($2, 'doi:10.1000/merge-me', 'active', 'Merge Work', '2021-01-01T00:00:00Z', '2021-01-01T00:00:00Z')
+	`, survivorWorkID, duplicateWorkID); err != nil {
+		t.Fatalf("insert duplicate legacy Works: %v", err)
+	}
+
+	sourceOne := insertLegacySourceRecord(t, pool, survivorWorkID, "crossref", "merge-source-one", "merge-hash-one")
+	sourceTwo := insertLegacySourceRecord(t, pool, duplicateWorkID, "openalex", "merge-source-two", "merge-hash-two")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO field_assertions (work_id, source_record_id, field_name, asserted_value)
+		VALUES
+			($1, $2, 'title', '{"value":"Merge Work","source":"crossref"}'),
+			($3, $4, 'abstract', '{"value":"Preserved evidence","source":"openalex"}')
+	`, survivorWorkID, sourceOne, duplicateWorkID, sourceTwo); err != nil {
+		t.Fatalf("insert legacy FieldAssertions: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO paper_versions (work_id, source_record_id, version_label, status)
+		VALUES
+			($1, $2, 'v1', 'active'),
+			($3, $4, 'v2', 'active')
+	`, survivorWorkID, sourceOne, duplicateWorkID, sourceTwo); err != nil {
+		t.Fatalf("insert non-conflicting legacy PaperVersions: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO external_identifiers (work_id, source_record_id, scheme, normalized_value)
+		VALUES
+			($1, $2, 'doi', '10.1000/Merge-Me'),
+			($3, $4, 'doi', '10.1000/merge-me')
+	`, survivorWorkID, sourceOne, duplicateWorkID, sourceTwo); err != nil {
+		t.Fatalf("insert duplicate legacy ExternalIdentifiers: %v", err)
+	}
+	var repositoryID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO code_repositories (canonical_url, host, owner_name, repository_name)
+		VALUES ('https://example.test/merge/repo', 'example.test', 'merge', 'repo')
+		RETURNING id
+	`), &repositoryID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_code_repositories (work_id, repository_id, relation_type)
+		VALUES
+			($1, $3, 'official'),
+			($2, $3, 'official')
+	`, survivorWorkID, duplicateWorkID, repositoryID); err != nil {
+		t.Fatalf("insert duplicate legacy repository links: %v", err)
+	}
+
+	if err := Up(ctx, pool); err != nil {
+		t.Fatalf("upgrade duplicate normalized Works: %v", err)
+	}
+
+	var survivingID string
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text
+		FROM works
+		WHERE canonical_key = 'doi:10.1000/merge-me'
+	`).Scan(&survivingID); err != nil {
+		t.Fatalf("query reconciled Work: %v", err)
+	}
+	if survivingID != survivorWorkID {
+		t.Fatalf("reconciled Work ID = %s, want stable survivor %s", survivingID, survivorWorkID)
+	}
+
+	assertWorkReferenceCount(t, pool, "source_record_works", "work_id", survivorWorkID, 2)
+	assertWorkReferenceCount(t, pool, "field_assertions", "work_id", survivorWorkID, 2)
+	assertWorkReferenceCount(t, pool, "paper_versions", "work_id", survivorWorkID, 2)
+	assertWorkReferenceCount(t, pool, "work_code_repositories", "work_id", survivorWorkID, 1)
+
+	var sourceEvidenceCount, externalIdentifierCount, duplicateWorkCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM source_records
+		WHERE id IN ($1, $2)
+		  AND raw_payload->>'id' IN ('merge-source-one', 'merge-source-two')
+	`, sourceOne, sourceTwo).Scan(&sourceEvidenceCount); err != nil {
+		t.Fatalf("count preserved SourceRecord evidence: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM external_identifiers
+		WHERE work_id = $1
+		  AND scheme = 'doi'
+		  AND normalized_value = '10.1000/merge-me'
+	`, survivorWorkID).Scan(&externalIdentifierCount); err != nil {
+		t.Fatalf("count reconciled ExternalIdentifiers: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM works WHERE id = $1", duplicateWorkID).Scan(&duplicateWorkCount); err != nil {
+		t.Fatalf("count removed duplicate Work: %v", err)
+	}
+	if sourceEvidenceCount != 2 || externalIdentifierCount != 1 || duplicateWorkCount != 0 {
+		t.Fatalf(
+			"reconciled data = SourceRecords %d, ExternalIdentifiers %d, duplicate Works %d; want 2, 1, 0",
+			sourceEvidenceCount,
+			externalIdentifierCount,
+			duplicateWorkCount,
+		)
+	}
+}
+
+func TestMigrationRejectsAmbiguousDuplicateWorkProjectionWithContext(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:1]); err != nil {
+		t.Fatalf("apply original 000001_initial: %v", err)
+	}
+
+	const (
+		survivorWorkID  = "00000000-0000-0000-0000-000000000011"
+		duplicateWorkID = "00000000-0000-0000-0000-000000000012"
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO works (id, canonical_key, status, title, created_at, updated_at)
+		VALUES
+			($1, 'doi:10.1000/Conflict', 'active', 'Conflict Work', '2020-01-01T00:00:00Z', now()),
+			($2, 'doi:10.1000/conflict', 'active', 'Conflict Work', '2021-01-01T00:00:00Z', now())
+	`, survivorWorkID, duplicateWorkID); err != nil {
+		t.Fatalf("insert conflicting legacy Works: %v", err)
+	}
+	sourceOne := insertLegacySourceRecord(t, pool, survivorWorkID, "crossref", "conflict-source-one", "conflict-hash-one")
+	sourceTwo := insertLegacySourceRecord(t, pool, duplicateWorkID, "openalex", "conflict-source-two", "conflict-hash-two")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO paper_versions (work_id, source_record_id, version_label, status)
+		VALUES
+			($1, $2, 'v1', 'active'),
+			($3, $4, 'v1', 'active')
+	`, survivorWorkID, sourceOne, duplicateWorkID, sourceTwo); err != nil {
+		t.Fatalf("insert ambiguous legacy PaperVersions: %v", err)
+	}
+
+	err = Up(ctx, pool)
+	if err == nil ||
+		!strings.Contains(err.Error(), "cannot reconcile normalized identity doi:10.1000/conflict") ||
+		!strings.Contains(err.Error(), "paper_versions") {
+		t.Fatalf("ambiguous upgrade error = %v, want contextual paper_versions reconciliation failure", err)
+	}
+
+	var appliedV2, retainedWorks, retainedSources int
+	if queryErr := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations WHERE version = 2").Scan(&appliedV2); queryErr != nil {
+		t.Fatalf("count failed v2 migration records: %v", queryErr)
+	}
+	if queryErr := pool.QueryRow(ctx, "SELECT count(*) FROM works WHERE id IN ($1, $2)", survivorWorkID, duplicateWorkID).Scan(&retainedWorks); queryErr != nil {
+		t.Fatalf("count retained conflicting Works: %v", queryErr)
+	}
+	if queryErr := pool.QueryRow(ctx, "SELECT count(*) FROM source_records WHERE id IN ($1, $2)", sourceOne, sourceTwo).Scan(&retainedSources); queryErr != nil {
+		t.Fatalf("count retained conflicting SourceRecords: %v", queryErr)
+	}
+	if appliedV2 != 0 || retainedWorks != 2 || retainedSources != 2 {
+		t.Fatalf(
+			"failed reconciliation state = applied v2 %d, Works %d, SourceRecords %d; want 0, 2, 2",
+			appliedV2,
+			retainedWorks,
+			retainedSources,
+		)
+	}
+}
+
 func TestFailedMigrationRollsBackAndIsNotRecorded(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := testContext(t)
@@ -720,6 +900,139 @@ func TestCanonicalAndExternalIdentifierNormalizationIsSchemeAware(t *testing.T) 
 	}
 	if preservedOpenReviewValues != 2 {
 		t.Fatalf("case-preserved OpenReview identifiers = %d, want 2", preservedOpenReviewValues)
+	}
+}
+
+func TestArXivNormalizationMatchesPaperDomainRules(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	testCases := []struct {
+		name            string
+		raw             string
+		want            string
+		storedCandidate string
+		wantError       bool
+	}{
+		{
+			name:            "legacy math subject class alias",
+			raw:             "math.CA/0611800v2",
+			want:            "math/0611800",
+			storedCandidate: "math.ca/0611800",
+		},
+		{
+			name:            "legacy cs subject class alias",
+			raw:             "CS.AI/9901001",
+			want:            "cs/9901001",
+			storedCandidate: "cs.ai/9901001",
+		},
+		{
+			name:            "controlled legacy archive",
+			raw:             "hep-th/9108001v2",
+			want:            "hep-th/9108001",
+			storedCandidate: "hep-th/9108001v2",
+		},
+		{
+			name:            "modern first four digit month",
+			raw:             "0704.0001",
+			want:            "0704.0001",
+			storedCandidate: "0704.0001",
+		},
+		{
+			name:            "modern last four digit month",
+			raw:             "1412.9999v1",
+			want:            "1412.9999",
+			storedCandidate: "1412.9999v1",
+		},
+		{
+			name:            "modern first five digit month",
+			raw:             "1501.00001V12",
+			want:            "1501.00001",
+			storedCandidate: "1501.00001v12",
+		},
+		{name: "modern before 0704", raw: "0703.0001", storedCandidate: "0703.0001", wantError: true},
+		{name: "four digit era with five digits", raw: "0704.00001", storedCandidate: "0704.00001", wantError: true},
+		{name: "1412 with five digits", raw: "1412.00001", storedCandidate: "1412.00001", wantError: true},
+		{name: "five digit era with four digits", raw: "1501.0001", storedCandidate: "1501.0001", wantError: true},
+		{name: "zero sequence", raw: "2401.00000", storedCandidate: "2401.00000", wantError: true},
+		{name: "zero version", raw: "2401.01234v0", storedCandidate: "2401.01234v0", wantError: true},
+		{name: "legacy after cutoff", raw: "math/0704001", storedCandidate: "math/0704001", wantError: true},
+		{name: "unknown legacy archive", raw: "unknown.AI/0611001", storedCandidate: "unknown.ai/0611001", wantError: true},
+		{name: "subject class on non alias archive", raw: "hep-th.X/0611001", storedCandidate: "hep-th.x/0611001", wantError: true},
+	}
+
+	for index, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			goNormalized, goErr := paperdomain.NormalizeArXiv(tt.raw)
+			if tt.wantError {
+				if goErr == nil {
+					t.Fatalf("paper.NormalizeArXiv(%q) = %q, want error", tt.raw, goNormalized)
+				}
+			} else {
+				if goErr != nil {
+					t.Fatalf("paper.NormalizeArXiv(%q) error = %v", tt.raw, goErr)
+				}
+				if goNormalized != tt.want {
+					t.Fatalf("paper.NormalizeArXiv(%q) = %q, want %q", tt.raw, goNormalized, tt.want)
+				}
+			}
+
+			var databaseNormalized *string
+			if err := pool.QueryRow(ctx, `
+				SELECT normalize_paper_identifier('arxiv', $1)
+			`, tt.raw).Scan(&databaseNormalized); err != nil {
+				t.Fatalf("normalize arXiv in PostgreSQL: %v", err)
+			}
+			if tt.wantError {
+				if databaseNormalized != nil {
+					t.Fatalf("database normalized invalid arXiv %q to %q", tt.raw, *databaseNormalized)
+				}
+			} else if databaseNormalized == nil || *databaseNormalized != goNormalized {
+				t.Fatalf(
+					"database normalization for %q = %v, want Go output %q",
+					tt.raw,
+					databaseNormalized,
+					goNormalized,
+				)
+			}
+
+			var workID string
+			if tt.wantError {
+				workID = insertWork(t, pool, fmt.Sprintf("openreview:arxiv_invalid_%d", index))
+				_, err := pool.Exec(ctx, `
+					INSERT INTO works (canonical_key, status, title)
+					VALUES ($1, 'active', $1)
+				`, "arxiv:"+tt.storedCandidate)
+				assertPostgresError(t, err, "23514", "works_canonical_key_check")
+				_, err = pool.Exec(ctx, `
+					INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+					VALUES ($1, 'arxiv', $2)
+				`, workID, tt.storedCandidate)
+				assertPostgresError(t, err, "23514", "external_identifiers_normalized_value_check")
+				return
+			}
+
+			workID = insertWork(t, pool, "arxiv:"+goNormalized)
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+				VALUES ($1, 'arxiv', $2)
+			`, workID, goNormalized); err != nil {
+				t.Fatalf("insert normalized arXiv external identifier %q: %v", goNormalized, err)
+			}
+			if tt.storedCandidate == goNormalized {
+				return
+			}
+			_, err := pool.Exec(ctx, `
+				INSERT INTO works (canonical_key, status, title)
+				VALUES ($1, 'active', $1)
+			`, "arxiv:"+tt.storedCandidate)
+			assertPostgresError(t, err, "23514", "works_canonical_key_check")
+			_, err = pool.Exec(ctx, `
+				INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+				VALUES ($1, 'arxiv', $2)
+			`, workID, tt.storedCandidate)
+			assertPostgresError(t, err, "23514", "external_identifiers_normalized_value_check")
+		})
 	}
 }
 
@@ -1398,6 +1711,59 @@ func insertSourceRecord(
 		FROM inserted_source
 	`, workID, source, sourceRecordID, contentHash), &id)
 	return id
+}
+
+func insertLegacySourceRecord(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	workID string,
+	source string,
+	sourceRecordID string,
+	contentHash string,
+) string {
+	t.Helper()
+	var id string
+	mustScanID(t, pool.QueryRow(testContext(t), `
+		INSERT INTO source_records (
+			work_id, source, source_record_id, source_identity, source_time, content_hash, raw_payload
+		) VALUES (
+			$1, $2, $3,
+			jsonb_build_object('id', $3::text),
+			now(),
+			$4,
+			jsonb_build_object('id', $3::text)
+		)
+		RETURNING id
+	`, workID, source, sourceRecordID, contentHash), &id)
+	return id
+}
+
+func assertWorkReferenceCount(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	table string,
+	column string,
+	workID string,
+	want int,
+) {
+	t.Helper()
+	allowedReferences := map[string]string{
+		"source_record_works":    "work_id",
+		"field_assertions":       "work_id",
+		"paper_versions":         "work_id",
+		"work_code_repositories": "work_id",
+	}
+	if allowedReferences[table] != column {
+		t.Fatalf("unsupported Work reference assertion %s.%s", table, column)
+	}
+	query := fmt.Sprintf("SELECT count(*) FROM %s WHERE %s = $1", table, column)
+	var got int
+	if err := pool.QueryRow(testContext(t), query, workID).Scan(&got); err != nil {
+		t.Fatalf("count %s.%s references: %v", table, column, err)
+	}
+	if got != want {
+		t.Fatalf("%s.%s references to Work %s = %d, want %d", table, column, workID, got, want)
+	}
 }
 
 type scanner interface {
