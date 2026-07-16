@@ -21,6 +21,7 @@ var expectedSchemaTables = []string{
 	"works",
 	"paper_versions",
 	"source_records",
+	"source_record_works",
 	"external_identifiers",
 	"field_assertions",
 	"authors",
@@ -161,7 +162,7 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		FROM pg_trigger
 		WHERE NOT tgisinternal
 	`, []string{
-		"source_records_raw_immutable",
+		"source_records_immutable",
 		"venue_metric_snapshots_immutable",
 		"venue_policy_versions_immutable",
 	})
@@ -170,7 +171,7 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		FROM pg_indexes
 		WHERE schemaname = 'public'
 	`, []string{
-		"idx_source_records_work_id",
+		"idx_source_record_works_work_id",
 		"idx_field_assertions_source_record_id",
 		"idx_work_code_repositories_repository_id",
 		"idx_metric_snapshots_work_observed_at",
@@ -181,10 +182,13 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 	})
 
 	expectedDeleteRules := map[string]string{
-		"source_records_work_id_fkey":                  "n",
+		"source_record_works_source_record_id_fkey":    "r",
+		"source_record_works_work_id_fkey":             "c",
 		"field_assertions_work_id_fkey":                "n",
-		"paper_versions_source_record_work_fkey":       "r",
-		"field_assertions_source_record_work_fkey":     "r",
+		"paper_versions_source_record_id_fkey":         "r",
+		"field_assertions_source_record_id_fkey":       "r",
+		"paper_versions_source_record_work_fkey":       "a",
+		"field_assertions_source_record_work_fkey":     "a",
 		"work_code_repositories_work_id_fkey":          "c",
 		"work_code_repositories_repository_id_fkey":    "r",
 		"venue_metric_snapshots_venue_id_fkey":         "r",
@@ -389,26 +393,91 @@ func TestCanonicalStatusIdentifierAndProjectionConstraints(t *testing.T) {
 	}
 }
 
-func TestSourceRecordRawSnapshotIsImmutable(t *testing.T) {
+func TestSourceRecordSnapshotIsCompletelyImmutable(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
 	workID := insertWork(t, pool, "openalex:W-immutable")
 	sourceID := insertSourceRecord(t, pool, workID, "openalex", "W-immutable", "immutable-hash")
 
 	updates := []string{
+		`id = gen_random_uuid()`,
 		`raw_payload = '{"changed":true}'`,
 		`source = 'crossref'`,
 		`source_record_id = 'changed-id'`,
 		`content_hash = 'changed-hash'`,
 		`source_identity = '{"id":"changed"}'`,
 		`source_time = source_time + interval '1 second'`,
+		`retrieved_at = retrieved_at + interval '1 second'`,
+		`created_at = created_at + interval '1 second'`,
 	}
 	for _, assignment := range updates {
 		t.Run(assignment, func(t *testing.T) {
-			if _, err := pool.Exec(ctx, "UPDATE source_records SET "+assignment+" WHERE id = $1", sourceID); err == nil {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin immutable update transaction: %v", err)
+			}
+			_, updateErr := tx.Exec(ctx, "UPDATE source_records SET "+assignment+" WHERE id = $1", sourceID)
+			if rollbackErr := tx.Rollback(context.Background()); rollbackErr != nil {
+				t.Fatalf("rollback immutable update transaction: %v", rollbackErr)
+			}
+			if updateErr == nil {
 				t.Fatalf("immutable update %q was accepted", assignment)
 			}
 		})
+	}
+}
+
+func TestSourceRecordCannotBeDeletedWithoutProjectionReferences(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+	workID := insertWork(t, pool, "openalex:undeletable-source")
+	sourceID := insertSourceRecord(t, pool, workID, "openalex", "undeletable-source", "undeletable-hash")
+
+	if _, err := pool.Exec(ctx, "DELETE FROM source_records WHERE id = $1", sourceID); err == nil {
+		t.Fatal("unprojected SourceRecord deletion was accepted")
+	}
+}
+
+func TestSourceRecordWorkOwnershipUsesSeparateAssociation(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	var sourceRecordWorkColumnCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND table_name = 'source_records'
+		  AND column_name = 'work_id'
+	`).Scan(&sourceRecordWorkColumnCount); err != nil {
+		t.Fatalf("query SourceRecord ownership column: %v", err)
+	}
+	if sourceRecordWorkColumnCount != 0 {
+		t.Fatal("source_records.work_id makes Work deletion mutate immutable evidence")
+	}
+
+	var associationTable *string
+	if err := pool.QueryRow(ctx, `
+		SELECT to_regclass('public.source_record_works')::text
+	`).Scan(&associationTable); err != nil {
+		t.Fatalf("query SourceRecord Work association table: %v", err)
+	}
+	if associationTable == nil {
+		t.Fatal("source_record_works association table was not created")
+	}
+
+	workID := insertWork(t, pool, "openalex:separate-source-ownership")
+	sourceID := insertSourceRecord(t, pool, workID, "openalex", "separate-source-ownership", "ownership-hash")
+	var linkedWorkID string
+	if err := pool.QueryRow(ctx, `
+		SELECT work_id::text
+		FROM source_record_works
+		WHERE source_record_id = $1
+	`, sourceID).Scan(&linkedWorkID); err != nil {
+		t.Fatalf("query SourceRecord Work association: %v", err)
+	}
+	if linkedWorkID != workID {
+		t.Fatalf("SourceRecord linked Work = %q, want %q", linkedWorkID, workID)
 	}
 }
 
@@ -420,20 +489,20 @@ func TestSourceRecordUniquenessAndJSONTypeConstraints(t *testing.T) {
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO source_records (
-			work_id, source, source_record_id, source_identity, source_time, content_hash, raw_payload
+			source, source_record_id, source_identity, source_time, content_hash, raw_payload
 		) VALUES (
-			$1, 'openalex', 'W-json', '{"id":"W-json"}', now(), 'same-hash', '{"id":"W-json"}'
+			'openalex', 'W-json', '{"id":"W-json"}', now(), 'same-hash', '{"id":"W-json"}'
 		)
-	`, workID); err == nil {
+	`); err == nil {
 		t.Fatal("duplicate (source, source_record_id, content_hash) was accepted")
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO source_records (
-			work_id, source, source_record_id, source_identity, source_time, content_hash, raw_payload
+			source, source_record_id, source_identity, source_time, content_hash, raw_payload
 		) VALUES (
-			$1, 'openalex', 'W-array', '{"id":"W-array"}', now(), 'array-hash', '[]'
+			'openalex', 'W-array', '{"id":"W-array"}', now(), 'array-hash', '[]'
 		)
-	`, workID); err == nil {
+	`); err == nil {
 		t.Fatal("array raw_payload was accepted")
 	}
 	if _, err := pool.Exec(ctx, `
@@ -576,15 +645,24 @@ func TestDeletingWorkRetainsEvidenceAndGlobalRepository(t *testing.T) {
 	if _, err := pool.Exec(ctx, "DELETE FROM works WHERE id = $1", workID); err != nil {
 		t.Fatalf("delete work: %v", err)
 	}
-	var sourceWorkID, assertionWorkID *string
-	if err := pool.QueryRow(ctx, "SELECT work_id::text FROM source_records WHERE id = $1", sourceID).Scan(&sourceWorkID); err != nil {
-		t.Fatalf("query retained SourceRecord: %v", err)
+	var retainedSources, sourceWorkLinks int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM source_records WHERE id = $1", sourceID).Scan(&retainedSources); err != nil {
+		t.Fatalf("count retained SourceRecord: %v", err)
 	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM source_record_works WHERE source_record_id = $1", sourceID).Scan(&sourceWorkLinks); err != nil {
+		t.Fatalf("count cleared SourceRecord Work links: %v", err)
+	}
+	var assertionWorkID *string
 	if err := pool.QueryRow(ctx, "SELECT work_id::text FROM field_assertions WHERE id = $1", assertionID).Scan(&assertionWorkID); err != nil {
 		t.Fatalf("query retained FieldAssertion: %v", err)
 	}
-	if sourceWorkID != nil || assertionWorkID != nil {
-		t.Fatalf("retained evidence still references deleted Work: source=%v assertion=%v", sourceWorkID, assertionWorkID)
+	if retainedSources != 1 || sourceWorkLinks != 0 || assertionWorkID != nil {
+		t.Fatalf(
+			"retained evidence = sources %d, source Work links %d, assertion Work %v; want 1, 0, nil",
+			retainedSources,
+			sourceWorkLinks,
+			assertionWorkID,
+		)
 	}
 	var repositories, links int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM code_repositories WHERE id = $1", repositoryID).Scan(&repositories); err != nil {
@@ -598,29 +676,39 @@ func TestDeletingWorkRetainsEvidenceAndGlobalRepository(t *testing.T) {
 	}
 }
 
-func TestSyntheticJCRFixtureExpressesExactISSNMultiCategoryQ1HighJIFAndUnknown(t *testing.T) {
+func TestSyntheticJCRFixtureMatchesPreexistingVenuesByExactISSN(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
 	fixture := loadJCRFixture(t)
-	venueIDs := map[string]string{}
+
+	var alphaVenueID, unknownVenueID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l)
+		VALUES ('journal', 'Preexisting Alpha Venue', '1234-567X')
+		RETURNING id
+	`), &alphaVenueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn)
+		VALUES ('journal', 'Preexisting Unknown Venue', '9876-543X')
+		RETURNING id
+	`), &unknownVenueID)
+
+	expectedVenueIDs := map[string]string{
+		"1234-567X": alphaVenueID,
+		"9876-543X": unknownVenueID,
+	}
+	var venuesBefore int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venues").Scan(&venuesBefore); err != nil {
+		t.Fatalf("count preexisting venues: %v", err)
+	}
+
 	for _, record := range fixture {
-		sourceID := record["controlled_source_id"]
-		venueID, exists := venueIDs[sourceID]
-		if !exists {
-			mustScanID(t, pool.QueryRow(ctx, `
-				INSERT INTO venues (
-					venue_type, display_title, issn_l, issn, eissn, source_scheme, source_identifier
-				) VALUES ('journal', $1, $2, $3, $4, $5, $6)
-				RETURNING id
-			`,
-				record["title"],
-				nullable(record["issn_l"]),
-				nullable(record["issn"]),
-				nullable(record["eissn"]),
-				record["controlled_source_scheme"],
-				sourceID,
-			), &venueID)
-			venueIDs[sourceID] = venueID
+		venueID, err := resolveVenueByExactISSN(ctx, pool, record)
+		if err != nil {
+			t.Fatalf("resolve fixture venue by exact ISSN: %v", err)
+		}
+		if want := expectedVenueIDs[record["issn_l"]]; venueID != want {
+			t.Fatalf("fixture ISSN-L %q matched venue %q, want preexisting venue %q", record["issn_l"], venueID, want)
 		}
 		metricYear, err := strconv.Atoi(record["metric_year"])
 		if err != nil {
@@ -643,30 +731,82 @@ func TestSyntheticJCRFixtureExpressesExactISSNMultiCategoryQ1HighJIFAndUnknown(t
 		}
 	}
 
-	var exactMatches int
-	if err := pool.QueryRow(ctx, `
-		SELECT count(*) FROM venues WHERE issn_l = '1234-567X'
-	`).Scan(&exactMatches); err != nil {
-		t.Fatalf("query exact ISSN-L match: %v", err)
+	var venuesAfter int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venues").Scan(&venuesAfter); err != nil {
+		t.Fatalf("count venues after fixture import: %v", err)
+	}
+	if venuesAfter != venuesBefore {
+		t.Fatalf("fixture import created venues: before=%d after=%d", venuesBefore, venuesAfter)
 	}
 	var q1Categories, highJIF, unknown int
 	if err := pool.QueryRow(ctx, `
 		SELECT
 			count(*) FILTER (WHERE quartile = 'Q1' AND venue_id = $1),
 			count(*) FILTER (WHERE jif >= 10),
-			count(*) FILTER (WHERE metric_status = 'unknown' AND jif IS NULL AND quartile IS NULL)
+			count(*) FILTER (
+				WHERE metric_status = 'unknown'
+				  AND jif IS NULL
+				  AND quartile IS NULL
+				  AND venue_id = $2
+			)
 		FROM venue_metric_snapshots
-	`, venueIDs["synthetic-source-alpha"]).Scan(&q1Categories, &highJIF, &unknown); err != nil {
+	`, alphaVenueID, unknownVenueID).Scan(&q1Categories, &highJIF, &unknown); err != nil {
 		t.Fatalf("query synthetic JCR semantics: %v", err)
 	}
-	if exactMatches != 1 || q1Categories < 2 || highJIF < 1 || unknown < 1 {
+	if q1Categories < 2 || highJIF < 1 || unknown < 1 {
 		t.Fatalf(
-			"fixture semantics = exact ISSN %d, Q1 categories %d, JIF>=10 %d, unknown %d",
-			exactMatches,
+			"fixture semantics = Q1 categories %d, JIF>=10 %d, unknown %d",
 			q1Categories,
 			highJIF,
 			unknown,
 		)
+	}
+
+	var controlledSourceMatches int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM venues
+		WHERE source_identifier IN ('synthetic-source-alpha', 'synthetic-source-unknown')
+	`).Scan(&controlledSourceMatches); err != nil {
+		t.Fatalf("count controlled-source venue matches: %v", err)
+	}
+	if controlledSourceMatches != 0 {
+		t.Fatalf("fixture resolved through %d controlled source identifiers, want ISSN-only matching", controlledSourceMatches)
+	}
+}
+
+func TestVenueISSNResolutionFailsExplicitlyWhenUnmatchedOrAmbiguous(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	_, err := resolveVenueByExactISSN(ctx, pool, map[string]string{
+		"issn_l": "0000-000X",
+		"issn":   "0000-000X",
+		"eissn":  "0000-000X",
+	})
+	if err == nil || !strings.Contains(err.Error(), "no venue matches exact ISSN identifiers") {
+		t.Fatalf("unmatched ISSN resolution error = %v, want explicit no-match error", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l)
+		VALUES ('journal', 'Ambiguous ISSN-L Venue', '3141-592X')
+	`); err != nil {
+		t.Fatalf("insert ambiguous ISSN-L venue: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn)
+		VALUES ('journal', 'Ambiguous ISSN Venue', '2718-281X')
+	`); err != nil {
+		t.Fatalf("insert ambiguous ISSN venue: %v", err)
+	}
+
+	_, err = resolveVenueByExactISSN(ctx, pool, map[string]string{
+		"issn_l": "3141-592X",
+		"issn":   "2718-281X",
+	})
+	if err == nil || !strings.Contains(err.Error(), "multiple venues match exact ISSN identifiers") {
+		t.Fatalf("ambiguous ISSN resolution error = %v, want explicit ambiguity error", err)
 	}
 }
 
@@ -864,16 +1004,25 @@ func insertSourceRecord(
 	t.Helper()
 	var id string
 	mustScanID(t, pool.QueryRow(testContext(t), `
-		INSERT INTO source_records (
-			work_id, source, source_record_id, source_identity, source_time, content_hash, raw_payload
-		) VALUES (
-			$1, $2, $3,
-			jsonb_build_object('id', $3::text),
-			now(),
-			$4,
-			jsonb_build_object('id', $3::text)
+		WITH inserted_source AS (
+			INSERT INTO source_records (
+				source, source_record_id, source_identity, source_time, content_hash, raw_payload
+			) VALUES (
+				$2, $3,
+				jsonb_build_object('id', $3::text),
+				now(),
+				$4,
+				jsonb_build_object('id', $3::text)
+			)
+			RETURNING id
+		),
+		linked_source AS (
+			INSERT INTO source_record_works (source_record_id, work_id)
+			SELECT id, $1
+			FROM inserted_source
 		)
-		RETURNING id
+		SELECT id
+		FROM inserted_source
 	`, workID, source, sourceRecordID, contentHash), &id)
 	return id
 }
@@ -947,6 +1096,18 @@ func loadJCRFixture(t *testing.T) []map[string]string {
 		result = append(result, record)
 	}
 	return result
+}
+
+func resolveVenueByExactISSN(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	record map[string]string,
+) (string, error) {
+	var venueID string
+	err := pool.QueryRow(ctx, `
+		SELECT resolve_venue_by_issn($1, $2, $3)::text
+	`, nullable(record["issn_l"]), nullable(record["issn"]), nullable(record["eissn"])).Scan(&venueID)
+	return venueID, err
 }
 
 func nullable(value string) any {
