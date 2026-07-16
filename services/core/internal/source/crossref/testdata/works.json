@@ -1,0 +1,143 @@
+{
+  "status": "ok",
+  "message-type": "work-list",
+  "message-version": "1.0.0",
+  "message": {
+    "next-cursor": "fixture cursor",
+    "total-results": 999999,
+    "items": [
+      {
+        "DOI": "HTTPS://DOI.ORG/10.1000/ARTICLE",
+        "title": [
+          "A deterministic Crossref record",
+          "A title that must not be selected"
+        ],
+        "publisher": "Association for Deterministic Metadata",
+        "author": [
+          {
+            "given": "Ada",
+            "family": "Agent",
+            "ORCID": "https://orcid.org/0000-0001-2345-6789",
+            "affiliation": [
+              {
+                "name": "Deterministic Systems Lab"
+              },
+              {
+                "name": " Example University "
+              },
+              {
+                "name": " "
+              }
+            ]
+          },
+          {
+            "name": "Evidence Consortium"
+          }
+        ],
+        "container-title": [
+          "Journal of Reproducible Agents",
+          "Unused container title"
+        ],
+        "short-container-title": [
+          "J. Reprod. Agents",
+          "Unused short title"
+        ],
+        "ISSN": [
+          "0028-0836",
+          "2049-3630",
+          "0028-0836"
+        ],
+        "issn-type": [
+          {
+            "value": "0028-0836",
+            "type": "print"
+          },
+          {
+            "value": "2049-3630",
+            "type": "electronic"
+          },
+          {
+            "value": "0028-0836",
+            "type": "print"
+          }
+        ],
+        "published": {
+          "date-parts": [
+            [
+              2026,
+              7
+            ]
+          ]
+        },
+        "published-online": {
+          "date-parts": [
+            [
+              2026,
+              7,
+              8
+            ]
+          ]
+        },
+        "issued": {
+          "date-parts": [
+            [
+              1999,
+              1,
+              1
+            ]
+          ]
+        },
+        "published-print": {
+          "date-parts": [
+            [
+              2000,
+              2,
+              2
+            ]
+          ]
+        },
+        "created": {
+          "date-time": "2026-07-01T12:34:56+02:00",
+          "timestamp": 1782909296000
+        },
+        "indexed": {
+          "date-time": "2026-07-15T23:45:00-04:00",
+          "timestamp": 1784173500000
+        },
+        "current-time": {
+          "date-time": "2099-01-01T00:00:00Z"
+        },
+        "abstract": "<jats:p xmlns:jats=\"http://www.ncbi.nlm.nih.gov/JATS1\">Agents <jats:italic>preserve</jats:italic> evidence.</jats:p>",
+        "license": [
+          {
+            "URL": "https://creativecommons.org/licenses/by/4.0/",
+            "content-version": "vor"
+          },
+          {
+            "URL": "http://example.test/license/metadata",
+            "content-version": "am"
+          }
+        ],
+        "update-to": [
+          {
+            "DOI": " DOI:10.1000/CORRECTION ",
+            "type": "correction",
+            "label": "Correction",
+            "updated": {
+              "date-parts": [
+                [
+                  2026,
+                  7,
+                  10
+                ]
+              ]
+            }
+          }
+        ],
+        "future-field": {
+          "must": "remain in raw payload and hash"
+        }
+      }
+    ]
+  }
+}
