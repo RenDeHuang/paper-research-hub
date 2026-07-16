@@ -273,6 +273,8 @@ git commit -m "feat: define service contracts and health endpoints"
 - Create: `services/core/internal/database/migrate.go`
 - Create: `services/core/internal/database/migrate_test.go`
 - Create: `services/core/migrations/000001_initial.sql`
+- Create: `data/venues/README.md`
+- Create: `data/venues/jcr-q1.example.csv`
 - Modify: `services/core/cmd/migrate/main.go`
 - Modify: `.env.example`
 
@@ -283,6 +285,12 @@ Cover:
 - `DATABASE_URL` is required.
 - only PostgreSQL URLs are accepted;
 - `OPENALEX_CONTACT_EMAIL` is required for ingestion;
+- `NCBI_TOOL` and `NCBI_EMAIL` are required for PubMed ingestion;
+- PubMed, Crossref, PMC, Springer Nature, and Elsevier retry and timeout
+  settings remain bounded;
+- optional API keys are redacted from formatted configuration;
+- `JCR_IMPORT_PATH` must refer to an explicitly supplied CSV and is never
+  silently replaced by OpenAlex citation metrics;
 - secrets are redacted from formatted configuration;
 - invalid durations and worker limits fail at startup.
 
@@ -313,6 +321,11 @@ type Config struct {
 	HTTP        HTTPConfig
 	Database    DatabaseConfig
 	OpenAlex    OpenAlexConfig
+	PubMed      PubMedConfig
+	Crossref    CrossrefConfig
+	PMC         PMCConfig
+	Publishers  PublisherConfig
+	Venues      VenueConfig
 }
 ```
 
@@ -348,6 +361,12 @@ ranking_snapshots
 ingestion_cursors
 ingestion_jobs
 analysis_runs
+venues
+venue_aliases
+venue_metric_snapshots
+venue_policy_versions
+venue_policy_assessments
+fulltext_assets
 ```
 
 Add database constraints for:
@@ -359,6 +378,13 @@ Add database constraints for:
 - exactly one ranking subject;
 - source and projection ownership;
 - unique normalized external identifiers.
+- unique ISSN-L and controlled venue-source identifiers;
+- unique `(venue_id, metric_year, category)` metric snapshots;
+- JIF values are nonnegative and JCR Quartile is one of `Q1` through `Q4`;
+- policy assessments reference an immutable policy version and expose matched
+  rules instead of a boolean without evidence;
+- full-text assets require content license, source URL, content hash, and a
+  reusable/publication status.
 
 **Step 5: Test migrations against real PostgreSQL**
 
@@ -368,7 +394,9 @@ The test must:
 2. apply migrations from an empty database;
 3. verify expected tables and constraints;
 4. apply the migration command a second time;
-5. verify no schema drift or duplicate effects.
+5. import the committed JCR example fixture and verify ISSN-based venue matching;
+6. verify an unknown metric remains `unknown`, not accepted or rejected;
+7. verify no schema drift or duplicate effects.
 
 Run:
 
@@ -465,17 +493,19 @@ git add services/core/internal/paper
 git commit -m "feat: implement canonical paper domain rules"
 ```
 
-### Task 5: Implement the OpenAlex connector with bounded network behavior
+### Task 5A: Implement the OpenAlex connector with bounded network behavior
 
 **Files:**
 - Create: `services/core/internal/source/source.go`
+- Create: `services/core/internal/source/httpclient/policy.go`
+- Create: `services/core/internal/source/httpclient/policy_test.go`
 - Create: `services/core/internal/source/openalex/client.go`
 - Create: `services/core/internal/source/openalex/client_test.go`
 - Create: `services/core/internal/source/openalex/parse.go`
 - Create: `services/core/internal/source/openalex/parse_test.go`
 - Create: `services/core/internal/source/openalex/testdata/works.json`
 
-**Step 1: Write failing HTTP client tests**
+**Step 1: Write failing HTTP policy and OpenAlex client tests**
 
 Use `httptest.Server` to verify:
 
@@ -489,6 +519,10 @@ Use `httptest.Server` to verify:
 - nonretryable 4xx is not retried;
 - malformed JSON is an explicit connector error.
 
+The shared HTTP policy must not contain a source-specific fallback. Every
+connector configures an explicit timeout, retry count, maximum wait, User-Agent,
+and rate limit.
+
 **Step 2: Write failing parser tests**
 
 Verify mapping of:
@@ -499,6 +533,7 @@ Verify mapping of:
 - abstract reconstruction;
 - topics;
 - citation count;
+- venue and source identifiers;
 - OA and license;
 - retraction state;
 - code repository URLs;
@@ -511,7 +546,7 @@ over re-serialized domain objects.
 **Step 3: Run RED**
 
 ```bash
-go test ./internal/source/openalex -v
+go test ./internal/source/httpclient ./internal/source/openalex -v
 ```
 
 **Step 4: Implement the connector**
@@ -529,8 +564,7 @@ No error may be converted into an empty successful result.
 **Step 5: Run GREEN**
 
 ```bash
-go test ./internal/source/openalex -v
-go test -race ./internal/source/openalex
+go test -race ./internal/source/httpclient ./internal/source/openalex
 ```
 
 **Step 6: Commit**
@@ -538,6 +572,234 @@ go test -race ./internal/source/openalex
 ```bash
 git add services/core/internal/source
 git commit -m "feat: add strict OpenAlex connector"
+```
+
+### Task 5B: Add PubMed E-utilities and ordered bulk-update ingestion
+
+**Files:**
+- Create: `services/core/internal/source/pubmed/client.go`
+- Create: `services/core/internal/source/pubmed/client_test.go`
+- Create: `services/core/internal/source/pubmed/query.go`
+- Create: `services/core/internal/source/pubmed/query_test.go`
+- Create: `services/core/internal/source/pubmed/parse.go`
+- Create: `services/core/internal/source/pubmed/parse_test.go`
+- Create: `services/core/internal/source/pubmed/bulk.go`
+- Create: `services/core/internal/source/pubmed/bulk_test.go`
+- Create: `services/core/internal/source/pubmed/testdata/esearch.json`
+- Create: `services/core/internal/source/pubmed/testdata/efetch.xml`
+- Create: `services/core/internal/source/pubmed/testdata/baseline.xml.gz`
+- Create: `services/core/internal/source/pubmed/testdata/update.xml.gz`
+
+**Step 1: Write failing E-utilities tests**
+
+Verify:
+
+- `tool`, `email`, and optional API key are sent;
+- ESearch uses the history server and returns ordered PMID batches;
+- EFetch requests deterministic batches from the ESearch history;
+- journal filters are generated from validated ISSN values, not raw titles;
+- incremental queries use an explicit Entrez date window;
+- three requests/second without a key and ten with a key are enforced by the
+  configured limiter;
+- 429 and 5xx follow the shared bounded retry policy;
+- API keys are redacted from all errors and logs.
+
+**Step 2: Write failing PubMed XML parser tests**
+
+Map:
+
+- PMID, DOI, PMCID, journal, ISSN, title, authors and affiliations;
+- abstract sections;
+- MeSH headings;
+- publication types;
+- publication, electronic publication and revision dates;
+- retraction, correction, update and comment relationships;
+- source license metadata when present;
+- exact raw XML content hash.
+
+Unknown XML elements must not corrupt known fields. Malformed required
+identifiers fail explicitly with the source record location.
+
+**Step 3: Write failing Baseline / Daily Update tests**
+
+The importer must:
+
+- require a declared baseline year;
+- read compressed XML as a stream;
+- persist file name, SHA-256, record ordinal and import job;
+- apply Daily Update files in strictly increasing sequence;
+- replace a PMID projection when a revised citation arrives;
+- record deletions as auditable source events and remove the public projection;
+- reject a missing, duplicate or out-of-order update file;
+- resume from the last durably committed file and ordinal.
+
+**Step 4: Implement E-utilities and bulk import**
+
+PubMed API and bulk XML share one parser and one source-record contract. The
+bulk importer never downloads article HTML and never treats PubMed metadata as
+licensed full text.
+
+**Step 5: Verify**
+
+```bash
+go test -race ./internal/source/pubmed -v
+```
+
+**Step 6: Commit**
+
+```bash
+git add services/core/internal/source/pubmed
+git commit -m "feat: ingest PubMed API and bulk updates"
+```
+
+### Task 5C: Add Crossref and the versioned JCR venue registry
+
+**Files:**
+- Create: `services/core/internal/source/crossref/client.go`
+- Create: `services/core/internal/source/crossref/client_test.go`
+- Create: `services/core/internal/source/crossref/parse.go`
+- Create: `services/core/internal/source/crossref/parse_test.go`
+- Create: `services/core/internal/source/crossref/testdata/works.json`
+- Create: `services/core/internal/venue/model.go`
+- Create: `services/core/internal/venue/model_test.go`
+- Create: `services/core/internal/venue/jcr_import.go`
+- Create: `services/core/internal/venue/jcr_import_test.go`
+- Create: `services/core/internal/venue/policy.go`
+- Create: `services/core/internal/venue/policy_test.go`
+
+**Step 1: Write failing Crossref tests**
+
+Verify:
+
+- ISSN and DOI filters are encoded deterministically;
+- cursor pagination and polite identity are used;
+- DOI, ISSN, publisher, dates, licenses, abstracts and update relations map
+  without inventing missing values;
+- Crossref updates enrich fields but do not overwrite a stronger field
+  assertion without provenance;
+- bounded network behavior is inherited from the shared HTTP policy.
+
+**Step 2: Write failing JCR import tests**
+
+The importer must:
+
+- require `metric_year`, category, Quartile, JIF, ISSN/eISSN/ISSN-L and source;
+- normalize ISSN checksums and reject malformed values;
+- match venues by ISSN-L or exact controlled ISSN, never fuzzy title alone;
+- preserve every JCR category row for a multi-category journal;
+- keep historical years immutable;
+- record the input file SHA-256 and import timestamp;
+- reject duplicate conflicting rows;
+- never substitute OpenAlex `2yr_mean_citedness` for JIF.
+
+The repository contains only a synthetic example CSV and schema documentation.
+The actual JCR export is supplied outside Git by an authorized user.
+
+**Step 3: Write failing curation-policy tests**
+
+Implement the approved journal rule:
+
+```text
+accepted = jif >= 10 OR any(jcr_quartile == Q1)
+```
+
+Each result contains:
+
+```text
+policy_version
+metric_year
+matched_rules
+category evidence
+evaluated_at
+```
+
+An unknown metric yields `unknown`, not accepted or rejected. Conference and
+preprint sources do not pass through the journal formula.
+
+**Step 4: Implement and verify**
+
+```bash
+go test -race ./internal/source/crossref ./internal/venue -v
+```
+
+**Step 5: Commit**
+
+```bash
+git add data/venues services/core/internal/source/crossref services/core/internal/venue
+git commit -m "feat: add Crossref and JCR venue policy"
+```
+
+### Task 5D: Add PMC open-full-text and publisher enrichment connectors
+
+**Files:**
+- Create: `services/core/internal/source/pmc/client.go`
+- Create: `services/core/internal/source/pmc/client_test.go`
+- Create: `services/core/internal/source/pmc/parse.go`
+- Create: `services/core/internal/source/pmc/parse_test.go`
+- Create: `services/core/internal/source/springernature/client.go`
+- Create: `services/core/internal/source/springernature/client_test.go`
+- Create: `services/core/internal/source/elsevier/client.go`
+- Create: `services/core/internal/source/elsevier/client_test.go`
+- Create: `services/core/internal/source/publisher/enrichment.go`
+- Create: `services/core/internal/source/publisher/enrichment_test.go`
+
+**Step 1: Write failing PMC tests**
+
+Verify:
+
+- OAI-PMH resumption tokens are followed exactly;
+- PMCID, PMID and DOI cross-links are preserved;
+- only records with an explicit reusable license become public full-text assets;
+- full text stores source URL, license, retrieved time and content hash;
+- metadata-only or restricted records never enter public object storage;
+- XML parsing is streaming and bounded.
+
+**Step 2: Write failing Springer Nature tests**
+
+Verify:
+
+- API key redaction;
+- DOI and ISSN lookup;
+- metadata and OA responses remain separate;
+- a subscription/full-text response is not marked publicly reusable without an
+  explicit content license;
+- errors do not mutate core OpenAlex/PubMed/Crossref assertions.
+
+**Step 3: Write failing Elsevier tests**
+
+Verify:
+
+- Scopus/ScienceDirect metadata and Article Retrieval responses map through
+  controlled identifiers;
+- entitlement is stored separately from content license;
+- lack of subscription access is an explicit unavailable state, not an empty
+  successful article;
+- Cell Press enrichment cannot overwrite core facts without field provenance.
+
+**Step 4: Implement publisher enrichment isolation**
+
+Publisher connectors enrich an existing canonical work. They cannot create a
+work from title similarity and they cannot make the ingestion job fail after
+core metadata has been durably stored.
+
+AAAS Science does not receive an HTML crawler. Science records arrive through
+Crossref, OpenAlex, and PubMed when indexed there.
+
+**Step 5: Verify**
+
+```bash
+go test -race \
+  ./internal/source/pmc \
+  ./internal/source/springernature \
+  ./internal/source/elsevier \
+  ./internal/source/publisher
+```
+
+**Step 6: Commit**
+
+```bash
+git add services/core/internal/source
+git commit -m "feat: add licensed full-text enrichment connectors"
 ```
 
 ### Task 6: Implement idempotent and concurrent-safe ingestion
@@ -568,6 +830,14 @@ Cover:
 - concurrent identical inserts create one source snapshot and one work;
 - concurrent sources cannot regress projections;
 - deleting a work preserves raw source records;
+- OpenAlex, PubMed and Crossref records with a shared DOI converge to one work
+  while preserving independent field assertions;
+- a PubMed deletion event removes the current public projection without
+  deleting immutable historical source records;
+- JCR policy reassessment after a new metric year reuses the venue and work
+  records and creates a new policy assessment;
+- publisher enrichment failure leaves core OpenAlex/PubMed/Crossref ingestion
+  committed and auditable;
 - a later-page failure preserves raw records already durably confirmed;
 - job summaries report actual committed raw, projected, excluded, and failed
   counts instead of zeroing earlier durable work.
@@ -595,6 +865,12 @@ Required rules:
 
 ```text
 paper-hub-worker sync openalex --query "LLM agent" --max-results 100
+paper-hub-worker sync pubmed --query "AI agent" --max-results 100
+paper-hub-worker import pubmed-baseline --year 2026 --manifest manifest.json
+paper-hub-worker apply pubmed-update --file pubmed26n0001.xml.gz
+paper-hub-worker sync crossref --from-date 2026-07-01
+paper-hub-worker sync pmc --set open-access
+paper-hub-worker import jcr --file /run/secrets/jcr.csv --metric-year 2026
 paper-hub-worker snapshot metrics
 paper-hub-worker rank --window 30d
 ```
@@ -645,7 +921,13 @@ Cover combined filters:
 - method;
 - code/data/benchmark presence;
 - publication status;
-- source.
+- source;
+- curated status;
+- venue type;
+- minimum JIF;
+- JCR Quartile;
+- JCR metric year;
+- PMID/PMCID and reusable-full-text state.
 
 **Step 2: Write failing pagination tests**
 
@@ -679,6 +961,11 @@ Paper detail must return:
 - metrics;
 - current source scope decisions;
 - license and update times.
+- venue identifiers, metric year, JIF and all JCR category Quartiles;
+- curation policy version, matched rules and evidence;
+- PubMed PMID, MeSH headings and publication types when available;
+- full-text availability, content license and reusable status without exposing
+  restricted publisher content.
 
 The same public visibility predicate and read-only transaction boundary must be
 used by `/api/v1/stats`, `/api/v1/topics`, `/api/v1/topics/{slug}`,
@@ -894,6 +1181,8 @@ Verify:
 - query parameters are serialized once;
 - non-2xx Problem Details become typed errors;
 - no mock data is used when the real endpoint fails.
+- curated and all-paper views send explicit policy parameters;
+- JCR, PubMed and full-text fields preserve `unknown` separately from `false`.
 
 **Step 3: Write failing home-page tests**
 
@@ -905,6 +1194,10 @@ Verify the SSR page renders:
 - topic trends;
 - method trends;
 - research-opportunity matrix;
+- curated journal section with transparent `JIF >= 10` or `JCR Q1` badges;
+- top-conference and frontier-preprint sections separate from journal policy;
+- PubMed/PMC availability indicators without implying that metadata equals
+  reusable full text;
 - explicit loading, empty, and error states.
 
 **Step 4: Implement the shell and home dashboard**
@@ -953,6 +1246,10 @@ Cover:
 - browser back/forward restores filters;
 - cursor pagination preserves the snapshot;
 - detail pages show source and license provenance;
+- venue filters include curated status, JIF, JCR Quartile and metric year;
+- a paper can show multiple JCR category Quartiles for the same venue;
+- PMID, PMCID, MeSH and publication types render only when asserted by PubMed;
+- restricted publisher full text never renders as a public download;
 - trend windows are separate;
 - opportunity status always shows formula, evidence, limitations, and confidence;
 - SSR metadata contains title, description, canonical URL, Open Graph, and scholarly structured data.
@@ -1046,6 +1343,12 @@ make compose-up
 make compose-down
 make smoke
 make sync-openalex
+make sync-pubmed
+make import-pubmed-baseline
+make apply-pubmed-update
+make sync-crossref
+make sync-pmc
+make import-jcr
 ```
 
 **Step 5: Verify from a clean container build**
@@ -1115,6 +1418,10 @@ The README must explain:
 - prerequisites;
 - one-command local startup;
 - live OpenAlex sync;
+- PubMed API sync and Baseline/Daily Update workflow;
+- Crossref DOI and ISSN enrichment;
+- authorized JCR CSV import and curation-policy semantics;
+- PMC OA and publisher-enrichment license boundaries;
 - test commands;
 - repository layout;
 - deployment boundaries;
@@ -1152,10 +1459,14 @@ git add .github README.md CONTRIBUTING.md LICENSE SECURITY.md docs
 git commit -m "docs: prepare the paper research hub for open source"
 ```
 
-### Task 14: Verify live ingestion and public user flows
+### Task 14: Verify live multi-source ingestion and public user flows
 
 **Files:**
 - Create: `artifacts/verification/openalex-sync.json`
+- Create: `artifacts/verification/pubmed-sync.json`
+- Create: `artifacts/verification/crossref-sync.json`
+- Create: `artifacts/verification/jcr-import.json`
+- Create: `artifacts/verification/fulltext-license-check.json`
 - Create: `artifacts/verification/portal-smoke.json`
 - Modify: `.gitignore`
 
@@ -1182,7 +1493,32 @@ Expected:
 - no secret values in logs;
 - a machine-readable summary written to `artifacts/verification/openalex-sync.json`.
 
-**Step 3: Verify API and rendered pages**
+**Step 3: Run PubMed, Crossref, JCR, and PMC verification**
+
+Run:
+
+```bash
+make sync-pubmed QUERY="AI agent" MAX_RESULTS=20
+make sync-crossref FROM_DATE="2026-07-01" MAX_RESULTS=20
+make import-jcr FILE="data/venues/jcr-q1.example.csv" METRIC_YEAR=2026
+make sync-pmc MAX_RESULTS=10
+```
+
+Expected:
+
+- PubMed returns nonzero PMIDs and preserves MeSH/publication-type data when
+  present;
+- OpenAlex, PubMed and Crossref records sharing a DOI resolve to one work;
+- the JCR example fixture produces both `JIF >= 10` and `JCR Q1` match cases;
+- a nonmatching and an unknown venue remain distinguishable;
+- PMC records without an explicit reusable license do not create public
+  full-text assets;
+- summaries are written to the corresponding verification JSON files.
+
+Apply the committed PubMed Baseline and Daily Update fixtures and verify one
+new, one revised and one deleted PMID transition without network access.
+
+**Step 4: Verify API and rendered pages**
 
 Check:
 
@@ -1196,9 +1532,12 @@ Check:
 /opportunities
 ```
 
-Capture only decisive status, count, and console-error information in `portal-smoke.json`.
+Verify the curated view exposes policy year and matched rules, the all-paper
+view retains relevant noncurated metadata, PubMed badges are source-backed, and
+only reusable full text offers a public download. Capture only decisive status,
+count, and console-error information in `portal-smoke.json`.
 
-**Step 4: Run complete verification**
+**Step 5: Run complete verification**
 
 ```bash
 go test -race ./...
@@ -1212,11 +1551,11 @@ git status --short
 
 Expected: all tests pass and only intended verification artifacts are added.
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add artifacts/verification .gitignore
-git commit -m "test: verify live paper ingestion and portal flows"
+git commit -m "test: verify live multi-source ingestion and portal flows"
 ```
 
 ### Task 15: Create and publish the GitHub repository
