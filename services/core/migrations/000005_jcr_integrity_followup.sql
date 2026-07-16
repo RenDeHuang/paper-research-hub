@@ -1,3 +1,9 @@
+LOCK TABLE jcr_import_receipts IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE venue_metric_snapshots IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE jcr_import_receipt_metrics IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE venue_aliases IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE jcr_import_receipt_aliases IN ACCESS EXCLUSIVE MODE;
+
 ALTER TABLE jcr_import_receipt_metrics
     DROP CONSTRAINT jcr_import_receipt_metrics_receipt_metric_key;
 
@@ -235,6 +241,71 @@ AFTER INSERT ON jcr_import_receipts
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW
 EXECUTE FUNCTION enforce_jcr_import_receipt_metric_integrity();
+
+CREATE FUNCTION enforce_jcr_import_receipt_child_transaction()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    target_receipt_id uuid;
+    receipt_created_in_current_transaction boolean;
+BEGIN
+    IF TG_TABLE_NAME = 'venue_metric_snapshots' THEN
+        target_receipt_id := NEW.jcr_import_receipt_id;
+        IF target_receipt_id IS NULL THEN
+            RETURN NEW;
+        END IF;
+    ELSE
+        target_receipt_id := NEW.import_receipt_id;
+    END IF;
+
+    SELECT receipt.xmin = pg_current_xact_id()::text::xid
+    INTO receipt_created_in_current_transaction
+    FROM jcr_import_receipts AS receipt
+    WHERE receipt.id = target_receipt_id;
+
+    IF NOT FOUND THEN
+        IF TG_TABLE_NAME = 'venue_metric_snapshots'
+           AND TG_WHEN = 'BEFORE' THEN
+            RETURN NEW;
+        END IF;
+
+        RAISE EXCEPTION
+            'JCR receipt % must be created in the current transaction before child rows are committed',
+            target_receipt_id
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'jcr_import_receipt_children_current_transaction';
+    END IF;
+
+    IF NOT receipt_created_in_current_transaction THEN
+        RAISE EXCEPTION
+            'JCR receipt % is sealed against post-commit child rows',
+            target_receipt_id
+            USING ERRCODE = '23514',
+                  CONSTRAINT = 'jcr_import_receipt_children_current_transaction';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER venue_metric_snapshots_receipt_transaction
+BEFORE INSERT ON venue_metric_snapshots
+FOR EACH ROW
+WHEN (NEW.jcr_import_receipt_id IS NOT NULL)
+EXECUTE FUNCTION enforce_jcr_import_receipt_child_transaction();
+
+CREATE CONSTRAINT TRIGGER venue_metric_snapshots_receipt_transaction_deferred
+AFTER INSERT ON venue_metric_snapshots
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+WHEN (NEW.jcr_import_receipt_id IS NOT NULL)
+EXECUTE FUNCTION enforce_jcr_import_receipt_child_transaction();
+
+CREATE TRIGGER jcr_import_receipt_metrics_receipt_transaction
+BEFORE INSERT ON jcr_import_receipt_metrics
+FOR EACH ROW
+EXECUTE FUNCTION enforce_jcr_import_receipt_child_transaction();
 
 DROP TRIGGER venue_policy_assessments_venue_type_semantics
     ON venue_policy_assessments;

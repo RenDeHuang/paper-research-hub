@@ -255,6 +255,9 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"jcr_import_receipt_aliases_immutable",
 		"jcr_import_receipt_metrics_immutable",
 		"jcr_import_receipts_metric_integrity",
+		"venue_metric_snapshots_receipt_transaction",
+		"venue_metric_snapshots_receipt_transaction_deferred",
+		"jcr_import_receipt_metrics_receipt_transaction",
 		"venue_policy_assessments_venue_type_semantics",
 	})
 	var rowLevelCountTriggers int
@@ -1121,6 +1124,141 @@ func TestJCRIntegrityFollowupEnforcesDeferredReceiptRowAssociations(t *testing.T
 	})
 }
 
+func TestJCRIntegrityFollowupSealsReceiptChildrenToCreationTransaction(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+	var venueID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Sealed Receipt Journal')
+		RETURNING id
+	`), &venueID)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin sealed receipt transaction: %v", err)
+	}
+	var receiptID, metricID string
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			$1, 'synthetic-jcr-fixture', now(), 1, 1, 0
+		)
+		RETURNING id
+	`, strings.Repeat("1", 64)), &receiptID)
+
+	var receiptCreatedInCurrentTransaction bool
+	if err := tx.QueryRow(ctx, `
+		SELECT xmin = pg_current_xact_id()::text::xid
+		FROM jcr_import_receipts
+		WHERE id = $1
+	`, receiptID).Scan(&receiptCreatedInCurrentTransaction); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("compare receipt xmin in creating transaction: %v", err)
+	}
+	if !receiptCreatedInCurrentTransaction {
+		_ = tx.Rollback(context.Background())
+		t.Fatal("receipt xmin did not equal PG18 current transaction xid")
+	}
+
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at, jcr_import_receipt_id
+		) VALUES (
+			$1, 2025, 'Sealed Receipt Category', 10, 'Q1', 'known',
+			'synthetic-jcr-fixture', 'license-a', now(), $2
+		)
+		RETURNING id
+	`, venueID, receiptID), &metricID)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_metrics (
+			import_receipt_id,
+			metric_snapshot_id
+		) VALUES ($1, $2)
+	`, receiptID, metricID); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("insert same-transaction receipt association: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit sealed receipt transaction: %v", err)
+	}
+
+	if err := pool.QueryRow(ctx, `
+		SELECT xmin = pg_current_xact_id()::text::xid
+		FROM jcr_import_receipts
+		WHERE id = $1
+	`, receiptID).Scan(&receiptCreatedInCurrentTransaction); err != nil {
+		t.Fatalf("compare receipt xmin after commit: %v", err)
+	}
+	if receiptCreatedInCurrentTransaction {
+		t.Fatal("committed receipt xmin still matched a later transaction")
+	}
+
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin post-commit association append: %v", err)
+	}
+	_, associationErr := tx.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_metrics (
+			import_receipt_id,
+			metric_snapshot_id
+		) VALUES ($1, $2)
+	`, receiptID, metricID)
+	_ = tx.Rollback(context.Background())
+	assertPostgresError(
+		t,
+		associationErr,
+		"23514",
+		"jcr_import_receipt_children_current_transaction",
+	)
+
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin post-commit creator metric append: %v", err)
+	}
+	_, metricErr := tx.Exec(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at, jcr_import_receipt_id
+		) VALUES (
+			$1, 2025, 'Post Commit Pollution Category', 9, 'Q2', 'known',
+			'synthetic-jcr-fixture', 'license-a', now(), $2
+		)
+	`, venueID, receiptID)
+	_ = tx.Rollback(context.Background())
+	assertPostgresError(
+		t,
+		metricErr,
+		"23514",
+		"jcr_import_receipt_children_current_transaction",
+	)
+
+	var associations, creatorMetrics int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM jcr_import_receipt_metrics
+		WHERE import_receipt_id = $1
+	`, receiptID).Scan(&associations); err != nil {
+		t.Fatalf("count sealed receipt associations: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM venue_metric_snapshots
+		WHERE jcr_import_receipt_id = $1
+	`, receiptID).Scan(&creatorMetrics); err != nil {
+		t.Fatalf("count sealed receipt creator metrics: %v", err)
+	}
+	if associations != 1 || creatorMetrics != 1 {
+		t.Fatalf(
+			"sealed receipt counts = associations %d creator metrics %d, want 1/1",
+			associations,
+			creatorMetrics,
+		)
+	}
+}
+
 func TestJCRIntegrityFollowupRunsDeferredCountOncePerReceipt(t *testing.T) {
 	const rowCount = 1000
 
@@ -1224,6 +1362,186 @@ func TestJCRIntegrityFollowupRunsDeferredCountOncePerReceipt(t *testing.T) {
 			triggerCalls,
 			rowCount,
 		)
+	}
+}
+
+func TestJCRIntegrityFollowupMigrationSerializesWithLegacyWriterLockOrder(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:4]); err != nil {
+		t.Fatalf("apply migrations through 000004: %v", err)
+	}
+
+	var venueID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Legacy Writer Lock Order Journal')
+		RETURNING id
+	`), &venueID)
+
+	writerTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin legacy writer transaction: %v", err)
+	}
+	var receiptID, metricID string
+	mustScanID(t, writerTx.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			$1, 'synthetic-jcr-fixture', now(), 1, 1, 0
+		)
+		RETURNING id
+	`, strings.Repeat("2", 64)), &receiptID)
+	mustScanID(t, writerTx.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at, jcr_import_receipt_id
+		) VALUES (
+			$1, 2025, 'Legacy Writer Lock Category', 10, 'Q1', 'known',
+			'synthetic-jcr-fixture', 'license-a', now(), $2
+		)
+		RETURNING id
+	`, venueID, receiptID), &metricID)
+
+	migrationCtx, cancelMigration := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelMigration()
+	migrationResult := make(chan error, 1)
+	go func() {
+		migrationResult <- UpMigrations(migrationCtx, pool, migrations[4:])
+	}()
+	waitForBlockedDatabaseSessions(t, pool, 1)
+
+	_, associationErr := writerTx.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_metrics (
+			import_receipt_id,
+			metric_snapshot_id
+		) VALUES ($1, $2)
+	`, receiptID, metricID)
+	if associationErr == nil {
+		associationErr = writerTx.Commit(ctx)
+	} else {
+		_ = writerTx.Rollback(context.Background())
+	}
+	migrationErr := <-migrationResult
+	assertNoPostgresDeadlock(t, "legacy writer", associationErr)
+	assertNoPostgresDeadlock(t, "000005 migration", migrationErr)
+	if associationErr != nil {
+		t.Fatalf("legacy writer receipt→metric→association error = %v", associationErr)
+	}
+	if migrationErr != nil {
+		t.Fatalf("000005 migration after legacy writer error = %v", migrationErr)
+	}
+}
+
+func TestJCRIntegrityFollowupMigrationBlocksLegacyWriterInForwardLockOrder(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:4]); err != nil {
+		t.Fatalf("apply migrations through 000004: %v", err)
+	}
+
+	var venueID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Migration First Lock Order Journal')
+		RETURNING id
+	`), &venueID)
+
+	blocker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire migration barrier connection: %v", err)
+	}
+	defer blocker.Release()
+	blockerTx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin migration barrier transaction: %v", err)
+	}
+	if _, err := blockerTx.Exec(ctx, `
+		LOCK TABLE venue_policy_assessments IN ACCESS EXCLUSIVE MODE
+	`); err != nil {
+		_ = blockerTx.Rollback(context.Background())
+		t.Fatalf("lock migration tail barrier: %v", err)
+	}
+
+	migrationCtx, cancelMigration := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelMigration()
+	migrationResult := make(chan error, 1)
+	go func() {
+		migrationResult <- UpMigrations(migrationCtx, pool, migrations[4:])
+	}()
+	waitForBlockedDatabaseSessions(t, pool, 1)
+
+	writerCtx, cancelWriter := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelWriter()
+	writerResult := make(chan error, 1)
+	go func() {
+		writerTx, beginErr := pool.Begin(writerCtx)
+		if beginErr != nil {
+			writerResult <- beginErr
+			return
+		}
+		defer func() {
+			_ = writerTx.Rollback(context.Background())
+		}()
+
+		var receiptID, metricID string
+		if err := writerTx.QueryRow(writerCtx, `
+			INSERT INTO jcr_import_receipts (
+				file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+			) VALUES (
+				$1, 'synthetic-jcr-fixture', now(), 1, 1, 0
+			)
+			RETURNING id
+		`, strings.Repeat("3", 64)).Scan(&receiptID); err != nil {
+			writerResult <- err
+			return
+		}
+		if err := writerTx.QueryRow(writerCtx, `
+			INSERT INTO venue_metric_snapshots (
+				venue_id, metric_year, category, jif, quartile, metric_status,
+				source_name, source_license, captured_at, jcr_import_receipt_id
+			) VALUES (
+				$1, 2025, 'Migration First Lock Category', 10, 'Q1', 'known',
+				'synthetic-jcr-fixture', 'license-a', now(), $2
+			)
+			RETURNING id
+		`, venueID, receiptID).Scan(&metricID); err != nil {
+			writerResult <- err
+			return
+		}
+		if _, err := writerTx.Exec(writerCtx, `
+			INSERT INTO jcr_import_receipt_metrics (
+				import_receipt_id,
+				metric_snapshot_id
+			) VALUES ($1, $2)
+		`, receiptID, metricID); err != nil {
+			writerResult <- err
+			return
+		}
+		writerResult <- writerTx.Commit(writerCtx)
+	}()
+	waitForBlockedDatabaseSessions(t, pool, 2)
+
+	if err := blockerTx.Commit(ctx); err != nil {
+		t.Fatalf("release migration tail barrier: %v", err)
+	}
+	migrationErr := <-migrationResult
+	writerErr := <-writerResult
+	assertNoPostgresDeadlock(t, "000005 migration", migrationErr)
+	assertNoPostgresDeadlock(t, "migration-blocked legacy writer", writerErr)
+	if migrationErr != nil {
+		t.Fatalf("migration-first 000005 error = %v", migrationErr)
+	}
+	if writerErr != nil {
+		t.Fatalf("legacy writer after migration error = %v", writerErr)
 	}
 }
 
@@ -3235,6 +3553,43 @@ func assertPostgresError(t *testing.T, err error, code string, constraint string
 			constraint,
 			pgError,
 		)
+	}
+}
+
+func assertNoPostgresDeadlock(t *testing.T, operation string, err error) {
+	t.Helper()
+	var pgError *pgconn.PgError
+	if errors.As(err, &pgError) && pgError.Code == "40P01" {
+		t.Fatalf("%s deadlocked: %v", operation, err)
+	}
+}
+
+func waitForBlockedDatabaseSessions(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	want int,
+) {
+	t.Helper()
+	ctx := testContext(t)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'
+		`).Scan(&blocked); err != nil {
+			t.Fatalf("query blocked database sessions: %v", err)
+		}
+		if blocked >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("blocked database sessions = %d, want at least %d", blocked, want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
