@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -52,7 +51,7 @@ type Client struct {
 	sensitiveQueries map[string]struct{}
 	sensitiveHeaders map[string]struct{}
 
-	rateMu      sync.Mutex
+	rateTurn    chan struct{}
 	nextRequest time.Time
 }
 
@@ -113,6 +112,7 @@ func New(base *http.Client, config Config, dependencies Dependencies) (*Client, 
 		now:             now,
 		sleep:           sleep,
 		requestInterval: requestInterval,
+		rateTurn:        make(chan struct{}, 1),
 		sensitiveQueries: normalizedSet(
 			append(
 				[]string{"api_key", "apikey", "access_token", "token", "key"},
@@ -234,8 +234,14 @@ func (client *Client) Do(request *http.Request) (*http.Response, error) {
 }
 
 func (client *Client) waitForRateLimit(ctx context.Context) error {
-	client.rateMu.Lock()
-	defer client.rateMu.Unlock()
+	select {
+	case client.rateTurn <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() {
+		<-client.rateTurn
+	}()
 
 	if err := ctx.Err(); err != nil {
 		return err

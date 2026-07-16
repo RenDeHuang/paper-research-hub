@@ -159,6 +159,129 @@ func TestCanceledConcurrentRateWaitsDoNotConsumeFutureSlots(t *testing.T) {
 	}
 }
 
+func TestRateLimitQueueCancellationDoesNotWaitForActiveSleeperOrConsumeSlots(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = writer.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	clock := newBlockingRateClock()
+	cfg := validConfig()
+	cfg.RateLimit = httpclient.RateLimit{Requests: 1, Interval: time.Second}
+	client, err := httpclient.New(server.Client(), cfg, clock.dependencies())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	first, err := doGet(client, server.URL)
+	if err != nil {
+		t.Fatalf("first Do() error = %v", err)
+	}
+	_ = first.Body.Close()
+
+	activeResult := make(chan error, 1)
+	go func() {
+		response, requestErr := doGet(client, server.URL)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		activeResult <- requestErr
+	}()
+
+	select {
+	case <-clock.sleepStarted:
+	case <-time.After(time.Second):
+		t.Fatal("active rate-limit sleep did not start")
+	}
+
+	const canceledRequests = 8
+	canceledResults := make(chan error, canceledRequests)
+	checked := make([]<-chan struct{}, 0, canceledRequests)
+	cancels := make([]context.CancelFunc, 0, canceledRequests)
+	var canceledWaitGroup sync.WaitGroup
+	for range canceledRequests {
+		baseContext, cancel := context.WithCancel(context.Background())
+		observed := &observedContext{
+			Context: baseContext,
+			checked: make(chan struct{}),
+		}
+		checked = append(checked, observed.checked)
+		cancels = append(cancels, cancel)
+
+		request, requestErr := http.NewRequestWithContext(
+			observed,
+			http.MethodGet,
+			server.URL,
+			nil,
+		)
+		if requestErr != nil {
+			t.Fatalf("NewRequestWithContext() error = %v", requestErr)
+		}
+		canceledWaitGroup.Add(1)
+		go func() {
+			defer canceledWaitGroup.Done()
+			_, requestErr := client.Do(request)
+			canceledResults <- requestErr
+		}()
+	}
+
+	for _, requestChecked := range checked {
+		select {
+		case <-requestChecked:
+		case <-time.After(time.Second):
+			close(clock.releaseFirstSleep)
+			t.Fatal("canceled request did not enter Do")
+		}
+	}
+	for _, cancel := range cancels {
+		cancel()
+	}
+
+	allCanceledReturned := make(chan struct{})
+	go func() {
+		canceledWaitGroup.Wait()
+		close(allCanceledReturned)
+	}()
+
+	select {
+	case <-allCanceledReturned:
+	case <-time.After(500 * time.Millisecond):
+		close(clock.releaseFirstSleep)
+		<-allCanceledReturned
+		t.Fatal("canceled requests remained queued behind active rate-limit sleep")
+	}
+	for range canceledRequests {
+		if err := <-canceledResults; !errors.Is(err, context.Canceled) {
+			close(clock.releaseFirstSleep)
+			t.Fatalf("canceled Do() error = %v, want context.Canceled", err)
+		}
+	}
+
+	close(clock.releaseFirstSleep)
+	if err := <-activeResult; err != nil {
+		t.Fatalf("active Do() error = %v", err)
+	}
+
+	final, err := doGet(client, server.URL)
+	if err != nil {
+		t.Fatalf("final Do() error = %v", err)
+	}
+	_ = final.Body.Close()
+
+	if requests.Load() != 3 {
+		t.Fatalf("HTTP requests = %d, want initial, active, and final valid requests", requests.Load())
+	}
+	if got := clock.sleeps(); len(got) != 2 ||
+		got[0] != time.Second ||
+		got[1] != time.Second {
+		t.Fatalf("successful rate-limit sleeps = %v, want [1s 1s]", got)
+	}
+}
+
 func TestClientRetries429UsingBoundedRetryAfter(t *testing.T) {
 	t.Parallel()
 
@@ -650,6 +773,81 @@ type fakeClock struct {
 }
 
 type cancellationRequestKey struct{}
+
+type observedContext struct {
+	context.Context
+	once    sync.Once
+	checked chan struct{}
+}
+
+func (ctx *observedContext) Err() error {
+	ctx.once.Do(func() {
+		close(ctx.checked)
+	})
+	return ctx.Context.Err()
+}
+
+type blockingRateClock struct {
+	mu                sync.Mutex
+	now               time.Time
+	recorded          []time.Duration
+	firstSleep        bool
+	sleepStarted      chan struct{}
+	releaseFirstSleep chan struct{}
+}
+
+func newBlockingRateClock() *blockingRateClock {
+	return &blockingRateClock{
+		now:               time.Date(2026, time.July, 16, 0, 0, 0, 0, time.UTC),
+		sleepStarted:      make(chan struct{}),
+		releaseFirstSleep: make(chan struct{}),
+	}
+}
+
+func (clock *blockingRateClock) dependencies() httpclient.Dependencies {
+	return httpclient.Dependencies{
+		Now: func() time.Time {
+			clock.mu.Lock()
+			defer clock.mu.Unlock()
+			return clock.now
+		},
+		Sleep: func(ctx context.Context, delay time.Duration) error {
+			clock.mu.Lock()
+			block := !clock.firstSleep
+			if block {
+				clock.firstSleep = true
+			}
+			clock.mu.Unlock()
+
+			if block {
+				close(clock.sleepStarted)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-clock.releaseFirstSleep:
+				}
+			} else {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+			}
+
+			clock.mu.Lock()
+			defer clock.mu.Unlock()
+			clock.recorded = append(clock.recorded, delay)
+			clock.now = clock.now.Add(delay)
+			return nil
+		},
+	}
+}
+
+func (clock *blockingRateClock) sleeps() []time.Duration {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return append([]time.Duration(nil), clock.recorded...)
+}
 
 type cancelingRateClock struct {
 	mu       sync.Mutex
