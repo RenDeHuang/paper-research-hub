@@ -20,6 +20,7 @@ import (
 const (
 	OpenAlex = "openalex"
 	PubMed   = "pubmed"
+	Crossref = "crossref"
 )
 
 type ClientSequence = iter.Seq2[Record, error]
@@ -210,6 +211,7 @@ type Record struct {
 	Evidence                  []FieldEvidence
 	Title                     string
 	Abstract                  string
+	Publisher                 string
 	AbstractSections          []AbstractSection
 	CopyrightInformation      string
 	PublishedAt               *time.Time

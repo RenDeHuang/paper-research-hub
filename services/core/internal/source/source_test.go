@@ -10,6 +10,22 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
+func TestCrossrefHasAFirstClassSourceAndPublisherField(t *testing.T) {
+	t.Parallel()
+
+	record := source.Record{
+		Source:    source.Crossref,
+		Publisher: "Association for Computing Machinery",
+	}
+
+	if record.Source != "crossref" {
+		t.Fatalf("Source = %q, want crossref", record.Source)
+	}
+	if record.Publisher != "Association for Computing Machinery" {
+		t.Fatalf("Publisher = %q, want exact source value", record.Publisher)
+	}
+}
+
 func TestNewRawRecordPreservesPayloadAndHashesCanonicalJSON(t *testing.T) {
 	t.Parallel()
 
