@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,11 +17,15 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
-const maxBulkRecordBytes = 64 << 20
+const (
+	maxBulkRecordBytes            = 64 << 20
+	DefaultMaxCompressedFileBytes = int64(1 << 30)
+)
 
 var (
-	bulkFilePattern = regexp.MustCompile(`^pubmed([0-9]{2})n([0-9]{4})\.xml\.gz$`)
-	sha256Pattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	bulkFilePattern     = regexp.MustCompile(`^pubmed([0-9]{2})n([0-9]{4})\.xml\.gz$`)
+	sha256Pattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	ErrBulkFileTooLarge = errors.New("PubMed compressed bulk file exceeds configured spool limit")
 )
 
 type BulkFile struct {
@@ -48,13 +53,21 @@ type Deletion struct {
 	Raw      source.RawRecord
 }
 
-// Sink replaces the current PMID projection for every Upsert and atomically
-// removes all listed PMIDs while retaining each Deletion as an audit event.
-// Implementations must make the source position idempotent because a process
-// can fail after the sink commits and before the checkpoint becomes durable.
+// Sink starts one isolated transaction for an already SHA256-verified source
+// file. No staged mutation may become visible before FileTransaction.Commit.
 type Sink interface {
+	BeginFile(context.Context, SourcePosition) (FileTransaction, error)
+}
+
+// FileTransaction stages all projection replacements and deletion audit events
+// for one source file. Commit must atomically make both the staged mutations and
+// the supplied checkpoint durable. If Commit returns an error, no staged
+// mutation or checkpoint may remain committed. Abort discards all staged work.
+type FileTransaction interface {
 	Replace(context.Context, Upsert) error
 	Delete(context.Context, Deletion) error
+	Commit(context.Context, Checkpoint, Progress) error
+	Abort(context.Context) error
 }
 
 type Progress struct {
@@ -67,7 +80,8 @@ type Progress struct {
 }
 
 // Checkpoint persists the last durable source position for one import job.
-// Save is called only after the corresponding sink mutation succeeds.
+// Save is a FileTransaction.Commit participant; the importer never advances
+// progress independently of the file transaction.
 type Checkpoint interface {
 	Load(context.Context, string) (Progress, bool, error)
 	Save(context.Context, Progress) error
@@ -85,18 +99,48 @@ type DailyImport struct {
 }
 
 type Importer struct {
-	sink        Sink
-	checkpoints Checkpoint
+	sink                   Sink
+	checkpoints            Checkpoint
+	maxCompressedFileBytes int64
+	tempDir                string
 }
 
 func NewImporter(sink Sink, checkpoints Checkpoint) (*Importer, error) {
+	return NewImporterWithConfig(sink, checkpoints, ImporterConfig{
+		MaxCompressedFileBytes: DefaultMaxCompressedFileBytes,
+		TempDir:                os.TempDir(),
+	})
+}
+
+type ImporterConfig struct {
+	MaxCompressedFileBytes int64
+	TempDir                string
+}
+
+func NewImporterWithConfig(
+	sink Sink,
+	checkpoints Checkpoint,
+	config ImporterConfig,
+) (*Importer, error) {
 	if sink == nil {
 		return nil, errors.New("PubMed bulk sink is required")
 	}
 	if checkpoints == nil {
 		return nil, errors.New("PubMed bulk checkpoint is required")
 	}
-	return &Importer{sink: sink, checkpoints: checkpoints}, nil
+	if config.MaxCompressedFileBytes <= 0 {
+		return nil, errors.New("PubMed compressed bulk file spool limit must be positive")
+	}
+	tempDir := strings.TrimSpace(config.TempDir)
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
+	return &Importer{
+		sink:                   sink,
+		checkpoints:            checkpoints,
+		maxCompressedFileBytes: config.MaxCompressedFileBytes,
+		tempDir:                tempDir,
+	}, nil
 }
 
 func (importer *Importer) ImportBaseline(
@@ -114,6 +158,11 @@ func (importer *Importer) ImportBaseline(
 	progress, hasProgress, err := importer.checkpoints.Load(ctx, job)
 	if err != nil {
 		return fmt.Errorf("load PubMed baseline checkpoint for job %q: %w", job, err)
+	}
+	if hasProgress {
+		if err := validateDurableProgress(job, progress); err != nil {
+			return err
+		}
 	}
 	ordered, err := validateBulkFiles(
 		files,
@@ -148,18 +197,56 @@ func (importer *Importer) ImportDaily(
 	if err != nil {
 		return fmt.Errorf("load PubMed daily checkpoint for job %q: %w", job, err)
 	}
+	initialSequence := spec.PreviousSequence + 1
+	if hasProgress {
+		if err := validateDurableProgress(job, progress); err != nil {
+			return err
+		}
+		if spec.PreviousSequence != progress.Sequence {
+			return fmt.Errorf(
+				"PubMed daily PreviousSequence %d conflicts with durable checkpoint sequence %d for job %q",
+				spec.PreviousSequence,
+				progress.Sequence,
+				job,
+			)
+		}
+		initialSequence = progress.Sequence + 1
+	}
 	ordered, err := validateBulkFiles(
 		files,
 		spec.Year,
-		spec.PreviousSequence+1,
-		progress,
-		hasProgress,
+		initialSequence,
+		Progress{},
+		false,
 		"daily",
 	)
 	if err != nil {
 		return err
 	}
 	return importer.importFiles(ctx, job, ordered, progress, hasProgress)
+}
+
+func validateDurableProgress(job string, progress Progress) error {
+	if progress.Job != job {
+		return fmt.Errorf(
+			"PubMed checkpoint job %q conflicts with requested job %q",
+			progress.Job,
+			job,
+		)
+	}
+	if progress.Sequence <= 0 ||
+		progress.Ordinal < 0 ||
+		strings.TrimSpace(progress.FileName) == "" ||
+		!sha256Pattern.MatchString(progress.SHA256) {
+		return fmt.Errorf("PubMed checkpoint for job %q is malformed", job)
+	}
+	if !progress.Complete {
+		return fmt.Errorf(
+			"PubMed checkpoint for job %q is not a durable completed file",
+			job,
+		)
+	}
+	return nil
 }
 
 func validateImportIdentity(
@@ -307,7 +394,6 @@ func (importer *Importer) importFiles(
 			continue
 		}
 
-		resumeOrdinal := int64(0)
 		if hasProgress && file.sequence == progress.Sequence {
 			if progress.FileName != file.Name || progress.SHA256 != file.SHA256 {
 				return fmt.Errorf(
@@ -316,74 +402,15 @@ func (importer *Importer) importFiles(
 					file.Name,
 				)
 			}
-			if progress.Complete {
-				continue
-			}
-			resumeOrdinal = progress.Ordinal
+			continue
 		}
 
-		if err := verifyBulkFile(ctx, file); err != nil {
-			return err
-		}
-		lastOrdinal, err := importer.importFile(ctx, job, file, resumeOrdinal)
+		nextProgress, err := importer.importFile(ctx, job, file)
 		if err != nil {
 			return err
 		}
-		progress = Progress{
-			Job:      job,
-			FileName: file.Name,
-			SHA256:   file.SHA256,
-			Sequence: file.sequence,
-			Ordinal:  lastOrdinal,
-			Complete: true,
-		}
-		if err := importer.checkpoints.Save(ctx, progress); err != nil {
-			return fmt.Errorf(
-				"save completed PubMed checkpoint for file %q: %w",
-				file.Name,
-				err,
-			)
-		}
+		progress = nextProgress
 		hasProgress = true
-	}
-	return nil
-}
-
-func verifyBulkFile(ctx context.Context, file orderedBulkFile) error {
-	reader, err := file.Open()
-	if err != nil {
-		return fmt.Errorf("open PubMed bulk file %q for SHA256 verification: %w", file.Name, err)
-	}
-	hasher := sha256.New()
-	payload := make([]byte, 32<<10)
-	for {
-		if err := ctx.Err(); err != nil {
-			_ = reader.Close()
-			return err
-		}
-		count, readErr := reader.Read(payload)
-		if count > 0 {
-			_, _ = hasher.Write(payload[:count])
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			_ = reader.Close()
-			return fmt.Errorf("hash PubMed bulk file %q: %w", file.Name, readErr)
-		}
-	}
-	if err := reader.Close(); err != nil {
-		return fmt.Errorf("close PubMed bulk file %q after SHA256 verification: %w", file.Name, err)
-	}
-	actual := hex.EncodeToString(hasher.Sum(nil))
-	if actual != file.SHA256 {
-		return fmt.Errorf(
-			"PubMed bulk file %q SHA256 = %s, want %s",
-			file.Name,
-			actual,
-			file.SHA256,
-		)
 	}
 	return nil
 }
@@ -392,31 +419,180 @@ func (importer *Importer) importFile(
 	ctx context.Context,
 	job string,
 	file orderedBulkFile,
-	resumeOrdinal int64,
-) (int64, error) {
-	compressed, err := file.Open()
+) (Progress, error) {
+	spool, actualSHA256, err := importer.spoolFile(ctx, file)
 	if err != nil {
-		return 0, fmt.Errorf("open PubMed bulk file %q: %w", file.Name, err)
+		return Progress{}, err
 	}
-	gzipReader, err := gzip.NewReader(compressed)
+	spoolPath := spool.Name()
+	defer func() {
+		_ = spool.Close()
+		_ = os.Remove(spoolPath)
+	}()
+
+	if actualSHA256 != file.SHA256 {
+		return Progress{}, fmt.Errorf(
+			"PubMed bulk file %q SHA256 = %s, want %s",
+			file.Name,
+			actualSHA256,
+			file.SHA256,
+		)
+	}
+
+	filePosition := SourcePosition{
+		Job:      job,
+		FileName: file.Name,
+		SHA256:   file.SHA256,
+		Sequence: file.sequence,
+	}
+	transaction, err := importer.sink.BeginFile(ctx, filePosition)
 	if err != nil {
-		_ = compressed.Close()
+		return Progress{}, fmt.Errorf(
+			"begin PubMed file transaction for %q: %w",
+			file.Name,
+			err,
+		)
+	}
+	if transaction == nil {
+		return Progress{}, fmt.Errorf(
+			"begin PubMed file transaction for %q returned nil transaction",
+			file.Name,
+		)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = transaction.Abort(context.WithoutCancel(ctx))
+		}
+	}()
+
+	lastOrdinal, err := importSpooledFile(ctx, file, filePosition, spool, transaction)
+	if err != nil {
+		return Progress{}, err
+	}
+	if err := spool.Close(); err != nil {
+		return Progress{}, fmt.Errorf("close PubMed spool for file %q: %w", file.Name, err)
+	}
+
+	progress := Progress{
+		Job:      job,
+		FileName: file.Name,
+		SHA256:   file.SHA256,
+		Sequence: file.sequence,
+		Ordinal:  lastOrdinal,
+		Complete: true,
+	}
+	if err := transaction.Commit(ctx, importer.checkpoints, progress); err != nil {
+		return Progress{}, fmt.Errorf(
+			"commit PubMed file transaction for %q: %w",
+			file.Name,
+			err,
+		)
+	}
+	committed = true
+	return progress, nil
+}
+
+func (importer *Importer) spoolFile(
+	ctx context.Context,
+	file orderedBulkFile,
+) (*os.File, string, error) {
+	sourceReader, err := file.Open()
+	if err != nil {
+		return nil, "", fmt.Errorf("open PubMed bulk file %q: %w", file.Name, err)
+	}
+	sourceClosed := false
+	defer func() {
+		if !sourceClosed {
+			_ = sourceReader.Close()
+		}
+	}()
+
+	spool, err := os.CreateTemp(importer.tempDir, "pubmed-import-*.xml.gz")
+	if err != nil {
+		return nil, "", fmt.Errorf("create controlled PubMed spool for %q: %w", file.Name, err)
+	}
+	spoolPath := spool.Name()
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = spool.Close()
+			_ = os.Remove(spoolPath)
+		}
+	}()
+
+	hasher := sha256.New()
+	buffer := make([]byte, 32<<10)
+	var total int64
+	emptyReads := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		count, readErr := sourceReader.Read(buffer)
+		if count > 0 {
+			emptyReads = 0
+			if total > importer.maxCompressedFileBytes-int64(count) {
+				return nil, "", fmt.Errorf(
+					"%w: file %q limit %d bytes",
+					ErrBulkFileTooLarge,
+					file.Name,
+					importer.maxCompressedFileBytes,
+				)
+			}
+			chunk := buffer[:count]
+			if _, err := spool.Write(chunk); err != nil {
+				return nil, "", fmt.Errorf("write PubMed spool for %q: %w", file.Name, err)
+			}
+			_, _ = hasher.Write(chunk)
+			total += int64(count)
+		} else if readErr == nil {
+			emptyReads++
+			if emptyReads >= 100 {
+				return nil, "", fmt.Errorf("read PubMed bulk file %q: %w", file.Name, io.ErrNoProgress)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, "", fmt.Errorf("read PubMed bulk file %q: %w", file.Name, readErr)
+		}
+	}
+	if err := sourceReader.Close(); err != nil {
+		return nil, "", fmt.Errorf("close PubMed bulk file %q: %w", file.Name, err)
+	}
+	sourceClosed = true
+	if err := spool.Sync(); err != nil {
+		return nil, "", fmt.Errorf("sync PubMed spool for %q: %w", file.Name, err)
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return nil, "", fmt.Errorf("rewind PubMed spool for %q: %w", file.Name, err)
+	}
+	succeeded = true
+	return spool, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func importSpooledFile(
+	ctx context.Context,
+	file orderedBulkFile,
+	filePosition SourcePosition,
+	spool io.Reader,
+	transaction FileTransaction,
+) (int64, error) {
+	gzipReader, err := gzip.NewReader(spool)
+	if err != nil {
 		return 0, fmt.Errorf("open PubMed gzip stream %q: %w", file.Name, err)
 	}
 
 	var lastOrdinal int64
 	scanErr := scanBulkEvents(gzipReader, func(event bulkEvent) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		lastOrdinal = event.ordinal
-		if event.ordinal <= resumeOrdinal {
-			return nil
-		}
-		position := SourcePosition{
-			Job:      job,
-			FileName: file.Name,
-			SHA256:   file.SHA256,
-			Sequence: file.sequence,
-			Ordinal:  event.ordinal,
-		}
+		position := filePosition
+		position.Ordinal = event.ordinal
 		switch event.kind {
 		case bulkEventUpsert:
 			record, err := ParseRecord(event.raw)
@@ -428,7 +604,7 @@ func (importer *Importer) importFile(
 					err,
 				)
 			}
-			if err := importer.sink.Replace(ctx, Upsert{
+			if err := transaction.Replace(ctx, Upsert{
 				Position: position,
 				Record:   record,
 			}); err != nil {
@@ -449,7 +625,7 @@ func (importer *Importer) importFile(
 					err,
 				)
 			}
-			if err := importer.sink.Delete(ctx, deletion); err != nil {
+			if err := transaction.Delete(ctx, deletion); err != nil {
 				return fmt.Errorf(
 					"apply PubMed deletion from file %q record %d: %w",
 					file.Name,
@@ -460,42 +636,14 @@ func (importer *Importer) importFile(
 		default:
 			return fmt.Errorf("unknown PubMed bulk event kind %q", event.kind)
 		}
-
-		if err := importer.checkpoints.Save(ctx, Progress{
-			Job:      job,
-			FileName: file.Name,
-			SHA256:   file.SHA256,
-			Sequence: file.sequence,
-			Ordinal:  event.ordinal,
-			Complete: false,
-		}); err != nil {
-			return fmt.Errorf(
-				"save PubMed checkpoint for file %q record %d: %w",
-				file.Name,
-				event.ordinal,
-				err,
-			)
-		}
 		return nil
 	})
 	gzipCloseErr := gzipReader.Close()
-	compressedCloseErr := compressed.Close()
 	if scanErr != nil {
 		return lastOrdinal, scanErr
 	}
 	if gzipCloseErr != nil {
 		return lastOrdinal, fmt.Errorf("close PubMed gzip stream %q: %w", file.Name, gzipCloseErr)
-	}
-	if compressedCloseErr != nil {
-		return lastOrdinal, fmt.Errorf("close PubMed bulk file %q: %w", file.Name, compressedCloseErr)
-	}
-	if lastOrdinal < resumeOrdinal {
-		return lastOrdinal, fmt.Errorf(
-			"PubMed checkpoint ordinal %d exceeds file %q record count %d",
-			resumeOrdinal,
-			file.Name,
-			lastOrdinal,
-		)
 	}
 	return lastOrdinal, nil
 }

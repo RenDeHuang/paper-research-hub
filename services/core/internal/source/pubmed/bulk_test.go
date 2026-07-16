@@ -1,6 +1,7 @@
 package pubmed_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
@@ -167,7 +169,7 @@ func TestDailyRejectsMissingDuplicateAndOutOfOrderFiles(t *testing.T) {
 	}
 }
 
-func TestImporterResumesFromLastDurableFileOrdinal(t *testing.T) {
+func TestImporterAbortsWholeFileAndRetriesFromLastDurableCheckpoint(t *testing.T) {
 	t.Parallel()
 
 	sink := newMemorySink()
@@ -185,11 +187,14 @@ func TestImporterResumesFromLastDurableFileOrdinal(t *testing.T) {
 		t.Fatal("ImportBaseline() accepted injected sink failure")
 	}
 	progress, ok, loadErr := checkpoints.Load(context.Background(), spec.Job)
-	if loadErr != nil || !ok {
+	if loadErr != nil {
 		t.Fatalf("Load() = %#v, %v, %v", progress, ok, loadErr)
 	}
-	if progress.Ordinal != 1 || progress.Complete {
-		t.Fatalf("progress after failure = %#v, want durable ordinal 1", progress)
+	if ok {
+		t.Fatalf("progress after aborted file = %#v, want no partial checkpoint", progress)
+	}
+	if len(sink.Upserts()) != 0 {
+		t.Fatalf("aborted file committed upserts = %#v", sink.Upserts())
 	}
 
 	if err := importer.ImportBaseline(context.Background(), spec, []pubmed.BulkFile{file}); err != nil {
@@ -235,6 +240,139 @@ func TestImporterVerifiesCompressedFileSHA256BeforeMutation(t *testing.T) {
 	}
 }
 
+func TestImporterParsesTheSameSingleOpenedByteStreamWhoseSHA256WasVerified(t *testing.T) {
+	t.Parallel()
+
+	baselinePayload, err := os.ReadFile("testdata/baseline.xml.gz")
+	if err != nil {
+		t.Fatalf("ReadFile(baseline) error = %v", err)
+	}
+	changedPayload, err := os.ReadFile("testdata/update.xml.gz")
+	if err != nil {
+		t.Fatalf("ReadFile(update) error = %v", err)
+	}
+	digest := sha256.Sum256(baselinePayload)
+	var opens atomic.Int32
+	file := pubmed.BulkFile{
+		Name:   "pubmed26n0001.xml.gz",
+		SHA256: hex.EncodeToString(digest[:]),
+		Open: func() (io.ReadCloser, error) {
+			if opens.Add(1) == 1 {
+				return io.NopCloser(bytes.NewReader(baselinePayload)), nil
+			}
+			return io.NopCloser(bytes.NewReader(changedPayload)), nil
+		},
+	}
+
+	sink := newMemorySink()
+	checkpoints := newMemoryCheckpoint()
+	importer, err := pubmed.NewImporter(sink, checkpoints)
+	if err != nil {
+		t.Fatalf("NewImporter() error = %v", err)
+	}
+	if err := importer.ImportBaseline(context.Background(), pubmed.BaselineImport{
+		Job:  "single-open",
+		Year: 2026,
+	}, []pubmed.BulkFile{file}); err != nil {
+		t.Fatalf("ImportBaseline() error = %v", err)
+	}
+	if opens.Load() != 1 {
+		t.Fatalf("BulkFile.Open calls = %d, want exactly one immutable source stream", opens.Load())
+	}
+	projection := sink.Projection()
+	if len(projection) != 2 ||
+		projection["1001"].Title != "Baseline title" ||
+		projection["1002"].Title != "Article to delete" {
+		t.Fatalf("projection = %#v, want records from the verified first stream", projection)
+	}
+}
+
+func TestImporterRejectsCompressedInputBeyondExplicitSpoolLimit(t *testing.T) {
+	t.Parallel()
+
+	payload, err := os.ReadFile("testdata/baseline.xml.gz")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	sink := newMemorySink()
+	checkpoints := newMemoryCheckpoint()
+	importer, err := pubmed.NewImporterWithConfig(sink, checkpoints, pubmed.ImporterConfig{
+		MaxCompressedFileBytes: int64(len(payload) - 1),
+	})
+	if err != nil {
+		t.Fatalf("NewImporterWithConfig() error = %v", err)
+	}
+	file := fixtureBulkFile(t, "baseline.xml.gz", "pubmed26n0001.xml.gz")
+
+	err = importer.ImportBaseline(context.Background(), pubmed.BaselineImport{
+		Job:  "bounded-spool",
+		Year: 2026,
+	}, []pubmed.BulkFile{file})
+	if !errors.Is(err, pubmed.ErrBulkFileTooLarge) {
+		t.Fatalf("ImportBaseline() error = %v, want ErrBulkFileTooLarge", err)
+	}
+	if len(sink.Upserts()) != 0 || len(sink.Deletions()) != 0 {
+		t.Fatal("oversized compressed input mutated sink")
+	}
+	if _, ok, loadErr := checkpoints.Load(context.Background(), "bounded-spool"); loadErr != nil || ok {
+		t.Fatalf("checkpoint after oversized input = ok %v, error %v", ok, loadErr)
+	}
+}
+
+func TestDailyRejectsPreviousSequenceThatConflictsWithDurableCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	sink := newMemorySink()
+	checkpoints := newMemoryCheckpoint()
+	if err := checkpoints.Save(context.Background(), pubmed.Progress{
+		Job:      "daily-conflict",
+		FileName: "pubmed26n0002.xml.gz",
+		SHA256:   strings.Repeat("a", 64),
+		Sequence: 2,
+		Ordinal:  2,
+		Complete: true,
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	var opens atomic.Int32
+	file := fixtureBulkFile(t, "update.xml.gz", "pubmed26n0101.xml.gz")
+	originalOpen := file.Open
+	file.Open = func() (io.ReadCloser, error) {
+		opens.Add(1)
+		return originalOpen()
+	}
+	importer, err := pubmed.NewImporter(sink, checkpoints)
+	if err != nil {
+		t.Fatalf("NewImporter() error = %v", err)
+	}
+
+	err = importer.ImportDaily(context.Background(), pubmed.DailyImport{
+		Job:              "daily-conflict",
+		Year:             2026,
+		PreviousSequence: 100,
+	}, []pubmed.BulkFile{file})
+	if err == nil {
+		t.Fatal("ImportDaily() accepted PreviousSequence conflicting with checkpoint")
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "checkpoint") ||
+		!strings.Contains(message, "previous") ||
+		!strings.Contains(message, "2") ||
+		!strings.Contains(message, "100") {
+		t.Fatalf("ImportDaily() error = %v, want explicit sequence conflict", err)
+	}
+	if opens.Load() != 0 {
+		t.Fatalf("BulkFile.Open calls = %d, want conflict rejected before reading file", opens.Load())
+	}
+	if len(sink.Upserts()) != 0 || len(sink.Deletions()) != 0 {
+		t.Fatal("sequence conflict mutated sink")
+	}
+	progress, ok, loadErr := checkpoints.Load(context.Background(), "daily-conflict")
+	if loadErr != nil || !ok || progress.Sequence != 2 {
+		t.Fatalf("checkpoint changed after conflict: %#v, %v, %v", progress, ok, loadErr)
+	}
+}
+
 func fixtureBulkFile(t *testing.T, fixtureName, fileName string) pubmed.BulkFile {
 	t.Helper()
 
@@ -266,25 +404,84 @@ func newMemorySink() *memorySink {
 	return &memorySink{projection: make(map[string]source.Record)}
 }
 
-func (sink *memorySink) Replace(_ context.Context, upsert pubmed.Upsert) error {
+func (sink *memorySink) BeginFile(
+	_ context.Context,
+	_ pubmed.SourcePosition,
+) (pubmed.FileTransaction, error) {
+	return &memoryFileTransaction{sink: sink}, nil
+}
+
+type memoryFileTransaction struct {
+	sink      *memorySink
+	upserts   []pubmed.Upsert
+	deletions []pubmed.Deletion
+	closed    bool
+}
+
+func (transaction *memoryFileTransaction) Replace(
+	_ context.Context,
+	upsert pubmed.Upsert,
+) error {
+	if transaction.closed {
+		return errors.New("transaction is closed")
+	}
+	sink := transaction.sink
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
 	if upsert.Record.SourceRecordID == sink.failPMIDOnce && !sink.failed {
 		sink.failed = true
 		return errors.New("injected sink failure")
 	}
-	sink.projection[upsert.Record.SourceRecordID] = upsert.Record
-	sink.upserts = append(sink.upserts, upsert)
+	transaction.upserts = append(transaction.upserts, upsert)
 	return nil
 }
 
-func (sink *memorySink) Delete(_ context.Context, deletion pubmed.Deletion) error {
+func (transaction *memoryFileTransaction) Delete(
+	_ context.Context,
+	deletion pubmed.Deletion,
+) error {
+	if transaction.closed {
+		return errors.New("transaction is closed")
+	}
+	transaction.deletions = append(transaction.deletions, deletion)
+	return nil
+}
+
+func (transaction *memoryFileTransaction) Commit(
+	ctx context.Context,
+	checkpoint pubmed.Checkpoint,
+	progress pubmed.Progress,
+) error {
+	if transaction.closed {
+		return errors.New("transaction is closed")
+	}
+	if err := checkpoint.Save(ctx, progress); err != nil {
+		return err
+	}
+	sink := transaction.sink
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
-	for _, pmid := range deletion.PMIDs {
-		delete(sink.projection, pmid)
+	for _, upsert := range transaction.upserts {
+		sink.projection[upsert.Record.SourceRecordID] = upsert.Record
+		sink.upserts = append(sink.upserts, upsert)
 	}
-	sink.deletions = append(sink.deletions, deletion)
+	for _, deletion := range transaction.deletions {
+		for _, pmid := range deletion.PMIDs {
+			delete(sink.projection, pmid)
+		}
+		sink.deletions = append(sink.deletions, deletion)
+	}
+	transaction.closed = true
+	return nil
+}
+
+func (transaction *memoryFileTransaction) Abort(context.Context) error {
+	if transaction.closed {
+		return nil
+	}
+	transaction.upserts = nil
+	transaction.deletions = nil
+	transaction.closed = true
 	return nil
 }
 
@@ -348,6 +545,7 @@ func (checkpoint *memoryCheckpoint) Save(
 }
 
 var (
-	_ pubmed.Sink       = (*memorySink)(nil)
-	_ pubmed.Checkpoint = (*memoryCheckpoint)(nil)
+	_ pubmed.Sink            = (*memorySink)(nil)
+	_ pubmed.FileTransaction = (*memoryFileTransaction)(nil)
+	_ pubmed.Checkpoint      = (*memoryCheckpoint)(nil)
 )
