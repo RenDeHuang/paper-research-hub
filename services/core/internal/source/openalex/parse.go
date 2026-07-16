@@ -35,6 +35,7 @@ type workPayload struct {
 	UpdatedDate           string              `json:"updated_date"`
 	AbstractInvertedIndex map[string][]int    `json:"abstract_inverted_index"`
 	Authorships           []authorshipPayload `json:"authorships"`
+	IsAuthorsTruncated    *bool               `json:"is_authors_truncated"`
 	Topics                []topicPayload      `json:"topics"`
 	Keywords              []keywordPayload    `json:"keywords"`
 	CitedByCount          *int                `json:"cited_by_count"`
@@ -249,25 +250,26 @@ func Parse(raw json.RawMessage) (source.Record, error) {
 	}
 
 	record := source.Record{
-		Source:         source.OpenAlex,
-		SourceRecordID: requiredOpenAlexID,
-		Identity:       identity,
-		Identifiers:    identifiers,
-		Raw:            rawRecord,
-		Title:          work.Title,
-		Abstract:       abstract,
-		PublishedAt:    publishedAt,
-		CreatedAt:      createdAt,
-		UpdatedAt:      updatedAt,
-		Authors:        authors,
-		Topics:         topics,
-		Keywords:       keywords,
-		CitedByCount:   cloneInt(work.CitedByCount),
-		Venue:          venue,
-		Licenses:       licenses,
-		Retracted:      cloneBool(work.IsRetracted),
-		CodeURLs:       codeURLs,
-		Scope:          scopeDecision,
+		Source:           source.OpenAlex,
+		SourceRecordID:   requiredOpenAlexID,
+		Identity:         identity,
+		Identifiers:      identifiers,
+		Raw:              rawRecord,
+		Title:            work.Title,
+		Abstract:         abstract,
+		PublishedAt:      publishedAt,
+		CreatedAt:        createdAt,
+		UpdatedAt:        updatedAt,
+		Authors:          authors,
+		AuthorsTruncated: cloneBool(work.IsAuthorsTruncated),
+		Topics:           topics,
+		Keywords:         keywords,
+		CitedByCount:     cloneInt(work.CitedByCount),
+		Venue:            venue,
+		Licenses:         licenses,
+		Retracted:        cloneBool(work.IsRetracted),
+		CodeURLs:         codeURLs,
+		Scope:            scopeDecision,
 	}
 	if work.OpenAccess != nil {
 		record.OpenAccess = source.OpenAccess{
@@ -735,6 +737,7 @@ func buildEvidence(
 	add("updated_at", "$.updated_date", record.UpdatedAt != nil)
 	add("abstract", "$.abstract_inverted_index", work.AbstractInvertedIndex != nil)
 	add("authors", "$.authorships", len(work.Authorships) > 0)
+	add("authors_truncated", "$.is_authors_truncated", record.AuthorsTruncated != nil)
 	add("institutions", "$.authorships[*].institutions", hasInstitutions)
 	add("topics", "$.topics", len(work.Topics) > 0)
 	add("keywords", "$.keywords", len(work.Keywords) > 0)

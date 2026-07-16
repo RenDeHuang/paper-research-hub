@@ -135,6 +135,7 @@
         "oa_url": "https://example.test/paper.pdf",
         "any_repository_has_fulltext": true
       },
+      "is_authors_truncated": true,
       "is_retracted": false
     }
   ]

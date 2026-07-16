@@ -171,6 +171,9 @@ func (client *Client) Fetch(ctx context.Context, query source.Query) source.Clie
 					return
 				}
 			}
+			if emitted >= query.MaxResults {
+				return
+			}
 
 			if page.NextCursor == nil || *page.NextCursor == "" {
 				return

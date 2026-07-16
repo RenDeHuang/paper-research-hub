@@ -36,7 +36,7 @@ func TestParseMapsOpenAlexRecordWithoutInventingValues(t *testing.T) {
 	if !bytes.Equal(record.Raw.Payload, raw) {
 		t.Fatal("Raw.Payload did not preserve the original single-record JSON")
 	}
-	if record.Raw.SHA256 != "d356a1f2a0056aeaf79df130b586858a907f5e4fd14bce262c9da0d77c52cd3b" {
+	if record.Raw.SHA256 != "8689ada40136504d7bb2cd4026643737b092dc9cfa56ce4239c8dada95b236d5" {
 		t.Fatalf("Raw.SHA256 = %q, want fixture canonical hash", record.Raw.SHA256)
 	}
 
@@ -116,6 +116,9 @@ func TestParseMapsOpenAlexRecordWithoutInventingValues(t *testing.T) {
 	if record.Retracted == nil || *record.Retracted {
 		t.Fatalf("Retracted = %v, want explicit false", record.Retracted)
 	}
+	if record.AuthorsTruncated == nil || !*record.AuthorsTruncated {
+		t.Fatalf("AuthorsTruncated = %v, want explicit true", record.AuthorsTruncated)
+	}
 	if !slices.Equal(record.CodeURLs, []string{"https://github.com/example-org/agent-system"}) {
 		t.Fatalf("CodeURLs = %#v, want only verified GitHub repository URL", record.CodeURLs)
 	}
@@ -129,6 +132,7 @@ func TestParseMapsOpenAlexRecordWithoutInventingValues(t *testing.T) {
 		"title",
 		"identifiers",
 		"authors",
+		"authors_truncated",
 		"institutions",
 		"published_at",
 		"updated_at",
@@ -165,6 +169,7 @@ func TestParseLeavesMissingOptionalFieldsAbsent(t *testing.T) {
 		record.UpdatedAt != nil ||
 		record.CitedByCount != nil ||
 		record.Retracted != nil ||
+		record.AuthorsTruncated != nil ||
 		record.Venue != nil ||
 		record.OpenAccess.IsOA != nil ||
 		len(record.Authors) != 0 ||
@@ -176,6 +181,24 @@ func TestParseLeavesMissingOptionalFieldsAbsent(t *testing.T) {
 	}
 	if record.Scope.Status != source.ScopePending {
 		t.Fatalf("Scope = %#v, want pending", record.Scope)
+	}
+}
+
+func TestParsePreservesExplicitFalseAuthorsTruncated(t *testing.T) {
+	t.Parallel()
+
+	record, err := openalex.Parse(json.RawMessage(`{
+		"id":"https://openalex.org/W1",
+		"is_authors_truncated":false
+	}`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if record.AuthorsTruncated == nil || *record.AuthorsTruncated {
+		t.Fatalf("AuthorsTruncated = %v, want explicit false", record.AuthorsTruncated)
+	}
+	if !hasEvidence(record.Evidence, "authors_truncated") {
+		t.Fatalf("Evidence missing authors_truncated: %#v", record.Evidence)
 	}
 }
 

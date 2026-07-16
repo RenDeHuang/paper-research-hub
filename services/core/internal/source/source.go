@@ -127,27 +127,28 @@ type FieldEvidence struct {
 }
 
 type Record struct {
-	Source         string
-	SourceRecordID string
-	Identity       paper.Identifier
-	Identifiers    []Identifier
-	Raw            RawRecord
-	Evidence       []FieldEvidence
-	Title          string
-	Abstract       string
-	PublishedAt    *time.Time
-	CreatedAt      *time.Time
-	UpdatedAt      *time.Time
-	Authors        []Author
-	Topics         []Topic
-	Keywords       []Keyword
-	CitedByCount   *int
-	Venue          *Venue
-	OpenAccess     OpenAccess
-	Licenses       []License
-	Retracted      *bool
-	CodeURLs       []string
-	Scope          ScopeDecision
+	Source           string
+	SourceRecordID   string
+	Identity         paper.Identifier
+	Identifiers      []Identifier
+	Raw              RawRecord
+	Evidence         []FieldEvidence
+	Title            string
+	Abstract         string
+	PublishedAt      *time.Time
+	CreatedAt        *time.Time
+	UpdatedAt        *time.Time
+	Authors          []Author
+	AuthorsTruncated *bool
+	Topics           []Topic
+	Keywords         []Keyword
+	CitedByCount     *int
+	Venue            *Venue
+	OpenAccess       OpenAccess
+	Licenses         []License
+	Retracted        *bool
+	CodeURLs         []string
+	Scope            ScopeDecision
 }
 
 type Author struct {

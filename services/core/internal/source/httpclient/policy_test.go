@@ -91,6 +91,74 @@ func TestClientSetsUserAgentAndAppliesInjectedRateLimit(t *testing.T) {
 	}
 }
 
+func TestCanceledConcurrentRateWaitsDoNotConsumeFutureSlots(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = writer.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	clock := newCancelingRateClock()
+	cfg := validConfig()
+	cfg.RateLimit = httpclient.RateLimit{Requests: 1, Interval: time.Second}
+	client, err := httpclient.New(server.Client(), cfg, clock.dependencies())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	first, err := doGet(client, server.URL)
+	if err != nil {
+		t.Fatalf("first Do() error = %v", err)
+	}
+	_ = first.Body.Close()
+
+	const canceledRequests = 8
+	start := make(chan struct{})
+	errs := make(chan error, canceledRequests)
+	var waitGroup sync.WaitGroup
+	for id := range canceledRequests {
+		baseContext := context.WithValue(context.Background(), cancellationRequestKey{}, id)
+		ctx, cancel := context.WithCancel(baseContext)
+		clock.registerCancel(id, cancel)
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+			if requestErr != nil {
+				errs <- requestErr
+				return
+			}
+			_, requestErr = client.Do(request)
+			errs <- requestErr
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	close(errs)
+	for err := range errs {
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled Do() error = %v, want context.Canceled", err)
+		}
+	}
+
+	final, err := doGet(client, server.URL)
+	if err != nil {
+		t.Fatalf("final Do() error = %v", err)
+	}
+	_ = final.Body.Close()
+
+	if requests.Load() != 2 {
+		t.Fatalf("HTTP requests = %d, want only initial and final valid requests", requests.Load())
+	}
+	if got := clock.sleeps(); len(got) != 1 || got[0] != time.Second {
+		t.Fatalf("successful rate-limit sleeps = %v, want one 1s slot", got)
+	}
+}
+
 func TestClientRetries429UsingBoundedRetryAfter(t *testing.T) {
 	t.Parallel()
 
@@ -124,6 +192,70 @@ func TestClientRetries429UsingBoundedRetryAfter(t *testing.T) {
 	}
 	if !containsDuration(clock.sleeps(), 2*time.Second) {
 		t.Fatalf("sleeps = %v, want Retry-After delay 2s", clock.sleeps())
+	}
+}
+
+func TestClientRetries503UsingBoundedRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			writer.Header().Set("Retry-After", "2")
+			http.Error(writer, "maintenance", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = writer.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	clock := newFakeClock()
+	cfg := validConfig()
+	cfg.RateLimit = httpclient.RateLimit{Requests: 1, Interval: time.Nanosecond}
+	client, err := httpclient.New(server.Client(), cfg, clock.dependencies())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	response, err := doGet(client, server.URL)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	_ = response.Body.Close()
+
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+	if !containsDuration(clock.sleeps(), 2*time.Second) {
+		t.Fatalf("sleeps = %v, want 503 Retry-After delay 2s", clock.sleeps())
+	}
+}
+
+func TestClientRejects503RetryAfterBeyondWaitBudget(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		writer.Header().Set("Retry-After", "120")
+		http.Error(writer, "maintenance", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	clock := newFakeClock()
+	cfg := validConfig()
+	cfg.MaxWait = 5 * time.Second
+	client, err := httpclient.New(server.Client(), cfg, clock.dependencies())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = doGet(client, server.URL)
+	if !errors.Is(err, httpclient.ErrRetryBudgetExceeded) {
+		t.Fatalf("Do() error = %v, want ErrRetryBudgetExceeded", err)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts = %d, want no retry beyond 503 wait budget", attempts.Load())
 	}
 }
 
@@ -431,6 +563,48 @@ func TestClientRedactsTransportErrors(t *testing.T) {
 	}
 }
 
+func TestClientRedactsAuthorizationCredentialsWhenErrorContainsOnlyToken(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		http.Error(
+			writer,
+			"auth=authorization-token-secret proxy=proxy-token-secret",
+			http.StatusBadRequest,
+		)
+	}))
+	defer server.Close()
+
+	client, err := httpclient.New(server.Client(), validConfig(), httpclient.Dependencies{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	request, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		server.URL,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer authorization-token-secret")
+	request.Header.Set("Proxy-Authorization", "Basic proxy-token-secret")
+
+	_, err = client.Do(request)
+	if err == nil {
+		t.Fatal("Do() error = nil, want 400 error")
+	}
+	for _, secret := range []string{
+		"authorization-token-secret",
+		"proxy-token-secret",
+	} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error leaked credential-only secret %q: %v", secret, err)
+		}
+	}
+}
+
 func validConfig() httpclient.Config {
 	return httpclient.Config{
 		Timeout:          time.Second,
@@ -473,6 +647,59 @@ type fakeClock struct {
 	now         time.Time
 	recorded    []time.Duration
 	beforeSleep func()
+}
+
+type cancellationRequestKey struct{}
+
+type cancelingRateClock struct {
+	mu       sync.Mutex
+	now      time.Time
+	recorded []time.Duration
+	cancels  map[int]context.CancelFunc
+}
+
+func newCancelingRateClock() *cancelingRateClock {
+	return &cancelingRateClock{
+		now:     time.Date(2026, time.July, 16, 0, 0, 0, 0, time.UTC),
+		cancels: make(map[int]context.CancelFunc),
+	}
+}
+
+func (clock *cancelingRateClock) registerCancel(id int, cancel context.CancelFunc) {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	clock.cancels[id] = cancel
+}
+
+func (clock *cancelingRateClock) dependencies() httpclient.Dependencies {
+	return httpclient.Dependencies{
+		Now: func() time.Time {
+			clock.mu.Lock()
+			defer clock.mu.Unlock()
+			return clock.now
+		},
+		Sleep: func(ctx context.Context, delay time.Duration) error {
+			if id, ok := ctx.Value(cancellationRequestKey{}).(int); ok {
+				clock.mu.Lock()
+				cancel := clock.cancels[id]
+				clock.mu.Unlock()
+				cancel()
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			clock.mu.Lock()
+			defer clock.mu.Unlock()
+			clock.recorded = append(clock.recorded, delay)
+			clock.now = clock.now.Add(delay)
+			return nil
+		},
+	}
+}
+
+func (clock *cancelingRateClock) sleeps() []time.Duration {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return append([]time.Duration(nil), clock.recorded...)
 }
 
 func newFakeClock() *fakeClock {

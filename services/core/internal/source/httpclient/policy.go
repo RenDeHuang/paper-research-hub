@@ -235,26 +235,30 @@ func (client *Client) Do(request *http.Request) (*http.Response, error) {
 
 func (client *Client) waitForRateLimit(ctx context.Context) error {
 	client.rateMu.Lock()
+	defer client.rateMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	now := client.now()
 	scheduled := now
 	if client.nextRequest.After(scheduled) {
 		scheduled = client.nextRequest
 	}
-	client.nextRequest = scheduled.Add(client.requestInterval)
-	client.rateMu.Unlock()
 
 	delay := scheduled.Sub(now)
-	if delay <= 0 {
-		return nil
+	if delay > 0 {
+		if err := client.sleep(ctx, delay); err != nil {
+			return err
+		}
 	}
-	return client.sleep(ctx, delay)
+	client.nextRequest = scheduled.Add(client.requestInterval)
+	return nil
 }
 
 func (client *Client) retryDelay(response *http.Response, retryIndex int) time.Duration {
-	if response.StatusCode == http.StatusTooManyRequests {
-		if delay, ok := parseRetryAfter(response.Header.Get("Retry-After"), client.now()); ok {
-			return delay
-		}
+	if delay, ok := parseRetryAfter(response.Header.Get("Retry-After"), client.now()); ok {
+		return delay
 	}
 
 	delay := client.config.InitialBackoff
@@ -353,9 +357,27 @@ func (client *Client) requestSecrets(request *http.Request) []string {
 		if _, sensitive := client.sensitiveHeaders[strings.ToLower(key)]; !sensitive {
 			continue
 		}
-		values = append(values, request.Header.Values(key)...)
+		headerValues := request.Header.Values(key)
+		values = append(values, headerValues...)
+		if strings.EqualFold(key, "Authorization") ||
+			strings.EqualFold(key, "Proxy-Authorization") {
+			for _, value := range headerValues {
+				if credential := authorizationCredential(value); credential != "" {
+					values = append(values, credential)
+				}
+			}
+		}
 	}
 	return normalizeSecrets(values)
+}
+
+func authorizationCredential(value string) string {
+	trimmed := strings.TrimSpace(value)
+	separator := strings.IndexAny(trimmed, " \t\r\n")
+	if separator < 0 {
+		return ""
+	}
+	return strings.TrimSpace(trimmed[separator:])
 }
 
 func cloneRequest(request *http.Request, attempt int) (*http.Request, error) {

@@ -98,6 +98,31 @@ func TestClientFetchUsesCursorPaginationAndHardMaxResults(t *testing.T) {
 	}
 }
 
+func TestClientFetchReturnsAtMaxResultsBeforeRepeatedCursorValidation(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.URL.Query().Get("cursor") != "*" {
+			t.Errorf("cursor = %q, want initial cursor", request.URL.Query().Get("cursor"))
+		}
+		writeEnvelope(t, writer, "*", "W1")
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(cfg *openalex.Config) {
+		cfg.PerPage = 1
+	})
+	records, errs := collect(client.Fetch(context.Background(), source.Query{MaxResults: 1}))
+	if len(records) != 1 || len(errs) != 0 {
+		t.Fatalf("Fetch() = %d records, %d errors; want max-results success", len(records), len(errs))
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want one request at max_results", requests.Load())
+	}
+}
+
 func TestNewClientRequiresCurrentOpenAlexCredentialsAndBounds(t *testing.T) {
 	t.Parallel()
 
