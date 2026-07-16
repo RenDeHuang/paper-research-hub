@@ -500,12 +500,28 @@ func TestMigrationReconcilesNormalizedDuplicateWorksAndPreservesEvidence(t *test
 		survivorWorkID  = "00000000-0000-0000-0000-000000000001"
 		duplicateWorkID = "00000000-0000-0000-0000-000000000002"
 	)
+	var venueID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l)
+		VALUES ('journal', 'Merge Venue', '1234-567X')
+		RETURNING id
+	`), &venueID)
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO works (id, canonical_key, status, title, created_at, updated_at)
+		INSERT INTO works (
+			id, canonical_key, status, title, abstract, published_at, venue_id, created_at, updated_at
+		)
 		VALUES
-			($1, 'doi:10.1000/Merge-Me', 'active', 'Merge Work', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'),
-			($2, 'doi:10.1000/merge-me', 'active', 'Merge Work', '2021-01-01T00:00:00Z', '2021-01-01T00:00:00Z')
-	`, survivorWorkID, duplicateWorkID); err != nil {
+			(
+				$1, 'doi:10.1000/Merge-Me', 'active', 'Merge Work',
+				NULL, NULL, NULL,
+				'2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'
+			),
+			(
+				$2, 'doi:10.1000/merge-me', 'retracted', 'Merge Work',
+				'Recovered abstract', '2024-02-03T04:05:06Z', $3,
+				'2021-01-01T00:00:00Z', '2021-01-01T00:00:00Z'
+			)
+	`, survivorWorkID, duplicateWorkID, venueID); err != nil {
 		t.Fatalf("insert duplicate legacy Works: %v", err)
 	}
 
@@ -566,6 +582,43 @@ func TestMigrationReconcilesNormalizedDuplicateWorksAndPreservesEvidence(t *test
 		t.Fatalf("reconciled Work ID = %s, want stable survivor %s", survivingID, survivorWorkID)
 	}
 
+	var (
+		reconciledStatus      string
+		reconciledAbstract    *string
+		reconciledPublishedAt *time.Time
+		reconciledVenueID     *string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT status, abstract, published_at, venue_id::text
+		FROM works
+		WHERE id = $1
+	`, survivorWorkID).Scan(
+		&reconciledStatus,
+		&reconciledAbstract,
+		&reconciledPublishedAt,
+		&reconciledVenueID,
+	); err != nil {
+		t.Fatalf("query reconciled Work metadata: %v", err)
+	}
+	wantPublishedAt := time.Date(2024, time.February, 3, 4, 5, 6, 0, time.UTC)
+	if reconciledStatus != "retracted" ||
+		reconciledAbstract == nil ||
+		*reconciledAbstract != "Recovered abstract" ||
+		reconciledPublishedAt == nil ||
+		!reconciledPublishedAt.Equal(wantPublishedAt) ||
+		reconciledVenueID == nil ||
+		*reconciledVenueID != venueID {
+		t.Fatalf(
+			"reconciled metadata = status %q, abstract %v, published_at %v, venue %v; want retracted, recovered abstract, %s, %s",
+			reconciledStatus,
+			reconciledAbstract,
+			reconciledPublishedAt,
+			reconciledVenueID,
+			wantPublishedAt,
+			venueID,
+		)
+	}
+
 	assertWorkReferenceCount(t, pool, "source_record_works", "work_id", survivorWorkID, 2)
 	assertWorkReferenceCount(t, pool, "field_assertions", "work_id", survivorWorkID, 2)
 	assertWorkReferenceCount(t, pool, "paper_versions", "work_id", survivorWorkID, 2)
@@ -599,6 +652,161 @@ func TestMigrationReconcilesNormalizedDuplicateWorksAndPreservesEvidence(t *test
 			externalIdentifierCount,
 			duplicateWorkCount,
 		)
+	}
+}
+
+func TestMigrationRejectsConflictingDuplicateWorkMetadataWithContext(t *testing.T) {
+	testCases := []struct {
+		name          string
+		field         string
+		titleOne      string
+		titleTwo      string
+		abstractOne   any
+		abstractTwo   any
+		publishedOne  any
+		publishedTwo  any
+		statusOne     string
+		statusTwo     string
+		venueConflict bool
+	}{
+		{
+			name:      "different non-empty titles",
+			field:     "title",
+			titleOne:  "First title",
+			titleTwo:  "Second title",
+			statusOne: "active",
+			statusTwo: "active",
+		},
+		{
+			name:        "different non-empty abstracts",
+			field:       "abstract",
+			titleOne:    "Shared title",
+			titleTwo:    "Shared title",
+			abstractOne: "First abstract",
+			abstractTwo: "Second abstract",
+			statusOne:   "active",
+			statusTwo:   "active",
+		},
+		{
+			name:         "different publication times",
+			field:        "published_at",
+			titleOne:     "Shared title",
+			titleTwo:     "Shared title",
+			publishedOne: time.Date(2023, time.January, 2, 3, 4, 5, 0, time.UTC),
+			publishedTwo: time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC),
+			statusOne:    "active",
+			statusTwo:    "active",
+		},
+		{
+			name:          "different venues",
+			field:         "venue_id",
+			titleOne:      "Shared title",
+			titleTwo:      "Shared title",
+			statusOne:     "active",
+			statusTwo:     "active",
+			venueConflict: true,
+		},
+		{
+			name:      "different terminal statuses",
+			field:     "status",
+			titleOne:  "Shared title",
+			titleTwo:  "Shared title",
+			statusOne: "retracted",
+			statusTwo: "rejected",
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			migrations, err := EmbeddedMigrations()
+			if err != nil {
+				t.Fatalf("EmbeddedMigrations() error = %v", err)
+			}
+			pool := openTestPool(t)
+			ctx := testContext(t)
+			if err := UpMigrations(ctx, pool, migrations[:1]); err != nil {
+				t.Fatalf("apply original 000001_initial: %v", err)
+			}
+
+			var venueOne, venueTwo any
+			if tt.venueConflict {
+				var firstVenueID, secondVenueID string
+				mustScanID(t, pool.QueryRow(ctx, `
+					INSERT INTO venues (venue_type, display_title, issn_l)
+					VALUES ('journal', 'First Venue', '1111-111X')
+					RETURNING id
+				`), &firstVenueID)
+				mustScanID(t, pool.QueryRow(ctx, `
+					INSERT INTO venues (venue_type, display_title, issn_l)
+					VALUES ('journal', 'Second Venue', '2222-222X')
+					RETURNING id
+				`), &secondVenueID)
+				venueOne = firstVenueID
+				venueTwo = secondVenueID
+			}
+
+			const (
+				firstWorkID  = "00000000-0000-0000-0000-000000000021"
+				secondWorkID = "00000000-0000-0000-0000-000000000022"
+			)
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO works (
+					id, canonical_key, status, title, abstract, published_at, venue_id, created_at, updated_at
+				)
+				VALUES
+					(
+						$1, 'doi:10.1000/Metadata-Conflict', $3, $5, $7, $9, $11,
+						'2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'
+					),
+					(
+						$2, 'doi:10.1000/metadata-conflict', $4, $6, $8, $10, $12,
+						'2021-01-01T00:00:00Z', '2021-01-01T00:00:00Z'
+					)
+			`,
+				firstWorkID,
+				secondWorkID,
+				tt.statusOne,
+				tt.statusTwo,
+				tt.titleOne,
+				tt.titleTwo,
+				tt.abstractOne,
+				tt.abstractTwo,
+				tt.publishedOne,
+				tt.publishedTwo,
+				venueOne,
+				venueTwo,
+			); err != nil {
+				t.Fatalf("insert conflicting legacy Works: %v", err)
+			}
+			firstSource := insertLegacySourceRecord(t, pool, firstWorkID, "crossref", "metadata-source-one", "metadata-hash-one")
+			secondSource := insertLegacySourceRecord(t, pool, secondWorkID, "openalex", "metadata-source-two", "metadata-hash-two")
+
+			err = Up(ctx, pool)
+			if err == nil ||
+				!strings.Contains(err.Error(), "cannot reconcile normalized identity doi:10.1000/metadata-conflict") ||
+				!strings.Contains(err.Error(), "field "+tt.field) {
+				t.Fatalf("metadata conflict error = %v, want contextual %s conflict", err, tt.field)
+			}
+
+			var appliedV2, retainedWorks, retainedSources int
+			if queryErr := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations WHERE version = 2").Scan(&appliedV2); queryErr != nil {
+				t.Fatalf("count failed v2 migration records: %v", queryErr)
+			}
+			if queryErr := pool.QueryRow(ctx, "SELECT count(*) FROM works WHERE id IN ($1, $2)", firstWorkID, secondWorkID).Scan(&retainedWorks); queryErr != nil {
+				t.Fatalf("count retained conflicting Works: %v", queryErr)
+			}
+			if queryErr := pool.QueryRow(ctx, "SELECT count(*) FROM source_records WHERE id IN ($1, $2)", firstSource, secondSource).Scan(&retainedSources); queryErr != nil {
+				t.Fatalf("count retained conflicting SourceRecords: %v", queryErr)
+			}
+			if appliedV2 != 0 || retainedWorks != 2 || retainedSources != 2 {
+				t.Fatalf(
+					"failed metadata reconciliation state = applied v2 %d, Works %d, SourceRecords %d; want 0, 2, 2",
+					appliedV2,
+					retainedWorks,
+					retainedSources,
+				)
+			}
+		})
 	}
 }
 
@@ -959,6 +1167,8 @@ func TestArXivNormalizationMatchesPaperDomainRules(t *testing.T) {
 		{name: "legacy after cutoff", raw: "math/0704001", storedCandidate: "math/0704001", wantError: true},
 		{name: "unknown legacy archive", raw: "unknown.AI/0611001", storedCandidate: "unknown.ai/0611001", wantError: true},
 		{name: "subject class on non alias archive", raw: "hep-th.X/0611001", storedCandidate: "hep-th.x/0611001", wantError: true},
+		{name: "legacy subject class trailing dot", raw: "math.CA./0611800", storedCandidate: "math.ca./0611800", wantError: true},
+		{name: "legacy subject class repeated trailing dots", raw: "math.CA../0611800", storedCandidate: "math.ca../0611800", wantError: true},
 	}
 
 	for index, tt := range testCases {
@@ -1033,6 +1243,47 @@ func TestArXivNormalizationMatchesPaperDomainRules(t *testing.T) {
 			`, workID, tt.storedCandidate)
 			assertPostgresError(t, err, "23514", "external_identifiers_normalized_value_check")
 		})
+	}
+}
+
+func TestMigrationDoesNotMergeMalformedLegacyArXivAlias(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:1]); err != nil {
+		t.Fatalf("apply original 000001_initial: %v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO works (canonical_key, status, title, created_at)
+		VALUES
+			('arxiv:math/0611800', 'active', 'Valid arXiv Work', '2020-01-01T00:00:00Z'),
+			('arxiv:math.CA./0611800', 'active', 'Malformed arXiv Work', '2021-01-01T00:00:00Z')
+	`); err != nil {
+		t.Fatalf("insert legacy arXiv aliases: %v", err)
+	}
+
+	err = Up(ctx, pool)
+	if err == nil {
+		t.Fatal("upgrade merged malformed legacy arXiv alias, want explicit rejection")
+	}
+
+	var appliedV2, retainedWorks int
+	if queryErr := pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations WHERE version = 2").Scan(&appliedV2); queryErr != nil {
+		t.Fatalf("count failed v2 migration records: %v", queryErr)
+	}
+	if queryErr := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM works
+		WHERE canonical_key IN ('arxiv:math/0611800', 'arxiv:math.CA./0611800')
+	`).Scan(&retainedWorks); queryErr != nil {
+		t.Fatalf("count retained legacy arXiv Works: %v", queryErr)
+	}
+	if appliedV2 != 0 || retainedWorks != 2 {
+		t.Fatalf("malformed arXiv rollback state = applied v2 %d, Works %d; want 0, 2", appliedV2, retainedWorks)
 	}
 }
 

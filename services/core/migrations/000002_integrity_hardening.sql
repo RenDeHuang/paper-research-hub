@@ -76,10 +76,13 @@ BEGIN
                 END IF;
 
                 IF strpos(arxiv_archive, '.') > 0 THEN
+                    IF arxiv_archive !~ '^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*$' THEN
+                        RETURN NULL;
+                    END IF;
                     arxiv_subject_class := split_part(arxiv_archive, '.', 2);
-                    IF split_part(arxiv_archive, '.', 3) <> ''
-                        OR arxiv_subject_class !~ '^[a-z][a-z0-9-]*$'
-                        OR split_part(arxiv_archive, '.', 1) <> ALL (
+                    arxiv_archive := split_part(arxiv_archive, '.', 1);
+                    IF arxiv_subject_class !~ '^[a-z][a-z0-9-]*$'
+                        OR arxiv_archive <> ALL (
                             ARRAY['astro-ph', 'cond-mat', 'cs', 'math', 'nlin', 'physics', 'q-bio']
                         )
                     THEN
@@ -198,6 +201,110 @@ FROM ranked_works;
 
 CREATE UNIQUE INDEX work_merge_destinations_work_id_key
     ON work_merge_destinations(work_id);
+
+DO $$
+DECLARE
+    conflict_identity text;
+BEGIN
+    SELECT destination.normalized_identity
+    INTO conflict_identity
+    FROM works AS work
+    JOIN work_merge_destinations AS destination
+      ON destination.work_id = work.id
+    WHERE destination.normalized_identity IS NOT NULL
+    GROUP BY destination.target_work_id, destination.normalized_identity
+    HAVING count(DISTINCT work.title)
+        FILTER (WHERE NULLIF(btrim(work.title), '') IS NOT NULL) > 1
+    ORDER BY destination.normalized_identity
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'cannot reconcile normalized identity %: conflicting core field title',
+            conflict_identity
+            USING ERRCODE = '23514', TABLE = 'works', COLUMN = 'title';
+    END IF;
+
+    SELECT destination.normalized_identity
+    INTO conflict_identity
+    FROM works AS work
+    JOIN work_merge_destinations AS destination
+      ON destination.work_id = work.id
+    WHERE destination.normalized_identity IS NOT NULL
+    GROUP BY destination.target_work_id, destination.normalized_identity
+    HAVING count(DISTINCT work.abstract)
+        FILTER (
+            WHERE work.abstract IS NOT NULL
+              AND NULLIF(btrim(work.abstract), '') IS NOT NULL
+        ) > 1
+    ORDER BY destination.normalized_identity
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'cannot reconcile normalized identity %: conflicting core field abstract',
+            conflict_identity
+            USING ERRCODE = '23514', TABLE = 'works', COLUMN = 'abstract';
+    END IF;
+
+    SELECT destination.normalized_identity
+    INTO conflict_identity
+    FROM works AS work
+    JOIN work_merge_destinations AS destination
+      ON destination.work_id = work.id
+    WHERE destination.normalized_identity IS NOT NULL
+    GROUP BY destination.target_work_id, destination.normalized_identity
+    HAVING count(DISTINCT work.published_at)
+        FILTER (WHERE work.published_at IS NOT NULL) > 1
+    ORDER BY destination.normalized_identity
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'cannot reconcile normalized identity %: conflicting core field published_at',
+            conflict_identity
+            USING ERRCODE = '23514', TABLE = 'works', COLUMN = 'published_at';
+    END IF;
+
+    SELECT destination.normalized_identity
+    INTO conflict_identity
+    FROM works AS work
+    JOIN work_merge_destinations AS destination
+      ON destination.work_id = work.id
+    WHERE destination.normalized_identity IS NOT NULL
+    GROUP BY destination.target_work_id, destination.normalized_identity
+    HAVING count(DISTINCT work.venue_id)
+        FILTER (WHERE work.venue_id IS NOT NULL) > 1
+    ORDER BY destination.normalized_identity
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'cannot reconcile normalized identity %: conflicting core field venue_id',
+            conflict_identity
+            USING ERRCODE = '23514', TABLE = 'works', COLUMN = 'venue_id';
+    END IF;
+
+    SELECT destination.normalized_identity
+    INTO conflict_identity
+    FROM works AS work
+    JOIN work_merge_destinations AS destination
+      ON destination.work_id = work.id
+    WHERE destination.normalized_identity IS NOT NULL
+    GROUP BY destination.target_work_id, destination.normalized_identity
+    HAVING count(DISTINCT work.status)
+        FILTER (WHERE work.status <> 'active') > 1
+    ORDER BY destination.normalized_identity
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'cannot reconcile normalized identity %: conflicting core field status',
+            conflict_identity
+            USING ERRCODE = '23514', TABLE = 'works', COLUMN = 'status';
+    END IF;
+END;
+$$;
 
 DO $$
 DECLARE
@@ -442,6 +549,45 @@ BEGIN
     END IF;
 END;
 $$;
+
+WITH merged_work_metadata AS (
+    SELECT
+        destination.target_work_id,
+        (
+            array_agg(work.abstract ORDER BY work.created_at, work.id)
+            FILTER (
+                WHERE work.abstract IS NOT NULL
+                  AND NULLIF(btrim(work.abstract), '') IS NOT NULL
+            )
+        )[1] AS merged_abstract,
+        min(work.published_at)
+            FILTER (WHERE work.published_at IS NOT NULL) AS merged_published_at,
+        (
+            array_agg(work.venue_id ORDER BY work.created_at, work.id)
+            FILTER (WHERE work.venue_id IS NOT NULL)
+        )[1] AS merged_venue_id,
+        (
+            array_agg(work.status ORDER BY work.created_at, work.id)
+            FILTER (WHERE work.status <> 'active')
+        )[1] AS merged_terminal_status
+    FROM works AS work
+    JOIN work_merge_destinations AS destination
+      ON destination.work_id = work.id
+    WHERE destination.normalized_identity IS NOT NULL
+    GROUP BY destination.target_work_id
+)
+UPDATE works AS survivor
+SET
+    abstract = CASE
+        WHEN survivor.abstract IS NULL OR NULLIF(btrim(survivor.abstract), '') IS NULL
+            THEN merged.merged_abstract
+        ELSE survivor.abstract
+    END,
+    published_at = COALESCE(survivor.published_at, merged.merged_published_at),
+    venue_id = COALESCE(survivor.venue_id, merged.merged_venue_id),
+    status = COALESCE(merged.merged_terminal_status, survivor.status)
+FROM merged_work_metadata AS merged
+WHERE survivor.id = merged.target_work_id;
 
 ALTER TABLE paper_versions
     DROP CONSTRAINT paper_versions_source_record_work_fkey;
