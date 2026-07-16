@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -328,35 +329,33 @@ func (client *Client) redactedURL(original *url.URL) string {
 }
 
 func (client *Client) requestSecrets(request *http.Request) []string {
-	unique := make(map[string]struct{})
+	values := make([]string, 0)
 	if request.URL != nil {
-		for key, values := range request.URL.Query() {
+		query := request.URL.Query()
+		keys := make([]string, 0, len(query))
+		for key := range query {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
 			if _, sensitive := client.sensitiveQueries[strings.ToLower(key)]; !sensitive {
 				continue
 			}
-			for _, value := range values {
-				if value != "" {
-					unique[value] = struct{}{}
-				}
-			}
+			values = append(values, query[key]...)
 		}
 	}
-	for key, values := range request.Header {
+	headerKeys := make([]string, 0, len(request.Header))
+	for key := range request.Header {
+		headerKeys = append(headerKeys, key)
+	}
+	sort.Strings(headerKeys)
+	for _, key := range headerKeys {
 		if _, sensitive := client.sensitiveHeaders[strings.ToLower(key)]; !sensitive {
 			continue
 		}
-		for _, value := range values {
-			if value != "" {
-				unique[value] = struct{}{}
-			}
-		}
+		values = append(values, request.Header.Values(key)...)
 	}
-
-	secrets := make([]string, 0, len(unique))
-	for secret := range unique {
-		secrets = append(secrets, secret)
-	}
-	return secrets
+	return normalizeSecrets(values)
 }
 
 func cloneRequest(request *http.Request, attempt int) (*http.Request, error) {
@@ -423,14 +422,30 @@ func parseRetryAfter(raw string, now time.Time) (time.Duration, bool) {
 
 func redactSecrets(message string, secrets []string) string {
 	redacted := message
-	for _, secret := range secrets {
-		if secret == "" {
-			continue
-		}
+	for _, secret := range normalizeSecrets(secrets) {
 		redacted = strings.ReplaceAll(redacted, secret, "[REDACTED]")
 		redacted = strings.ReplaceAll(redacted, url.QueryEscape(secret), "[REDACTED]")
 	}
 	return redacted
+}
+
+func normalizeSecrets(values []string) []string {
+	unique := make(map[string]struct{}, len(values))
+	secrets := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if _, exists := unique[value]; exists {
+			continue
+		}
+		unique[value] = struct{}{}
+		secrets = append(secrets, value)
+	}
+	sort.SliceStable(secrets, func(left, right int) bool {
+		return len(secrets[left]) > len(secrets[right])
+	})
+	return secrets
 }
 
 func normalizedSet(values []string) map[string]struct{} {

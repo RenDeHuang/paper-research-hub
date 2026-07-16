@@ -141,6 +141,18 @@ func (client *Client) Fetch(ctx context.Context, query source.Query) source.Clie
 				yield(source.Record{}, err)
 				return
 			}
+			if len(page.Results) == 0 &&
+				page.NextCursor != nil &&
+				*page.NextCursor != "" {
+				yield(
+					source.Record{},
+					fmt.Errorf(
+						"OpenAlex protocol error: empty results page requires continuation cursor %q",
+						*page.NextCursor,
+					),
+				)
+				return
+			}
 			pageStart := emitted
 			for index, raw := range page.Results {
 				if emitted >= query.MaxResults {

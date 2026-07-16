@@ -190,6 +190,34 @@ func TestClientFetchRejectsMissingResultsEnvelope(t *testing.T) {
 	}
 }
 
+func TestClientFetchRejectsEmptyPageWithContinuationAfterOneRequest(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{
+			"meta":{"next_cursor":"cursor-2"},
+			"results":[]
+		}`))
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, nil)
+	records, errs := collect(client.Fetch(context.Background(), source.Query{MaxResults: 10}))
+	if len(records) != 0 || len(errs) != 1 {
+		t.Fatalf("Fetch() = %d records, %d errors; want explicit empty-page protocol error", len(records), len(errs))
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want exactly 1 before empty-page protocol error", requests.Load())
+	}
+	errorMessage := strings.ToLower(errs[0].Error())
+	if !strings.Contains(errorMessage, "empty") || !strings.Contains(errorMessage, "cursor") {
+		t.Fatalf("Fetch() error = %v, want empty-page continuation context", errs[0])
+	}
+}
+
 func TestClientFetchReportsExactMalformedRecordPosition(t *testing.T) {
 	t.Parallel()
 

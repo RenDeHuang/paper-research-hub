@@ -349,6 +349,52 @@ func TestClientRedactsSensitiveQueryHeaderAndResponseValuesFromErrors(t *testing
 	}
 }
 
+func TestClientRedactsOverlappingQueryAndHeaderSecretsLongestFirst(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Error(
+			writer,
+			fmt.Sprintf(
+				"query=%s header=%s repeated=%s",
+				request.URL.Query().Get("api_key"),
+				request.Header.Get("X-API-Key"),
+				request.URL.Query().Get("token"),
+			),
+			http.StatusBadRequest,
+		)
+	}))
+	defer server.Close()
+
+	client, err := httpclient.New(server.Client(), validConfig(), httpclient.Dependencies{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	request, err := http.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		server.URL+"?api_key=abcdef&token=abcdef",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+	request.Header.Set("X-API-Key", "abc")
+
+	_, err = client.Do(request)
+	if err == nil {
+		t.Fatal("Do() error = nil, want 400 error")
+	}
+	for _, leaked := range []string{"abcdef", "abc", "def"} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("error retained overlapping secret fragment %q: %v", leaked, err)
+		}
+	}
+	if strings.Count(err.Error(), "[REDACTED]") < 3 {
+		t.Fatalf("error = %v, want query/header/error values visibly redacted", err)
+	}
+}
+
 func TestClientRedactsTransportErrors(t *testing.T) {
 	t.Parallel()
 
