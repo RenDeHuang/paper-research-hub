@@ -19,9 +19,11 @@ import (
 )
 
 const (
-	DefaultMaxBulkRecordBytes     = int64(64 << 20)
-	DefaultMaxCompressedFileBytes = int64(1 << 30)
-	fileTransactionAbortTimeout   = 5 * time.Second
+	DefaultMaxBulkRecordBytes       = int64(64 << 20)
+	DefaultMaxBulkUncompressedBytes = int64(4 << 30)
+	DefaultMaxBulkEvents            = int64(250_000)
+	DefaultMaxCompressedFileBytes   = int64(1 << 30)
+	fileTransactionAbortTimeout     = 5 * time.Second
 )
 
 var (
@@ -31,8 +33,51 @@ var (
 	ErrBulkRecordTooLarge = errors.New(
 		"PubMed expanded bulk record exceeds configured capture limit",
 	)
+	ErrBulkUncompressedTooLarge = errors.New(
+		"PubMed bulk file exceeds configured uncompressed byte limit",
+	)
+	ErrBulkTooManyEvents  = errors.New("PubMed bulk file exceeds configured event limit")
 	ErrCheckpointConflict = errors.New("PubMed checkpoint conflict")
 )
+
+type BulkLimitKind string
+
+const (
+	BulkLimitUncompressedBytes BulkLimitKind = "uncompressed_bytes"
+	BulkLimitEvents            BulkLimitKind = "events"
+)
+
+type BulkLimitError struct {
+	Kind     BulkLimitKind
+	Limit    int64
+	Observed int64
+}
+
+func (limitError *BulkLimitError) Error() string {
+	return fmt.Sprintf(
+		"PubMed bulk %s limit exceeded: observed %d, limit %d",
+		limitError.Kind,
+		limitError.Observed,
+		limitError.Limit,
+	)
+}
+
+func (limitError *BulkLimitError) Unwrap() error {
+	switch limitError.Kind {
+	case BulkLimitUncompressedBytes:
+		return ErrBulkUncompressedTooLarge
+	case BulkLimitEvents:
+		return ErrBulkTooManyEvents
+	default:
+		return nil
+	}
+}
+
+type BulkLimits struct {
+	MaxRecordBytes       int64
+	MaxUncompressedBytes int64
+	MaxEvents            int64
+}
 
 type BulkFile struct {
 	Name   string
@@ -124,21 +169,25 @@ type Importer struct {
 	sink                   Sink
 	checkpoints            Checkpoint
 	maxCompressedFileBytes int64
-	maxRecordBytes         int64
+	limits                 BulkLimits
 	tempDir                string
 }
 
 func NewImporter(sink Sink, checkpoints Checkpoint) (*Importer, error) {
 	return NewImporterWithConfig(sink, checkpoints, ImporterConfig{
 		MaxCompressedFileBytes: DefaultMaxCompressedFileBytes,
-		MaxRecordBytes:         DefaultMaxBulkRecordBytes,
-		TempDir:                os.TempDir(),
+		Limits: BulkLimits{
+			MaxRecordBytes:       DefaultMaxBulkRecordBytes,
+			MaxUncompressedBytes: DefaultMaxBulkUncompressedBytes,
+			MaxEvents:            DefaultMaxBulkEvents,
+		},
+		TempDir: os.TempDir(),
 	})
 }
 
 type ImporterConfig struct {
 	MaxCompressedFileBytes int64
-	MaxRecordBytes         int64
+	Limits                 BulkLimits
 	TempDir                string
 }
 
@@ -156,12 +205,8 @@ func NewImporterWithConfig(
 	if config.MaxCompressedFileBytes <= 0 {
 		return nil, errors.New("PubMed compressed bulk file spool limit must be positive")
 	}
-	maxRecordBytes := config.MaxRecordBytes
-	if maxRecordBytes == 0 {
-		maxRecordBytes = DefaultMaxBulkRecordBytes
-	}
-	if maxRecordBytes < 0 {
-		return nil, errors.New("PubMed expanded bulk record capture limit must be positive")
+	if err := validateBulkLimits(config.Limits); err != nil {
+		return nil, err
 	}
 	tempDir := strings.TrimSpace(config.TempDir)
 	if tempDir == "" {
@@ -171,9 +216,22 @@ func NewImporterWithConfig(
 		sink:                   sink,
 		checkpoints:            checkpoints,
 		maxCompressedFileBytes: config.MaxCompressedFileBytes,
-		maxRecordBytes:         maxRecordBytes,
+		limits:                 config.Limits,
 		tempDir:                tempDir,
 	}, nil
+}
+
+func validateBulkLimits(limits BulkLimits) error {
+	if limits.MaxRecordBytes <= 0 {
+		return errors.New("PubMed expanded bulk record capture limit must be positive")
+	}
+	if limits.MaxUncompressedBytes <= 0 {
+		return errors.New("PubMed bulk uncompressed byte limit must be positive")
+	}
+	if limits.MaxEvents <= 0 {
+		return errors.New("PubMed bulk event limit must be positive")
+	}
+	return nil
 }
 
 func (importer *Importer) ImportBaseline(
@@ -540,7 +598,7 @@ func (importer *Importer) importFile(
 		filePosition,
 		spool,
 		transaction,
-		importer.maxRecordBytes,
+		importer.limits,
 	)
 	if err != nil {
 		return Progress{}, err
@@ -660,7 +718,7 @@ func importSpooledFile(
 	filePosition SourcePosition,
 	spool io.Reader,
 	transaction FileTransaction,
-	maxRecordBytes int64,
+	limits BulkLimits,
 ) (int64, error) {
 	gzipReader, err := gzip.NewReader(spool)
 	if err != nil {
@@ -668,7 +726,7 @@ func importSpooledFile(
 	}
 
 	var lastOrdinal int64
-	scanErr := scanBulkEvents(gzipReader, maxRecordBytes, func(event bulkEvent) error {
+	scanErr := scanBulkEvents(ctx, gzipReader, limits, func(event bulkEvent) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -744,19 +802,31 @@ type bulkEvent struct {
 }
 
 func scanBulkEvents(
+	ctx context.Context,
 	reader io.Reader,
-	maxRecordBytes int64,
+	limits BulkLimits,
 	yield func(bulkEvent) error,
 ) error {
-	if maxRecordBytes <= 0 {
-		return errors.New("PubMed expanded bulk record capture limit must be positive")
+	if ctx == nil {
+		return errors.New("PubMed bulk scan context is required")
 	}
-	capture := newCaptureReader(reader, maxRecordBytes)
+	if err := validateBulkLimits(limits); err != nil {
+		return err
+	}
+	bounded := &uncompressedLimitReader{
+		ctx:    ctx,
+		reader: reader,
+		limit:  limits.MaxUncompressedBytes,
+	}
+	capture := newCaptureReader(bounded, limits.MaxRecordBytes)
 	decoder := xml.NewDecoder(capture)
 	depth := 0
 	var ordinal int64
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		startOffset := decoder.InputOffset()
 		token, err := decoder.Token()
 		if errors.Is(err, io.EOF) {
@@ -771,6 +841,13 @@ func scanBulkEvents(
 			if depth == 1 &&
 				(value.Name.Local == "PubmedArticle" ||
 					value.Name.Local == "DeleteCitation") {
+				if ordinal >= limits.MaxEvents {
+					return &BulkLimitError{
+						Kind:     BulkLimitEvents,
+						Limit:    limits.MaxEvents,
+						Observed: ordinal + 1,
+					}
+				}
 				capture.discardBefore(startOffset)
 				if err := capture.beginCapture(startOffset); err != nil {
 					return fmt.Errorf(
@@ -785,6 +862,9 @@ func scanBulkEvents(
 				}
 				elementDepth := 1
 				for elementDepth > 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
 					next, err := decoder.Token()
 					if err != nil {
 						return fmt.Errorf(
@@ -823,6 +903,40 @@ func scanBulkEvents(
 		}
 		capture.discardBefore(decoder.InputOffset())
 	}
+}
+
+type uncompressedLimitReader struct {
+	ctx      context.Context
+	reader   io.Reader
+	limit    int64
+	consumed int64
+}
+
+func (reader *uncompressedLimitReader) Read(payload []byte) (int, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, err
+	}
+	remaining := reader.limit - reader.consumed
+	if remaining > 0 {
+		if int64(len(payload)) > remaining {
+			payload = payload[:remaining]
+		}
+		count, err := reader.reader.Read(payload)
+		reader.consumed += int64(count)
+		return count, err
+	}
+
+	var probe [1]byte
+	count, err := reader.reader.Read(probe[:])
+	if count > 0 {
+		reader.consumed++
+		return 0, &BulkLimitError{
+			Kind:     BulkLimitUncompressedBytes,
+			Limit:    reader.limit,
+			Observed: reader.consumed,
+		}
+	}
+	return 0, err
 }
 
 type deleteCitationXML struct {

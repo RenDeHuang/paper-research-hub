@@ -301,6 +301,7 @@ func TestImporterRejectsCompressedInputBeyondExplicitSpoolLimit(t *testing.T) {
 	checkpoints := newMemoryCheckpoint()
 	importer, err := pubmed.NewImporterWithConfig(sink, checkpoints, pubmed.ImporterConfig{
 		MaxCompressedFileBytes: int64(len(payload) - 1),
+		Limits:                 defaultBulkLimits(),
 	})
 	if err != nil {
 		t.Fatalf("NewImporterWithConfig() error = %v", err)
@@ -385,9 +386,11 @@ func TestImporterAbortsOversizedExpandedRecordWithoutDurableMutation(t *testing.
 	file := compressedBulkFile(t, "pubmed26n0001.xml.gz", []byte(payload))
 	sink := newMemorySink()
 	checkpoints := newMemoryCheckpoint()
+	limits := defaultBulkLimits()
+	limits.MaxRecordBytes = 512
 	importer, err := pubmed.NewImporterWithConfig(sink, checkpoints, pubmed.ImporterConfig{
 		MaxCompressedFileBytes: int64(len(payload)),
-		MaxRecordBytes:         512,
+		Limits:                 limits,
 	})
 	if err != nil {
 		t.Fatalf("NewImporterWithConfig() error = %v", err)
@@ -408,6 +411,182 @@ func TestImporterAbortsOversizedExpandedRecordWithoutDurableMutation(t *testing.
 	}
 	if _, ok, loadErr := checkpoints.Load(context.Background(), "oversized-expanded-record"); loadErr != nil || ok {
 		t.Fatalf("checkpoint after oversized record = ok %v, error %v", ok, loadErr)
+	}
+}
+
+func TestImporterAbortsHighlyCompressedSmallTokensAtTotalByteLimit(t *testing.T) {
+	t.Parallel()
+
+	payload := `<PubmedArticleSet>` +
+		bulkArticleXML("123") +
+		strings.Repeat(`<!--small-->`, 120_000) +
+		`</PubmedArticleSet>`
+	file := compressedBulkFile(t, "pubmed26n0001.xml.gz", []byte(payload))
+	sink := newMemorySink()
+	checkpoints := newMemoryCheckpoint()
+	limits := defaultBulkLimits()
+	limits.MaxRecordBytes = 512
+	limits.MaxUncompressedBytes = 4096
+	limits.MaxEvents = 100
+	importer, err := pubmed.NewImporterWithConfig(sink, checkpoints, pubmed.ImporterConfig{
+		MaxCompressedFileBytes: int64(len(payload)),
+		Limits:                 limits,
+	})
+	if err != nil {
+		t.Fatalf("NewImporterWithConfig() error = %v", err)
+	}
+
+	err = importer.ImportBaseline(context.Background(), pubmed.BaselineImport{
+		Job:  "bounded-total-expansion",
+		Year: 2026,
+	}, []pubmed.BulkFile{file})
+	if !errors.Is(err, pubmed.ErrBulkUncompressedTooLarge) {
+		t.Fatalf("ImportBaseline() error = %v, want ErrBulkUncompressedTooLarge", err)
+	}
+	if sink.Aborts() != 1 {
+		t.Fatalf("transaction aborts = %d, want 1", sink.Aborts())
+	}
+	if len(sink.Upserts()) != 0 || len(sink.Deletions()) != 0 {
+		t.Fatal("total expansion overflow committed staged mutations")
+	}
+	if _, ok, loadErr := checkpoints.Load(context.Background(), "bounded-total-expansion"); loadErr != nil || ok {
+		t.Fatalf("checkpoint after expansion overflow = ok %v, error %v", ok, loadErr)
+	}
+}
+
+func TestImporterAbortsFileBeyondBulkEventLimit(t *testing.T) {
+	t.Parallel()
+
+	payload := `<PubmedArticleSet>` +
+		bulkArticleXML("101") +
+		bulkArticleXML("102") +
+		bulkArticleXML("103") +
+		`</PubmedArticleSet>`
+	file := compressedBulkFile(t, "pubmed26n0001.xml.gz", []byte(payload))
+	sink := newMemorySink()
+	checkpoints := newMemoryCheckpoint()
+	limits := defaultBulkLimits()
+	limits.MaxRecordBytes = 512
+	limits.MaxUncompressedBytes = int64(len(payload))
+	limits.MaxEvents = 2
+	importer, err := pubmed.NewImporterWithConfig(sink, checkpoints, pubmed.ImporterConfig{
+		MaxCompressedFileBytes: int64(len(payload)),
+		Limits:                 limits,
+	})
+	if err != nil {
+		t.Fatalf("NewImporterWithConfig() error = %v", err)
+	}
+
+	err = importer.ImportBaseline(context.Background(), pubmed.BaselineImport{
+		Job:  "bounded-bulk-events",
+		Year: 2026,
+	}, []pubmed.BulkFile{file})
+	if !errors.Is(err, pubmed.ErrBulkTooManyEvents) {
+		t.Fatalf("ImportBaseline() error = %v, want ErrBulkTooManyEvents", err)
+	}
+	if sink.Aborts() != 1 {
+		t.Fatalf("transaction aborts = %d, want 1", sink.Aborts())
+	}
+	if len(sink.Upserts()) != 0 || len(sink.Deletions()) != 0 {
+		t.Fatal("event overflow committed staged mutations")
+	}
+	if _, ok, loadErr := checkpoints.Load(context.Background(), "bounded-bulk-events"); loadErr != nil || ok {
+		t.Fatalf("checkpoint after event overflow = ok %v, error %v", ok, loadErr)
+	}
+}
+
+func TestImporterJoinsExpansionLimitAndAbortFailures(t *testing.T) {
+	t.Parallel()
+
+	payload := `<PubmedArticleSet>` +
+		bulkArticleXML("123") +
+		strings.Repeat(`<!--small-->`, 120_000) +
+		`</PubmedArticleSet>`
+	file := compressedBulkFile(t, "pubmed26n0001.xml.gz", []byte(payload))
+	abortErr := errors.New("abort failed")
+	transaction := &abortProbeTransaction{
+		cancelParent: func() {},
+		abortErr:     abortErr,
+	}
+	limits := defaultBulkLimits()
+	limits.MaxRecordBytes = 512
+	limits.MaxUncompressedBytes = 4096
+	limits.MaxEvents = 100
+	importer, err := pubmed.NewImporterWithConfig(
+		&singleTransactionSink{transaction: transaction},
+		newMemoryCheckpoint(),
+		pubmed.ImporterConfig{
+			MaxCompressedFileBytes: int64(len(payload)),
+			Limits:                 limits,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewImporterWithConfig() error = %v", err)
+	}
+
+	err = importer.ImportBaseline(context.Background(), pubmed.BaselineImport{
+		Job:  "expansion-abort-join",
+		Year: 2026,
+	}, []pubmed.BulkFile{file})
+	if !errors.Is(err, pubmed.ErrBulkUncompressedTooLarge) ||
+		!errors.Is(err, abortErr) {
+		t.Fatalf("ImportBaseline() error = %v, want joined expansion and abort failures", err)
+	}
+	if transaction.abortCalls != 1 ||
+		transaction.abortContextErr != nil ||
+		!transaction.abortHasDeadline ||
+		transaction.abortTimeout < 4*time.Second ||
+		transaction.abortTimeout > 5*time.Second {
+		t.Fatalf("Abort() observations = %#v", transaction)
+	}
+}
+
+func TestImporterConfigRequiresEveryBulkLimit(t *testing.T) {
+	t.Parallel()
+
+	validLimits := defaultBulkLimits()
+	tests := []struct {
+		name   string
+		limits pubmed.BulkLimits
+	}{
+		{
+			name: "record bytes",
+			limits: pubmed.BulkLimits{
+				MaxUncompressedBytes: validLimits.MaxUncompressedBytes,
+				MaxEvents:            validLimits.MaxEvents,
+			},
+		},
+		{
+			name: "uncompressed bytes",
+			limits: pubmed.BulkLimits{
+				MaxRecordBytes: validLimits.MaxRecordBytes,
+				MaxEvents:      validLimits.MaxEvents,
+			},
+		},
+		{
+			name: "events",
+			limits: pubmed.BulkLimits{
+				MaxRecordBytes:       validLimits.MaxRecordBytes,
+				MaxUncompressedBytes: validLimits.MaxUncompressedBytes,
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if importer, err := pubmed.NewImporterWithConfig(
+				newMemorySink(),
+				newMemoryCheckpoint(),
+				pubmed.ImporterConfig{
+					MaxCompressedFileBytes: 1024,
+					Limits:                 tt.limits,
+				},
+			); err == nil {
+				t.Fatalf("NewImporterWithConfig() = %#v, want invalid limit error", importer)
+			}
+		})
 	}
 }
 
@@ -592,6 +771,19 @@ func compressedBulkFile(t *testing.T, fileName string, payload []byte) pubmed.Bu
 			return io.NopCloser(bytes.NewReader(data)), nil
 		},
 	}
+}
+
+func defaultBulkLimits() pubmed.BulkLimits {
+	return pubmed.BulkLimits{
+		MaxRecordBytes:       pubmed.DefaultMaxBulkRecordBytes,
+		MaxUncompressedBytes: pubmed.DefaultMaxBulkUncompressedBytes,
+		MaxEvents:            pubmed.DefaultMaxBulkEvents,
+	}
+}
+
+func bulkArticleXML(pmid string) string {
+	return `<PubmedArticle><MedlineCitation><PMID>` + pmid +
+		`</PMID><Article/></MedlineCitation></PubmedArticle>`
 }
 
 type memorySink struct {
