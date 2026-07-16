@@ -255,10 +255,23 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"jcr_import_receipt_aliases_immutable",
 		"jcr_import_receipt_metrics_immutable",
 		"jcr_import_receipts_metric_integrity",
-		"jcr_import_receipt_metrics_integrity",
-		"venue_metric_snapshots_receipt_integrity",
 		"venue_policy_assessments_venue_type_semantics",
 	})
+	var rowLevelCountTriggers int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_trigger
+		WHERE NOT tgisinternal
+		  AND tgname IN (
+		      'jcr_import_receipt_metrics_integrity',
+		      'venue_metric_snapshots_receipt_integrity'
+		  )
+	`).Scan(&rowLevelCountTriggers); err != nil {
+		t.Fatalf("query removed row-level JCR count triggers: %v", err)
+	}
+	if rowLevelCountTriggers != 0 {
+		t.Fatalf("row-level JCR count triggers = %d, want 0", rowLevelCountTriggers)
+	}
 	assertNamesExist(t, pool, `
 		SELECT indexname
 		FROM pg_indexes
@@ -274,6 +287,7 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"idx_venue_metric_snapshots_import_receipt",
 		"idx_jcr_import_receipt_aliases_alias",
 		"idx_jcr_import_receipt_metrics_metric",
+		"idx_jcr_import_receipt_metrics_receipt_metric",
 		"idx_fulltext_assets_public",
 	})
 
@@ -768,7 +782,9 @@ func TestJCRIntegrityFollowupBackfillsUniqueLegacyUnchangedReceipt(t *testing.T)
 	}
 }
 
-func TestJCRIntegrityFollowupBackfillsDuplicateRowsForOneLegacyMetricKey(t *testing.T) {
+func TestJCRIntegrityFollowupBackfillsSingleCandidateUsingReceiptMultiplicity(t *testing.T) {
+	const multiplicity = 7
+
 	migrations, err := EmbeddedMigrations()
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
@@ -805,10 +821,10 @@ func TestJCRIntegrityFollowupBackfillsDuplicateRowsForOneLegacyMetricKey(t *test
 			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
 		) VALUES (
 			'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
-			'synthetic-jcr-fixture', '2026-01-01T00:00:00Z', 2, 0, 2
+			'synthetic-jcr-fixture', '2026-01-01T00:00:00Z', $1, 0, $1
 		)
 		RETURNING id
-	`), &receiptID)
+	`, multiplicity), &receiptID)
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO jcr_import_receipt_aliases (import_receipt_id, venue_alias_id)
 		VALUES ($1, $2)
@@ -828,8 +844,72 @@ func TestJCRIntegrityFollowupBackfillsDuplicateRowsForOneLegacyMetricKey(t *test
 	`, receiptID, metricID).Scan(&links); err != nil {
 		t.Fatalf("query duplicate legacy receipt links: %v", err)
 	}
-	if links != 2 {
-		t.Fatalf("duplicate legacy receipt links = %d, want 2", links)
+	if links != multiplicity {
+		t.Fatalf(
+			"single-candidate legacy receipt links = %d, want multiplicity %d",
+			links,
+			multiplicity,
+		)
+	}
+}
+
+func TestJCRIntegrityFollowupRejectsLegacyStateAmbiguousBetweenAAAndAB(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:3]); err != nil {
+		t.Fatalf("apply migrations through 000003: %v", err)
+	}
+
+	var venueID, aliasID, receiptID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'AA Versus AB Legacy Journal')
+		RETURNING id
+	`), &venueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_aliases (venue_id, alias, source)
+		VALUES ($1, 'AA Versus AB Legacy Journal', 'synthetic-jcr-fixture')
+		RETURNING id
+	`, venueID), &aliasID)
+	for _, category := range []string{"Candidate A", "Candidate B"} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO venue_metric_snapshots (
+				venue_id, metric_year, category, jif, quartile, metric_status,
+				source_name, source_license, captured_at
+			) VALUES (
+				$1, 2025, $2, 10, 'Q1', 'known',
+				'synthetic-jcr-fixture', 'license-a', '2025-01-01T00:00:00Z'
+			)
+		`, venueID, category); err != nil {
+			t.Fatalf("insert ambiguous candidate %q: %v", category, err)
+		}
+	}
+	const fileSHA = "cececececececececececececececececececececececececececececececece"
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			$1, 'synthetic-jcr-fixture', '2026-01-01T00:00:00Z', 2, 0, 2
+		)
+		RETURNING id
+	`, fileSHA), &receiptID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_aliases (import_receipt_id, venue_alias_id)
+		VALUES ($1, $2)
+	`, receiptID, aliasID); err != nil {
+		t.Fatalf("link A/A versus A/B legacy receipt alias: %v", err)
+	}
+
+	err = Up(ctx, pool)
+	if err == nil ||
+		!strings.Contains(err.Error(), "cannot deterministically associate legacy JCR receipt") ||
+		!strings.Contains(err.Error(), fileSHA) ||
+		!strings.Contains(err.Error(), "exact candidate metric keys 2") {
+		t.Fatalf("upgrade A/A versus A/B ambiguous receipt error = %v", err)
 	}
 }
 
@@ -985,7 +1065,7 @@ func TestJCRIntegrityFollowupEnforcesDeferredReceiptRowAssociations(t *testing.T
 		}
 	})
 
-	t.Run("later metric cannot overstate inserted rows", func(t *testing.T) {
+	t.Run("metric receipt foreign key is immutable", func(t *testing.T) {
 		pool := openMigratedTestPool(t)
 		ctx := testContext(t)
 		var venueID string
@@ -1031,30 +1111,120 @@ func TestJCRIntegrityFollowupEnforcesDeferredReceiptRowAssociations(t *testing.T
 			t.Fatalf("commit valid receipt creator transaction: %v", err)
 		}
 
-		tx, err = pool.Begin(ctx)
-		if err != nil {
-			t.Fatalf("begin overstated receipt creator transaction: %v", err)
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO venue_metric_snapshots (
-				venue_id, metric_year, category, jif, quartile, metric_status,
-				source_name, source_license, captured_at, jcr_import_receipt_id
-			) VALUES (
-				$1, 2025, 'Unexpected Extra Creator Category', 9, 'Q2', 'known',
-				'synthetic-jcr-fixture', 'license-a', now(), $2
-			)
-		`, venueID, receiptID); err != nil {
-			_ = tx.Rollback(context.Background())
-			t.Fatalf("insert extra receipt creator metric: %v", err)
-		}
-		err = tx.Commit(ctx)
-		var postgresError *pgconn.PgError
-		if err == nil ||
-			!errors.As(err, &postgresError) ||
-			postgresError.Code != "23514" {
-			t.Fatalf("commit extra receipt creator error = %v, want deferred check violation", err)
+		if _, err := pool.Exec(ctx, `
+			UPDATE venue_metric_snapshots
+			SET jcr_import_receipt_id = NULL
+			WHERE id = $1
+		`, metricID); err == nil {
+			t.Fatal("metric import receipt foreign key mutation was accepted")
 		}
 	})
+}
+
+func TestJCRIntegrityFollowupRunsDeferredCountOncePerReceipt(t *testing.T) {
+	const rowCount = 1000
+
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+	connection, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire trigger audit connection: %v", err)
+	}
+	defer connection.Release()
+
+	if _, err := connection.Exec(ctx, `
+		CREATE TEMP TABLE jcr_receipt_trigger_audit (
+			receipt_id uuid NOT NULL
+		);
+
+		CREATE OR REPLACE FUNCTION enforce_jcr_import_receipt_metric_integrity()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			INSERT INTO pg_temp.jcr_receipt_trigger_audit (receipt_id)
+			VALUES (NEW.id);
+			RETURN NULL;
+		END;
+		$$;
+	`); err != nil {
+		t.Fatalf("instrument JCR receipt integrity trigger: %v", err)
+	}
+
+	var venueID string
+	mustScanID(t, connection.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'High Row Count Receipt Journal')
+		RETURNING id
+	`), &venueID)
+
+	tx, err := connection.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin high-row receipt transaction: %v", err)
+	}
+	var receiptID string
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			'efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef',
+			'synthetic-jcr-fixture', now(), $1, $1, 0
+		)
+		RETURNING id
+	`, rowCount), &receiptID)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at, jcr_import_receipt_id
+		)
+		SELECT
+			$1,
+			2025,
+			'High Row Category ' || series,
+			10,
+			'Q1',
+			'known',
+			'synthetic-jcr-fixture',
+			'license-a',
+			now(),
+			$2
+		FROM generate_series(1, $3) AS series
+	`, venueID, receiptID, rowCount); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("insert high-row metric snapshots: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_metrics (
+			import_receipt_id,
+			metric_snapshot_id
+		)
+		SELECT
+			$1,
+			id
+		FROM venue_metric_snapshots
+		WHERE jcr_import_receipt_id = $1
+	`, receiptID); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("insert high-row receipt associations: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit high-row receipt transaction: %v", err)
+	}
+
+	var triggerCalls int
+	if err := connection.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_temp.jcr_receipt_trigger_audit
+	`).Scan(&triggerCalls); err != nil {
+		t.Fatalf("count JCR receipt integrity trigger calls: %v", err)
+	}
+	if triggerCalls != 1 {
+		t.Fatalf(
+			"JCR deferred count trigger calls = %d for %d rows, want 1 receipt-level call",
+			triggerCalls,
+			rowCount,
+		)
+	}
 }
 
 func TestJCRIntegrityFollowupRejectsInvalidHistoricalPolicyAssessments(t *testing.T) {

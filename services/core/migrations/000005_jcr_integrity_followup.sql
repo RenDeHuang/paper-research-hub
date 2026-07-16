@@ -1,6 +1,9 @@
 ALTER TABLE jcr_import_receipt_metrics
     DROP CONSTRAINT jcr_import_receipt_metrics_receipt_metric_key;
 
+CREATE INDEX idx_jcr_import_receipt_metrics_receipt_metric
+    ON jcr_import_receipt_metrics(import_receipt_id, metric_snapshot_id);
+
 DO $$
 DECLARE
     receipt record;
@@ -8,8 +11,8 @@ DECLARE
     missing_links integer;
     candidate_links integer;
     invalid_existing_links integer;
-    backfilled_links integer;
-    candidate record;
+    candidate_metric_id uuid;
+    backfilled_link integer;
 BEGIN
     FOR receipt IN
         SELECT
@@ -76,10 +79,7 @@ BEGIN
           );
 
         IF invalid_existing_links <> 0
-           OR (
-               candidate_links <> 1
-               AND candidate_links <> receipt.input_rows
-           ) THEN
+           OR candidate_links <> 1 THEN
             RAISE EXCEPTION
                 'cannot deterministically associate legacy JCR receipt % (%): missing rows %, exact candidate metric keys %, invalid existing links %',
                 receipt.id,
@@ -91,70 +91,27 @@ BEGIN
                       CONSTRAINT = 'jcr_import_receipts_metric_association_integrity';
         END IF;
 
-        backfilled_links := 0;
-        FOR candidate IN
-            SELECT DISTINCT
-                metric.id,
-                metric.venue_id,
-                metric.metric_year,
-                metric.category
-            FROM jcr_import_receipt_aliases AS receipt_alias
-            JOIN venue_aliases AS alias
-              ON alias.id = receipt_alias.venue_alias_id
-            JOIN venue_metric_snapshots AS metric
-              ON metric.venue_id = alias.venue_id
-            WHERE receipt_alias.import_receipt_id = receipt.id
-              AND alias.source = receipt.source
-              AND metric.source_name = receipt.source
-              AND metric.captured_at <= receipt.imported_at
-              AND (
-                  candidate_links = 1
-                  OR NOT EXISTS (
-                      SELECT 1
-                      FROM jcr_import_receipt_metrics AS existing
-                      WHERE existing.import_receipt_id = receipt.id
-                        AND existing.metric_snapshot_id = metric.id
-                  )
-              )
-            ORDER BY
-                metric.venue_id,
-                metric.metric_year,
-                metric.category,
-                metric.id
-        LOOP
+        SELECT DISTINCT metric.id
+        INTO candidate_metric_id
+        FROM jcr_import_receipt_aliases AS receipt_alias
+        JOIN venue_aliases AS alias
+          ON alias.id = receipt_alias.venue_alias_id
+        JOIN venue_metric_snapshots AS metric
+          ON metric.venue_id = alias.venue_id
+        WHERE receipt_alias.import_receipt_id = receipt.id
+          AND alias.source = receipt.source
+          AND metric.source_name = receipt.source
+          AND metric.captured_at <= receipt.imported_at;
+
+        FOR backfilled_link IN 1..missing_links LOOP
             INSERT INTO jcr_import_receipt_metrics (
                 import_receipt_id,
                 metric_snapshot_id
             ) VALUES (
                 receipt.id,
-                candidate.id
+                candidate_metric_id
             );
-            backfilled_links := backfilled_links + 1;
-
-            IF candidate_links = 1 THEN
-                WHILE backfilled_links < missing_links LOOP
-                    INSERT INTO jcr_import_receipt_metrics (
-                        import_receipt_id,
-                        metric_snapshot_id
-                    ) VALUES (
-                        receipt.id,
-                        candidate.id
-                    );
-                    backfilled_links := backfilled_links + 1;
-                END LOOP;
-            END IF;
         END LOOP;
-
-        IF backfilled_links <> missing_links THEN
-            RAISE EXCEPTION
-                'cannot deterministically associate legacy JCR receipt % (%): backfilled rows % do not equal missing rows %',
-                receipt.id,
-                receipt.file_sha256,
-                backfilled_links,
-                missing_links
-                USING ERRCODE = '23514',
-                      CONSTRAINT = 'jcr_import_receipts_metric_association_integrity';
-        END IF;
     END LOOP;
 END;
 $$;
@@ -168,6 +125,7 @@ BEGIN
         receipt.file_sha256,
         receipt.input_rows,
         receipt.inserted_rows,
+        receipt.unchanged_rows,
         count(receipt_metric.id) AS associated_rows,
         (
             SELECT count(*)
@@ -182,7 +140,8 @@ BEGIN
         receipt.id,
         receipt.file_sha256,
         receipt.input_rows,
-        receipt.inserted_rows
+        receipt.inserted_rows,
+        receipt.unchanged_rows
     HAVING
         count(receipt_metric.id) <> receipt.input_rows
         OR (
@@ -190,18 +149,25 @@ BEGIN
             FROM venue_metric_snapshots AS inserted_metric
             WHERE inserted_metric.jcr_import_receipt_id = receipt.id
         ) <> receipt.inserted_rows
+        OR count(receipt_metric.id) - (
+            SELECT count(*)
+            FROM venue_metric_snapshots AS inserted_metric
+            WHERE inserted_metric.jcr_import_receipt_id = receipt.id
+        ) <> receipt.unchanged_rows
     ORDER BY receipt.id
     LIMIT 1;
 
     IF FOUND THEN
         RAISE EXCEPTION
-            'invalid historical JCR receipt % (%): associated rows %/%; creator rows %/%',
+            'invalid historical JCR receipt % (%): associated rows %/%; creator rows %/%; unchanged rows %/%',
             invalid_receipt.id,
             invalid_receipt.file_sha256,
             invalid_receipt.associated_rows,
             invalid_receipt.input_rows,
             invalid_receipt.creator_rows,
-            invalid_receipt.inserted_rows
+            invalid_receipt.inserted_rows,
+            invalid_receipt.associated_rows - invalid_receipt.creator_rows,
+            invalid_receipt.unchanged_rows
             USING ERRCODE = '23514',
                   CONSTRAINT = 'jcr_import_receipts_metric_association_integrity';
     END IF;
@@ -216,31 +182,17 @@ DECLARE
     target_receipt_id uuid;
     declared_input_rows integer;
     declared_inserted_rows integer;
+    declared_unchanged_rows integer;
     associated_rows integer;
     creator_rows integer;
 BEGIN
-    IF TG_TABLE_NAME = 'jcr_import_receipts' THEN
-        target_receipt_id := NEW.id;
-    ELSIF TG_TABLE_NAME = 'venue_metric_snapshots' THEN
-        IF TG_OP = 'DELETE' THEN
-            target_receipt_id := OLD.jcr_import_receipt_id;
-        ELSE
-            target_receipt_id := NEW.jcr_import_receipt_id;
-        END IF;
-    ELSE
-        IF TG_OP = 'DELETE' THEN
-            target_receipt_id := OLD.import_receipt_id;
-        ELSE
-            target_receipt_id := NEW.import_receipt_id;
-        END IF;
-    END IF;
+    target_receipt_id := NEW.id;
 
-    IF target_receipt_id IS NULL THEN
-        RETURN NULL;
-    END IF;
-
-    SELECT input_rows, inserted_rows
-    INTO declared_input_rows, declared_inserted_rows
+    SELECT input_rows, inserted_rows, unchanged_rows
+    INTO
+        declared_input_rows,
+        declared_inserted_rows,
+        declared_unchanged_rows
     FROM jcr_import_receipts
     WHERE id = target_receipt_id;
 
@@ -259,14 +211,17 @@ BEGIN
     WHERE jcr_import_receipt_id = target_receipt_id;
 
     IF associated_rows <> declared_input_rows
-       OR creator_rows <> declared_inserted_rows THEN
+       OR creator_rows <> declared_inserted_rows
+       OR associated_rows - creator_rows <> declared_unchanged_rows THEN
         RAISE EXCEPTION
-            'JCR receipt % integrity mismatch: associated rows %/%; creator rows %/%',
+            'JCR receipt % integrity mismatch: associated rows %/%; creator rows %/%; unchanged rows %/%',
             target_receipt_id,
             associated_rows,
             declared_input_rows,
             creator_rows,
-            declared_inserted_rows
+            declared_inserted_rows,
+            associated_rows - creator_rows,
+            declared_unchanged_rows
             USING ERRCODE = '23514',
                   CONSTRAINT = 'jcr_import_receipts_metric_association_integrity';
     END IF;
@@ -277,18 +232,6 @@ $$;
 
 CREATE CONSTRAINT TRIGGER jcr_import_receipts_metric_integrity
 AFTER INSERT ON jcr_import_receipts
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW
-EXECUTE FUNCTION enforce_jcr_import_receipt_metric_integrity();
-
-CREATE CONSTRAINT TRIGGER jcr_import_receipt_metrics_integrity
-AFTER INSERT OR UPDATE OR DELETE ON jcr_import_receipt_metrics
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW
-EXECUTE FUNCTION enforce_jcr_import_receipt_metric_integrity();
-
-CREATE CONSTRAINT TRIGGER venue_metric_snapshots_receipt_integrity
-AFTER INSERT OR UPDATE OR DELETE ON venue_metric_snapshots
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW
 EXECUTE FUNCTION enforce_jcr_import_receipt_metric_integrity();
