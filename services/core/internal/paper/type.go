@@ -5,12 +5,11 @@ import "fmt"
 type PaperType string
 
 const (
-	PaperTypeResearchArticle    PaperType = "research_article"
-	PaperTypeReview             PaperType = "review"
-	PaperTypePreprint           PaperType = "preprint"
-	PaperTypeProceedingsArticle PaperType = "proceedings_article"
-	PaperTypeDataset            PaperType = "dataset"
-	PaperTypeOther              PaperType = "other"
+	PaperTypeResearchArticle PaperType = "research_article"
+	PaperTypeReview          PaperType = "review"
+	PaperTypePreprint        PaperType = "preprint"
+	PaperTypeDataset         PaperType = "dataset"
+	PaperTypeBenchmark       PaperType = "benchmark"
 )
 
 func NewPaperType(raw string) (PaperType, error) {
@@ -26,9 +25,8 @@ func (paperType PaperType) Valid() bool {
 	case PaperTypeResearchArticle,
 		PaperTypeReview,
 		PaperTypePreprint,
-		PaperTypeProceedingsArticle,
 		PaperTypeDataset,
-		PaperTypeOther:
+		PaperTypeBenchmark:
 		return true
 	default:
 		return false

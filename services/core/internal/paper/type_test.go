@@ -9,9 +9,8 @@ func TestNewPaperTypeAcceptsExactlyControlledValues(t *testing.T) {
 		PaperTypeResearchArticle,
 		PaperTypeReview,
 		PaperTypePreprint,
-		PaperTypeProceedingsArticle,
 		PaperTypeDataset,
-		PaperTypeOther,
+		PaperTypeBenchmark,
 	}
 	for _, want := range valid {
 		want := want
@@ -36,7 +35,8 @@ func TestNewPaperTypeAcceptsExactlyControlledValues(t *testing.T) {
 
 	for _, raw := range []string{
 		"",
-		"benchmark",
+		"proceedings_article",
+		"other",
 		"research-article",
 		"RESEARCH_ARTICLE",
 		" research_article ",

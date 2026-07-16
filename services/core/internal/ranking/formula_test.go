@@ -630,7 +630,7 @@ func TestCitationPercentileRejectsIncompleteCohortAndMissingValues(t *testing.T)
 	}{
 		{name: "missing topic", paperType: paper.PaperTypeReview},
 		{name: "missing paper type", topic: "ml"},
-		{name: "invalid paper type", topic: "ml", paperType: paper.PaperType("benchmark")},
+		{name: "invalid paper type", topic: "ml", paperType: paper.PaperType("other")},
 	} {
 		input := input
 		t.Run(input.name, func(t *testing.T) {
