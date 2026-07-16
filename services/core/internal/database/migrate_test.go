@@ -503,7 +503,7 @@ func TestMigrationReconcilesNormalizedDuplicateWorksAndPreservesEvidence(t *test
 	var venueID string
 	mustScanID(t, pool.QueryRow(ctx, `
 		INSERT INTO venues (venue_type, display_title, issn_l)
-		VALUES ('journal', 'Merge Venue', '1234-567X')
+		VALUES ('journal', 'Merge Venue', '1234-5679')
 		RETURNING id
 	`), &venueID)
 	if _, err := pool.Exec(ctx, `
@@ -733,12 +733,12 @@ func TestMigrationRejectsConflictingDuplicateWorkMetadataWithContext(t *testing.
 				var firstVenueID, secondVenueID string
 				mustScanID(t, pool.QueryRow(ctx, `
 					INSERT INTO venues (venue_type, display_title, issn_l)
-					VALUES ('journal', 'First Venue', '1111-111X')
+					VALUES ('journal', 'First Venue', '1111-1119')
 					RETURNING id
 				`), &firstVenueID)
 				mustScanID(t, pool.QueryRow(ctx, `
 					INSERT INTO venues (venue_type, display_title, issn_l)
-					VALUES ('journal', 'Second Venue', '2222-222X')
+					VALUES ('journal', 'Second Venue', '2222-2227')
 					RETURNING id
 				`), &secondVenueID)
 				venueOne = firstVenueID
@@ -1618,21 +1618,27 @@ func TestSyntheticJCRFixtureMatchesPreexistingVenuesByExactISSN(t *testing.T) {
 	ctx := testContext(t)
 	fixture := loadJCRFixture(t)
 
-	var alphaVenueID, unknownVenueID string
+	var alphaVenueID, unknownVenueID, subthresholdVenueID string
 	mustScanID(t, pool.QueryRow(ctx, `
-		INSERT INTO venues (venue_type, display_title, issn_l)
-		VALUES ('journal', 'Preexisting Alpha Venue', '1234-567X')
+		INSERT INTO venues (venue_type, display_title, issn_l, issn, eissn)
+		VALUES ('journal', 'Preexisting Alpha Venue', '0000-0019', '0000-0027', '0000-0035')
 		RETURNING id
 	`), &alphaVenueID)
 	mustScanID(t, pool.QueryRow(ctx, `
-		INSERT INTO venues (venue_type, display_title, issn)
-		VALUES ('journal', 'Preexisting Unknown Venue', '9876-543X')
+		INSERT INTO venues (venue_type, display_title, issn_l, issn, eissn)
+		VALUES ('journal', 'Preexisting Unknown Venue', '0000-0043', '0000-0051', '0000-006X')
 		RETURNING id
 	`), &unknownVenueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l, issn, eissn)
+		VALUES ('journal', 'Preexisting Subthreshold Venue', '0000-0078', '0000-0086', '0000-0094')
+		RETURNING id
+	`), &subthresholdVenueID)
 
 	expectedVenueIDs := map[string]string{
-		"1234-567X": alphaVenueID,
-		"9876-543X": unknownVenueID,
+		"0000-0019": alphaVenueID,
+		"0000-0043": unknownVenueID,
+		"0000-0078": subthresholdVenueID,
 	}
 	var venuesBefore int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venues").Scan(&venuesBefore); err != nil {
@@ -1717,9 +1723,9 @@ func TestVenueISSNResolutionFailsExplicitlyWhenUnmatchedOrAmbiguous(t *testing.T
 	ctx := testContext(t)
 
 	_, err := resolveVenueByExactISSN(ctx, pool, map[string]string{
-		"issn_l": "0000-000X",
-		"issn":   "0000-000X",
-		"eissn":  "0000-000X",
+		"issn_l": "0000-0108",
+		"issn":   "0000-0116",
+		"eissn":  "0000-0124",
 	})
 	if err == nil || !strings.Contains(err.Error(), "no venue matches exact ISSN identifiers") {
 		t.Fatalf("unmatched ISSN resolution error = %v, want explicit no-match error", err)
@@ -1733,14 +1739,14 @@ func TestVenueISSNResolutionFailsExplicitlyWhenUnmatchedOrAmbiguous(t *testing.T
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO venues (venue_type, display_title, issn)
-		VALUES ('journal', 'Ambiguous ISSN Venue', '2718-281X')
+		VALUES ('journal', 'Ambiguous ISSN Venue', '2718-2819')
 	`); err != nil {
 		t.Fatalf("insert ambiguous ISSN venue: %v", err)
 	}
 
 	_, err = resolveVenueByExactISSN(ctx, pool, map[string]string{
 		"issn_l": "3141-592X",
-		"issn":   "2718-281X",
+		"issn":   "2718-2819",
 	})
 	if err == nil || !strings.Contains(err.Error(), "multiple venues match exact ISSN identifiers") {
 		t.Fatalf("ambiguous ISSN resolution error = %v, want explicit ambiguity error", err)
@@ -1756,14 +1762,14 @@ func TestVenueMetricsPoliciesAndFulltextConstraints(t *testing.T) {
 	mustScanID(t, pool.QueryRow(ctx, `
 		INSERT INTO venues (
 			venue_type, display_title, issn_l, issn, eissn, source_scheme, source_identifier
-		) VALUES ('journal', 'Synthetic Venue', '1111-111X', '1111-111X', '2222-222X', 'openalex', 'S111')
+		) VALUES ('journal', 'Synthetic Venue', '1111-1119', '1111-1119', '2222-2227', 'openalex', 'S111')
 		RETURNING id
 	`), &venueID)
 
 	for _, query := range []string{
-		`INSERT INTO venues (venue_type, display_title, issn_l) VALUES ('journal', 'Duplicate ISSN-L', '1111-111X')`,
-		`INSERT INTO venues (venue_type, display_title, issn) VALUES ('journal', 'Duplicate ISSN', '1111-111X')`,
-		`INSERT INTO venues (venue_type, display_title, eissn) VALUES ('journal', 'Duplicate eISSN', '2222-222X')`,
+		`INSERT INTO venues (venue_type, display_title, issn_l) VALUES ('journal', 'Duplicate ISSN-L', '1111-1119')`,
+		`INSERT INTO venues (venue_type, display_title, issn) VALUES ('journal', 'Duplicate ISSN', '1111-1119')`,
+		`INSERT INTO venues (venue_type, display_title, eissn) VALUES ('journal', 'Duplicate eISSN', '2222-2227')`,
 		`INSERT INTO venues (venue_type, display_title, source_scheme, source_identifier)
 		 VALUES ('journal', 'Duplicate Source', 'openalex', 'S111')`,
 		`INSERT INTO venues (venue_type, display_title, source_scheme)
