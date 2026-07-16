@@ -3,10 +3,12 @@ package ranking
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
@@ -360,6 +362,73 @@ func TestMethodAdoptionIsShareDeltaRatherThanTopicCountGrowth(t *testing.T) {
 	}
 }
 
+func TestMethodAdoptionCrossMultipliesBeforeSingleRounding(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	window := func(offset int) Window {
+		windowStart := start.Add(time.Duration(offset) * 24 * time.Hour)
+		return Window{Start: windowStart, End: windowStart.Add(24 * time.Hour)}
+	}
+
+	tests := []struct {
+		name            string
+		baselineAdopted int64
+		baselineTotal   int64
+		currentAdopted  int64
+		currentTotal    int64
+		want            string
+	}{
+		{
+			name:            "positive repeating delta",
+			baselineAdopted: 1,
+			baselineTotal:   6,
+			currentAdopted:  1,
+			currentTotal:    3,
+			want:            "0.166666666666666667",
+		},
+		{
+			name:            "negative repeating delta",
+			baselineAdopted: 1,
+			baselineTotal:   3,
+			currentAdopted:  1,
+			currentTotal:    6,
+			want:            "-0.166666666666666667",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := MethodAdoption(MethodAdoptionInput{
+				Baseline: &AdoptionWindow{
+					Window:  window(0),
+					Adopted: decimal.NewFromInt(tt.baselineAdopted),
+					Total:   decimal.NewFromInt(tt.baselineTotal),
+				},
+				Current: &AdoptionWindow{
+					Window:  window(1),
+					Adopted: decimal.NewFromInt(tt.currentAdopted),
+					Total:   decimal.NewFromInt(tt.currentTotal),
+				},
+			})
+			if err != nil {
+				t.Fatalf("MethodAdoption() error = %v", err)
+			}
+			threshold := decimal.RequireFromString(tt.want)
+			if got.Cmp(threshold) != 0 {
+				t.Fatalf(
+					"MethodAdoption() = %s, want exact threshold boundary %s",
+					got,
+					threshold,
+				)
+			}
+		})
+	}
+}
+
 func TestMethodAdoptionReportsMissingWindows(t *testing.T) {
 	t.Parallel()
 
@@ -430,7 +499,7 @@ func TestCitationPercentileUsesTopicMonthAndPaperTypeCohort(t *testing.T) {
 	key, err := NewCitationCohortKey(
 		"machine-learning",
 		time.Date(2026, time.July, 16, 13, 45, 0, 0, time.FixedZone("CST", 8*60*60)),
-		"research-article",
+		paper.PaperTypeResearchArticle,
 	)
 	if err != nil {
 		t.Fatalf("NewCitationCohortKey() error = %v", err)
@@ -442,17 +511,37 @@ func TestCitationPercentileUsesTopicMonthAndPaperTypeCohort(t *testing.T) {
 	if !key.Month.Equal(wantMonth) {
 		t.Fatalf("CitationCohortKey.Month = %v, want %v", key.Month, wantMonth)
 	}
-	if key.PaperType != "research-article" {
+	if key.PaperType != paper.PaperTypeResearchArticle {
 		t.Fatalf("CitationCohortKey.PaperType = %q", key.PaperType)
 	}
-	if got, want := key.String(), "machine-learning|2026-07|research-article"; got != want {
+	if got, want := key.String(), "t16:machine-learningm7:2026-07p16:research_article"; got != want {
 		t.Fatalf("CitationCohortKey.String() = %q, want %q", got, want)
 	}
 
 	got, err := CitationPercentile(CitationPercentileInput{
-		Cohort:       key,
-		Value:        decimal.NewFromInt(20),
-		CohortValues: []decimal.Decimal{decimal.NewFromInt(30), decimal.NewFromInt(20), decimal.NewFromInt(10), decimal.NewFromInt(20)},
+		Cohort: key,
+		Target: CohortObservation{
+			PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000100"),
+			Value:   decimal.NewFromInt(20),
+		},
+		Observations: []CohortObservation{
+			{
+				PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+				Value:   decimal.NewFromInt(30),
+			},
+			{
+				PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000002"),
+				Value:   decimal.NewFromInt(20),
+			},
+			{
+				PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000003"),
+				Value:   decimal.NewFromInt(10),
+			},
+			{
+				PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000004"),
+				Value:   decimal.NewFromInt(20),
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("CitationPercentile() error = %v", err)
@@ -469,7 +558,7 @@ func TestCitationCohortMonthUsesCalendarMonthWithoutTimezoneDrift(t *testing.T) 
 	key, err := NewCitationCohortKey(
 		"ml",
 		time.Date(2026, time.July, 1, 0, 30, 0, 0, time.FixedZone("UTC+14", 14*60*60)),
-		"article",
+		paper.PaperTypeReview,
 	)
 	if err != nil {
 		t.Fatalf("NewCitationCohortKey() error = %v", err)
@@ -479,16 +568,69 @@ func TestCitationCohortMonthUsesCalendarMonthWithoutTimezoneDrift(t *testing.T) 
 	}
 }
 
+func TestCitationCohortRequiresCanonicalTopicSlugOrID(t *testing.T) {
+	t.Parallel()
+
+	month := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	canonicalID := "123e4567-e89b-12d3-a456-426614174000"
+	key, err := NewCitationCohortKey(canonicalID, month, paper.PaperTypeReview)
+	if err != nil {
+		t.Fatalf("NewCitationCohortKey(canonical UUID) error = %v", err)
+	}
+	if key.Topic != canonicalID {
+		t.Fatalf("CitationCohortKey.Topic = %q, want canonical UUID", key.Topic)
+	}
+
+	for _, topic := range []string{
+		"Machine-Learning",
+		"machine_learning",
+		"machine--learning",
+		" machine-learning ",
+		"alpha|2026-07",
+		"123E4567-E89B-12D3-A456-426614174000",
+	} {
+		topic := topic
+		t.Run(topic, func(t *testing.T) {
+			t.Parallel()
+
+			if key, err := NewCitationCohortKey(
+				topic,
+				month,
+				paper.PaperTypeReview,
+			); !errors.Is(err, ErrInvalidCohort) {
+				t.Fatalf("NewCitationCohortKey(%q) = %#v, %v, want ErrInvalidCohort", topic, key, err)
+			}
+		})
+	}
+}
+
+func TestCitationCohortEncodingSeparatesFormerPipeCollisionInputs(t *testing.T) {
+	t.Parallel()
+
+	left := []string{"alpha|2026-07", "review", "dataset"}
+	right := []string{"alpha", "2026-07|review", "dataset"}
+	if strings.Join(left, "|") != strings.Join(right, "|") {
+		t.Fatal("test fixture does not collide under raw pipe joining")
+	}
+
+	leftEncoded := encodeCohortComponents(left...)
+	rightEncoded := encodeCohortComponents(right...)
+	if leftEncoded == rightEncoded {
+		t.Fatalf("length-prefixed cohort encodings collide: %q", leftEncoded)
+	}
+}
+
 func TestCitationPercentileRejectsIncompleteCohortAndMissingValues(t *testing.T) {
 	t.Parallel()
 
 	for _, input := range []struct {
 		name      string
 		topic     string
-		paperType string
+		paperType paper.PaperType
 	}{
-		{name: "missing topic", paperType: "article"},
+		{name: "missing topic", paperType: paper.PaperTypeReview},
 		{name: "missing paper type", topic: "ml"},
+		{name: "invalid paper type", topic: "ml", paperType: paper.PaperType("benchmark")},
 	} {
 		input := input
 		t.Run(input.name, func(t *testing.T) {
@@ -507,19 +649,181 @@ func TestCitationPercentileRejectsIncompleteCohortAndMissingValues(t *testing.T)
 	key, err := NewCitationCohortKey(
 		"ml",
 		time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
-		"article",
+		paper.PaperTypeReview,
 	)
 	if err != nil {
 		t.Fatalf("NewCitationCohortKey() error = %v", err)
 	}
-	_, err = CitationPercentile(CitationPercentileInput{Cohort: key})
+	_, err = CitationPercentile(CitationPercentileInput{
+		Cohort: key,
+		Target: CohortObservation{
+			PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000100"),
+			Value:   decimal.NewFromInt(20),
+		},
+	})
 	var missing *MissingSignalError
 	if !errors.As(err, &missing) {
 		t.Fatalf("CitationPercentile() error = %v, want MissingSignalError", err)
 	}
 	if missing.Signal != SignalCitationPercentile ||
-		!reflect.DeepEqual(missing.Fields, []string{"cohort_values"}) {
-		t.Fatalf("MissingSignalError = %#v, want citation_percentile cohort_values", missing)
+		!reflect.DeepEqual(missing.Fields, []string{"cohort_observations"}) {
+		t.Fatalf("MissingSignalError = %#v, want citation_percentile cohort_observations", missing)
+	}
+}
+
+func TestCitationPercentileRejectsNilOrDuplicatePaperIDs(t *testing.T) {
+	t.Parallel()
+
+	key, err := NewCitationCohortKey(
+		"ml",
+		time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+		paper.PaperTypeReview,
+	)
+	if err != nil {
+		t.Fatalf("NewCitationCohortKey() error = %v", err)
+	}
+	targetID := uuid.MustParse("00000000-0000-0000-0000-000000000100")
+	firstID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
+	tests := []struct {
+		name  string
+		input CitationPercentileInput
+	}{
+		{
+			name: "nil target ID",
+			input: CitationPercentileInput{
+				Cohort: key,
+				Target: CohortObservation{Value: decimal.NewFromInt(20)},
+				Observations: []CohortObservation{
+					{PaperID: firstID, Value: decimal.NewFromInt(10)},
+				},
+			},
+		},
+		{
+			name: "nil cohort ID",
+			input: CitationPercentileInput{
+				Cohort: key,
+				Target: CohortObservation{PaperID: targetID, Value: decimal.NewFromInt(20)},
+				Observations: []CohortObservation{
+					{Value: decimal.NewFromInt(10)},
+				},
+			},
+		},
+		{
+			name: "duplicate cohort ID",
+			input: CitationPercentileInput{
+				Cohort: key,
+				Target: CohortObservation{PaperID: targetID, Value: decimal.NewFromInt(20)},
+				Observations: []CohortObservation{
+					{PaperID: firstID, Value: decimal.NewFromInt(10)},
+					{PaperID: firstID, Value: decimal.NewFromInt(30)},
+				},
+			},
+		},
+		{
+			name: "target ID repeated in cohort",
+			input: CitationPercentileInput{
+				Cohort: key,
+				Target: CohortObservation{PaperID: targetID, Value: decimal.NewFromInt(20)},
+				Observations: []CohortObservation{
+					{PaperID: targetID, Value: decimal.NewFromInt(10)},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := CitationPercentile(tt.input); !errors.Is(err, ErrInvalidCohort) {
+				t.Fatalf("CitationPercentile() error = %v, want ErrInvalidCohort", err)
+			}
+		})
+	}
+}
+
+func TestCitationPercentileRejectsNegativeTargetOrCohortValues(t *testing.T) {
+	t.Parallel()
+
+	key, err := NewCitationCohortKey(
+		"ml",
+		time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+		paper.PaperTypeReview,
+	)
+	if err != nil {
+		t.Fatalf("NewCitationCohortKey() error = %v", err)
+	}
+	targetID := uuid.MustParse("00000000-0000-0000-0000-000000000100")
+	firstID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
+	tests := []CitationPercentileInput{
+		{
+			Cohort: key,
+			Target: CohortObservation{
+				PaperID: targetID,
+				Value:   decimal.NewFromInt(-1),
+			},
+			Observations: []CohortObservation{
+				{PaperID: firstID, Value: decimal.Zero},
+			},
+		},
+		{
+			Cohort: key,
+			Target: CohortObservation{
+				PaperID: targetID,
+				Value:   decimal.Zero,
+			},
+			Observations: []CohortObservation{
+				{PaperID: firstID, Value: decimal.NewFromInt(-1)},
+			},
+		},
+	}
+
+	for _, input := range tests {
+		if _, err := CitationPercentile(input); !errors.Is(err, ErrInvalidMetric) {
+			t.Fatalf("CitationPercentile() error = %v, want ErrInvalidMetric", err)
+		}
+	}
+}
+
+func TestCitationPercentileDoesNotMutateObservationInput(t *testing.T) {
+	t.Parallel()
+
+	key, err := NewCitationCohortKey(
+		"ml",
+		time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+		paper.PaperTypeReview,
+	)
+	if err != nil {
+		t.Fatalf("NewCitationCohortKey() error = %v", err)
+	}
+	observations := []CohortObservation{
+		{
+			PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000002"),
+			Value:   decimal.NewFromInt(20),
+		},
+		{
+			PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000001"),
+			Value:   decimal.NewFromInt(20),
+		},
+	}
+	before := append([]CohortObservation(nil), observations...)
+
+	_, err = CitationPercentile(CitationPercentileInput{
+		Cohort: key,
+		Target: CohortObservation{
+			PaperID: uuid.MustParse("00000000-0000-0000-0000-000000000100"),
+			Value:   decimal.NewFromInt(20),
+		},
+		Observations: observations,
+	})
+	if err != nil {
+		t.Fatalf("CitationPercentile() error = %v", err)
+	}
+	if !reflect.DeepEqual(observations, before) {
+		t.Fatalf("CitationPercentile() mutated observations: got %v want %v", observations, before)
 	}
 }
 

@@ -3,10 +3,13 @@ package ranking
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
@@ -31,6 +34,8 @@ var (
 	ErrInvalidMetric  = errors.New("ranking metric is invalid")
 	ErrInvalidCohort  = errors.New("citation cohort key is invalid")
 )
+
+var taxonomySlugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 type MetricSnapshot struct {
 	ObservedAt time.Time
@@ -76,13 +81,18 @@ type MethodAdoptionInput struct {
 type CitationCohortKey struct {
 	Topic     string
 	Month     time.Time
-	PaperType string
+	PaperType paper.PaperType
+}
+
+type CohortObservation struct {
+	PaperID uuid.UUID
+	Value   decimal.Decimal
 }
 
 type CitationPercentileInput struct {
 	Cohort       CitationCohortKey
-	Value        decimal.Decimal
-	CohortValues []decimal.Decimal
+	Target       CohortObservation
+	Observations []CohortObservation
 }
 
 type RankabilityInput struct {
@@ -323,20 +333,21 @@ func MethodAdoption(input MethodAdoptionInput) (decimal.Decimal, error) {
 		return decimal.Zero, err
 	}
 
-	baselineShare := input.Baseline.Adopted.DivRound(input.Baseline.Total, DivisionScale)
-	currentShare := input.Current.Adopted.DivRound(input.Current.Total, DivisionScale)
-	return currentShare.Sub(baselineShare), nil
+	numerator := input.Current.Adopted.Mul(input.Baseline.Total).
+		Sub(input.Baseline.Adopted.Mul(input.Current.Total))
+	denominator := input.Current.Total.Mul(input.Baseline.Total)
+	return numerator.DivRound(denominator, DivisionScale), nil
 }
 
 func NewCitationCohortKey(
 	topic string,
 	month time.Time,
-	paperType string,
+	paperType paper.PaperType,
 ) (CitationCohortKey, error) {
 	key := CitationCohortKey{
-		Topic:     strings.TrimSpace(topic),
+		Topic:     topic,
 		Month:     time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC),
-		PaperType: strings.TrimSpace(paperType),
+		PaperType: paperType,
 	}
 	if month.IsZero() || !key.Valid() {
 		return CitationCohortKey{}, ErrInvalidCohort
@@ -345,10 +356,7 @@ func NewCitationCohortKey(
 }
 
 func (key CitationCohortKey) Valid() bool {
-	if strings.TrimSpace(key.Topic) == "" || strings.TrimSpace(key.PaperType) == "" {
-		return false
-	}
-	if key.Topic != strings.TrimSpace(key.Topic) || key.PaperType != strings.TrimSpace(key.PaperType) {
+	if !validCanonicalTopic(key.Topic) || !key.PaperType.Valid() {
 		return false
 	}
 	wantMonth := time.Date(key.Month.Year(), key.Month.Month(), 1, 0, 0, 0, 0, time.UTC)
@@ -359,28 +367,59 @@ func (key CitationCohortKey) String() string {
 	if !key.Valid() {
 		return ""
 	}
-	return key.Topic + "|" + key.Month.Format("2006-01") + "|" + key.PaperType
+	return encodeCohortComponents(
+		key.Topic,
+		key.Month.Format("2006-01"),
+		key.PaperType.String(),
+	)
 }
 
 func CitationPercentile(input CitationPercentileInput) (decimal.Decimal, error) {
 	if !input.Cohort.Valid() {
 		return decimal.Zero, ErrInvalidCohort
 	}
-	if len(input.CohortValues) == 0 {
+	if input.Target.PaperID == uuid.Nil {
+		return decimal.Zero, fmt.Errorf("%w: target paper ID is nil", ErrInvalidCohort)
+	}
+	if input.Target.Value.IsNegative() {
+		return decimal.Zero, fmt.Errorf("%w: target citation value must be nonnegative", ErrInvalidMetric)
+	}
+	if len(input.Observations) == 0 {
 		return decimal.Zero, &MissingSignalError{
 			Signal: SignalCitationPercentile,
-			Fields: []string{"cohort_values"},
+			Fields: []string{"cohort_observations"},
 		}
 	}
 
+	seenPaperIDs := map[uuid.UUID]struct{}{
+		input.Target.PaperID: {},
+	}
 	atOrBelow := int64(0)
-	for _, value := range input.CohortValues {
-		if value.LessThanOrEqual(input.Value) {
+	for _, observation := range input.Observations {
+		if observation.PaperID == uuid.Nil {
+			return decimal.Zero, fmt.Errorf("%w: cohort paper ID is nil", ErrInvalidCohort)
+		}
+		if _, exists := seenPaperIDs[observation.PaperID]; exists {
+			return decimal.Zero, fmt.Errorf(
+				"%w: duplicate paper ID %s",
+				ErrInvalidCohort,
+				observation.PaperID,
+			)
+		}
+		seenPaperIDs[observation.PaperID] = struct{}{}
+		if observation.Value.IsNegative() {
+			return decimal.Zero, fmt.Errorf(
+				"%w: cohort citation value for %s must be nonnegative",
+				ErrInvalidMetric,
+				observation.PaperID,
+			)
+		}
+		if observation.Value.LessThanOrEqual(input.Target.Value) {
 			atOrBelow++
 		}
 	}
 	numerator := decimal.NewFromInt(atOrBelow).Mul(decimal.NewFromInt(100))
-	denominator := decimal.NewFromInt(int64(len(input.CohortValues)))
+	denominator := decimal.NewFromInt(int64(len(input.Observations)))
 	return numerator.DivRound(denominator, DivisionScale), nil
 }
 
@@ -442,4 +481,27 @@ func missingWindowBoundaries(prefix string, window Window) []string {
 		missing = append(missing, prefix+"_end")
 	}
 	return missing
+}
+
+func validCanonicalTopic(value string) bool {
+	if len(value) == 36 {
+		if id, err := uuid.Parse(value); err == nil {
+			return id != uuid.Nil && id.String() == value
+		}
+	}
+	return len(value) <= 120 && taxonomySlugPattern.MatchString(value)
+}
+
+func encodeCohortComponents(components ...string) string {
+	labels := [...]byte{'t', 'm', 'p'}
+	var encoded strings.Builder
+	for index, component := range components {
+		if index < len(labels) {
+			encoded.WriteByte(labels[index])
+		}
+		encoded.WriteString(strconv.Itoa(len(component)))
+		encoded.WriteByte(':')
+		encoded.WriteString(component)
+	}
+	return encoded.String()
 }
