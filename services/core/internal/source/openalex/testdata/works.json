@@ -1,0 +1,141 @@
+{
+  "meta": {
+    "count": 1,
+    "next_cursor": null
+  },
+  "results": [
+    {
+      "updated_date": "2026-07-16T12:34:56Z",
+      "id": "https://openalex.org/W1234567890",
+      "display_name": "Deterministic Agent Systems",
+      "title": "Deterministic Agent Systems",
+      "doi": "https://doi.org/10.1234/Agent.1",
+      "ids": {
+        "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7654321",
+        "openalex": "https://openalex.org/W1234567890",
+        "arxiv": "https://arxiv.org/abs/2401.01234v2",
+        "pmid": "https://pubmed.ncbi.nlm.nih.gov/12345678",
+        "doi": "https://doi.org/10.1234/agent.1"
+      },
+      "publication_date": "2026-07-15",
+      "created_date": "2026-07-10",
+      "abstract_inverted_index": {
+        "reproducible": [3],
+        "Agents": [0],
+        "are": [1],
+        "strictly": [2]
+      },
+      "authorships": [
+        {
+          "author_position": "first",
+          "is_corresponding": true,
+          "author": {
+            "id": "https://openalex.org/A111",
+            "display_name": "Ada Agent",
+            "orcid": "https://orcid.org/0000-0001-2345-6789"
+          },
+          "institutions": [
+            {
+              "id": "https://openalex.org/I111",
+              "display_name": "Deterministic Systems Lab",
+              "ror": "https://ror.org/012345678",
+              "country_code": "CN",
+              "type": "education"
+            }
+          ]
+        },
+        {
+          "author_position": "last",
+          "is_corresponding": false,
+          "author": {
+            "id": "https://openalex.org/A222",
+            "display_name": "Grace Verifier",
+            "orcid": null
+          },
+          "institutions": []
+        }
+      ],
+      "topics": [
+        {
+          "id": "https://openalex.org/T100",
+          "display_name": "Autonomous Agents",
+          "score": 0.97,
+          "subfield": {
+            "id": "https://openalex.org/subfields/1702",
+            "display_name": "Artificial Intelligence"
+          },
+          "field": {
+            "id": "https://openalex.org/fields/17",
+            "display_name": "Computer Science"
+          },
+          "domain": {
+            "id": "https://openalex.org/domains/3",
+            "display_name": "Physical Sciences"
+          }
+        }
+      ],
+      "keywords": [
+        {
+          "id": "https://openalex.org/keywords/agent",
+          "display_name": "LLM agent",
+          "score": 0.88
+        }
+      ],
+      "cited_by_count": 42,
+      "primary_location": {
+        "is_oa": true,
+        "landing_page_url": "https://doi.org/10.1234/agent.1",
+        "pdf_url": "https://example.test/paper.pdf",
+        "license": "cc-by",
+        "license_id": "https://openalex.org/licenses/cc-by",
+        "version": "publishedVersion",
+        "source": {
+          "id": "https://openalex.org/S987654321",
+          "display_name": "Journal of Deterministic Systems",
+          "issn_l": "1234-567X",
+          "issn": [
+            "1234-567X",
+            "2049-3630"
+          ],
+          "type": "journal"
+        }
+      },
+      "best_oa_location": {
+        "is_oa": true,
+        "landing_page_url": "https://github.com/example-org/agent-system/tree/main",
+        "pdf_url": null,
+        "license": "cc-by",
+        "license_id": "https://openalex.org/licenses/cc-by",
+        "version": "acceptedVersion",
+        "source": null
+      },
+      "locations": [
+        {
+          "is_oa": true,
+          "landing_page_url": "https://github.com/example-org/agent-system",
+          "pdf_url": null,
+          "license": "mit",
+          "license_id": "https://spdx.org/licenses/MIT.html",
+          "version": "submittedVersion",
+          "source": null
+        },
+        {
+          "is_oa": false,
+          "landing_page_url": "https://notgithub.example/example-org/agent-system",
+          "pdf_url": null,
+          "license": null,
+          "license_id": null,
+          "version": "publishedVersion",
+          "source": null
+        }
+      ],
+      "open_access": {
+        "is_oa": true,
+        "oa_status": "gold",
+        "oa_url": "https://example.test/paper.pdf",
+        "any_repository_has_fulltext": true
+      },
+      "is_retracted": false
+    }
+  ]
+}

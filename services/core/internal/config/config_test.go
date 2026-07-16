@@ -30,6 +30,18 @@ func TestLoadForAPIRequiresOnlySharedConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadForMigrateDoesNotRequireOpenAlexCredentials(t *testing.T) {
+	cfg, err := LoadFrom(RoleMigrate, envMap(
+		"DATABASE_URL", testDatabaseURL,
+	))
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if cfg.OpenAlex.APIKey != "" || cfg.OpenAlex.ContactEmail != "" {
+		t.Fatalf("migrate configuration unexpectedly populated OpenAlex credentials: %+v", cfg.Redacted())
+	}
+}
+
 func TestLoadRequiresPostgreSQLDatabaseURLWithoutLeakingIt(t *testing.T) {
 	tests := []struct {
 		name string
@@ -62,7 +74,12 @@ func TestLoadValidatesCredentialsOnlyForSelectedRole(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		{role: RoleOpenAlexSync, want: "OPENALEX_CONTACT_EMAIL"},
+		{role: RoleOpenAlexSync, want: "OPENALEX_API_KEY"},
+		{
+			role: RoleOpenAlexSync,
+			env:  map[string]string{"OPENALEX_API_KEY": "openalex-secret"},
+			want: "OPENALEX_CONTACT_EMAIL",
+		},
 		{role: RolePubMedSync, want: "NCBI_TOOL"},
 		{role: RolePubMedImport, env: map[string]string{"NCBI_TOOL": "paper-hub"}, want: "NCBI_EMAIL"},
 		{role: RoleCrossrefSync, want: "CROSSREF_CONTACT_EMAIL"},
@@ -93,7 +110,9 @@ func TestLoadValidatesCredentialsOnlyForSelectedRole(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("LoadFrom(%q) error = %v, want containing %q", tt.role, err, tt.want)
 			}
-			if strings.Contains(err.Error(), "springer-secret") || strings.Contains(err.Error(), "elsevier-secret") {
+			if strings.Contains(err.Error(), "openalex-secret") ||
+				strings.Contains(err.Error(), "springer-secret") ||
+				strings.Contains(err.Error(), "elsevier-secret") {
 				t.Fatalf("LoadFrom() error leaked an API key: %v", err)
 			}
 		})
@@ -105,7 +124,13 @@ func TestLoadAcceptsRoleSpecificCredentials(t *testing.T) {
 		role Role
 		env  map[string]string
 	}{
-		{role: RoleOpenAlexSync, env: map[string]string{"OPENALEX_CONTACT_EMAIL": "openalex@example.test"}},
+		{
+			role: RoleOpenAlexSync,
+			env: map[string]string{
+				"OPENALEX_API_KEY":       "openalex-secret",
+				"OPENALEX_CONTACT_EMAIL": "openalex@example.test",
+			},
+		},
 		{
 			role: RolePubMedSync,
 			env: map[string]string{
@@ -159,7 +184,11 @@ func TestLoadRejectsInvalidEmailForSelectedRole(t *testing.T) {
 		emailKey string
 		extra    map[string]string
 	}{
-		{role: RoleOpenAlexSync, emailKey: "OPENALEX_CONTACT_EMAIL"},
+		{
+			role:     RoleOpenAlexSync,
+			emailKey: "OPENALEX_CONTACT_EMAIL",
+			extra:    map[string]string{"OPENALEX_API_KEY": "secret"},
+		},
 		{role: RolePubMedSync, emailKey: "NCBI_EMAIL", extra: map[string]string{"NCBI_TOOL": "paper-hub"}},
 		{role: RoleCrossrefSync, emailKey: "CROSSREF_CONTACT_EMAIL"},
 		{role: RolePMCSync, emailKey: "PMC_CONTACT_EMAIL"},
@@ -192,6 +221,17 @@ func TestLoadRejectsInvalidEmailForSelectedRole(t *testing.T) {
 	}
 }
 
+func TestOpenAlexSyncRejectsBlankAPIKey(t *testing.T) {
+	_, err := LoadFrom(RoleOpenAlexSync, envMap(
+		"DATABASE_URL", testDatabaseURL,
+		"OPENALEX_API_KEY", " \t ",
+		"OPENALEX_CONTACT_EMAIL", "openalex@example.test",
+	))
+	if err == nil || !strings.Contains(err.Error(), "OPENALEX_API_KEY is required") {
+		t.Fatalf("LoadFrom() error = %v, want blank OpenAlex API key rejection", err)
+	}
+}
+
 func TestLoadRejectsUnknownRole(t *testing.T) {
 	_, err := LoadFrom(Role("unknown-command"), envMap("DATABASE_URL", testDatabaseURL))
 	if err == nil || !strings.Contains(err.Error(), "unsupported configuration role") {
@@ -220,6 +260,7 @@ func TestLoadRejectsValuesOutsideStrictBounds(t *testing.T) {
 		{key: "WORKER_MAX_RETRIES", value: "21"},
 		{key: "WORKER_MAX_WAIT", value: "25h"},
 		{key: "OPENALEX_TIMEOUT", value: "500ms"},
+		{key: "OPENALEX_BATCH_SIZE", value: "101"},
 		{key: "PUBMED_BATCH_SIZE", value: "1001"},
 		{key: "CROSSREF_MAX_RETRIES", value: "21"},
 		{key: "PMC_MAX_WAIT", value: "500ms"},

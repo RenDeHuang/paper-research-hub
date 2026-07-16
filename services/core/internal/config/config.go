@@ -212,27 +212,32 @@ func LoadFrom(role Role, lookup LookupEnv) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	openAlexRequest, err := loadRequest(lookup, "OPENALEX", "https://api.openalex.org")
+	openAlexRequest, err := loadRequest(lookup, "OPENALEX", "https://api.openalex.org", 100)
 	if err != nil {
 		return Config{}, err
 	}
-	pubMedRequest, err := loadRequest(lookup, "PUBMED", "https://eutils.ncbi.nlm.nih.gov")
+	pubMedRequest, err := loadRequest(lookup, "PUBMED", "https://eutils.ncbi.nlm.nih.gov", 1000)
 	if err != nil {
 		return Config{}, err
 	}
-	crossrefRequest, err := loadRequest(lookup, "CROSSREF", "https://api.crossref.org")
+	crossrefRequest, err := loadRequest(lookup, "CROSSREF", "https://api.crossref.org", 1000)
 	if err != nil {
 		return Config{}, err
 	}
-	pmcRequest, err := loadRequest(lookup, "PMC", "https://www.ncbi.nlm.nih.gov/pmc")
+	pmcRequest, err := loadRequest(lookup, "PMC", "https://www.ncbi.nlm.nih.gov/pmc", 1000)
 	if err != nil {
 		return Config{}, err
 	}
-	springerRequest, err := loadRequest(lookup, "SPRINGER_NATURE", "https://api.springernature.com")
+	springerRequest, err := loadRequest(
+		lookup,
+		"SPRINGER_NATURE",
+		"https://api.springernature.com",
+		1000,
+	)
 	if err != nil {
 		return Config{}, err
 	}
-	elsevierRequest, err := loadRequest(lookup, "ELSEVIER", "https://api.elsevier.com")
+	elsevierRequest, err := loadRequest(lookup, "ELSEVIER", "https://api.elsevier.com", 1000)
 	if err != nil {
 		return Config{}, err
 	}
@@ -290,6 +295,9 @@ func (cfg Config) validateRole(role Role) error {
 	case RoleAPI, RoleMigrate:
 		return nil
 	case RoleOpenAlexSync:
+		if strings.TrimSpace(cfg.OpenAlex.APIKey) == "" {
+			return errors.New("OPENALEX_API_KEY is required")
+		}
 		return validateEmailRequired("OPENALEX_CONTACT_EMAIL", cfg.OpenAlex.ContactEmail)
 	case RolePubMedSync, RolePubMedImport:
 		if strings.TrimSpace(cfg.PubMed.Tool) == "" {
@@ -458,7 +466,12 @@ func loadWorker(lookup LookupEnv) (WorkerConfig, error) {
 	}, nil
 }
 
-func loadRequest(lookup LookupEnv, prefix, defaultBaseURL string) (RequestConfig, error) {
+func loadRequest(
+	lookup LookupEnv,
+	prefix string,
+	defaultBaseURL string,
+	maximumBatchSize int,
+) (RequestConfig, error) {
 	baseURLKey := prefix + "_BASE_URL"
 	baseURL, err := readString(lookup, baseURLKey, defaultBaseURL)
 	if err != nil {
@@ -479,7 +492,7 @@ func loadRequest(lookup LookupEnv, prefix, defaultBaseURL string) (RequestConfig
 	if err != nil {
 		return RequestConfig{}, err
 	}
-	batchSize, err := readInt(lookup, prefix+"_BATCH_SIZE", 100, 1, 1000)
+	batchSize, err := readInt(lookup, prefix+"_BATCH_SIZE", 100, 1, maximumBatchSize)
 	if err != nil {
 		return RequestConfig{}, err
 	}
