@@ -1,9 +1,11 @@
 <template>
-  <main>
+  <main aria-labelledby="replatform-heading">
     <p class="eyebrow">
       Paper Research Hub
     </p>
-    <h1>Go + Nuxt 重构中</h1>
+    <h1 id="replatform-heading">
+      Go + Nuxt 重构中
+    </h1>
     <p>新的论文研究门户正在建立最小运行基线。</p>
   </main>
 </template>
