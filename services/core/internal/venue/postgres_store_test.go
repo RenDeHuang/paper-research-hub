@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -522,6 +523,257 @@ func TestPostgresJCRStoreRejectsIdenticalMetricWithDifferentSourceLicense(t *tes
 	}
 }
 
+func TestPreparePostgresAliasesSortsAdvisoryLocksAndDeduplicatesAliases(t *testing.T) {
+	const source = "synthetic-jcr-fixture"
+	alpha := mustVenueAliasEvidence(t, "venue-a", "Alias Alpha", source)
+	beta := mustVenueAliasEvidence(t, "venue-a", "Alias Beta", source)
+
+	plans, err := preparePostgresAliases(
+		[]VenueAliasEvidence{beta, alpha, beta},
+		source,
+	)
+	if err != nil {
+		t.Fatalf("preparePostgresAliases() error = %v", err)
+	}
+	if len(plans) != 2 {
+		t.Fatalf("prepared alias plans = %d, want 2 unique aliases", len(plans))
+	}
+	if plans[0].lockKey >= plans[1].lockKey {
+		t.Fatalf(
+			"alias advisory lock order = %d then %d, want ascending lock keys",
+			plans[0].lockKey,
+			plans[1].lockKey,
+		)
+	}
+	if plans[0].evidence.Alias().Value() != "Alias Alpha" ||
+		plans[1].evidence.Alias().Value() != "Alias Beta" {
+		t.Fatalf(
+			"alias order = %q, %q; want Alias Alpha, Alias Beta",
+			plans[0].evidence.Alias().Value(),
+			plans[1].evidence.Alias().Value(),
+		)
+	}
+}
+
+func TestPostgresJCRStoreRejectsSameHashDifferentLicenseWithLegacyMissingAssociation(t *testing.T) {
+	pool := openVenueTestPoolThroughMigration(t, 4)
+	venueID := insertSingleStoreVenue(t, pool)
+	ctx := venueTestContext(t)
+	metric := mustMetricSnapshot(
+		t,
+		venueID,
+		2025,
+		"Legacy Missing Association",
+		"10",
+		QuartileQ1,
+		MetricStatusKnown,
+		"synthetic-jcr-fixture",
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at
+		) VALUES (
+			$1, $2, $3, 10, 'Q1', 'known',
+			'synthetic-jcr-fixture', 'license-a', '2025-01-01T00:00:00Z'
+		)
+	`, venueID, metric.MetricYear(), metric.Category()); err != nil {
+		t.Fatalf("insert legacy metric without receipt association: %v", err)
+	}
+	const fileSHA = "abababababababababababababababababababababababababababababababab"
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			$1, 'synthetic-jcr-fixture', '2026-01-01T00:00:00Z', 1, 0, 1
+		)
+	`, fileSHA); err != nil {
+		t.Fatalf("insert legacy unchanged-only receipt: %v", err)
+	}
+	var associations int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_metrics").Scan(&associations); err != nil {
+		t.Fatalf("count legacy missing associations: %v", err)
+	}
+	if associations != 0 {
+		t.Fatalf("legacy associations before Store call = %d, want 0", associations)
+	}
+
+	store, err := NewPostgresJCRStore(pool, PostgresJCRStoreConfig{
+		SourceLicense: "license-b",
+	})
+	if err != nil {
+		t.Fatalf("NewPostgresJCRStore() error = %v", err)
+	}
+	batch := mustJCRImport(t, fileSHA, 2026, []MetricSnapshot{metric}, nil)
+	if _, err := store.PersistJCRImport(context.Background(), batch); !errors.Is(err, ErrConflictingMetric) {
+		t.Fatalf(
+			"PersistJCRImport(legacy missing association) error = %v, want ErrConflictingMetric",
+			err,
+		)
+	}
+}
+
+func TestPostgresJCRStoreConcurrentReverseAliasOrderAvoidsDeadlock(t *testing.T) {
+	pool := openMigratedVenueTestPool(t)
+	venueID := insertSingleStoreVenue(t, pool)
+	store := mustNewPostgresJCRStore(t, pool)
+	ctx := venueTestContext(t)
+
+	const (
+		aliasAlphaBarrier int64 = 0x4a43524101
+		aliasBetaBarrier  int64 = 0x4a43524102
+	)
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`
+		CREATE FUNCTION block_reverse_alias_inserts()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.alias = 'Concurrent Alias Alpha' THEN
+				PERFORM pg_advisory_xact_lock(%d);
+			ELSIF NEW.alias = 'Concurrent Alias Beta' THEN
+				PERFORM pg_advisory_xact_lock(%d);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+
+		CREATE TRIGGER block_reverse_alias_inserts
+		AFTER INSERT ON venue_aliases
+		FOR EACH ROW
+		EXECUTE FUNCTION block_reverse_alias_inserts();
+	`, aliasAlphaBarrier, aliasBetaBarrier)); err != nil {
+		t.Fatalf("install reverse alias barrier trigger: %v", err)
+	}
+
+	blocker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire reverse alias barrier connection: %v", err)
+	}
+	defer blocker.Release()
+	for _, key := range []int64{aliasAlphaBarrier, aliasBetaBarrier} {
+		if _, err := blocker.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
+			t.Fatalf("acquire reverse alias barrier %d: %v", key, err)
+		}
+	}
+	barriersHeld := true
+	defer func() {
+		if !barriersHeld {
+			return
+		}
+		for _, key := range []int64{aliasAlphaBarrier, aliasBetaBarrier} {
+			_, _ = blocker.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", key)
+		}
+	}()
+
+	alphaAlias := mustVenueAliasEvidence(
+		t,
+		venueID,
+		"Concurrent Alias Alpha",
+		"synthetic-jcr-fixture",
+	)
+	betaAlias := mustVenueAliasEvidence(
+		t,
+		venueID,
+		"Concurrent Alias Beta",
+		"synthetic-jcr-fixture",
+	)
+	alphaMetric := mustMetricSnapshot(
+		t,
+		venueID,
+		2025,
+		"Concurrent Alias Alpha Metric",
+		"10",
+		QuartileQ1,
+		MetricStatusKnown,
+		"synthetic-jcr-fixture",
+	)
+	betaMetric := mustMetricSnapshot(
+		t,
+		venueID,
+		2025,
+		"Concurrent Alias Beta Metric",
+		"10",
+		QuartileQ1,
+		MetricStatusKnown,
+		"synthetic-jcr-fixture",
+	)
+	batches := []JCRImport{
+		mustJCRImport(
+			t,
+			strings.Repeat("7", 64),
+			2026,
+			[]MetricSnapshot{alphaMetric},
+			[]VenueAliasEvidence{alphaAlias, betaAlias},
+		),
+		mustJCRImport(
+			t,
+			strings.Repeat("8", 64),
+			2027,
+			[]MetricSnapshot{betaMetric},
+			[]VenueAliasEvidence{betaAlias, alphaAlias},
+		),
+	}
+
+	importCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	errorsFound := make(chan error, len(batches))
+	var wait sync.WaitGroup
+	wait.Add(len(batches))
+	for _, batch := range batches {
+		batch := batch
+		go func() {
+			defer wait.Done()
+			_, persistErr := store.PersistJCRImport(importCtx, batch)
+			errorsFound <- persistErr
+		}()
+	}
+	waitForBlockedPostgresSessions(t, pool, 2)
+	for _, key := range []int64{aliasAlphaBarrier, aliasBetaBarrier} {
+		if _, err := blocker.Exec(ctx, "SELECT pg_advisory_unlock($1)", key); err != nil {
+			t.Fatalf("release reverse alias barrier %d: %v", key, err)
+		}
+	}
+	barriersHeld = false
+	wait.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		if err != nil {
+			var postgresError *pgconn.PgError
+			if errors.As(err, &postgresError) && postgresError.Code == "40P01" {
+				t.Fatalf("reverse alias persistence deadlocked: %v", err)
+			}
+			t.Fatalf("reverse alias persistence error = %v", err)
+		}
+	}
+
+	var receipts, aliases, aliasLinks, metricLinks int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipts").Scan(&receipts); err != nil {
+		t.Fatalf("count reverse alias receipts: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM venue_aliases
+		WHERE alias IN ('Concurrent Alias Alpha', 'Concurrent Alias Beta')
+	`).Scan(&aliases); err != nil {
+		t.Fatalf("count reverse aliases: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_aliases").Scan(&aliasLinks); err != nil {
+		t.Fatalf("count reverse alias receipt links: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_metrics").Scan(&metricLinks); err != nil {
+		t.Fatalf("count reverse alias metric links: %v", err)
+	}
+	if receipts != 2 || aliases != 2 || aliasLinks != 4 || metricLinks != 2 {
+		t.Fatalf(
+			"reverse alias persistence = receipts %d aliases %d alias links %d metric links %d, want 2/2/4/2",
+			receipts,
+			aliases,
+			aliasLinks,
+			metricLinks,
+		)
+	}
+}
+
 func TestPostgresJCRStoreMapsMetricUniqueViolationToDomainConflict(t *testing.T) {
 	pool := openMigratedVenueTestPool(t)
 	venueID := insertSingleStoreVenue(t, pool)
@@ -804,6 +1056,32 @@ func openMigratedVenueTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+func openVenueTestPoolThroughMigration(t *testing.T, migrationCount int) *pgxpool.Pool {
+	t.Helper()
+	databaseURL := newVenueTestDatabase(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("open partial venue PostgreSQL test pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping partial venue PostgreSQL test pool: %v", err)
+	}
+	migrations, err := database.EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	if migrationCount < 1 || migrationCount > len(migrations) {
+		t.Fatalf("migrationCount = %d, available migrations = %d", migrationCount, len(migrations))
+	}
+	if err := database.UpMigrations(ctx, pool, migrations[:migrationCount]); err != nil {
+		t.Fatalf("migrate venue PostgreSQL test database through %d: %v", migrationCount, err)
+	}
+	return pool
+}
+
 func newVenueTestDatabase(t *testing.T) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -881,6 +1159,35 @@ func waitForBlockedPostgresQueries(
 				blocked,
 				want,
 			)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForBlockedPostgresSessions(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	want int,
+) {
+	t.Helper()
+	ctx := venueTestContext(t)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'
+		`).Scan(&blocked); err != nil {
+			t.Fatalf("query blocked PostgreSQL sessions: %v", err)
+		}
+		if blocked >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("blocked PostgreSQL sessions = %d, want at least %d", blocked, want)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1030,4 +1337,22 @@ func mustJCRImport(
 		t.Fatalf("newJCRImport() error = %v", err)
 	}
 	return batch
+}
+
+func mustVenueAliasEvidence(
+	t *testing.T,
+	venueID string,
+	value string,
+	source string,
+) VenueAliasEvidence {
+	t.Helper()
+	alias, err := NewAlias(value, source)
+	if err != nil {
+		t.Fatalf("NewAlias() error = %v", err)
+	}
+	evidence, err := NewVenueAliasEvidence(venueID, alias)
+	if err != nil {
+		t.Fatalf("NewVenueAliasEvidence() error = %v", err)
+	}
+	return evidence
 }

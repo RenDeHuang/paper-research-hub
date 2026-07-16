@@ -107,6 +107,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 2, name: "integrity_hardening"},
 		{version: 3, name: "jcr_import_receipts"},
 		{version: 4, name: "venue_policy_semantics"},
+		{version: 5, name: "jcr_integrity_followup"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -142,7 +143,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 	}
 }
 
-func TestEmbeddedMigrationsPreservePriorChecksumsAndAddVenuePolicySemantics(t *testing.T) {
+func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRIntegrityFollowup(t *testing.T) {
 	migrations, err := EmbeddedMigrations()
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
@@ -150,8 +151,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndAddVenuePolicySemantics(t *t
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 4 {
-		t.Fatalf("embedded migration count = %d, want 4", len(migrations))
+	if len(migrations) != 5 {
+		t.Fatalf("embedded migration count = %d, want 5", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -164,6 +165,9 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndAddVenuePolicySemantics(t *t
 	}
 	if migrations[3].Version != 4 || migrations[3].Name != "venue_policy_semantics" {
 		t.Fatalf("fourth migration = %#v, want 000004_venue_policy_semantics", migrations[3])
+	}
+	if migrations[4].Version != 5 || migrations[4].Name != "jcr_integrity_followup" {
+		t.Fatalf("fifth migration = %#v, want 000005_jcr_integrity_followup", migrations[4])
 	}
 }
 
@@ -236,7 +240,6 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"jcr_import_receipt_aliases_import_receipt_id_venue_alias_id_key",
 		"jcr_import_receipt_metrics_import_receipt_id_fkey",
 		"jcr_import_receipt_metrics_metric_snapshot_id_fkey",
-		"jcr_import_receipt_metrics_receipt_metric_key",
 		"fulltext_assets_public_reusable_check",
 	})
 	assertNamesExist(t, pool, `
@@ -251,6 +254,9 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"jcr_import_receipts_immutable",
 		"jcr_import_receipt_aliases_immutable",
 		"jcr_import_receipt_metrics_immutable",
+		"jcr_import_receipts_metric_integrity",
+		"jcr_import_receipt_metrics_integrity",
+		"venue_metric_snapshots_receipt_integrity",
 		"venue_policy_assessments_venue_type_semantics",
 	})
 	assertNamesExist(t, pool, `
@@ -343,8 +349,15 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 
 	const fileSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	importedAt := time.Date(2026, time.July, 16, 9, 30, 0, 0, time.UTC)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin JCR provenance transaction: %v", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
 	var receiptID string
-	mustScanID(t, pool.QueryRow(ctx, `
+	mustScanID(t, tx.QueryRow(ctx, `
 		INSERT INTO jcr_import_receipts (
 			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
 		) VALUES ($1, 'synthetic-jcr-fixture', $2, 1, 1, 0)
@@ -352,7 +365,7 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 	`, fileSHA, importedAt), &receiptID)
 
 	var metricID string
-	mustScanID(t, pool.QueryRow(ctx, `
+	mustScanID(t, tx.QueryRow(ctx, `
 		INSERT INTO venue_metric_snapshots (
 			venue_id, metric_year, category, jif, quartile, metric_status,
 			source_name, source_license, captured_at, jcr_import_receipt_id
@@ -362,17 +375,20 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 		)
 		RETURNING id
 	`, journalID, importedAt, receiptID), &metricID)
-	if _, err := pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO jcr_import_receipt_aliases (import_receipt_id, venue_alias_id)
 		VALUES ($1, $2)
 	`, receiptID, aliasID); err != nil {
 		t.Fatalf("link imported alias to receipt: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO jcr_import_receipt_metrics (import_receipt_id, metric_snapshot_id)
 		VALUES ($1, $2)
 	`, receiptID, metricID); err != nil {
 		t.Fatalf("link imported metric to receipt: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit JCR provenance transaction: %v", err)
 	}
 
 	var tracedSHA, jif string
@@ -671,7 +687,7 @@ func TestVenuePolicySemanticsMigrationBackfillsMetricReceiptLinks(t *testing.T) 
 	`, venueID, receiptID), &metricID)
 
 	if err := UpMigrations(ctx, pool, migrations); err != nil {
-		t.Fatalf("upgrade through 000004: %v", err)
+		t.Fatalf("upgrade through 000005: %v", err)
 	}
 	var links int
 	if err := pool.QueryRow(ctx, `
@@ -684,6 +700,567 @@ func TestVenuePolicySemanticsMigrationBackfillsMetricReceiptLinks(t *testing.T) 
 	}
 	if links != 1 {
 		t.Fatalf("backfilled receipt metric links = %d, want 1", links)
+	}
+}
+
+func TestJCRIntegrityFollowupBackfillsUniqueLegacyUnchangedReceipt(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:3]); err != nil {
+		t.Fatalf("apply migrations through 000003: %v", err)
+	}
+
+	var venueID, aliasID, receiptID, metricID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Unique Legacy Receipt Journal')
+		RETURNING id
+	`), &venueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_aliases (venue_id, alias, source)
+		VALUES ($1, 'Unique Legacy Receipt Journal', 'synthetic-jcr-fixture')
+		RETURNING id
+	`, venueID), &aliasID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at
+		) VALUES (
+			$1, 2025, 'Unique Legacy Category', 10, 'Q1', 'known',
+			'synthetic-jcr-fixture', 'license-a', '2025-01-01T00:00:00Z'
+		)
+		RETURNING id
+	`, venueID), &metricID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+			'synthetic-jcr-fixture', '2026-01-01T00:00:00Z', 1, 0, 1
+		)
+		RETURNING id
+	`), &receiptID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_aliases (import_receipt_id, venue_alias_id)
+		VALUES ($1, $2)
+	`, receiptID, aliasID); err != nil {
+		t.Fatalf("link legacy receipt alias: %v", err)
+	}
+
+	if err := Up(ctx, pool); err != nil {
+		t.Fatalf("upgrade unique legacy receipt: %v", err)
+	}
+	var links int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM jcr_import_receipt_metrics
+		WHERE import_receipt_id = $1
+		  AND metric_snapshot_id = $2
+	`, receiptID, metricID).Scan(&links); err != nil {
+		t.Fatalf("query unique legacy receipt link: %v", err)
+	}
+	if links != 1 {
+		t.Fatalf("unique legacy receipt links = %d, want 1", links)
+	}
+}
+
+func TestJCRIntegrityFollowupBackfillsDuplicateRowsForOneLegacyMetricKey(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:3]); err != nil {
+		t.Fatalf("apply migrations through 000003: %v", err)
+	}
+
+	var venueID, aliasID, receiptID, metricID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Duplicate Legacy Receipt Journal')
+		RETURNING id
+	`), &venueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_aliases (venue_id, alias, source)
+		VALUES ($1, 'Duplicate Legacy Receipt Journal', 'synthetic-jcr-fixture')
+		RETURNING id
+	`, venueID), &aliasID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at
+		) VALUES (
+			$1, 2025, 'Duplicate Legacy Category', 10, 'Q1', 'known',
+			'synthetic-jcr-fixture', 'license-a', '2025-01-01T00:00:00Z'
+		)
+		RETURNING id
+	`, venueID), &metricID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+			'synthetic-jcr-fixture', '2026-01-01T00:00:00Z', 2, 0, 2
+		)
+		RETURNING id
+	`), &receiptID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_aliases (import_receipt_id, venue_alias_id)
+		VALUES ($1, $2)
+	`, receiptID, aliasID); err != nil {
+		t.Fatalf("link duplicate legacy receipt alias: %v", err)
+	}
+
+	if err := Up(ctx, pool); err != nil {
+		t.Fatalf("upgrade duplicate legacy receipt: %v", err)
+	}
+	var links int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM jcr_import_receipt_metrics
+		WHERE import_receipt_id = $1
+		  AND metric_snapshot_id = $2
+	`, receiptID, metricID).Scan(&links); err != nil {
+		t.Fatalf("query duplicate legacy receipt links: %v", err)
+	}
+	if links != 2 {
+		t.Fatalf("duplicate legacy receipt links = %d, want 2", links)
+	}
+}
+
+func TestJCRIntegrityFollowupRejectsAmbiguousLegacyUnchangedReceipts(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		fileSHA          string
+		candidateMetrics int
+	}{
+		{
+			name:             "no candidate metric",
+			fileSHA:          "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+			candidateMetrics: 0,
+		},
+		{
+			name:             "multiple candidate metrics",
+			fileSHA:          "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+			candidateMetrics: 2,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			migrations, err := EmbeddedMigrations()
+			if err != nil {
+				t.Fatalf("EmbeddedMigrations() error = %v", err)
+			}
+			pool := openTestPool(t)
+			ctx := testContext(t)
+			if err := UpMigrations(ctx, pool, migrations[:3]); err != nil {
+				t.Fatalf("apply migrations through 000003: %v", err)
+			}
+
+			var venueID, aliasID, receiptID string
+			mustScanID(t, pool.QueryRow(ctx, `
+				INSERT INTO venues (venue_type, display_title)
+				VALUES ('journal', 'Ambiguous Legacy Receipt Journal')
+				RETURNING id
+			`), &venueID)
+			mustScanID(t, pool.QueryRow(ctx, `
+				INSERT INTO venue_aliases (venue_id, alias, source)
+				VALUES ($1, 'Ambiguous Legacy Receipt Journal', 'synthetic-jcr-fixture')
+				RETURNING id
+			`, venueID), &aliasID)
+			for index := range test.candidateMetrics {
+				if _, err := pool.Exec(ctx, `
+					INSERT INTO venue_metric_snapshots (
+						venue_id, metric_year, category, jif, quartile, metric_status,
+						source_name, source_license, captured_at
+					) VALUES (
+						$1, 2025, $2, 10, 'Q1', 'known',
+						'synthetic-jcr-fixture', 'license-a', '2025-01-01T00:00:00Z'
+					)
+				`, venueID, fmt.Sprintf("Candidate Category %d", index+1)); err != nil {
+					t.Fatalf("insert candidate metric %d: %v", index+1, err)
+				}
+			}
+			mustScanID(t, pool.QueryRow(ctx, `
+				INSERT INTO jcr_import_receipts (
+					file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+				) VALUES ($1, 'synthetic-jcr-fixture', '2026-01-01T00:00:00Z', 1, 0, 1)
+				RETURNING id
+			`, test.fileSHA), &receiptID)
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO jcr_import_receipt_aliases (import_receipt_id, venue_alias_id)
+				VALUES ($1, $2)
+			`, receiptID, aliasID); err != nil {
+				t.Fatalf("link ambiguous legacy receipt alias: %v", err)
+			}
+
+			err = Up(ctx, pool)
+			if err == nil ||
+				!strings.Contains(err.Error(), "cannot deterministically associate legacy JCR receipt") ||
+				!strings.Contains(err.Error(), test.fileSHA) {
+				t.Fatalf("upgrade ambiguous legacy receipt error = %v", err)
+			}
+		})
+	}
+}
+
+func TestJCRIntegrityFollowupEnforcesDeferredReceiptRowAssociations(t *testing.T) {
+	t.Run("missing association fails at commit", func(t *testing.T) {
+		pool := openMigratedTestPool(t)
+		ctx := testContext(t)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin missing association transaction: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO jcr_import_receipts (
+				file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+			) VALUES (
+				'abababababababababababababababababababababababababababababababab',
+				'synthetic-jcr-fixture', now(), 1, 0, 1
+			)
+		`); err != nil {
+			_ = tx.Rollback(context.Background())
+			t.Fatalf("insert receipt without association: %v", err)
+		}
+		err = tx.Commit(ctx)
+		var postgresError *pgconn.PgError
+		if err == nil ||
+			!errors.As(err, &postgresError) ||
+			postgresError.Code != "23514" {
+			t.Fatalf("commit missing association error = %v, want deferred check violation", err)
+		}
+	})
+
+	t.Run("duplicate input rows retain duplicate associations", func(t *testing.T) {
+		pool := openMigratedTestPool(t)
+		ctx := testContext(t)
+		var venueID string
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO venues (venue_type, display_title)
+			VALUES ('journal', 'Duplicate Association Journal')
+			RETURNING id
+		`), &venueID)
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin duplicate association transaction: %v", err)
+		}
+		var receiptID, metricID string
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO jcr_import_receipts (
+				file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+			) VALUES (
+				'acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac',
+				'synthetic-jcr-fixture', now(), 2, 1, 1
+			)
+			RETURNING id
+		`), &receiptID)
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO venue_metric_snapshots (
+				venue_id, metric_year, category, jif, quartile, metric_status,
+				source_name, source_license, captured_at, jcr_import_receipt_id
+			) VALUES (
+				$1, 2025, 'Duplicate Association Category', 10, 'Q1', 'known',
+				'synthetic-jcr-fixture', 'license-a', now(), $2
+			)
+			RETURNING id
+		`, venueID, receiptID), &metricID)
+		for range 2 {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO jcr_import_receipt_metrics (
+					import_receipt_id, metric_snapshot_id
+				) VALUES ($1, $2)
+			`, receiptID, metricID); err != nil {
+				_ = tx.Rollback(context.Background())
+				t.Fatalf("insert duplicate receipt association: %v", err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit duplicate receipt associations: %v", err)
+		}
+	})
+
+	t.Run("later metric cannot overstate inserted rows", func(t *testing.T) {
+		pool := openMigratedTestPool(t)
+		ctx := testContext(t)
+		var venueID string
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO venues (venue_type, display_title)
+			VALUES ('journal', 'Receipt Creator Integrity Journal')
+			RETURNING id
+		`), &venueID)
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin valid receipt creator transaction: %v", err)
+		}
+		var receiptID, metricID string
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO jcr_import_receipts (
+				file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+			) VALUES (
+				'adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad',
+				'synthetic-jcr-fixture', now(), 1, 1, 0
+			)
+			RETURNING id
+		`), &receiptID)
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO venue_metric_snapshots (
+				venue_id, metric_year, category, jif, quartile, metric_status,
+				source_name, source_license, captured_at, jcr_import_receipt_id
+			) VALUES (
+				$1, 2025, 'Receipt Creator Category', 10, 'Q1', 'known',
+				'synthetic-jcr-fixture', 'license-a', now(), $2
+			)
+			RETURNING id
+		`, venueID, receiptID), &metricID)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO jcr_import_receipt_metrics (
+				import_receipt_id, metric_snapshot_id
+			) VALUES ($1, $2)
+		`, receiptID, metricID); err != nil {
+			_ = tx.Rollback(context.Background())
+			t.Fatalf("link valid receipt creator metric: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit valid receipt creator transaction: %v", err)
+		}
+
+		tx, err = pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin overstated receipt creator transaction: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO venue_metric_snapshots (
+				venue_id, metric_year, category, jif, quartile, metric_status,
+				source_name, source_license, captured_at, jcr_import_receipt_id
+			) VALUES (
+				$1, 2025, 'Unexpected Extra Creator Category', 9, 'Q2', 'known',
+				'synthetic-jcr-fixture', 'license-a', now(), $2
+			)
+		`, venueID, receiptID); err != nil {
+			_ = tx.Rollback(context.Background())
+			t.Fatalf("insert extra receipt creator metric: %v", err)
+		}
+		err = tx.Commit(ctx)
+		var postgresError *pgconn.PgError
+		if err == nil ||
+			!errors.As(err, &postgresError) ||
+			postgresError.Code != "23514" {
+			t.Fatalf("commit extra receipt creator error = %v, want deferred check violation", err)
+		}
+	})
+}
+
+func TestJCRIntegrityFollowupRejectsInvalidHistoricalPolicyAssessments(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		venueType             string
+		decision              string
+		matchedRules          string
+		evidence              string
+		dropDecisionSemantics bool
+	}{
+		{
+			name:         "journal not applicable",
+			venueType:    "journal",
+			decision:     "not_applicable",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"journal","reason":"venue_type_not_journal"}`,
+		},
+		{
+			name:         "conference accepted",
+			venueType:    "conference",
+			decision:     "accepted",
+			matchedRules: `["jcr_q1"]`,
+			evidence:     `{"venue_type":"conference"}`,
+		},
+		{
+			name:         "preprint rejected",
+			venueType:    "preprint",
+			decision:     "rejected",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"preprint"}`,
+		},
+		{
+			name:         "repository unknown",
+			venueType:    "repository",
+			decision:     "unknown",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"repository","reason":"missing_metric"}`,
+		},
+		{
+			name:         "evidence venue type mismatch",
+			venueType:    "journal",
+			decision:     "unknown",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"conference","reason":"missing_metric"}`,
+		},
+		{
+			name:         "invalid not applicable reason",
+			venueType:    "conference",
+			decision:     "not_applicable",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"conference","reason":"journal_policy_not_applicable"}`,
+		},
+		{
+			name:                  "invalid matched rules",
+			venueType:             "conference",
+			decision:              "not_applicable",
+			matchedRules:          `["jcr_q1"]`,
+			evidence:              `{"venue_type":"conference","reason":"venue_type_not_journal"}`,
+			dropDecisionSemantics: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			migrations, err := EmbeddedMigrations()
+			if err != nil {
+				t.Fatalf("EmbeddedMigrations() error = %v", err)
+			}
+			pool := openTestPool(t)
+			ctx := testContext(t)
+			if err := UpMigrations(ctx, pool, migrations[:3]); err != nil {
+				t.Fatalf("apply migrations through 000003: %v", err)
+			}
+			if test.dropDecisionSemantics {
+				if _, err := pool.Exec(ctx, `
+					ALTER TABLE venue_policy_assessments
+					DROP CONSTRAINT venue_policy_assessments_decision_semantics_check
+				`); err != nil {
+					t.Fatalf("drop decision semantics for corrupt-history fixture: %v", err)
+				}
+			}
+
+			var venueID, policyID, assessmentID string
+			mustScanID(t, pool.QueryRow(ctx, `
+				INSERT INTO venues (venue_type, display_title)
+				VALUES ($1, 'Invalid Historical Assessment Venue')
+				RETURNING id
+			`, test.venueType), &venueID)
+			mustScanID(t, pool.QueryRow(ctx, `
+				INSERT INTO venue_policy_versions (
+					policy_name, version_number, definition, effective_at
+				) VALUES (
+					'invalid-history-policy', 1,
+					'{"accept":["jif_gte_10","jcr_q1"]}', now()
+				)
+				RETURNING id
+			`), &policyID)
+			mustScanID(t, pool.QueryRow(ctx, `
+				INSERT INTO venue_policy_assessments (
+					venue_id, policy_version_id, metric_year, decision,
+					matched_rules, evidence, assessed_at
+				) VALUES ($1, $2, 2025, $3, $4, $5, now())
+				RETURNING id
+			`,
+				venueID,
+				policyID,
+				test.decision,
+				test.matchedRules,
+				test.evidence,
+			), &assessmentID)
+
+			err = Up(ctx, pool)
+			if err == nil ||
+				!strings.Contains(err.Error(), "invalid historical venue_policy_assessment") ||
+				!strings.Contains(err.Error(), assessmentID) {
+				t.Fatalf("upgrade invalid historical assessment error = %v", err)
+			}
+		})
+	}
+}
+
+func TestJCRIntegrityFollowupAcceptsValidHistoricalPolicyAssessments(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:3]); err != nil {
+		t.Fatalf("apply migrations through 000003: %v", err)
+	}
+
+	var journalID, conferenceID, policyID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Valid Historical Journal')
+		RETURNING id
+	`), &journalID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('conference', 'Valid Historical Conference')
+		RETURNING id
+	`), &conferenceID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_policy_versions (
+			policy_name, version_number, definition, effective_at
+		) VALUES (
+			'valid-history-policy', 1,
+			'{"accept":["jif_gte_10","jcr_q1"]}', now()
+		)
+		RETURNING id
+	`), &policyID)
+	for _, assessment := range []struct {
+		venueID    string
+		metricYear int
+		decision   string
+		matched    string
+		evidence   string
+	}{
+		{
+			venueID:    journalID,
+			metricYear: 2025,
+			decision:   "accepted",
+			matched:    `["jif_gte_10"]`,
+			evidence:   `{"venue_type":"journal"}`,
+		},
+		{
+			venueID:    journalID,
+			metricYear: 2026,
+			decision:   "rejected",
+			matched:    `[]`,
+			evidence:   `{"venue_type":"journal"}`,
+		},
+		{
+			venueID:    journalID,
+			metricYear: 2027,
+			decision:   "unknown",
+			matched:    `[]`,
+			evidence:   `{"venue_type":"journal","reason":"missing_metric"}`,
+		},
+		{
+			venueID:    conferenceID,
+			metricYear: 2025,
+			decision:   "not_applicable",
+			matched:    `[]`,
+			evidence:   `{"venue_type":"conference","reason":"venue_type_not_journal"}`,
+		},
+	} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO venue_policy_assessments (
+				venue_id, policy_version_id, metric_year, decision,
+				matched_rules, evidence, assessed_at
+			) VALUES ($1, $2, $3, $4, $5, $6, now())
+		`,
+			assessment.venueID,
+			policyID,
+			assessment.metricYear,
+			assessment.decision,
+			assessment.matched,
+			assessment.evidence,
+		); err != nil {
+			t.Fatalf("insert valid historical %s assessment: %v", assessment.decision, err)
+		}
+	}
+
+	if err := Up(ctx, pool); err != nil {
+		t.Fatalf("upgrade valid historical assessments: %v", err)
 	}
 }
 
@@ -704,7 +1281,7 @@ func TestMigrationSecondRunIsIdempotent(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*), min(checksum) FROM schema_migrations").Scan(&afterCount, &afterChecksum); err != nil {
 		t.Fatalf("query migration state after second run: %v", err)
 	}
-	if beforeCount != 4 || afterCount != beforeCount || afterChecksum != beforeChecksum {
+	if beforeCount != 5 || afterCount != beforeCount || afterChecksum != beforeChecksum {
 		t.Fatalf("migration state changed: before=(%d,%s) after=(%d,%s)", beforeCount, beforeChecksum, afterCount, afterChecksum)
 	}
 }
@@ -777,8 +1354,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 4 {
-		t.Fatalf("embedded migration count = %d, want 4", len(migrations))
+	if len(migrations) != 5 {
+		t.Fatalf("embedded migration count = %d, want 5", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -892,9 +1469,9 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	`).Scan(&appliedCount, &preservedChecksum); err != nil {
 		t.Fatalf("query upgraded migration records: %v", err)
 	}
-	if appliedCount != 4 || preservedChecksum != initialMigrationChecksum {
+	if appliedCount != 5 || preservedChecksum != initialMigrationChecksum {
 		t.Fatalf(
-			"upgraded migrations = count %d, initial checksum %s; want 4, %s",
+			"upgraded migrations = count %d, initial checksum %s; want 5, %s",
 			appliedCount,
 			preservedChecksum,
 			initialMigrationChecksum,

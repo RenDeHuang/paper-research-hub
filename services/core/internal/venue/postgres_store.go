@@ -3,6 +3,7 @@ package venue
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -16,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const postgresJCRAliasAdvisoryNamespace int32 = 0x4a435241
 
 type PostgresJCRStoreConfig struct {
 	SourceLicense string
@@ -152,7 +155,7 @@ func (store *PostgresJCRStore) FindMetric(
 	if store == nil || store.pool == nil {
 		return MetricSnapshot{}, false, errors.New("PostgresJCRStore is not initialized")
 	}
-	stored, found, err := findPostgresMetric(ctx, store.pool, key)
+	stored, found, err := findPostgresMetric(ctx, store.pool, key, false)
 	if err != nil || !found {
 		return MetricSnapshot{}, found, err
 	}
@@ -183,6 +186,10 @@ func (store *PostgresJCRStore) PersistJCRImport(
 	); err != nil {
 		return ImportReceipt{}, fmt.Errorf("invalid JCR import batch: %w", err)
 	}
+	aliases, err := preparePostgresAliases(batch.Aliases(), batch.Source())
+	if err != nil {
+		return ImportReceipt{}, err
+	}
 
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -199,16 +206,34 @@ func (store *PostgresJCRStore) PersistJCRImport(
 	); err != nil {
 		return ImportReceipt{}, fmt.Errorf("acquire JCR import advisory lock: %w", err)
 	}
+	var previousAliasLock int32
+	haveAliasLock := false
+	for _, alias := range aliases {
+		if haveAliasLock && alias.lockKey == previousAliasLock {
+			continue
+		}
+		if _, err := tx.Exec(
+			ctx,
+			"SELECT pg_advisory_xact_lock($1::integer, $2::integer)",
+			postgresJCRAliasAdvisoryNamespace,
+			alias.lockKey,
+		); err != nil {
+			return ImportReceipt{}, fmt.Errorf("acquire JCR alias advisory lock: %w", err)
+		}
+		previousAliasLock = alias.lockKey
+		haveAliasLock = true
+	}
 
 	existingReceipt, found, err := findPostgresImport(ctx, tx, batch.FileSHA256())
 	if err != nil {
 		return ImportReceipt{}, err
 	}
 	if found {
-		if err := validatePostgresImportLicense(
+		if err := validateExistingPostgresImport(
 			ctx,
 			tx,
-			batch.FileSHA256(),
+			batch,
+			existingReceipt,
 			store.sourceLicense,
 		); err != nil {
 			return ImportReceipt{}, err
@@ -256,7 +281,7 @@ func (store *PostgresJCRStore) PersistJCRImport(
 			continue
 		}
 
-		existing, found, err := findPostgresMetric(ctx, tx, snapshot.Key())
+		existing, found, err := findPostgresMetric(ctx, tx, snapshot.Key(), false)
 		if err != nil {
 			return ImportReceipt{}, err
 		}
@@ -332,7 +357,6 @@ func (store *PostgresJCRStore) PersistJCRImport(
 				$1,
 				$2
 			)
-			ON CONFLICT (import_receipt_id, metric_snapshot_id) DO NOTHING
 		`,
 			receiptID,
 			metricID,
@@ -341,15 +365,8 @@ func (store *PostgresJCRStore) PersistJCRImport(
 		}
 	}
 
-	for _, aliasEvidence := range batch.Aliases() {
-		if aliasEvidence.Alias().Source() != batch.Source() {
-			return ImportReceipt{}, fmt.Errorf(
-				"alias source %q does not match import source %q",
-				aliasEvidence.Alias().Source(),
-				batch.Source(),
-			)
-		}
-		aliasID, err := persistPostgresAlias(ctx, tx, aliasEvidence)
+	for _, alias := range aliases {
+		aliasID, err := persistPostgresAlias(ctx, tx, alias.evidence)
 		if err != nil {
 			return ImportReceipt{}, err
 		}
@@ -370,6 +387,69 @@ func (store *PostgresJCRStore) PersistJCRImport(
 		return ImportReceipt{}, fmt.Errorf("commit JCR import transaction: %w", err)
 	}
 	return receipt, nil
+}
+
+type postgresAliasPlan struct {
+	evidence VenueAliasEvidence
+	key      string
+	lockKey  int32
+}
+
+func preparePostgresAliases(
+	values []VenueAliasEvidence,
+	importSource string,
+) ([]postgresAliasPlan, error) {
+	normalizedSource := strings.TrimSpace(importSource)
+	plansByKey := make(map[string]postgresAliasPlan, len(values))
+	for _, value := range values {
+		alias, err := NewAlias(
+			value.Alias().Value(),
+			value.Alias().Source(),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("normalize JCR alias: %w", err)
+		}
+		if alias.Source() != normalizedSource {
+			return nil, fmt.Errorf(
+				"alias source %q does not match import source %q",
+				alias.Source(),
+				normalizedSource,
+			)
+		}
+		evidence, err := NewVenueAliasEvidence(value.VenueID(), alias)
+		if err != nil {
+			return nil, fmt.Errorf("normalize JCR alias evidence: %w", err)
+		}
+		key := fmt.Sprintf(
+			"%d:%s:%d:%s:%d:%s",
+			len(evidence.VenueID()),
+			evidence.VenueID(),
+			len(alias.Value()),
+			alias.Value(),
+			len(alias.Source()),
+			alias.Source(),
+		)
+		if _, duplicate := plansByKey[key]; duplicate {
+			continue
+		}
+		digest := sha256.Sum256([]byte(key))
+		plansByKey[key] = postgresAliasPlan{
+			evidence: evidence,
+			key:      key,
+			lockKey:  int32(binary.BigEndian.Uint32(digest[:4])),
+		}
+	}
+	plans := make([]postgresAliasPlan, 0, len(plansByKey))
+	for _, plan := range plansByKey {
+		plans = append(plans, plan)
+	}
+	slices.SortFunc(plans, func(left, right postgresAliasPlan) int {
+		if order := cmp.Compare(left.lockKey, right.lockKey); order != 0 {
+			return order
+		}
+		return cmp.Compare(left.key, right.key)
+	})
+	return plans, nil
 }
 
 func postgresJCRImportAdvisoryKey(fileSHA256 string) (int64, error) {
@@ -524,36 +604,47 @@ func findPostgresImport(
 	return receipt, true, nil
 }
 
-func validatePostgresImportLicense(
+func validateExistingPostgresImport(
 	ctx context.Context,
 	querier postgresRowQuerier,
-	fileSHA256 string,
+	batch JCRImport,
+	receipt ImportReceipt,
 	sourceLicense string,
 ) error {
-	var conflicting bool
-	if err := querier.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1
-			FROM jcr_import_receipts AS receipt
-			JOIN jcr_import_receipt_metrics AS receipt_metric
-			  ON receipt_metric.import_receipt_id = receipt.id
-			JOIN venue_metric_snapshots AS metric
-			  ON metric.id = receipt_metric.metric_snapshot_id
-			WHERE receipt.file_sha256 = $1
-			  AND metric.source_license <> $2
-		)
-	`,
-		strings.ToLower(strings.TrimSpace(fileSHA256)),
-		sourceLicense,
-	).Scan(&conflicting); err != nil {
-		return fmt.Errorf("validate existing JCR import source license: %w", err)
-	}
-	if conflicting {
+	if receipt.Source() != batch.Source() ||
+		receipt.InputRows() != batch.InputRows() ||
+		batch.UnchangedRows() != 0 ||
+		len(batch.Rows()) != batch.InputRows() {
 		return fmt.Errorf(
-			"%w: file %q was persisted under a different source license",
+			"%w: existing receipt metadata does not match replayed JCR rows",
 			ErrConflictingMetric,
-			fileSHA256,
 		)
+	}
+	rows := batch.Rows()
+	slices.SortFunc(rows, func(left, right MetricSnapshot) int {
+		return cmp.Compare(left.Key().String(), right.Key().String())
+	})
+	for _, snapshot := range rows {
+		existing, found, err := findPostgresMetric(
+			ctx,
+			querier,
+			snapshot.Key(),
+			true,
+		)
+		if err != nil {
+			return err
+		}
+		if !found ||
+			!existing.snapshot.Equal(snapshot) ||
+			existing.sourceLicense != sourceLicense {
+			return fmt.Errorf(
+				"%w for venue %q, metric_year %d, category %q",
+				ErrConflictingMetric,
+				snapshot.VenueID(),
+				snapshot.MetricYear(),
+				snapshot.Category(),
+			)
+		}
 	}
 	return nil
 }
@@ -568,6 +659,7 @@ func findPostgresMetric(
 	ctx context.Context,
 	querier postgresRowQuerier,
 	key MetricKey,
+	lock bool,
 ) (storedPostgresMetric, bool, error) {
 	query := `
 		SELECT
@@ -582,6 +674,9 @@ func findPostgresMetric(
 		  AND metric_year = $2
 		  AND category = $3
 	`
+	if lock {
+		query += " FOR KEY SHARE"
+	}
 	var (
 		id                               string
 		jif, quartile                    pgtype.Text
