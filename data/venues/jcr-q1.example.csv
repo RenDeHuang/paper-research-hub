@@ -1,4 +1,5 @@
-controlled_source_scheme,controlled_source_id,title,issn_l,issn,eissn,metric_year,category,jif,quartile,status
-doaj,synthetic-source-alpha,Synthetic Journal of Agent Systems,1234-567X,1234-567X,2049-3630,2025,Artificial Intelligence,12.5,Q1,known
-doaj,synthetic-source-alpha,Synthetic Journal of Agent Systems,1234-567X,1234-567X,2049-3630,2025,Robotics,12.5,Q1,known
-doaj,synthetic-source-unknown,Synthetic Journal with Unknown Metrics,9876-543X,9876-543X,1357-246X,2025,"Computer Science, Interdisciplinary Applications",,,unknown
+title,issn_l,issn,eissn,metric_year,category,jif,quartile,status,source
+Synthetic Journal of Deterministic Agents,0000-0019,0000-0027,0000-0035,2025,Artificial Agent Systems,12.5,Q2,known,synthetic-jcr-fixture
+Synthetic Journal of Deterministic Agents,0000-0019,0000-0027,0000-0035,2025,Autonomous Robotics,12.5,Q1,known,synthetic-jcr-fixture
+Synthetic Journal of Unknown Evidence,0000-0043,0000-0051,0000-006X,2025,Unresolved Computational Studies,,,unknown,synthetic-jcr-fixture
+Synthetic Journal of Subthreshold Results,0000-0078,0000-0086,0000-0094,2025,Applied Synthetic Evaluation,9.999,Q2,known,synthetic-jcr-fixture

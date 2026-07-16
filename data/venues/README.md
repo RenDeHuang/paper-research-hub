@@ -1,20 +1,60 @@
 # Venue metric fixtures
 
-`jcr-q1.example.csv` is a **fully synthetic** schema fixture. Its journal
-titles, identifiers, ISSNs, categories, JIF values, and quartiles are invented
-for automated tests and documentation; they are not copied from JCR or any
-other commercial dataset.
+`jcr-q1.example.csv` is a fully synthetic schema and policy fixture. Every
+title, category, identifier, metric, and source label is invented for this
+repository. The `0000-*` ISSNs are checksum-valid synthetic identifiers used
+only by tests; they are not claims about registered publications.
 
 Production JCR data must come from a user-authorized CSV export supplied
-explicitly through `JCR_IMPORT_PATH`. The application never substitutes
-OpenAlex citation metrics, title similarity, or another inferred metric when
-that path is absent.
+explicitly through `JCR_IMPORT_PATH`. The importer never substitutes OpenAlex
+`2yr_mean_citedness`, title similarity, or another inferred citation metric
+for JIF.
 
-The fixture demonstrates:
+## Required columns
 
-- exact ISSN-L/ISSN/eISSN and controlled-source matching;
-- multiple Q1 categories for one venue and metric year;
-- a nonnegative JIF greater than or equal to 10;
-- an explicit `unknown` metric row with no JIF or quartile.
+Every file must contain these case-sensitive columns:
 
-The production importer is intentionally outside Task 3.
+```text
+metric_year,category,quartile,jif,issn,eissn,issn_l,source,status
+```
+
+`title` is optional alias evidence. It is never sent to the venue identity
+repository and cannot resolve a Venue. Extra controlled-source columns may be
+carried by an authorized export, but Venue matching remains exact
+ISSN-L/print-ISSN/eISSN matching.
+
+All data rows must have the same width as the header. A `known` row requires
+both a nonnegative decimal JIF and one of `Q1` through `Q4`. An `unknown` row
+requires blank JIF and Quartile fields while retaining metric year, category,
+all three ISSN roles, source, and status.
+
+## Persistence contract
+
+The Go importer reads through a `JCRRepository` and writes one atomic
+`JCRImport` through a `JCRSink`; it does not define a second database
+migration. Persistence implementations must:
+
+- resolve exactly one pre-existing Venue from the three role-labelled ISSNs;
+- append `(venue_id, metric_year, category)` snapshots without overwriting
+  historical years;
+- treat normalized identical rows and identical file SHA-256 values as
+  idempotent;
+- reject conflicting rows explicitly;
+- atomically record the input SHA-256 and import timestamp with inserted rows.
+
+## Decimal representation
+
+JIF uses an arbitrary-precision decimal value represented as a canonical digit
+coefficient plus decimal scale. Comparisons align scales with integer
+arithmetic, so values immediately below or equal to `10` cannot be
+misclassified by binary floating-point rounding.
+
+## Covered synthetic outcomes
+
+The fixture has four rows covering:
+
+- a high-JIF journal (`12.5`) that is not dependent on Q1;
+- a second category for the same journal that is Q1;
+- a multi-category journal with both policy rules visible;
+- an explicit `unknown` metric row;
+- a known `9.999`, Q2 row that evaluates to `rejected`.
