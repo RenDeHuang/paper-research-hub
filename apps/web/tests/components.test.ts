@@ -21,12 +21,16 @@ describe("AppHeader", () => {
     expect(links.map((link) => link.text())).toEqual([
       "首页",
       "论文",
+      "Topic",
+      "Method",
       "趋势",
       "研究机会",
     ])
     expect(links.map((link) => link.attributes("href"))).toEqual([
       "/",
       "/papers",
+      "/topics",
+      "/methods",
       "/trends",
       "/opportunities",
     ])
@@ -83,18 +87,27 @@ describe("DiscoveryRail", () => {
   it("renders the four discovery contracts from caller-provided items", async () => {
     const wrapper = await mountSuspended(DiscoveryRail, {
       props: {
-        popularMethods: [
-          { label: "检索增强生成", to: "/methods/rag" },
-        ],
-        popularTopics: [
-          { label: "Agent", to: "/topics/agent" },
-        ],
-        quickFilters: [
-          { label: "JIF ≥ 10", to: "/papers?jif_min=10" },
-        ],
-        savedViews: [
-          { label: "我的高影响力视图", to: "/papers?saved=high-impact" },
-        ],
+        popularMethods: {
+          items: [{ label: "检索增强生成", to: "/methods/rag" }],
+          state: "known",
+        },
+        popularTopics: {
+          items: [{ label: "Agent", to: "/topics/agent" }],
+          state: "known",
+        },
+        quickFilters: {
+          items: [{ label: "JIF ≥ 10", to: "/papers?jif_min=10" }],
+          state: "known",
+        },
+        savedViews: {
+          items: [
+            {
+              label: "我的高影响力视图",
+              to: "/papers?saved=high-impact",
+            },
+          ],
+          state: "known",
+        },
       },
     })
     const groups = wrapper.findAll("[data-discovery-group]")
@@ -123,13 +136,25 @@ describe("DiscoveryRail", () => {
     expect(wrapper.text()).not.toContain("研究机会")
   })
 
-  it("renders a distinct empty state for every discovery contract", async () => {
+  it("keeps known-empty, missing, and unknown discovery states distinct", async () => {
     const wrapper = await mountSuspended(DiscoveryRail, {
       props: {
-        popularMethods: [],
-        popularTopics: [],
-        quickFilters: [],
-        savedViews: [],
+        popularMethods: {
+          label: "热门 Method 尚未生成",
+          state: "missing",
+        },
+        popularTopics: {
+          label: "热门 Topic 来源未覆盖",
+          state: "unknown",
+        },
+        quickFilters: {
+          items: [],
+          state: "known",
+        },
+        savedViews: {
+          items: [],
+          state: "known",
+        },
       },
     })
     const states = wrapper.findAll("[data-discovery-empty]")
@@ -140,10 +165,13 @@ describe("DiscoveryRail", () => {
       "popular-methods",
       "saved-views",
     ])
+    expect(
+      states.map((state) => state.attributes("data-discovery-state")),
+    ).toEqual(["empty", "unknown", "missing", "empty"])
     expect(states.map((state) => state.text())).toEqual([
       "暂无快捷筛选",
-      "等待首次同步",
-      "等待首次同步",
+      "热门 Topic 来源未覆盖",
+      "热门 Method 尚未生成",
       "暂无保存视图",
     ])
   })
@@ -207,8 +235,36 @@ describe("SearchCommand", () => {
       "global-search-helper",
       "global-search-status",
     ])
+    expect(input.attributes("aria-controls")).toBeUndefined()
     expect(wrapper.get("#global-search-helper").text()).toContain("可搜索标题")
     expect(wrapper.get('button[type="submit"]').text()).toBe("搜索")
+  })
+
+  it("distinguishes unavailable suggestions from a completed no-match result", async () => {
+    const unavailable = await mountSuspended(SearchCommand, {
+      props: {
+        modelValue: "agent",
+        suggestionGroups: [],
+      },
+    })
+    const noMatch = await mountSuspended(SearchCommand, {
+      props: {
+        modelValue: "agent",
+        suggestionGroups: [],
+        suggestionsState: "ready",
+      },
+    })
+
+    expect(unavailable.get("[data-search-state]").attributes(
+      "data-search-state",
+    )).toBe("unavailable")
+    expect(unavailable.get("[data-search-state]").text()).toBe(
+      "搜索建议尚未生成",
+    )
+    expect(noMatch.get("[data-search-state]").attributes(
+      "data-search-state",
+    )).toBe("no-match")
+    expect(noMatch.get("[data-search-state]").text()).toBe("没有匹配结果")
   })
 
   it("exposes caller-provided entity groups through combobox semantics", async () => {
@@ -372,7 +428,7 @@ describe("SearchCommand", () => {
     await nextTick()
 
     expect(router.currentRoute.value.fullPath).toBe("/")
-    expect(wrapper.emitted("search")?.at(-1)).toEqual([""])
+    expect(wrapper.emitted("search")).toBeUndefined()
 
     await input.setValue("causal inference")
     await wrapper.get("form").trigger("submit")
@@ -386,6 +442,39 @@ describe("SearchCommand", () => {
     expect(router.currentRoute.value.fullPath).toBe(
       "/topics?q=causal+inference",
     )
+  })
+
+  it("restores input focus after a pointer selects a suggestion", async () => {
+    const wrapper = await mountSuspended(SearchCommand, {
+      attachTo: document.body,
+      props: {
+        modelValue: "agent",
+        suggestionGroups: [
+          {
+            id: "entities",
+            items: [
+              {
+                entityType: "topic",
+                id: "topic-1",
+                label: "Agent",
+              },
+            ],
+            label: "研究实体",
+          },
+        ],
+      },
+    })
+    const input = wrapper.get<HTMLInputElement>('[role="combobox"]')
+    const option = wrapper.get<HTMLButtonElement>('[role="option"]')
+
+    option.element.focus()
+    expect(document.activeElement).toBe(option.element)
+    await option.trigger("click")
+    await nextTick()
+
+    expect(document.activeElement).toBe(input.element)
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(false)
+    wrapper.unmount()
   })
 
   it("supports option navigation, selection, and Escape dismissal", async () => {
@@ -478,7 +567,11 @@ describe("SearchCommand", () => {
     },
     {
       expected: "没有匹配结果",
-      props: { modelValue: "agent", suggestionGroups: [] },
+      props: {
+        modelValue: "agent",
+        suggestionGroups: [],
+        suggestionsState: "ready",
+      },
       state: "no-match",
     },
   ])("renders the $state command state independently", async ({
@@ -873,6 +966,12 @@ describe("OpportunityMatrix", () => {
     expect(wrapper.get("[data-unplottable-count]").text()).toContain(
       "3 个方向",
     )
+    expect(wrapper.get("[data-unplottable-count]").text()).toContain(
+      "2 个方向存在预期坐标缺失",
+    )
+    expect(wrapper.get("[data-unplottable-count]").text()).toContain(
+      "1 个方向的坐标未覆盖",
+    )
     expect(coordinateCells.map((cell) => cell.text())).toEqual([
       "缺失",
       "未覆盖",
@@ -905,6 +1004,44 @@ describe("OpportunityMatrix", () => {
       "not-recommended-now",
       "insufficient-evidence",
     ])
+    expect(
+      wrapper
+        .findAll(".opportunity-matrix__desktop-chart [data-axis-tick]")
+        .map((tick) => tick.text()),
+    ).toEqual(["0", "50", "100", "0", "50", "100"])
+  })
+
+  it("uses unknown rather than insufficient when every coordinate is uncovered", async () => {
+    const wrapper = await mountSuspended(OpportunityMatrix, {
+      props: {
+        points: [
+          {
+            id: "unknown",
+            label: "方向 U",
+            missingSignals: ["竞争密度", "增长信号"],
+            status: "insufficient-evidence",
+            x: { state: "unknown" },
+            y: { state: "unknown" },
+          },
+        ],
+        summary: "坐标来源尚未覆盖。",
+        title: "坐标覆盖未知",
+        xAxisLabel: "竞争密度",
+        yAxisLabel: "增长信号",
+      },
+    })
+
+    expect(
+      wrapper.get(".opportunity-matrix__desktop-state").attributes(
+        "data-state",
+      ),
+    ).toBe("unknown")
+    expect(wrapper.get("[data-unplottable-count]").text()).toContain(
+      "1 个方向的坐标未覆盖",
+    )
+    expect(wrapper.get("[data-unplottable-count]").text()).not.toContain(
+      "坐标缺失",
+    )
   })
 
   it("preserves caller signal order across matrix details and accessible alternatives", async () => {

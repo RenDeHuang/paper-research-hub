@@ -102,12 +102,43 @@ const unplottableCount = computed(
   () => normalizedPoints.value.length - plottablePoints.value.length,
 )
 
-const unavailableCoordinateState = computed<"insufficient" | "missing">(() =>
-  normalizedPoints.value.some(
+const missingCoordinateCount = computed(
+  () => normalizedPoints.value.filter(
     (point) => point.x.state === "missing" || point.y.state === "missing",
-  )
-    ? "missing"
-    : "insufficient",
+  ).length,
+)
+
+const unknownCoordinateCount = computed(
+  () => normalizedPoints.value.filter(
+    (point) =>
+      point.x.state !== "missing"
+      && point.y.state !== "missing"
+      && (point.x.state === "unknown" || point.y.state === "unknown"),
+  ).length,
+)
+
+const unavailableCoordinateState = computed<"missing" | "unknown">(() =>
+  missingCoordinateCount.value > 0 ? "missing" : "unknown",
+)
+
+const coordinateCoverageText = computed(() => {
+  const reasons: string[] = []
+  if (missingCoordinateCount.value > 0) {
+    reasons.push(
+      `${missingCoordinateCount.value} 个方向存在预期坐标缺失`,
+    )
+  }
+  if (unknownCoordinateCount.value > 0) {
+    reasons.push(
+      `${unknownCoordinateCount.value} 个方向的坐标未覆盖`,
+    )
+  }
+  return reasons.join("，")
+})
+
+const unavailableCoordinateMessage = computed(
+  () =>
+    `全部方向均不可绘制：${coordinateCoverageText.value}。矩阵不会推断或填补位置。`,
 )
 
 function coordinateText(value: DataValue<number>) {
@@ -154,7 +185,7 @@ function missingSignalsText(signals: string[]) {
         class="opportunity-matrix__coverage-note"
         data-unplottable-count
       >
-        {{ unplottableCount }} 个方向因坐标缺失或未覆盖而未绘制，仍保留在分组列表和数据表中。
+        {{ unplottableCount }} 个方向未绘制：{{ coordinateCoverageText }}；这些方向仍保留在分组列表和数据表中。
       </p>
 
       <div
@@ -223,7 +254,7 @@ function missingSignalsText(signals: string[]) {
           v-else
           :state="unavailableCoordinateState"
           title="暂无可绘制坐标"
-          message="所有方向的坐标均为缺失或未覆盖，矩阵不会推断或填补位置。"
+          :message="unavailableCoordinateMessage"
         />
         <ul
           class="opportunity-matrix__point-details"
@@ -273,7 +304,7 @@ function missingSignalsText(signals: string[]) {
         class="opportunity-matrix__desktop-state"
         :state="unavailableCoordinateState"
         title="暂无可绘制坐标"
-        message="所有方向的坐标均为缺失或未覆盖，矩阵不会推断或填补位置。"
+        :message="unavailableCoordinateMessage"
       />
       <ul
         class="opportunity-matrix__point-details opportunity-matrix__desktop-details"

@@ -101,6 +101,24 @@ test("restores focus after Escape closes the mobile navigation", async ({
   await expect(page.locator("html")).not.toHaveClass(/menu-open/)
 })
 
+test("releases the mobile menu scroll lock at the desktop breakpoint", async ({
+  page,
+}) => {
+  await page.setViewportSize({ height: 900, width: 375 })
+  await page.goto("/")
+  await waitForNuxtHydration(page)
+  const menuButton = page.locator(".app-header__menu-button")
+
+  await menuButton.click()
+  await expect(page.locator("html")).toHaveClass(/menu-open/)
+
+  await page.setViewportSize({ height: 900, width: 768 })
+
+  await expect(page.locator("html")).not.toHaveClass(/menu-open/)
+  await expect(page.getByRole("navigation", { name: "一级导航" })).toBeVisible()
+  await expect(menuButton).toBeHidden()
+})
+
 test("reduces transition and animation durations when motion is reduced", async ({
   page,
 }) => {
@@ -169,3 +187,119 @@ test("restores the homepage search query through browser history", async ({
   await expect(page).toHaveURL(/\/\?q=second$/)
   await expect(search).toHaveValue("second")
 })
+
+for (const route of [
+  { heading: "论文", path: "/papers" },
+  { heading: "Topic", path: "/topics" },
+  { heading: "Method", path: "/methods" },
+  { heading: "趋势", path: "/trends" },
+  { heading: "研究机会", path: "/opportunities" },
+]) {
+  test(`renders the real API boundary for ${route.path}`, async ({ page }) => {
+    await page.goto(route.path)
+    await expect(
+      page.getByRole("heading", { level: 1, name: route.heading }),
+    ).toBeVisible()
+
+    const state = page.locator(".data-state").first()
+    if (await state.count()) {
+      const stateKind = await state.getAttribute("data-state")
+      expect(["empty", "error"]).toContain(stateKind)
+      const title = await state.getByRole("heading", { level: 2 }).textContent()
+      expect(["等待首次同步", "暂时无法加载"]).toContain(title)
+      if (title === "暂时无法加载") {
+        await expect(state.getByRole("button", { name: "重试" })).toBeVisible()
+      }
+    }
+
+    await expect(page.locator("body")).not.toContainText("示例论文")
+    await expect(page.locator("body")).not.toContainText("伪造趋势")
+  })
+}
+
+test("restores every supported paper filter from the shareable URL", async ({
+  page,
+}) => {
+  await page.goto(
+    "/papers?q=agent&type=research_article&topic=agents&method=causal-inference"
+    + "&has_code=true&has_data=false&has_benchmark=true&status=active"
+    + "&source=openalex&sort=relevance"
+    + "&published_from=2026-07-01T00%3A00%3A00Z"
+    + "&published_to=2026-07-16T23%3A59%3A59Z",
+  )
+
+  await expect(page.locator('[name="q"]')).toHaveValue("agent")
+  await expect(page.locator('[name="type"]')).toHaveValue("research_article")
+  await expect(page.locator('[name="topic"]')).toHaveValue("agents")
+  await expect(page.locator('[name="method"]')).toHaveValue("causal-inference")
+  await expect(page.locator('[name="has_code"]')).toHaveValue("true")
+  await expect(page.locator('[name="has_data"]')).toHaveValue("false")
+  await expect(page.locator('[name="has_benchmark"]')).toHaveValue("true")
+  await expect(page.locator('[name="status"]')).toHaveValue("active")
+  await expect(page.locator('[name="source"]')).toHaveValue("openalex")
+  await expect(page.locator('[name="sort"]')).toHaveValue("relevance")
+  await expect(page.locator('[name="published_from"]')).toHaveValue(
+    "2026-07-01T00:00:00Z",
+  )
+  await expect(page.locator('[name="published_to"]')).toHaveValue(
+    "2026-07-16T23:59:59Z",
+  )
+  await expect(page.locator('[name="jif_min"]')).toHaveCount(0)
+  await expect(page.locator('[name="jcr_quartile"]')).toHaveCount(0)
+})
+
+test("submits paper filters as exact Go API query names", async ({ page }) => {
+  await page.goto("/papers")
+  const submitButton = page.getByRole("button", { name: "应用筛选" })
+  await expect(submitButton).toBeEnabled()
+
+  await page.locator('[name="q"]').fill("agent evaluation")
+  await page.locator('[name="has_code"]').selectOption("true")
+  await page.locator('[name="status"]').selectOption("active")
+  await page.locator('[name="source"]').selectOption("openalex")
+  await page.locator('[name="sort"]').selectOption("relevance")
+  await submitButton.click()
+
+  await expect
+    .poll(() => new URL(page.url()).searchParams.get("q"))
+    .toBe("agent evaluation")
+  expect(new URL(page.url()).pathname).toBe("/papers")
+  const query = new URL(page.url()).searchParams
+  expect(Object.fromEntries(query)).toEqual({
+    has_code: "true",
+    q: "agent evaluation",
+    sort: "relevance",
+    source: "openalex",
+    status: "active",
+  })
+})
+
+for (const route of [
+  {
+    back: "返回论文目录",
+    label: "论文详情",
+    path: "/papers/00000000-0000-0000-0000-000000000000",
+  },
+  {
+    back: "返回 Topic",
+    label: "Topic",
+    path: "/topics/not-published",
+  },
+  {
+    back: "返回 Method",
+    label: "Method",
+    path: "/methods/not-published",
+  },
+]) {
+  test(`keeps ${route.path} recoverable without invented detail data`, async ({
+    page,
+  }) => {
+    await page.goto(route.path)
+
+    await expect(page.locator(".app-header__route-name")).toHaveText(
+      route.label,
+    )
+    await expect(page.getByRole("link", { name: route.back })).toBeVisible()
+    await expect(page.locator("body")).not.toContainText("示例论文")
+  })
+}

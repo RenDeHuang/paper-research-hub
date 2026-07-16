@@ -5,47 +5,64 @@ export interface DiscoveryRailItem {
   to: string
 }
 
-const props = withDefaults(
-  defineProps<{
-    popularMethods?: DiscoveryRailItem[]
-    popularTopics?: DiscoveryRailItem[]
-    quickFilters?: DiscoveryRailItem[]
-    savedViews?: DiscoveryRailItem[]
-  }>(),
-  {
-    popularMethods: () => [],
-    popularTopics: () => [],
-    quickFilters: () => [],
-    savedViews: () => [],
-  },
-)
+export type DiscoveryRailCollection =
+  | {
+      items: DiscoveryRailItem[]
+      state: "known"
+    }
+  | {
+      label: string
+      state: "missing" | "unknown"
+    }
+
+const props = defineProps<{
+  popularMethods: DiscoveryRailCollection
+  popularTopics: DiscoveryRailCollection
+  quickFilters: DiscoveryRailCollection
+  savedViews: DiscoveryRailCollection
+}>()
+
+function resolveCollection(
+  collection: DiscoveryRailCollection,
+  emptyMessage: string,
+) {
+  if (collection.state === "known") {
+    return {
+      emptyMessage,
+      items: collection.items,
+      state: collection.items.length > 0 ? "known" : "empty",
+    }
+  }
+
+  return {
+    emptyMessage: collection.label,
+    items: [],
+    state: collection.state,
+  }
+}
 
 const groups = computed(() => [
   {
-    emptyMessage: "暂无快捷筛选",
     id: "quick-filters",
-    items: props.quickFilters,
+    ...resolveCollection(props.quickFilters, "暂无快捷筛选"),
     slotName: "quick-filters",
     title: "快捷筛选",
   },
   {
-    emptyMessage: "等待首次同步",
     id: "popular-topics",
-    items: props.popularTopics,
+    ...resolveCollection(props.popularTopics, "当前没有热门 Topic"),
     slotName: "popular-topics",
     title: "热门 Topic",
   },
   {
-    emptyMessage: "等待首次同步",
     id: "popular-methods",
-    items: props.popularMethods,
+    ...resolveCollection(props.popularMethods, "当前没有热门 Method"),
     slotName: "popular-methods",
     title: "热门 Method",
   },
   {
-    emptyMessage: "暂无保存视图",
     id: "saved-views",
-    items: props.savedViews,
+    ...resolveCollection(props.savedViews, "暂无保存视图"),
     slotName: "saved-views",
     title: "保存视图",
   },
@@ -59,10 +76,15 @@ const groups = computed(() => [
       :key="group.id"
       class="discovery-rail__section"
       :data-discovery-group="group.id"
+      :data-discovery-state="group.state"
     >
       <h2>{{ group.title }}</h2>
-      <slot :name="group.slotName" :items="group.items">
-        <ul>
+      <slot
+        :name="group.slotName"
+        :items="group.items"
+        :state="group.state"
+      >
+        <ul v-if="group.items.length > 0">
           <li v-for="item in group.items" :key="`${group.id}:${item.to}`">
             <NuxtLink :to="item.to">
               <span>{{ item.label }}</span>
@@ -71,9 +93,10 @@ const groups = computed(() => [
           </li>
         </ul>
         <p
-          v-if="group.items.length === 0"
+          v-else
           class="discovery-rail__empty"
           :data-discovery-empty="group.id"
+          :data-discovery-state="group.state"
         >
           {{ group.emptyMessage }}
         </p>

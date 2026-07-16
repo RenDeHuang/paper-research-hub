@@ -5,6 +5,8 @@ const route = useRoute()
 const menuOpen = ref(false)
 const menuReady = ref(false)
 const menuButton = useTemplateRef<HTMLButtonElement>("menuButton")
+const desktopNavigationQuery = "(min-width: 768px)"
+let desktopNavigationMedia: MediaQueryList | undefined
 
 const props = defineProps<{
   routeLabel?: string
@@ -13,6 +15,8 @@ const props = defineProps<{
 const navigation = [
   { label: "首页", to: "/" },
   { label: "论文", to: "/papers" },
+  { label: "Topic", to: "/topics" },
+  { label: "Method", to: "/methods" },
   { label: "趋势", to: "/trends" },
   { label: "研究机会", to: "/opportunities" },
 ] as const
@@ -46,6 +50,12 @@ function closeMenu({ restoreFocus = false } = {}) {
   }
 }
 
+function handleNavigationBreakpoint(event: MediaQueryListEvent | MediaQueryList) {
+  if (event.matches) {
+    closeMenu()
+  }
+}
+
 watch(
   () => route.path,
   () => closeMenu(),
@@ -57,9 +67,16 @@ watch(menuOpen, (open) => {
 
 onMounted(() => {
   menuReady.value = true
+  desktopNavigationMedia = window.matchMedia(desktopNavigationQuery)
+  handleNavigationBreakpoint(desktopNavigationMedia)
+  desktopNavigationMedia.addEventListener("change", handleNavigationBreakpoint)
 })
 
 onBeforeUnmount(() => {
+  desktopNavigationMedia?.removeEventListener(
+    "change",
+    handleNavigationBreakpoint,
+  )
   document.documentElement.classList.remove("menu-open")
 })
 </script>

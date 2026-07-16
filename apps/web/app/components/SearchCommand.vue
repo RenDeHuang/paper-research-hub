@@ -9,6 +9,8 @@ type SearchEntityType =
   | "topic"
   | "venue"
 
+type SearchSuggestionsState = "ready" | "unavailable"
+
 interface SearchSuggestion {
   description?: string
   entityType: SearchEntityType
@@ -38,6 +40,8 @@ const props = withDefaults(
     placeholder?: string
     submitLabel?: string
     suggestionGroups?: SearchSuggestionGroup[]
+    suggestionsState?: SearchSuggestionsState
+    unavailableMessage?: string
   }>(),
   {
     destination: "/papers",
@@ -53,11 +57,14 @@ const props = withDefaults(
     placeholder: "例如：agent、single-cell、DOI 或作者名",
     submitLabel: "搜索",
     suggestionGroups: () => [],
+    suggestionsState: "unavailable",
+    unavailableMessage: "搜索建议尚未生成",
   },
 )
 
 const route = useRoute()
 const router = useRouter()
+const searchInput = useTemplateRef<HTMLInputElement>("searchInput")
 const emit = defineEmits<{
   search: [query: string]
   select: [suggestion: SearchSuggestion]
@@ -119,7 +126,12 @@ const flattenedSuggestions = computed(() =>
 )
 
 const commandState = computed<
-  "empty-query" | "error" | "loading" | "no-match" | "suggestions"
+  | "empty-query"
+  | "error"
+  | "loading"
+  | "no-match"
+  | "suggestions"
+  | "unavailable"
 >(() => {
   if (props.loading) {
     return "loading"
@@ -130,10 +142,10 @@ const commandState = computed<
   if (query.value.trim().length === 0) {
     return "empty-query"
   }
-  if (flattenedSuggestions.value.length === 0) {
-    return "no-match"
+  if (flattenedSuggestions.value.length > 0) {
+    return "suggestions"
   }
-  return "suggestions"
+  return props.suggestionsState === "ready" ? "no-match" : "unavailable"
 })
 
 const isListboxOpen = computed(
@@ -179,11 +191,11 @@ function updateQuery(event: Event) {
 
 async function submitSearch() {
   const normalizedQuery = query.value.trim()
-  emit("search", normalizedQuery)
   if (normalizedQuery.length === 0) {
     return
   }
 
+  emit("search", normalizedQuery)
   await router.push({
     path: props.destination,
     query: { q: normalizedQuery },
@@ -213,6 +225,7 @@ function moveActiveOption(direction: 1 | -1) {
 }
 
 function selectSuggestion(suggestion: SearchSuggestion) {
+  searchInput.value?.focus()
   query.value = suggestion.value ?? suggestion.label
   emit("select", suggestion)
   activeIndex.value = -1
@@ -238,7 +251,7 @@ function handleKeydown(event: KeyboardEvent) {
     }
     return
   }
-  if (event.key === "Escape") {
+  if (event.key === "Escape" && isListboxOpen.value) {
     event.preventDefault()
     activeIndex.value = -1
     isDismissed.value = true
@@ -260,6 +273,7 @@ function handleKeydown(event: KeyboardEvent) {
     <div class="search-command__control">
       <input
         :id="id"
+        ref="searchInput"
         class="search-command__input"
         name="q"
         type="search"
@@ -268,7 +282,7 @@ function handleKeydown(event: KeyboardEvent) {
         :placeholder="placeholder"
         aria-autocomplete="list"
         :aria-busy="loading || undefined"
-        :aria-controls="listboxId"
+        :aria-controls="isListboxOpen ? listboxId : undefined"
         :aria-describedby="describedBy"
         :aria-expanded="isListboxOpen"
         :aria-activedescendant="activeOptionId"
@@ -351,8 +365,11 @@ function handleKeydown(event: KeyboardEvent) {
       <template v-else-if="commandState === 'error'">
         {{ error }}
       </template>
-      <template v-else>
+      <template v-else-if="commandState === 'no-match'">
         {{ noMatchMessage }}
+      </template>
+      <template v-else>
+        {{ unavailableMessage }}
       </template>
     </p>
   </form>

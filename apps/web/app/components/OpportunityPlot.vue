@@ -35,6 +35,8 @@ const chart = {
   top: 20,
 } as const
 
+const axisTicks = [0, 50, 100] as const
+
 function coordinate(point: OpportunityPlotPoint) {
   if (point.x < 0 || point.x > 100 || point.y < 0 || point.y > 100) {
     throw new Error("OpportunityPlot coordinates must be between 0 and 100.")
@@ -49,6 +51,14 @@ function coordinate(point: OpportunityPlotPoint) {
 function diamondPoints(point: OpportunityPlotPoint) {
   const { x, y } = coordinate(point)
   return `${x},${y - 7} ${x + 7},${y} ${x},${y + 7} ${x - 7},${y}`
+}
+
+function xTickPosition(value: number) {
+  return chart.left + (value / 100) * (chart.right - chart.left)
+}
+
+function yTickPosition(value: number) {
+  return chart.bottom - (value / 100) * (chart.bottom - chart.top)
 }
 
 function pointLabel(point: OpportunityPlotPoint) {
@@ -93,6 +103,27 @@ function pointLabel(point: OpportunityPlotPoint) {
       :y2="(chart.top + chart.bottom) / 2"
       class="opportunity-plot__gridline"
     />
+
+    <text
+      v-for="tick in axisTicks"
+      :key="`x-${tick}`"
+      :x="xTickPosition(tick)"
+      y="288"
+      class="opportunity-plot__axis-tick"
+      data-axis-tick
+    >
+      {{ tick }}
+    </text>
+    <text
+      v-for="tick in axisTicks"
+      :key="`y-${tick}`"
+      x="40"
+      :y="yTickPosition(tick)"
+      class="opportunity-plot__axis-tick opportunity-plot__axis-tick--vertical"
+      data-axis-tick
+    >
+      {{ tick }}
+    </text>
 
     <text x="274" y="310" class="opportunity-plot__axis-label">
       {{ xAxisLabel }}
@@ -174,6 +205,18 @@ function pointLabel(point: OpportunityPlotPoint) {
   font-family: var(--font-ui);
   font-size: 12px;
   text-anchor: middle;
+}
+
+.opportunity-plot__axis-tick {
+  fill: var(--color-text-muted);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  text-anchor: middle;
+}
+
+.opportunity-plot__axis-tick--vertical {
+  dominant-baseline: middle;
+  text-anchor: end;
 }
 
 .opportunity-plot__point {

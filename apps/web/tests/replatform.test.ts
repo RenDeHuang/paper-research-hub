@@ -34,14 +34,34 @@ describe("default application shell", () => {
     ])
     expect(
       wrapper
+        .findAll(
+          'aside[aria-label="发现导航"] [data-discovery-group]',
+        )
+        .map((group) => group.attributes("data-discovery-state")),
+    ).toEqual(["known", "unknown", "unknown", "empty"])
+    expect(
+      wrapper
         .findAll('aside[aria-label="发现导航"] a')
         .map((link) => link.text()),
-    ).toEqual(["JIF ≥ 10", "JCR Q1"])
+    ).toEqual(["有代码", "有数据", "有 Benchmark", "趋势优先"])
+    expect(
+      wrapper
+        .findAll('aside[aria-label="发现导航"] a')
+        .map((link) => link.attributes("href")),
+    ).toEqual([
+      "/papers?has_code=true",
+      "/papers?has_data=true",
+      "/papers?has_benchmark=true",
+      "/papers?sort=trend_desc",
+    ])
     expect(wrapper.get('aside[aria-label="发现导航"]').text()).not.toContain(
       "浏览论文",
     )
     expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
-      "等待首次同步",
+      "请在 Topic 页加载真实目录",
+    )
+    expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
+      "请在 Method 页加载真实目录",
     )
     expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
       "暂无保存视图",
