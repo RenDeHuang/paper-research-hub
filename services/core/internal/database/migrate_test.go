@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const initialMigrationChecksum = "3568e26689b33d651fe0ee5089587ba2d3efd74517eb430b83766f9907881404"
 
 var expectedSchemaTables = []string{
 	"works",
@@ -82,17 +85,72 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		}
 	}
 
-	var version int64
-	var name, checksum string
-	var appliedAt time.Time
-	if err := pool.QueryRow(ctx, `
+	rows, err = pool.Query(ctx, `
 		SELECT version, name, checksum, applied_at
 		FROM schema_migrations
-	`).Scan(&version, &name, &checksum, &appliedAt); err != nil {
-		t.Fatalf("query migration record: %v", err)
+		ORDER BY version
+	`)
+	if err != nil {
+		t.Fatalf("query migration records: %v", err)
 	}
-	if version != 1 || name != "initial" || len(checksum) != 64 || appliedAt.IsZero() {
-		t.Fatalf("migration record = (%d, %q, %q, %s), want version/name/SHA-256/applied_at", version, name, checksum, appliedAt)
+	defer rows.Close()
+	expectedMigrations := []struct {
+		version int64
+		name    string
+	}{
+		{version: 1, name: "initial"},
+		{version: 2, name: "integrity_hardening"},
+	}
+	var migrationIndex int
+	for rows.Next() {
+		if migrationIndex >= len(expectedMigrations) {
+			t.Fatalf("unexpected extra migration record at index %d", migrationIndex)
+		}
+		var version int64
+		var name, checksum string
+		var appliedAt time.Time
+		if err := rows.Scan(&version, &name, &checksum, &appliedAt); err != nil {
+			t.Fatalf("scan migration record: %v", err)
+		}
+		expected := expectedMigrations[migrationIndex]
+		if version != expected.version || name != expected.name || len(checksum) != 64 || appliedAt.IsZero() {
+			t.Fatalf(
+				"migration record %d = (%d, %q, %q, %s), want (%d, %q, SHA-256, applied_at)",
+				migrationIndex,
+				version,
+				name,
+				checksum,
+				appliedAt,
+				expected.version,
+				expected.name,
+			)
+		}
+		migrationIndex++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate migration records: %v", err)
+	}
+	if migrationIndex != len(expectedMigrations) {
+		t.Fatalf("migration record count = %d, want %d", migrationIndex, len(expectedMigrations))
+	}
+}
+
+func TestEmbeddedMigrationsPreserveInitialChecksumAndAddForwardHardening(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
+		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
+	}
+	if len(migrations) != 2 {
+		t.Fatalf("embedded migration count = %d, want 2", len(migrations))
+	}
+	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
+		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
+	}
+	if migrations[1].Version != 2 || migrations[1].Name != "integrity_hardening" {
+		t.Fatalf("second migration = %#v, want 000002_integrity_hardening", migrations[1])
 	}
 }
 
@@ -163,6 +221,7 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		WHERE NOT tgisinternal
 	`, []string{
 		"source_records_immutable",
+		"works_status_monotonic",
 		"venue_metric_snapshots_immutable",
 		"venue_policy_versions_immutable",
 	})
@@ -226,7 +285,7 @@ func TestMigrationSecondRunIsIdempotent(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*), min(checksum) FROM schema_migrations").Scan(&afterCount, &afterChecksum); err != nil {
 		t.Fatalf("query migration state after second run: %v", err)
 	}
-	if beforeCount != 1 || afterCount != beforeCount || afterChecksum != beforeChecksum {
+	if beforeCount != 2 || afterCount != beforeCount || afterChecksum != beforeChecksum {
 		t.Fatalf("migration state changed: before=(%d,%s) after=(%d,%s)", beforeCount, beforeChecksum, afterCount, afterChecksum)
 	}
 }
@@ -288,6 +347,139 @@ func TestChangedAppliedMigrationChecksumFailsExplicitly(t *testing.T) {
 	err = UpMigrations(ctx, pool, migrations)
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch for migration 000001_initial") {
 		t.Fatalf("UpMigrations() error = %v, want explicit checksum mismatch", err)
+	}
+}
+
+func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
+		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
+	}
+	if len(migrations) != 2 {
+		t.Fatalf("embedded migration count = %d, want 2", len(migrations))
+	}
+
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:1]); err != nil {
+		t.Fatalf("apply original 000001_initial: %v", err)
+	}
+
+	var workID, sourceRecordID, paperVersionID, externalIdentifierID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO works (canonical_key, status, title)
+		VALUES ('doi:10.1000/Legacy', 'active', 'Legacy Work')
+		RETURNING id
+	`), &workID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO source_records (
+			work_id, source, source_record_id, source_identity, source_time, content_hash, raw_payload
+		) VALUES (
+			$1, 'crossref', 'legacy-source', '{"id":"legacy-source"}', now(),
+			'legacy-hash', '{"id":"legacy-source"}'
+		)
+		RETURNING id
+	`, workID), &sourceRecordID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO paper_versions (work_id, source_record_id, version_label, status)
+		VALUES ($1, $2, 'v1', 'active')
+		RETURNING id
+	`, workID, sourceRecordID), &paperVersionID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO external_identifiers (work_id, source_record_id, scheme, normalized_value)
+		VALUES ($1, $2, 'doi', '10.1000/Legacy')
+		RETURNING id
+	`, workID, sourceRecordID), &externalIdentifierID)
+
+	var appliedInitialChecksum string
+	if err := pool.QueryRow(ctx, `
+		SELECT checksum
+		FROM schema_migrations
+		WHERE version = 1
+	`).Scan(&appliedInitialChecksum); err != nil {
+		t.Fatalf("query applied initial checksum: %v", err)
+	}
+	if appliedInitialChecksum != initialMigrationChecksum {
+		t.Fatalf("applied initial checksum = %s, want %s", appliedInitialChecksum, initialMigrationChecksum)
+	}
+
+	if err := Up(ctx, pool); err != nil {
+		t.Fatalf("upgrade applied 000001 schema to 000002: %v", err)
+	}
+
+	var canonicalKey, normalizedDOI, linkedWorkID string
+	if err := pool.QueryRow(ctx, "SELECT canonical_key FROM works WHERE id = $1", workID).Scan(&canonicalKey); err != nil {
+		t.Fatalf("query normalized canonical key: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT normalized_value
+		FROM external_identifiers
+		WHERE id = $1
+	`, externalIdentifierID).Scan(&normalizedDOI); err != nil {
+		t.Fatalf("query normalized external identifier: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT work_id::text
+		FROM source_record_works
+		WHERE source_record_id = $1
+	`, sourceRecordID).Scan(&linkedWorkID); err != nil {
+		t.Fatalf("query backfilled SourceRecord Work link: %v", err)
+	}
+	if canonicalKey != "doi:10.1000/legacy" ||
+		normalizedDOI != "10.1000/legacy" ||
+		linkedWorkID != workID {
+		t.Fatalf(
+			"upgrade backfill = canonical %q, DOI %q, linked Work %q; want normalized values and %q",
+			canonicalKey,
+			normalizedDOI,
+			linkedWorkID,
+			workID,
+		)
+	}
+
+	var sourceRecordWorkColumnCount, paperVersionCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND table_name = 'source_records'
+		  AND column_name = 'work_id'
+	`).Scan(&sourceRecordWorkColumnCount); err != nil {
+		t.Fatalf("query upgraded SourceRecord columns: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM paper_versions
+		WHERE id = $1 AND work_id = $2 AND source_record_id = $3
+	`, paperVersionID, workID, sourceRecordID).Scan(&paperVersionCount); err != nil {
+		t.Fatalf("query preserved paper version: %v", err)
+	}
+	if sourceRecordWorkColumnCount != 0 || paperVersionCount != 1 {
+		t.Fatalf(
+			"upgraded ownership = source_records.work_id columns %d, paper versions %d; want 0, 1",
+			sourceRecordWorkColumnCount,
+			paperVersionCount,
+		)
+	}
+
+	var appliedCount int
+	var preservedChecksum string
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), min(checksum) FILTER (WHERE version = 1)
+		FROM schema_migrations
+	`).Scan(&appliedCount, &preservedChecksum); err != nil {
+		t.Fatalf("query upgraded migration records: %v", err)
+	}
+	if appliedCount != 2 || preservedChecksum != initialMigrationChecksum {
+		t.Fatalf(
+			"upgraded migrations = count %d, initial checksum %s; want 2, %s",
+			appliedCount,
+			preservedChecksum,
+			initialMigrationChecksum,
+		)
 	}
 }
 
@@ -393,10 +585,177 @@ func TestCanonicalStatusIdentifierAndProjectionConstraints(t *testing.T) {
 	}
 }
 
+func TestCanonicalAndExternalIdentifierNormalizationIsSchemeAware(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	const (
+		s2Lower = "a0b1c2d3e4f5678901234567890abcdeffedcba9"
+		s2Upper = "A0B1C2D3E4F5678901234567890ABCDEFFEDCBA9"
+	)
+	doiWorkID := insertWork(t, pool, "doi:10.1000/case-sensitive-storage")
+	arXivWorkID := insertWork(t, pool, "arxiv:hep-th/9901001")
+	s2WorkID := insertWork(t, pool, "s2:"+s2Lower)
+	openAlexWorkID := insertWork(t, pool, "openalex:W123")
+	openReviewUpperID := insertWork(t, pool, "openreview:Forum_AbC123")
+	openReviewLowerID := insertWork(t, pool, "openreview:forum_AbC123")
+
+	invalidCanonicalKeys := []struct {
+		name           string
+		canonicalKey   string
+		wantConstraint string
+	}{
+		{
+			name:           "DOI case variant",
+			canonicalKey:   "doi:10.1000/CASE-SENSITIVE-STORAGE",
+			wantConstraint: "works_canonical_key_check",
+		},
+		{
+			name:           "arXiv case variant",
+			canonicalKey:   "arxiv:HEP-TH/9901001",
+			wantConstraint: "works_canonical_key_check",
+		},
+		{
+			name:           "Semantic Scholar case variant",
+			canonicalKey:   "s2:" + s2Upper,
+			wantConstraint: "works_canonical_key_check",
+		},
+		{
+			name:           "OpenAlex lowercase",
+			canonicalKey:   "openalex:w123",
+			wantConstraint: "works_canonical_key_check",
+		},
+		{
+			name:           "OpenAlex malformed",
+			canonicalKey:   "openalex:W-123",
+			wantConstraint: "works_canonical_key_check",
+		},
+	}
+	for _, tt := range invalidCanonicalKeys {
+		t.Run("canonical "+tt.name, func(t *testing.T) {
+			_, err := pool.Exec(ctx, `
+				INSERT INTO works (canonical_key, status, title)
+				VALUES ($1, 'active', $1)
+			`, tt.canonicalKey)
+			assertPostgresError(t, err, "23514", tt.wantConstraint)
+		})
+	}
+
+	validExternalIdentifiers := []struct {
+		workID string
+		scheme string
+		value  string
+	}{
+		{workID: doiWorkID, scheme: "doi", value: "10.1000/case-sensitive-storage"},
+		{workID: arXivWorkID, scheme: "arxiv", value: "hep-th/9901001"},
+		{workID: s2WorkID, scheme: "s2", value: s2Lower},
+		{workID: openAlexWorkID, scheme: "openalex", value: "W123"},
+		{workID: openReviewUpperID, scheme: "openreview", value: "Forum_AbC123"},
+		{workID: openReviewLowerID, scheme: "openreview", value: "forum_AbC123"},
+	}
+	for _, identifier := range validExternalIdentifiers {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+			VALUES ($1, $2, $3)
+		`, identifier.workID, identifier.scheme, identifier.value); err != nil {
+			t.Fatalf("insert normalized %s identifier %q: %v", identifier.scheme, identifier.value, err)
+		}
+	}
+
+	invalidExternalIdentifiers := []struct {
+		name   string
+		workID string
+		scheme string
+		value  string
+	}{
+		{
+			name:   "DOI case variant",
+			workID: doiWorkID,
+			scheme: "doi",
+			value:  "10.1000/CASE-SENSITIVE-STORAGE",
+		},
+		{
+			name:   "arXiv case variant",
+			workID: arXivWorkID,
+			scheme: "arxiv",
+			value:  "HEP-TH/9901001",
+		},
+		{
+			name:   "Semantic Scholar case variant",
+			workID: s2WorkID,
+			scheme: "s2",
+			value:  s2Upper,
+		},
+		{
+			name:   "OpenAlex lowercase",
+			workID: openAlexWorkID,
+			scheme: "openalex",
+			value:  "w123",
+		},
+		{
+			name:   "OpenAlex malformed",
+			workID: openAlexWorkID,
+			scheme: "openalex",
+			value:  "W-123",
+		},
+	}
+	for _, tt := range invalidExternalIdentifiers {
+		t.Run("external "+tt.name, func(t *testing.T) {
+			_, err := pool.Exec(ctx, `
+				INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+				VALUES ($1, $2, $3)
+			`, tt.workID, tt.scheme, tt.value)
+			assertPostgresError(t, err, "23514", "external_identifiers_normalized_value_check")
+		})
+	}
+
+	var preservedOpenReviewValues int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM external_identifiers
+		WHERE scheme = 'openreview'
+		  AND normalized_value IN ('Forum_AbC123', 'forum_AbC123')
+	`).Scan(&preservedOpenReviewValues); err != nil {
+		t.Fatalf("query case-preserved OpenReview identifiers: %v", err)
+	}
+	if preservedOpenReviewValues != 2 {
+		t.Fatalf("case-preserved OpenReview identifiers = %d, want 2", preservedOpenReviewValues)
+	}
+}
+
+func TestWorkStatusTransitionsAreMonotonic(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	// This test covers database-level monotonicity only. Versioned repository
+	// compare-and-swap for concurrent writers is intentionally deferred to Task 7.
+	terminalStatuses := []string{"withdrawn", "retracted", "rejected", "superseded"}
+	for _, terminalStatus := range terminalStatuses {
+		t.Run(terminalStatus, func(t *testing.T) {
+			workID := insertWork(t, pool, "openreview:status_"+terminalStatus)
+			if _, err := pool.Exec(ctx, "UPDATE works SET status = $1 WHERE id = $2", terminalStatus, workID); err != nil {
+				t.Fatalf("transition active -> %s: %v", terminalStatus, err)
+			}
+			if _, err := pool.Exec(ctx, "UPDATE works SET status = $1 WHERE id = $2", terminalStatus, workID); err != nil {
+				t.Fatalf("repeat terminal status %s: %v", terminalStatus, err)
+			}
+
+			forbiddenTargets := []string{"active", "withdrawn", "retracted", "rejected", "superseded"}
+			for _, targetStatus := range forbiddenTargets {
+				if targetStatus == terminalStatus {
+					continue
+				}
+				_, err := pool.Exec(ctx, "UPDATE works SET status = $1 WHERE id = $2", targetStatus, workID)
+				assertPostgresError(t, err, "23514", "works_status_monotonic")
+			}
+		})
+	}
+}
+
 func TestSourceRecordSnapshotIsCompletelyImmutable(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
-	workID := insertWork(t, pool, "openalex:W-immutable")
+	workID := insertWork(t, pool, "openalex:W1001")
 	sourceID := insertSourceRecord(t, pool, workID, "openalex", "W-immutable", "immutable-hash")
 
 	updates := []string{
@@ -420,21 +779,35 @@ func TestSourceRecordSnapshotIsCompletelyImmutable(t *testing.T) {
 			if rollbackErr := tx.Rollback(context.Background()); rollbackErr != nil {
 				t.Fatalf("rollback immutable update transaction: %v", rollbackErr)
 			}
-			if updateErr == nil {
-				t.Fatalf("immutable update %q was accepted", assignment)
-			}
+			assertPostgresError(t, updateErr, "55000", "")
 		})
 	}
 }
 
-func TestSourceRecordCannotBeDeletedWithoutProjectionReferences(t *testing.T) {
+func TestSourceRecordCannotBeDeletedWithoutAnyWorkAssociation(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
-	workID := insertWork(t, pool, "openalex:undeletable-source")
-	sourceID := insertSourceRecord(t, pool, workID, "openalex", "undeletable-source", "undeletable-hash")
 
-	if _, err := pool.Exec(ctx, "DELETE FROM source_records WHERE id = $1", sourceID); err == nil {
-		t.Fatal("unprojected SourceRecord deletion was accepted")
+	var sourceID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO source_records (
+			source, source_record_id, source_identity, source_time, content_hash, raw_payload
+		) VALUES (
+			'openalex', 'unassociated-source', '{"id":"unassociated-source"}', now(),
+			'unassociated-hash', '{"id":"unassociated-source"}'
+		)
+		RETURNING id
+	`), &sourceID)
+
+	_, err := pool.Exec(ctx, "DELETE FROM source_records WHERE id = $1", sourceID)
+	assertPostgresError(t, err, "55000", "")
+
+	var retained int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM source_records WHERE id = $1", sourceID).Scan(&retained); err != nil {
+		t.Fatalf("count immutable unassociated SourceRecord: %v", err)
+	}
+	if retained != 1 {
+		t.Fatalf("retained unassociated SourceRecord count = %d, want 1", retained)
 	}
 }
 
@@ -466,7 +839,7 @@ func TestSourceRecordWorkOwnershipUsesSeparateAssociation(t *testing.T) {
 		t.Fatal("source_record_works association table was not created")
 	}
 
-	workID := insertWork(t, pool, "openalex:separate-source-ownership")
+	workID := insertWork(t, pool, "openalex:W1002")
 	sourceID := insertSourceRecord(t, pool, workID, "openalex", "separate-source-ownership", "ownership-hash")
 	var linkedWorkID string
 	if err := pool.QueryRow(ctx, `
@@ -484,7 +857,7 @@ func TestSourceRecordWorkOwnershipUsesSeparateAssociation(t *testing.T) {
 func TestSourceRecordUniquenessAndJSONTypeConstraints(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
-	workID := insertWork(t, pool, "openalex:json-constraints")
+	workID := insertWork(t, pool, "openalex:W1003")
 	insertSourceRecord(t, pool, workID, "openalex", "W-json", "same-hash")
 
 	if _, err := pool.Exec(ctx, `
@@ -530,7 +903,7 @@ func TestSourceRecordUniquenessAndJSONTypeConstraints(t *testing.T) {
 func TestMetricAndRankingExactlyOneConstraints(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
-	workID := insertWork(t, pool, "s2:metric-target")
+	workID := insertWork(t, pool, "s2:0123456789abcdef0123456789abcdef01234567")
 	var repositoryID, topicID, methodID string
 	mustScanID(t, pool.QueryRow(ctx, `
 		INSERT INTO code_repositories (canonical_url, host, owner_name, repository_name)
@@ -1035,6 +1408,28 @@ func mustScanID(t *testing.T, row scanner, destination *string) {
 	t.Helper()
 	if err := row.Scan(destination); err != nil {
 		t.Fatalf("scan inserted ID: %v", err)
+	}
+}
+
+func assertPostgresError(t *testing.T, err error, code string, constraint string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("PostgreSQL operation succeeded, want SQLSTATE %s", code)
+	}
+	var pgError *pgconn.PgError
+	if !errors.As(err, &pgError) {
+		t.Fatalf("error = %T %v, want *pgconn.PgError with SQLSTATE %s", err, err, code)
+	}
+	if pgError.Code != code {
+		t.Fatalf("PostgreSQL SQLSTATE = %s, want %s: %v", pgError.Code, code, pgError)
+	}
+	if constraint != "" && pgError.ConstraintName != constraint {
+		t.Fatalf(
+			"PostgreSQL constraint = %q, want %q: %v",
+			pgError.ConstraintName,
+			constraint,
+			pgError,
+		)
 	}
 }
 

@@ -8,6 +8,25 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION enforce_source_record_raw_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.source IS DISTINCT FROM OLD.source
+        OR NEW.source_record_id IS DISTINCT FROM OLD.source_record_id
+        OR NEW.source_identity IS DISTINCT FROM OLD.source_identity
+        OR NEW.source_time IS DISTINCT FROM OLD.source_time
+        OR NEW.content_hash IS DISTINCT FROM OLD.content_hash
+        OR NEW.raw_payload IS DISTINCT FROM OLD.raw_payload
+    THEN
+        RAISE EXCEPTION 'source record raw snapshot is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
 CREATE TABLE venues (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     venue_type text NOT NULL,
@@ -46,44 +65,6 @@ CREATE TABLE venues (
     UNIQUE (source_scheme, source_identifier)
 );
 
-CREATE FUNCTION resolve_venue_by_issn(
-    requested_issn_l text,
-    requested_issn text,
-    requested_eissn text
-)
-RETURNS uuid
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    matched_venue_ids uuid[];
-BEGIN
-    SELECT array_agg(matches.id ORDER BY matches.id)
-    INTO matched_venue_ids
-    FROM (
-        SELECT DISTINCT venue.id
-        FROM venues AS venue
-        CROSS JOIN LATERAL (
-            VALUES (requested_issn_l), (requested_issn), (requested_eissn)
-        ) AS requested(identifier)
-        WHERE requested.identifier IS NOT NULL
-          AND requested.identifier <> ''
-          AND requested.identifier IN (venue.issn_l, venue.issn, venue.eissn)
-    ) AS matches;
-
-    CASE COALESCE(cardinality(matched_venue_ids), 0)
-        WHEN 0 THEN
-            RAISE EXCEPTION 'no venue matches exact ISSN identifiers'
-                USING ERRCODE = 'P0002';
-        WHEN 1 THEN
-            RETURN matched_venue_ids[1];
-        ELSE
-            RAISE EXCEPTION 'multiple venues match exact ISSN identifiers'
-                USING ERRCODE = 'P0003';
-    END CASE;
-END;
-$$;
-
 CREATE TABLE venue_aliases (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     venue_id uuid NOT NULL REFERENCES venues(id) ON DELETE CASCADE,
@@ -117,6 +98,7 @@ CREATE INDEX idx_works_published_at ON works(published_at DESC);
 
 CREATE TABLE source_records (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_id uuid REFERENCES works(id) ON DELETE SET NULL,
     source text NOT NULL,
     source_record_id text NOT NULL,
     source_identity jsonb NOT NULL,
@@ -132,36 +114,17 @@ CREATE TABLE source_records (
         CHECK (jsonb_typeof(source_identity) = 'object'),
     CONSTRAINT source_records_raw_payload_json_check
         CHECK (jsonb_typeof(raw_payload) = 'object'),
-    UNIQUE (source, source_record_id, content_hash)
+    UNIQUE (source, source_record_id, content_hash),
+    UNIQUE (id, work_id)
 );
 
+CREATE INDEX idx_source_records_work_id ON source_records(work_id);
 CREATE INDEX idx_source_records_source_identity ON source_records USING gin(source_identity);
 
-CREATE TRIGGER source_records_immutable
-BEFORE UPDATE OR DELETE ON source_records
+CREATE TRIGGER source_records_raw_immutable
+BEFORE UPDATE ON source_records
 FOR EACH ROW
-EXECUTE FUNCTION reject_immutable_row();
-
-CREATE TABLE source_record_works (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    source_record_id uuid NOT NULL,
-    work_id uuid NOT NULL,
-    linked_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT source_record_works_source_record_id_fkey
-        FOREIGN KEY (source_record_id)
-        REFERENCES source_records(id)
-        ON DELETE RESTRICT,
-    CONSTRAINT source_record_works_work_id_fkey
-        FOREIGN KEY (work_id)
-        REFERENCES works(id)
-        ON DELETE CASCADE,
-    CONSTRAINT source_record_works_source_record_id_key
-        UNIQUE (source_record_id),
-    CONSTRAINT source_record_works_source_record_id_work_id_key
-        UNIQUE (source_record_id, work_id)
-);
-
-CREATE INDEX idx_source_record_works_work_id ON source_record_works(work_id);
+EXECUTE FUNCTION enforce_source_record_raw_immutability();
 
 CREATE TABLE paper_versions (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -171,14 +134,10 @@ CREATE TABLE paper_versions (
     status text NOT NULL,
     released_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT paper_versions_source_record_id_fkey
-        FOREIGN KEY (source_record_id)
-        REFERENCES source_records(id)
-        ON DELETE RESTRICT,
     CONSTRAINT paper_versions_source_record_work_fkey
         FOREIGN KEY (source_record_id, work_id)
-        REFERENCES source_record_works(source_record_id, work_id)
-        DEFERRABLE INITIALLY DEFERRED,
+        REFERENCES source_records(id, work_id)
+        ON DELETE RESTRICT,
     CONSTRAINT paper_versions_version_label_check CHECK (btrim(version_label) <> ''),
     CONSTRAINT paper_versions_status_check
         CHECK (status IN ('active', 'withdrawn', 'retracted', 'rejected', 'superseded')),
@@ -194,14 +153,10 @@ CREATE TABLE external_identifiers (
     scheme text NOT NULL,
     normalized_value text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT external_identifiers_source_record_id_fkey
-        FOREIGN KEY (source_record_id)
-        REFERENCES source_records(id)
-        ON DELETE RESTRICT,
     CONSTRAINT external_identifiers_source_record_work_fkey
         FOREIGN KEY (source_record_id, work_id)
-        REFERENCES source_record_works(source_record_id, work_id)
-        DEFERRABLE INITIALLY DEFERRED,
+        REFERENCES source_records(id, work_id)
+        ON DELETE RESTRICT,
     CONSTRAINT external_identifiers_scheme_check
         CHECK (scheme IN ('doi', 'arxiv', 'openreview', 's2', 'openalex', 'pmid', 'pmcid')),
     CONSTRAINT external_identifiers_normalized_value_check
@@ -220,14 +175,10 @@ CREATE TABLE field_assertions (
     asserted_value jsonb NOT NULL,
     asserted_at timestamptz NOT NULL DEFAULT now(),
     created_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT field_assertions_source_record_id_fkey
-        FOREIGN KEY (source_record_id)
-        REFERENCES source_records(id)
-        ON DELETE RESTRICT,
     CONSTRAINT field_assertions_source_record_work_fkey
         FOREIGN KEY (source_record_id, work_id)
-        REFERENCES source_record_works(source_record_id, work_id)
-        DEFERRABLE INITIALLY DEFERRED,
+        REFERENCES source_records(id, work_id)
+        ON DELETE RESTRICT,
     CONSTRAINT field_assertions_field_name_check CHECK (btrim(field_name) <> ''),
     CONSTRAINT field_assertions_value_json_check
         CHECK (jsonb_typeof(asserted_value) = 'object')
@@ -292,14 +243,10 @@ CREATE TABLE work_topics (
     confidence numeric NOT NULL DEFAULT 1,
     source_record_id uuid,
     created_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT work_topics_source_record_id_fkey
-        FOREIGN KEY (source_record_id)
-        REFERENCES source_records(id)
-        ON DELETE RESTRICT,
     CONSTRAINT work_topics_source_record_work_fkey
         FOREIGN KEY (source_record_id, work_id)
-        REFERENCES source_record_works(source_record_id, work_id)
-        DEFERRABLE INITIALLY DEFERRED,
+        REFERENCES source_records(id, work_id)
+        ON DELETE RESTRICT,
     CONSTRAINT work_topics_confidence_check CHECK (confidence >= 0 AND confidence <= 1),
     UNIQUE (work_id, topic_id)
 );
@@ -323,14 +270,10 @@ CREATE TABLE work_methods (
     confidence numeric NOT NULL DEFAULT 1,
     source_record_id uuid,
     created_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT work_methods_source_record_id_fkey
-        FOREIGN KEY (source_record_id)
-        REFERENCES source_records(id)
-        ON DELETE RESTRICT,
     CONSTRAINT work_methods_source_record_work_fkey
         FOREIGN KEY (source_record_id, work_id)
-        REFERENCES source_record_works(source_record_id, work_id)
-        DEFERRABLE INITIALLY DEFERRED,
+        REFERENCES source_records(id, work_id)
+        ON DELETE RESTRICT,
     CONSTRAINT work_methods_confidence_check CHECK (confidence >= 0 AND confidence <= 1),
     UNIQUE (work_id, method_id)
 );
@@ -681,14 +624,10 @@ CREATE TABLE fulltext_assets (
     storage_key text,
     metadata jsonb NOT NULL DEFAULT '{}',
     created_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT fulltext_assets_source_record_id_fkey
-        FOREIGN KEY (source_record_id)
-        REFERENCES source_records(id)
-        ON DELETE RESTRICT,
     CONSTRAINT fulltext_assets_source_record_work_fkey
         FOREIGN KEY (source_record_id, work_id)
-        REFERENCES source_record_works(source_record_id, work_id)
-        DEFERRABLE INITIALLY DEFERRED,
+        REFERENCES source_records(id, work_id)
+        ON DELETE RESTRICT,
     CONSTRAINT fulltext_assets_source_url_check
         CHECK (source_url ~ '^https?://[^[:space:]]+$'),
     CONSTRAINT fulltext_assets_license_check CHECK (btrim(license) <> ''),
