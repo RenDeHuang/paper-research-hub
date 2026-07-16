@@ -35,3 +35,4 @@ postgres-data/
 
 # Logs
 *.log
+.gstack/
