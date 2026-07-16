@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PubmedArticleSet>
+  <PubmedArticle Status="MEDLINE">
+    <MedlineCitation Status="MEDLINE" Owner="NLM">
+      <PMID Version="1">12345678</PMID>
+      <DateCompleted><Year>2026</Year><Month>07</Month><Day>12</Day></DateCompleted>
+      <DateRevised><Year>2026</Year><Month>07</Month><Day>16</Day></DateRevised>
+      <Article PubModel="Print-Electronic">
+        <Journal>
+          <ISSN IssnType="Print">0028-0836</ISSN>
+          <ISSN IssnType="Electronic">2049-3630</ISSN>
+          <JournalIssue CitedMedium="Internet">
+            <PubDate><Year>2026</Year><Month>Jul</Month><Day>10</Day></PubDate>
+          </JournalIssue>
+          <Title>Journal of Reproducible Agents</Title>
+          <ISOAbbreviation>J Reprod Agents</ISOAbbreviation>
+        </Journal>
+        <ArticleTitle>A <i>deterministic</i> agent study <FutureInline>with unknown markup</FutureInline></ArticleTitle>
+        <Abstract>
+          <AbstractText Label="BACKGROUND" NlmCategory="BACKGROUND">Agents are <b>reproducible</b>.</AbstractText>
+          <AbstractText Label="METHODS" NlmCategory="METHODS">They preserve evidence.</AbstractText>
+          <CopyrightInformation>© 2026 Authors. CC BY 4.0.</CopyrightInformation>
+        </Abstract>
+        <AuthorList CompleteYN="N">
+          <Author ValidYN="Y">
+            <LastName>Agent</LastName>
+            <ForeName>Ada</ForeName>
+            <Initials>AA</Initials>
+            <Identifier Source="ORCID">0000-0001-2345-6789</Identifier>
+            <AffiliationInfo>
+              <Affiliation>Deterministic Systems Lab, Example University</Affiliation>
+              <Identifier Source="ROR">https://ror.org/012345678</Identifier>
+            </AffiliationInfo>
+          </Author>
+          <Author ValidYN="Y"><CollectiveName>Evidence Consortium</CollectiveName></Author>
+        </AuthorList>
+        <PublicationTypeList>
+          <PublicationType UI="D016428">Journal Article</PublicationType>
+          <PublicationType UI="D000077182">Retracted Publication</PublicationType>
+        </PublicationTypeList>
+        <ArticleDate DateType="Electronic"><Year>2026</Year><Month>07</Month><Day>08</Day></ArticleDate>
+        <ELocationID EIdType="doi" ValidYN="Y">10.1000/pubmed.1</ELocationID>
+        <UnknownArticleField><PMID>999999</PMID></UnknownArticleField>
+      </Article>
+      <MedlineJournalInfo>
+        <Country>United States</Country>
+        <MedlineTA>J Reprod Agents</MedlineTA>
+        <NlmUniqueID>0123456</NlmUniqueID>
+        <ISSNLinking>0028-0836</ISSNLinking>
+      </MedlineJournalInfo>
+      <CommentsCorrectionsList>
+        <CommentsCorrections RefType="RetractionIn"><RefSource>Retracted by</RefSource><PMID>22345678</PMID></CommentsCorrections>
+        <CommentsCorrections RefType="ErratumIn"><RefSource>Corrected by</RefSource><PMID>32345678</PMID></CommentsCorrections>
+        <CommentsCorrections RefType="UpdateIn"><RefSource>Updated by</RefSource><PMID>42345678</PMID></CommentsCorrections>
+        <CommentsCorrections RefType="CommentIn"><RefSource>Commented on by</RefSource><PMID>52345678</PMID></CommentsCorrections>
+      </CommentsCorrectionsList>
+      <MeshHeadingList>
+        <MeshHeading>
+          <DescriptorName UI="D001185" MajorTopicYN="Y">Artificial Intelligence</DescriptorName>
+          <QualifierName UI="Q000379" MajorTopicYN="N">methods</QualifierName>
+        </MeshHeading>
+      </MeshHeadingList>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">12345678</ArticleId>
+        <ArticleId IdType="doi">https://doi.org/10.1000/PUBMED.1</ArticleId>
+        <ArticleId IdType="pmc">PMC7654321</ArticleId>
+      </ArticleIdList>
+      <License LicenseID="cc-by-4.0" LicenseType="open-access" URL="https://creativecommons.org/licenses/by/4.0/">Creative Commons Attribution 4.0 International</License>
+      <FuturePubmedData><ArticleId IdType="doi">10.1000/wrong</ArticleId></FuturePubmedData>
+    </PubmedData>
+  </PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>87654321</PMID>
+      <Article>
+        <Journal>
+          <ISSN IssnType="Electronic">2049-3630</ISSN>
+          <JournalIssue><PubDate><Year>2026</Year><Month>07</Month><Day>11</Day></PubDate></JournalIssue>
+          <Title>Second Journal</Title>
+        </Journal>
+        <ArticleTitle>Second record</ArticleTitle>
+      </Article>
+    </MedlineCitation>
+    <PubmedData><ArticleIdList><ArticleId IdType="pubmed">87654321</ArticleId></ArticleIdList></PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>

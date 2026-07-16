@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +17,10 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
 )
 
-const OpenAlex = "openalex"
+const (
+	OpenAlex = "openalex"
+	PubMed   = "pubmed"
+)
 
 type ClientSequence = iter.Seq2[Record, error]
 
@@ -46,7 +50,7 @@ type Identifier struct {
 }
 
 type RawRecord struct {
-	Payload json.RawMessage
+	Payload []byte
 	SHA256  string
 }
 
@@ -77,7 +81,49 @@ func NewRawRecord(payload []byte) (RawRecord, error) {
 	digest := sha256.Sum256(canonical)
 
 	return RawRecord{
-		Payload: append(json.RawMessage(nil), payload...),
+		Payload: append([]byte(nil), payload...),
+		SHA256:  hex.EncodeToString(digest[:]),
+	}, nil
+}
+
+func NewRawXMLRecord(payload []byte) (RawRecord, error) {
+	decoder := xml.NewDecoder(bytes.NewReader(payload))
+	depth := 0
+	roots := 0
+
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return RawRecord{}, fmt.Errorf("decode source record XML: %w", err)
+		}
+
+		switch value := token.(type) {
+		case xml.StartElement:
+			if depth == 0 {
+				roots++
+				if roots > 1 {
+					return RawRecord{}, errors.New("source record XML must contain exactly one element")
+				}
+			}
+			depth++
+		case xml.EndElement:
+			depth--
+		case xml.CharData:
+			if depth == 0 && strings.TrimSpace(string(value)) != "" {
+				return RawRecord{}, errors.New("source record XML cannot contain text outside its root element")
+			}
+		}
+	}
+	if roots != 1 || depth != 0 {
+		return RawRecord{}, errors.New("source record XML must contain exactly one complete element")
+	}
+
+	digest := sha256.Sum256(payload)
+	return RawRecord{
+		Payload: append([]byte(nil), payload...),
 		SHA256:  hex.EncodeToString(digest[:]),
 	}, nil
 }
@@ -126,39 +172,101 @@ type FieldEvidence struct {
 	SourcePath string
 }
 
+type DatePrecision string
+
+const (
+	DatePrecisionYear  DatePrecision = "year"
+	DatePrecisionMonth DatePrecision = "month"
+	DatePrecisionDay   DatePrecision = "day"
+	DatePrecisionText  DatePrecision = "text"
+)
+
+type SourceDate struct {
+	Year      int
+	Month     time.Month
+	Day       int
+	Raw       string
+	Precision DatePrecision
+}
+
 type Record struct {
-	Source           string
-	SourceRecordID   string
-	Identity         paper.Identifier
-	Identifiers      []Identifier
-	Raw              RawRecord
-	Evidence         []FieldEvidence
-	Title            string
-	Abstract         string
-	PublishedAt      *time.Time
-	CreatedAt        *time.Time
-	UpdatedAt        *time.Time
-	Authors          []Author
-	AuthorsTruncated *bool
-	Topics           []Topic
-	Keywords         []Keyword
-	CitedByCount     *int
-	Venue            *Venue
-	OpenAccess       OpenAccess
-	Licenses         []License
-	Retracted        *bool
-	CodeURLs         []string
-	Scope            ScopeDecision
+	Source                    string
+	SourceRecordID            string
+	Identity                  paper.Identifier
+	Identifiers               []Identifier
+	Raw                       RawRecord
+	Evidence                  []FieldEvidence
+	Title                     string
+	Abstract                  string
+	AbstractSections          []AbstractSection
+	CopyrightInformation      string
+	PublishedAt               *time.Time
+	PublishedDate             *SourceDate
+	ElectronicPublishedAt     *time.Time
+	ElectronicPublicationDate *SourceDate
+	CreatedAt                 *time.Time
+	CompletedAt               *time.Time
+	CompletedDate             *SourceDate
+	UpdatedAt                 *time.Time
+	RevisedAt                 *time.Time
+	RevisionDate              *SourceDate
+	Authors                   []Author
+	AuthorsTruncated          *bool
+	MeSHHeadings              []MeSHHeading
+	PublicationTypes          []PublicationType
+	Relations                 []Relation
+	Topics                    []Topic
+	Keywords                  []Keyword
+	CitedByCount              *int
+	Venue                     *Venue
+	OpenAccess                OpenAccess
+	Licenses                  []License
+	Retracted                 *bool
+	CodeURLs                  []string
+	Scope                     ScopeDecision
 }
 
 type Author struct {
 	OpenAlexID      string
 	DisplayName     string
+	LastName        string
+	ForeName        string
+	Initials        string
+	CollectiveName  string
 	ORCID           string
 	Position        int
 	PositionLabel   string
 	IsCorresponding bool
+	Affiliations    []string
 	Institutions    []Institution
+}
+
+type AbstractSection struct {
+	Label       string
+	NLMCategory string
+	Text        string
+}
+
+type MeSHTerm struct {
+	UI         string
+	Name       string
+	MajorTopic bool
+}
+
+type MeSHHeading struct {
+	Descriptor MeSHTerm
+	Qualifiers []MeSHTerm
+}
+
+type PublicationType struct {
+	UI   string
+	Name string
+}
+
+type Relation struct {
+	Type     string
+	TargetID string
+	Note     string
 }
 
 type Institution struct {
@@ -190,11 +298,18 @@ type Keyword struct {
 }
 
 type Venue struct {
-	OpenAlexID  string
-	DisplayName string
-	Type        string
-	ISSNL       string
-	ISSN        []string
+	OpenAlexID      string
+	DisplayName     string
+	ISOAbbreviation string
+	Type            string
+	ISSNL           string
+	ISSN            []string
+	ISSNDetails     []VenueISSN
+}
+
+type VenueISSN struct {
+	Value string
+	Type  string
 }
 
 type OpenAccess struct {
