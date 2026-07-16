@@ -1,22 +1,43 @@
 // @vitest-environment node
 
-import { existsSync } from "node:fs"
+import { fileURLToPath } from "node:url"
 
+import { fetch, setup } from "@nuxt/test-utils/e2e"
 import { describe, expect, it } from "vitest"
 
-const healthRouteURL = new URL("../server/routes/health.get.ts", import.meta.url)
+await setup({
+  rootDir: fileURLToPath(new URL("..", import.meta.url)),
+  browser: false,
+})
 
-describe("GET /health", () => {
-  it("returns the web service health payload", async () => {
-    expect(existsSync(healthRouteURL)).toBe(true)
+describe("/health", () => {
+  it("serves the health payload over Nitro HTTP", async () => {
+    const response = await fetch("/health")
 
-    const healthRoute = await import(
-      /* @vite-ignore */ healthRouteURL.href
-    )
-
-    expect(await healthRoute.default()).toEqual({
+    expect(response.status).toBe(200)
+    expect(response.headers.get("content-type")).toBe("application/json")
+    await expect(response.json()).resolves.toEqual({
       status: "ok",
       service: "paper-hub-web",
+    })
+  })
+
+  it("rejects POST without falling through to SSR HTML", async () => {
+    const response = await fetch("/health", {
+      method: "POST",
+    })
+
+    expect(response.status).toBe(405)
+    expect(response.headers.get("content-type")).toBe(
+      "application/problem+json",
+    )
+    expect(response.headers.get("allow")).toBe("GET")
+    await expect(response.json()).resolves.toEqual({
+      type: "urn:paper-hub:problem:method-not-allowed",
+      title: "Method Not Allowed",
+      status: 405,
+      detail: "Only GET is supported for /health.",
+      instance: "/health",
     })
   })
 })

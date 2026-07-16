@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,255}$`)
 
 func TestNewServerReturnsHTTPHandler(t *testing.T) {
 	t.Parallel()
@@ -57,18 +60,53 @@ func TestRequestIDReusesNonBlankIncomingValue(t *testing.T) {
 	}
 }
 
-func TestRequestIDDoesNotReuseBlankIncomingValue(t *testing.T) {
+func TestRequestIDAccepts255AllowedCharacters(t *testing.T) {
 	t.Parallel()
 
-	response := serve(t, http.MethodGet, "/health", " \t ")
+	requestID := strings.Repeat("A", 255)
+	response := serve(t, http.MethodGet, "/health", requestID)
 
-	requestID := response.Header().Get("X-Request-ID")
-	if strings.TrimSpace(requestID) == "" {
-		t.Fatal("X-Request-ID is blank")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
 	}
-	if requestID == " \t " {
-		t.Fatal("blank incoming X-Request-ID was reused")
+	if actual := response.Header().Get("X-Request-ID"); actual != requestID {
+		t.Fatalf("X-Request-ID = %q, want 255-character client value", actual)
 	}
+}
+
+func TestRequestIDRejects256Characters(t *testing.T) {
+	t.Parallel()
+
+	assertInvalidRequestID(t, strings.Repeat("A", 256))
+}
+
+func TestRequestIDRejectsBlankOrIllegalCharacters(t *testing.T) {
+	t.Parallel()
+
+	for _, requestID := range []string{
+		" \t ",
+		"request id",
+		"request/id",
+		"请求",
+	} {
+		requestID := requestID
+		t.Run(requestID, func(t *testing.T) {
+			t.Parallel()
+			assertInvalidRequestID(t, requestID)
+		})
+	}
+}
+
+func TestRequestIDRejectsPresentEmptyHeader(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	request.Header["X-Request-ID"] = []string{""}
+	response := httptest.NewRecorder()
+
+	NewServer(Dependencies{}).ServeHTTP(response, request)
+
+	assertInvalidRequestIDResponse(t, response, "")
 }
 
 func TestUnmatchedAPIRouteReturnsProblemDetails(t *testing.T) {
@@ -180,6 +218,57 @@ func serve(t *testing.T, method, target, requestID string) *httptest.ResponseRec
 	NewServer(Dependencies{}).ServeHTTP(response, request)
 
 	return response
+}
+
+func assertInvalidRequestID(t *testing.T, incomingRequestID string) {
+	t.Helper()
+
+	response := serve(t, http.MethodGet, "/health", incomingRequestID)
+	assertInvalidRequestIDResponse(t, response, incomingRequestID)
+}
+
+func assertInvalidRequestIDResponse(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	incomingRequestID string,
+) {
+	t.Helper()
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want %q", contentType, "application/problem+json")
+	}
+
+	responseRequestID := response.Header().Get("X-Request-ID")
+	if !requestIDPattern.MatchString(responseRequestID) {
+		t.Fatalf("response X-Request-ID = %q, want pattern %s", responseRequestID, requestIDPattern)
+	}
+	if responseRequestID == incomingRequestID {
+		t.Fatalf("response reused invalid client X-Request-ID %q", incomingRequestID)
+	}
+
+	var problem problemDetails
+	decodeJSON(t, response, &problem)
+	if problem.Type != "urn:paper-hub:problem:invalid-request-id" {
+		t.Errorf("type = %q, want invalid-request-id problem", problem.Type)
+	}
+	if problem.Title != "Bad Request" {
+		t.Errorf("title = %q, want %q", problem.Title, "Bad Request")
+	}
+	if problem.Status != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", problem.Status, http.StatusBadRequest)
+	}
+	if problem.Detail != "X-Request-ID must match [A-Za-z0-9._:-]{1,255}." {
+		t.Errorf("detail = %q, want Request ID format requirement", problem.Detail)
+	}
+	if problem.Instance != "/health" {
+		t.Errorf("instance = %q, want %q", problem.Instance, "/health")
+	}
+	if problem.RequestID != responseRequestID {
+		t.Errorf("request_id = %q, want response header value %q", problem.RequestID, responseRequestID)
+	}
 }
 
 func decodeJSON(t *testing.T, response *httptest.ResponseRecorder, destination any) {

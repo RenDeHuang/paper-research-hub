@@ -48,15 +48,70 @@ func apiNotFound(writer http.ResponseWriter, request *http.Request) {
 
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		requestID := request.Header.Get(requestIDHeader)
-		if strings.TrimSpace(requestID) == "" {
+		requestID, present := headerValue(request.Header, requestIDHeader)
+		if !present {
 			requestID = newRequestID()
 		}
 
 		writer.Header().Set(requestIDHeader, requestID)
 		ctx := context.WithValue(request.Context(), requestIDContextKey{}, requestID)
-		next.ServeHTTP(writer, request.WithContext(ctx))
+		request = request.WithContext(ctx)
+
+		if present && !validRequestID(requestID) {
+			requestID = newRequestID()
+			writer.Header().Set(requestIDHeader, requestID)
+			request = request.WithContext(
+				context.WithValue(request.Context(), requestIDContextKey{}, requestID),
+			)
+			writeProblem(
+				writer,
+				request,
+				http.StatusBadRequest,
+				"urn:paper-hub:problem:invalid-request-id",
+				"Bad Request",
+				"X-Request-ID must match [A-Za-z0-9._:-]{1,255}.",
+			)
+			return
+		}
+
+		next.ServeHTTP(writer, request)
 	})
+}
+
+func headerValue(header http.Header, name string) (string, bool) {
+	for headerName, values := range header {
+		if !strings.EqualFold(headerName, name) {
+			continue
+		}
+		if len(values) == 0 {
+			return "", true
+		}
+		return values[0], true
+	}
+
+	return "", false
+}
+
+func validRequestID(requestID string) bool {
+	if len(requestID) == 0 || len(requestID) > 255 {
+		return false
+	}
+
+	for index := range len(requestID) {
+		character := requestID[index]
+		if (character >= 'A' && character <= 'Z') ||
+			(character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			character == '.' ||
+			character == '_' ||
+			character == ':' ||
+			character == '-' {
+			continue
+		}
+		return false
+	}
+
+	return true
 }
 
 func newRequestID() string {

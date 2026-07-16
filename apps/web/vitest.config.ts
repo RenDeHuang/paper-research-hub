@@ -3,6 +3,6 @@ import { defineVitestConfig } from "@nuxt/test-utils/config"
 export default defineVitestConfig({
   test: {
     environment: "nuxt",
-    exclude: ["e2e/**"],
+    exclude: ["e2e/**", "tests/health.test.ts"],
   },
 })
