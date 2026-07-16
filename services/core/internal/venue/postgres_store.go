@@ -1,17 +1,21 @@
 package venue
 
 import (
+	"cmp"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-const postgresJCRImportAdvisoryLockKey int64 = 0x4a4352494d504f52
 
 type PostgresJCRStoreConfig struct {
 	SourceLicense string
@@ -148,7 +152,7 @@ func (store *PostgresJCRStore) FindMetric(
 	if store == nil || store.pool == nil {
 		return MetricSnapshot{}, false, errors.New("PostgresJCRStore is not initialized")
 	}
-	stored, found, err := findPostgresMetric(ctx, store.pool, key, false)
+	stored, found, err := findPostgresMetric(ctx, store.pool, key)
 	if err != nil || !found {
 		return MetricSnapshot{}, found, err
 	}
@@ -164,6 +168,10 @@ func (store *PostgresJCRStore) PersistJCRImport(
 	}
 	if store == nil || store.pool == nil {
 		return ImportReceipt{}, errors.New("PostgresJCRStore is not initialized")
+	}
+	lockKey, err := postgresJCRImportAdvisoryKey(batch.FileSHA256())
+	if err != nil {
+		return ImportReceipt{}, fmt.Errorf("invalid JCR import file hash: %w", err)
 	}
 	if _, err := NewImportReceipt(
 		batch.FileSHA256(),
@@ -187,7 +195,7 @@ func (store *PostgresJCRStore) PersistJCRImport(
 	if _, err := tx.Exec(
 		ctx,
 		"SELECT pg_advisory_xact_lock($1)",
-		postgresJCRImportAdvisoryLockKey,
+		lockKey,
 	); err != nil {
 		return ImportReceipt{}, fmt.Errorf("acquire JCR import advisory lock: %w", err)
 	}
@@ -197,15 +205,33 @@ func (store *PostgresJCRStore) PersistJCRImport(
 		return ImportReceipt{}, err
 	}
 	if found {
+		if err := validatePostgresImportLicense(
+			ctx,
+			tx,
+			batch.FileSHA256(),
+			store.sourceLicense,
+		); err != nil {
+			return ImportReceipt{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ImportReceipt{}, fmt.Errorf("commit idempotent JCR import lookup: %w", err)
 		}
 		return existingReceipt, nil
 	}
 
-	rowsToInsert := make([]MetricSnapshot, 0, len(batch.Rows()))
+	var receiptID string
+	if err := tx.QueryRow(ctx, "SELECT gen_random_uuid()::text").Scan(&receiptID); err != nil {
+		return ImportReceipt{}, fmt.Errorf("allocate JCR import receipt ID: %w", err)
+	}
+
+	rows := batch.Rows()
+	slices.SortFunc(rows, func(left, right MetricSnapshot) int {
+		return cmp.Compare(left.Key().String(), right.Key().String())
+	})
+	metricIDs := make([]string, 0, len(rows))
+	insertedRows := 0
 	unchangedRows := batch.UnchangedRows()
-	for _, snapshot := range batch.Rows() {
+	for _, snapshot := range rows {
 		if snapshot.Source() != batch.Source() {
 			return ImportReceipt{}, fmt.Errorf(
 				"metric source %q does not match import source %q",
@@ -213,13 +239,34 @@ func (store *PostgresJCRStore) PersistJCRImport(
 				batch.Source(),
 			)
 		}
-		existing, found, err := findPostgresMetric(ctx, tx, snapshot.Key(), true)
+		metricID, inserted, err := insertPostgresMetric(
+			ctx,
+			tx,
+			snapshot,
+			store.sourceLicense,
+			batch.ImportedAt(),
+			receiptID,
+		)
+		if err != nil {
+			return ImportReceipt{}, err
+		}
+		if inserted {
+			insertedRows++
+			metricIDs = append(metricIDs, metricID)
+			continue
+		}
+
+		existing, found, err := findPostgresMetric(ctx, tx, snapshot.Key())
 		if err != nil {
 			return ImportReceipt{}, err
 		}
 		if !found {
-			rowsToInsert = append(rowsToInsert, snapshot)
-			continue
+			return ImportReceipt{}, fmt.Errorf(
+				"metric insert for venue %q, metric_year %d, category %q reported a conflict but no row is visible",
+				snapshot.VenueID(),
+				snapshot.MetricYear(),
+				snapshot.Category(),
+			)
 		}
 		if !existing.snapshot.Equal(snapshot) ||
 			existing.sourceLicense != store.sourceLicense {
@@ -232,8 +279,8 @@ func (store *PostgresJCRStore) PersistJCRImport(
 			)
 		}
 		unchangedRows++
+		metricIDs = append(metricIDs, existing.id)
 	}
-	insertedRows := len(rowsToInsert)
 	if insertedRows+unchangedRows != batch.InputRows() {
 		return ImportReceipt{}, fmt.Errorf(
 			"JCR persistence counts are inconsistent: input=%d inserted=%d unchanged=%d",
@@ -254,80 +301,43 @@ func (store *PostgresJCRStore) PersistJCRImport(
 	if err != nil {
 		return ImportReceipt{}, fmt.Errorf("build persisted JCR receipt: %w", err)
 	}
-	var receiptID string
-	if err := tx.QueryRow(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO jcr_import_receipts (
+			id,
 			file_sha256,
 			source,
 			imported_at,
 			input_rows,
 			inserted_rows,
 			unchanged_rows
-		) VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id::text
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`,
+		receiptID,
 		receipt.FileSHA256(),
 		receipt.Source(),
 		receipt.ImportedAt(),
 		receipt.InputRows(),
 		receipt.InsertedRows(),
 		receipt.UnchangedRows(),
-	).Scan(&receiptID); err != nil {
+	); err != nil {
 		return ImportReceipt{}, fmt.Errorf("insert JCR import receipt: %w", err)
 	}
 
-	for _, snapshot := range rowsToInsert {
-		var jif any
-		if snapshot.HasJIF() {
-			jif = snapshot.JIF().String()
-		}
-		var quartile any
-		if snapshot.Quartile() != "" {
-			quartile = string(snapshot.Quartile())
-		}
+	for _, metricID := range metricIDs {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO venue_metric_snapshots (
-				venue_id,
-				metric_year,
-				category,
-				jif,
-				quartile,
-				metric_status,
-				source_name,
-				source_license,
-				captured_at,
-				jcr_import_receipt_id
+			INSERT INTO jcr_import_receipt_metrics (
+				import_receipt_id,
+				metric_snapshot_id
 			) VALUES (
 				$1,
-				$2,
-				$3,
-				$4::numeric,
-				$5,
-				$6,
-				$7,
-				$8,
-				$9,
-				$10
+				$2
 			)
+			ON CONFLICT (import_receipt_id, metric_snapshot_id) DO NOTHING
 		`,
-			snapshot.VenueID(),
-			snapshot.MetricYear(),
-			snapshot.Category(),
-			jif,
-			quartile,
-			snapshot.Status(),
-			snapshot.Source(),
-			store.sourceLicense,
-			receipt.ImportedAt(),
 			receiptID,
+			metricID,
 		); err != nil {
-			return ImportReceipt{}, fmt.Errorf(
-				"insert JCR metric for venue %q, metric_year %d, category %q: %w",
-				snapshot.VenueID(),
-				snapshot.MetricYear(),
-				snapshot.Category(),
-				err,
-			)
+			return ImportReceipt{}, fmt.Errorf("link JCR import receipt metric: %w", err)
 		}
 	}
 
@@ -354,9 +364,113 @@ func (store *PostgresJCRStore) PersistJCRImport(
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		if mapped := mapPostgresMetricConflict(err, MetricKey{}); mapped != nil {
+			return ImportReceipt{}, mapped
+		}
 		return ImportReceipt{}, fmt.Errorf("commit JCR import transaction: %w", err)
 	}
 	return receipt, nil
+}
+
+func postgresJCRImportAdvisoryKey(fileSHA256 string) (int64, error) {
+	normalizedSHA := strings.ToLower(strings.TrimSpace(fileSHA256))
+	decoded, err := hex.DecodeString(normalizedSHA)
+	if err != nil || len(decoded) != 32 {
+		return 0, errors.New("JCR import advisory key requires a SHA-256 hex digest")
+	}
+	return int64(binary.BigEndian.Uint64(decoded[:8])), nil
+}
+
+func insertPostgresMetric(
+	ctx context.Context,
+	tx pgx.Tx,
+	snapshot MetricSnapshot,
+	sourceLicense string,
+	capturedAt time.Time,
+	receiptID string,
+) (string, bool, error) {
+	var jif any
+	if snapshot.HasJIF() {
+		jif = snapshot.JIF().String()
+	}
+	var quartile any
+	if snapshot.Quartile() != "" {
+		quartile = string(snapshot.Quartile())
+	}
+	var metricID string
+	err := tx.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id,
+			metric_year,
+			category,
+			jif,
+			quartile,
+			metric_status,
+			source_name,
+			source_license,
+			captured_at,
+			jcr_import_receipt_id
+		) VALUES (
+			$1,
+			$2,
+			$3,
+			$4::numeric,
+			$5,
+			$6,
+			$7,
+			$8,
+			$9,
+			$10
+		)
+		ON CONFLICT (venue_id, metric_year, category) DO NOTHING
+		RETURNING id::text
+	`,
+		snapshot.VenueID(),
+		snapshot.MetricYear(),
+		snapshot.Category(),
+		jif,
+		quartile,
+		snapshot.Status(),
+		snapshot.Source(),
+		sourceLicense,
+		capturedAt,
+		receiptID,
+	).Scan(&metricID)
+	switch {
+	case err == nil:
+		return metricID, true, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return "", false, nil
+	default:
+		if mapped := mapPostgresMetricConflict(err, snapshot.Key()); mapped != nil {
+			return "", false, mapped
+		}
+		return "", false, fmt.Errorf(
+			"insert JCR metric for venue %q, metric_year %d, category %q: %w",
+			snapshot.VenueID(),
+			snapshot.MetricYear(),
+			snapshot.Category(),
+			err,
+		)
+	}
+}
+
+func mapPostgresMetricConflict(err error, key MetricKey) error {
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != "23505" {
+		return nil
+	}
+	if key.String() == "" {
+		return fmt.Errorf("%w: PostgreSQL unique violation: %w", ErrConflictingMetric, err)
+	}
+	return fmt.Errorf(
+		"%w for venue %q, metric_year %d, category %q: %w",
+		ErrConflictingMetric,
+		key.VenueID(),
+		key.MetricYear(),
+		key.Category(),
+		err,
+	)
 }
 
 type postgresRowQuerier interface {
@@ -410,7 +524,42 @@ func findPostgresImport(
 	return receipt, true, nil
 }
 
+func validatePostgresImportLicense(
+	ctx context.Context,
+	querier postgresRowQuerier,
+	fileSHA256 string,
+	sourceLicense string,
+) error {
+	var conflicting bool
+	if err := querier.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM jcr_import_receipts AS receipt
+			JOIN jcr_import_receipt_metrics AS receipt_metric
+			  ON receipt_metric.import_receipt_id = receipt.id
+			JOIN venue_metric_snapshots AS metric
+			  ON metric.id = receipt_metric.metric_snapshot_id
+			WHERE receipt.file_sha256 = $1
+			  AND metric.source_license <> $2
+		)
+	`,
+		strings.ToLower(strings.TrimSpace(fileSHA256)),
+		sourceLicense,
+	).Scan(&conflicting); err != nil {
+		return fmt.Errorf("validate existing JCR import source license: %w", err)
+	}
+	if conflicting {
+		return fmt.Errorf(
+			"%w: file %q was persisted under a different source license",
+			ErrConflictingMetric,
+			fileSHA256,
+		)
+	}
+	return nil
+}
+
 type storedPostgresMetric struct {
+	id            string
 	snapshot      MetricSnapshot
 	sourceLicense string
 }
@@ -419,10 +568,10 @@ func findPostgresMetric(
 	ctx context.Context,
 	querier postgresRowQuerier,
 	key MetricKey,
-	lock bool,
 ) (storedPostgresMetric, bool, error) {
 	query := `
 		SELECT
+			id::text,
 			jif::text,
 			quartile,
 			metric_status,
@@ -433,10 +582,8 @@ func findPostgresMetric(
 		  AND metric_year = $2
 		  AND category = $3
 	`
-	if lock {
-		query += " FOR KEY SHARE"
-	}
 	var (
+		id                               string
 		jif, quartile                    pgtype.Text
 		rawStatus, source, sourceLicense string
 	)
@@ -447,6 +594,7 @@ func findPostgresMetric(
 		key.MetricYear(),
 		key.Category(),
 	).Scan(
+		&id,
 		&jif,
 		&quartile,
 		&rawStatus,
@@ -487,6 +635,7 @@ func findPostgresMetric(
 		return storedPostgresMetric{}, false, fmt.Errorf("restore JCR metric: %w", err)
 	}
 	return storedPostgresMetric{
+		id:            id,
 		snapshot:      snapshot,
 		sourceLicense: sourceLicense,
 	}, true, nil

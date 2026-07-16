@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -377,7 +378,12 @@ func TestJCRImporterTreatsIdenticalDuplicatesAsIdempotent(t *testing.T) {
 		"2049-3630",
 	)
 	repository := &fakeJCRRepository{venues: []Venue{item}}
-	sink := &fakeJCRSink{}
+	sink := &fakeJCRSink{
+		receiptCounts: &fakeReceiptCounts{
+			inserted:  1,
+			unchanged: 1,
+		},
+	}
 	importer := mustNewJCRImporter(t, repository, sink)
 	row := "Synthetic Journal,1234-5679,1234-5679,2049-3630,2025,AI,12.500,Q1,known,synthetic-jcr\n"
 
@@ -388,8 +394,8 @@ func TestJCRImporterTreatsIdenticalDuplicatesAsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import() error = %v", err)
 	}
-	if len(sink.batch.Rows()) != 1 {
-		t.Fatalf("persisted rows = %d, want one normalized identical row", len(sink.batch.Rows()))
+	if len(sink.batch.Rows()) != 2 {
+		t.Fatalf("rows handed to sink = %d, want both resolved identical rows", len(sink.batch.Rows()))
 	}
 	if result.InputRows() != 2 || result.InsertedRows() != 1 || result.UnchangedRows() != 1 {
 		t.Fatalf(
@@ -413,7 +419,7 @@ func TestJCRImporterRejectsConflictingDuplicateRows(t *testing.T) {
 		"2049-3630",
 	)
 	repository := &fakeJCRRepository{venues: []Venue{item}}
-	sink := &fakeJCRSink{}
+	sink := &fakeJCRSink{err: ErrConflictingMetric}
 	importer := mustNewJCRImporter(t, repository, sink)
 	input := validJCRHeader +
 		"Synthetic Journal,1234-5679,1234-5679,2049-3630,2025,AI,12.5,Q1,known,synthetic-jcr\n" +
@@ -423,12 +429,16 @@ func TestJCRImporterRejectsConflictingDuplicateRows(t *testing.T) {
 	if !errors.Is(err, ErrConflictingMetric) {
 		t.Fatalf("Import() error = %v, want ErrConflictingMetric", err)
 	}
-	if sink.calls != 0 {
-		t.Fatalf("JCRSink calls = %d after conflicting duplicate, want 0", sink.calls)
+	if sink.calls != 1 || len(sink.batch.Rows()) != 2 {
+		t.Fatalf(
+			"sink calls/rows = %d/%d, want 1/2 so transaction classifies duplicate conflict",
+			sink.calls,
+			len(sink.batch.Rows()),
+		)
 	}
 }
 
-func TestJCRImporterKeepsHistoricalYearsAndRejectsPersistedConflicts(t *testing.T) {
+func TestJCRImporterKeepsHistoricalYearsAndDelegatesPersistedConflicts(t *testing.T) {
 	t.Parallel()
 
 	item := venueForTest(
@@ -486,16 +496,24 @@ func TestJCRImporterKeepsHistoricalYearsAndRejectsPersistedConflicts(t *testing.
 	)
 	repository.metrics[conflicting.Key().String()] = conflicting
 	sink.calls = 0
+	sink.err = ErrConflictingMetric
 	_, err = importer.Import(context.Background(), strings.NewReader(input))
 	if !errors.Is(err, ErrConflictingMetric) {
 		t.Fatalf("Import(conflict) error = %v, want ErrConflictingMetric", err)
 	}
-	if sink.calls != 0 {
-		t.Fatalf("JCRSink calls = %d after persisted conflict, want 0", sink.calls)
+	if sink.calls != 1 || len(sink.batch.Rows()) != 1 {
+		t.Fatalf(
+			"sink calls/rows = %d/%d, want 1/1 so transaction classifies persisted conflict",
+			sink.calls,
+			len(sink.batch.Rows()),
+		)
+	}
+	if repository.metricCalls != 0 {
+		t.Fatalf("repository FindMetric calls = %d, want 0 outside transaction", repository.metricCalls)
 	}
 }
 
-func TestJCRImporterSkipsIdenticalPersistedRowsAndRecordsNewFile(t *testing.T) {
+func TestJCRImporterHandsIdenticalPersistedRowsToSinkAndRecordsNewFile(t *testing.T) {
 	t.Parallel()
 
 	item := venueForTest(
@@ -522,7 +540,12 @@ func TestJCRImporterSkipsIdenticalPersistedRowsAndRecordsNewFile(t *testing.T) {
 			existing.Key().String(): existing,
 		},
 	}
-	sink := &fakeJCRSink{}
+	sink := &fakeJCRSink{
+		receiptCounts: &fakeReceiptCounts{
+			inserted:  0,
+			unchanged: 1,
+		},
+	}
 	importer := mustNewJCRImporter(t, repository, sink)
 	input := validJCRHeader +
 		"Synthetic Journal,1234-5679,1234-5679,2049-3630,2025,AI,12.500,Q1,known,synthetic-jcr\n"
@@ -538,12 +561,19 @@ func TestJCRImporterSkipsIdenticalPersistedRowsAndRecordsNewFile(t *testing.T) {
 			result.UnchangedRows(),
 		)
 	}
-	if sink.calls != 1 || len(sink.batch.Rows()) != 0 {
-		t.Fatalf("sink calls/rows = %d/%d, want 1/0 to record new file receipt", sink.calls, len(sink.batch.Rows()))
+	if sink.calls != 1 || len(sink.batch.Rows()) != 1 {
+		t.Fatalf(
+			"sink calls/rows = %d/%d, want 1/1 so transaction classifies identical metric",
+			sink.calls,
+			len(sink.batch.Rows()),
+		)
+	}
+	if repository.metricCalls != 0 {
+		t.Fatalf("repository FindMetric calls = %d, want 0 outside transaction", repository.metricCalls)
 	}
 }
 
-func TestJCRImporterReturnsOriginalReceiptForIdenticalFile(t *testing.T) {
+func TestJCRImporterDelegatesIdenticalFileIdempotencyToSink(t *testing.T) {
 	t.Parallel()
 
 	input := validJCRHeader +
@@ -562,10 +592,19 @@ func TestJCRImporterReturnsOriginalReceiptForIdenticalFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewImportReceipt() error = %v", err)
 	}
+	item := venueForTest(
+		t,
+		"venue-alpha",
+		"Synthetic Journal",
+		"1234-5679",
+		"1234-5679",
+		"2049-3630",
+	)
 	repository := &fakeJCRRepository{
+		venues:  []Venue{item},
 		imports: map[string]ImportReceipt{fileSHA: receipt},
 	}
-	sink := &fakeJCRSink{}
+	sink := &fakeJCRSink{receipt: &receipt}
 	importer := mustNewJCRImporter(t, repository, sink)
 
 	result, err := importer.Import(context.Background(), strings.NewReader(input))
@@ -575,9 +614,9 @@ func TestJCRImporterReturnsOriginalReceiptForIdenticalFile(t *testing.T) {
 	if !result.ImportedAt().Equal(originalTime) || result.FileSHA256() != fileSHA {
 		t.Fatalf("idempotent result = %#v, want original receipt", result)
 	}
-	if repository.venueCalls != 0 || repository.metricCalls != 0 || sink.calls != 0 {
+	if repository.venueCalls != 1 || repository.metricCalls != 0 || sink.calls != 1 {
 		t.Fatalf(
-			"idempotent file performed work: venue=%d metric=%d sink=%d",
+			"idempotent file flow = venue=%d metric=%d sink=%d, want 1/0/1",
 			repository.venueCalls,
 			repository.metricCalls,
 			sink.calls,
@@ -596,6 +635,150 @@ func TestJCRImporterHonorsContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Import() error = %v, want context.Canceled", err)
 	}
+}
+
+func TestJCRImporterEnforcesStreamingLimitsAndCleansSecureSpool(t *testing.T) {
+	item := venueForTest(
+		t,
+		"venue-alpha",
+		"Synthetic Journal",
+		"1234-5679",
+		"1234-5679",
+		"2049-3630",
+	)
+	validRow := "X,1234-5679,1234-5679,2049-3630,2025,AI,12.5,Q1,known,synthetic-jcr\n"
+	validInput := validJCRHeader + validRow
+
+	t.Run("maximum bytes", func(t *testing.T) {
+		limits := DefaultJCRImportLimits()
+		limits.MaxBytes = int64(len(validInput) - 1)
+		importer := mustNewConfiguredJCRImporter(
+			t,
+			&fakeJCRRepository{venues: []Venue{item}},
+			&fakeJCRSink{},
+			limits,
+			t.TempDir(),
+		)
+
+		_, err := importer.Import(context.Background(), strings.NewReader(validInput))
+		if !errors.Is(err, ErrJCRLimitExceeded) ||
+			!strings.Contains(err.Error(), "bytes") {
+			t.Fatalf("Import() error = %v, want byte limit error", err)
+		}
+	})
+
+	t.Run("maximum rows", func(t *testing.T) {
+		limits := DefaultJCRImportLimits()
+		limits.MaxRows = 1
+		importer := mustNewConfiguredJCRImporter(
+			t,
+			&fakeJCRRepository{venues: []Venue{item}},
+			&fakeJCRSink{},
+			limits,
+			t.TempDir(),
+		)
+		input := validInput +
+			"X,1234-5679,1234-5679,2049-3630,2025,Robotics,12.5,Q2,known,synthetic-jcr\n"
+
+		_, err := importer.Import(context.Background(), strings.NewReader(input))
+		if !errors.Is(err, ErrJCRLimitExceeded) ||
+			!strings.Contains(err.Error(), "rows") {
+			t.Fatalf("Import() error = %v, want row limit error", err)
+		}
+	})
+
+	t.Run("maximum field bytes", func(t *testing.T) {
+		limits := DefaultJCRImportLimits()
+		limits.MaxFieldBytes = 16
+		importer := mustNewConfiguredJCRImporter(
+			t,
+			&fakeJCRRepository{venues: []Venue{item}},
+			&fakeJCRSink{},
+			limits,
+			t.TempDir(),
+		)
+		input := validJCRHeader +
+			"X,1234-5679,1234-5679,2049-3630,2025,ABCDEFGHIJKLMNOPQ,12.5,Q1,known,synthetic-jcr\n"
+
+		_, err := importer.Import(context.Background(), strings.NewReader(input))
+		if !errors.Is(err, ErrJCRLimitExceeded) ||
+			!strings.Contains(err.Error(), "field") {
+			t.Fatalf("Import() error = %v, want field limit error", err)
+		}
+	})
+
+	t.Run("maximum decimal places", func(t *testing.T) {
+		limits := DefaultJCRImportLimits()
+		limits.MaxDecimalPlaces = 3
+		importer := mustNewConfiguredJCRImporter(
+			t,
+			&fakeJCRRepository{venues: []Venue{item}},
+			&fakeJCRSink{},
+			limits,
+			t.TempDir(),
+		)
+		input := validJCRHeader +
+			"X,1234-5679,1234-5679,2049-3630,2025,AI,12.5000,Q1,known,synthetic-jcr\n"
+
+		_, err := importer.Import(context.Background(), strings.NewReader(input))
+		if !errors.Is(err, ErrJCRLimitExceeded) ||
+			!strings.Contains(err.Error(), "decimal places") {
+			t.Fatalf("Import() error = %v, want decimal-place limit error", err)
+		}
+	})
+
+	t.Run("context stops source reads", func(t *testing.T) {
+		limits := DefaultJCRImportLimits()
+		ctx, cancel := context.WithCancel(context.Background())
+		source := &cancelAfterFirstRead{
+			reader: strings.NewReader(validInput + strings.Repeat(validRow, 50)),
+			cancel: cancel,
+		}
+		importer := mustNewConfiguredJCRImporter(
+			t,
+			&fakeJCRRepository{venues: []Venue{item}},
+			&fakeJCRSink{},
+			limits,
+			t.TempDir(),
+		)
+
+		_, err := importer.Import(ctx, source)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Import() error = %v, want context.Canceled", err)
+		}
+		if source.reads != 1 {
+			t.Fatalf("source reads after cancellation = %d, want 1", source.reads)
+		}
+	})
+
+	t.Run("spool is mode 0600 and removed", func(t *testing.T) {
+		spoolDirectory := t.TempDir()
+		source := &spoolObservingReader{
+			reader:    strings.NewReader(validInput),
+			directory: spoolDirectory,
+		}
+		importer := mustNewConfiguredJCRImporter(
+			t,
+			&fakeJCRRepository{venues: []Venue{item}},
+			&fakeJCRSink{},
+			DefaultJCRImportLimits(),
+			spoolDirectory,
+		)
+
+		if _, err := importer.Import(context.Background(), source); err != nil {
+			t.Fatalf("Import() error = %v", err)
+		}
+		if source.observedMode.Perm() != 0o600 {
+			t.Fatalf("spool mode = %04o, want 0600", source.observedMode.Perm())
+		}
+		entries, err := os.ReadDir(spoolDirectory)
+		if err != nil {
+			t.Fatalf("read spool directory after Import(): %v", err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("spool files after Import() = %d, want 0", len(entries))
+		}
+	})
 }
 
 func TestCommittedSyntheticJCRFixtureCoversPolicyOutcomes(t *testing.T) {
@@ -753,9 +936,52 @@ func (repository *fakeJCRRepository) FindMetric(
 }
 
 type fakeJCRSink struct {
-	calls int
-	batch JCRImport
-	err   error
+	calls         int
+	batch         JCRImport
+	err           error
+	receiptCounts *fakeReceiptCounts
+	receipt       *ImportReceipt
+}
+
+type fakeReceiptCounts struct {
+	inserted  int
+	unchanged int
+}
+
+type cancelAfterFirstRead struct {
+	reader io.Reader
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (reader *cancelAfterFirstRead) Read(buffer []byte) (int, error) {
+	reader.reads++
+	read, err := reader.reader.Read(buffer[:min(len(buffer), 8)])
+	if reader.reads == 1 {
+		reader.cancel()
+	}
+	return read, err
+}
+
+type spoolObservingReader struct {
+	reader       io.Reader
+	directory    string
+	observedMode os.FileMode
+	observed     bool
+}
+
+func (reader *spoolObservingReader) Read(buffer []byte) (int, error) {
+	if !reader.observed {
+		reader.observed = true
+		entries, err := os.ReadDir(reader.directory)
+		if err == nil && len(entries) == 1 {
+			info, infoErr := entries[0].Info()
+			if infoErr == nil {
+				reader.observedMode = info.Mode()
+			}
+		}
+	}
+	return reader.reader.Read(buffer)
 }
 
 func (sink *fakeJCRSink) PersistJCRImport(
@@ -767,13 +993,22 @@ func (sink *fakeJCRSink) PersistJCRImport(
 	if sink.err != nil {
 		return ImportReceipt{}, sink.err
 	}
+	if sink.receipt != nil {
+		return *sink.receipt, nil
+	}
+	inserted := len(batch.Rows())
+	unchanged := batch.UnchangedRows()
+	if sink.receiptCounts != nil {
+		inserted = sink.receiptCounts.inserted
+		unchanged = sink.receiptCounts.unchanged
+	}
 	return NewImportReceipt(
 		batch.FileSHA256(),
 		batch.Source(),
 		batch.ImportedAt(),
 		batch.InputRows(),
-		len(batch.Rows()),
-		batch.UnchangedRows(),
+		inserted,
+		unchanged,
 	)
 }
 
@@ -793,6 +1028,32 @@ func mustNewJCRImporter(
 	)
 	if err != nil {
 		t.Fatalf("NewJCRImporter() error = %v", err)
+	}
+	return importer
+}
+
+func mustNewConfiguredJCRImporter(
+	t *testing.T,
+	repository JCRRepository,
+	sink JCRSink,
+	limits JCRImportLimits,
+	spoolDirectory string,
+) *JCRImporter {
+	t.Helper()
+
+	importer, err := NewJCRImporterWithConfig(
+		repository,
+		sink,
+		JCRImporterConfig{
+			Clock: func() time.Time {
+				return time.Date(2026, time.July, 16, 12, 30, 0, 0, time.UTC)
+			},
+			Limits:         limits,
+			SpoolDirectory: spoolDirectory,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewJCRImporterWithConfig() error = %v", err)
 	}
 	return importer
 }

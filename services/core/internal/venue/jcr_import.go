@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -21,6 +22,7 @@ var (
 	ErrNoVenueMatch         = errors.New("no venue matches exact ISSN identifiers")
 	ErrMultipleVenueMatches = errors.New("multiple venues match exact ISSN identifiers")
 	ErrConflictingMetric    = errors.New("conflicting JCR metric row")
+	ErrJCRLimitExceeded     = errors.New("JCR CSV limit exceeded")
 )
 
 var decimalPattern = regexp.MustCompile(`^(0|[0-9]+)(\.[0-9]+)?$`)
@@ -492,9 +494,7 @@ func (batch JCRImport) Aliases() []VenueAliasEvidence {
 }
 
 type JCRRepository interface {
-	FindImport(context.Context, string) (ImportReceipt, bool, error)
 	FindVenuesByISSNs(context.Context, ISSNSet) ([]Venue, error)
-	FindMetric(context.Context, MetricKey) (MetricSnapshot, bool, error)
 }
 
 type JCRSink interface {
@@ -507,9 +507,11 @@ type JCRSink interface {
 }
 
 type JCRImporter struct {
-	repository JCRRepository
-	sink       JCRSink
-	clock      func() time.Time
+	repository     JCRRepository
+	sink           JCRSink
+	clock          func() time.Time
+	limits         JCRImportLimits
+	spoolDirectory string
 }
 
 type resolvedJCRRow struct {
@@ -517,10 +519,63 @@ type resolvedJCRRow struct {
 	title    string
 }
 
+type JCRImportLimits struct {
+	MaxBytes         int64
+	MaxRows          int
+	MaxFieldBytes    int
+	MaxDecimalPlaces int
+}
+
+func DefaultJCRImportLimits() JCRImportLimits {
+	return JCRImportLimits{
+		MaxBytes:         32 << 20,
+		MaxRows:          250_000,
+		MaxFieldBytes:    16 << 10,
+		MaxDecimalPlaces: 6,
+	}
+}
+
+func (limits JCRImportLimits) validate() error {
+	if limits.MaxBytes <= 0 {
+		return errors.New("JCR maximum bytes must be positive")
+	}
+	if limits.MaxRows <= 0 {
+		return errors.New("JCR maximum rows must be positive")
+	}
+	if limits.MaxFieldBytes <= 0 {
+		return errors.New("JCR maximum field bytes must be positive")
+	}
+	if limits.MaxDecimalPlaces < 0 {
+		return errors.New("JCR maximum decimal places must be nonnegative")
+	}
+	return nil
+}
+
+type JCRImporterConfig struct {
+	Clock          func() time.Time
+	Limits         JCRImportLimits
+	SpoolDirectory string
+}
+
 func NewJCRImporter(
 	repository JCRRepository,
 	sink JCRSink,
 	clock func() time.Time,
+) (*JCRImporter, error) {
+	return NewJCRImporterWithConfig(
+		repository,
+		sink,
+		JCRImporterConfig{
+			Clock:  clock,
+			Limits: DefaultJCRImportLimits(),
+		},
+	)
+}
+
+func NewJCRImporterWithConfig(
+	repository JCRRepository,
+	sink JCRSink,
+	config JCRImporterConfig,
 ) (*JCRImporter, error) {
 	if repository == nil {
 		return nil, errors.New("JCR repository is required")
@@ -528,16 +583,25 @@ func NewJCRImporter(
 	if sink == nil {
 		return nil, errors.New("JCR sink is required")
 	}
-	if clock == nil {
+	if config.Clock == nil {
 		return nil, errors.New("JCR import clock is required")
 	}
-	return &JCRImporter{repository: repository, sink: sink, clock: clock}, nil
+	if err := config.Limits.validate(); err != nil {
+		return nil, err
+	}
+	return &JCRImporter{
+		repository:     repository,
+		sink:           sink,
+		clock:          config.Clock,
+		limits:         config.Limits,
+		spoolDirectory: config.SpoolDirectory,
+	}, nil
 }
 
 func (importer *JCRImporter) Import(
 	ctx context.Context,
 	source io.Reader,
-) (ImportResult, error) {
+) (result ImportResult, returnErr error) {
 	if err := ctx.Err(); err != nil {
 		return ImportResult{}, err
 	}
@@ -545,25 +609,28 @@ func (importer *JCRImporter) Import(
 		return ImportResult{}, errors.New("JCR CSV reader is required")
 	}
 
-	contents, err := io.ReadAll(source)
+	spool, fileSHA256, err := spoolJCRCSV(
+		ctx,
+		source,
+		importer.limits,
+		importer.spoolDirectory,
+	)
 	if err != nil {
-		return ImportResult{}, fmt.Errorf("read JCR CSV: %w", err)
+		return ImportResult{}, err
 	}
-	digest := sha256.Sum256(contents)
-	fileSHA256 := hex.EncodeToString(digest[:])
-
-	existingImport, found, err := importer.repository.FindImport(ctx, fileSHA256)
-	if err != nil {
-		return ImportResult{}, fmt.Errorf("find JCR import receipt: %w", err)
-	}
-	if found {
-		if !existingImport.Valid() {
-			return ImportResult{}, errors.New("repository returned an invalid JCR import receipt")
+	defer func() {
+		var cleanupErr error
+		if err := spool.Close(); err != nil {
+			cleanupErr = fmt.Errorf("close JCR CSV spool: %w", err)
 		}
-		return existingImport, nil
-	}
+		if err := os.Remove(spool.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErr := fmt.Errorf("remove JCR CSV spool: %w", err)
+			cleanupErr = errors.Join(cleanupErr, removeErr)
+		}
+		returnErr = errors.Join(returnErr, cleanupErr)
+	}()
 
-	parsedRows, err := parseJCRCSV(contents)
+	parsedRows, err := parseJCRCSV(ctx, spool, importer.limits)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -626,59 +693,12 @@ func (importer *JCRImporter) Import(
 		resolved = append(resolved, resolvedJCRRow{snapshot: snapshot, title: row.title})
 	}
 
-	unchangedRows := 0
-	uniqueRows := make([]resolvedJCRRow, 0, len(resolved))
-	rowByKey := make(map[string]MetricSnapshot, len(resolved))
+	rowsToPersist := make([]MetricSnapshot, 0, len(resolved))
 	for _, row := range resolved {
-		key := row.snapshot.Key().String()
-		existing, duplicate := rowByKey[key]
-		if duplicate {
-			if !existing.Equal(row.snapshot) {
-				return ImportResult{}, fmt.Errorf(
-					"%w for venue %q, metric_year %d, category %q within input file",
-					ErrConflictingMetric,
-					row.snapshot.VenueID(),
-					row.snapshot.MetricYear(),
-					row.snapshot.Category(),
-				)
-			}
-			unchangedRows++
-			continue
-		}
-		rowByKey[key] = row.snapshot
-		uniqueRows = append(uniqueRows, row)
+		rowsToPersist = append(rowsToPersist, row.snapshot)
 	}
 
-	rowsToPersist := make([]MetricSnapshot, 0, len(uniqueRows))
-	for _, row := range uniqueRows {
-		if err := ctx.Err(); err != nil {
-			return ImportResult{}, err
-		}
-		existing, found, err := importer.repository.FindMetric(ctx, row.snapshot.Key())
-		if err != nil {
-			return ImportResult{}, fmt.Errorf(
-				"find existing metric %s: %w",
-				row.snapshot.Key().String(),
-				err,
-			)
-		}
-		if !found {
-			rowsToPersist = append(rowsToPersist, row.snapshot)
-			continue
-		}
-		if !existing.Equal(row.snapshot) {
-			return ImportResult{}, fmt.Errorf(
-				"%w for venue %q, metric_year %d, category %q: historical rows are immutable",
-				ErrConflictingMetric,
-				row.snapshot.VenueID(),
-				row.snapshot.MetricYear(),
-				row.snapshot.Category(),
-			)
-		}
-		unchangedRows++
-	}
-
-	aliases, err := collectAliasEvidence(uniqueRows)
+	aliases, err := collectAliasEvidence(resolved)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -691,7 +711,7 @@ func (importer *JCRImporter) Import(
 		fileSource,
 		importedAt,
 		len(parsedRows),
-		unchangedRows,
+		0,
 		rowsToPersist,
 		aliases,
 	)
@@ -723,17 +743,89 @@ type parsedJCRRow struct {
 	source      string
 }
 
-func parseJCRCSV(contents []byte) ([]parsedJCRRow, error) {
-	reader := csv.NewReader(strings.NewReader(string(contents)))
+func spoolJCRCSV(
+	ctx context.Context,
+	source io.Reader,
+	limits JCRImportLimits,
+	directory string,
+) (_ *os.File, _ string, returnErr error) {
+	spool, err := os.CreateTemp(directory, "jcr-import-*.csv")
+	if err != nil {
+		return nil, "", fmt.Errorf("create JCR CSV spool: %w", err)
+	}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+	}()
+	if err := spool.Chmod(0o600); err != nil {
+		return nil, "", fmt.Errorf("secure JCR CSV spool: %w", err)
+	}
+
+	hasher := sha256.New()
+	contextSource := &contextReader{ctx: ctx, reader: source}
+	written, err := io.CopyBuffer(
+		io.MultiWriter(spool, hasher),
+		io.LimitReader(contextSource, limits.MaxBytes),
+		make([]byte, 32<<10),
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("read JCR CSV: %w", err)
+	}
+	var extra [1]byte
+	extraBytes, err := contextSource.Read(extra[:])
+	if extraBytes > 0 {
+		return nil, "", fmt.Errorf(
+			"%w: input exceeds maximum bytes %d",
+			ErrJCRLimitExceeded,
+			limits.MaxBytes,
+		)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, "", fmt.Errorf("read JCR CSV after %d bytes: %w", written, err)
+	}
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return nil, "", fmt.Errorf("rewind JCR CSV spool: %w", err)
+	}
+	return spool, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (reader *contextReader) Read(buffer []byte) (int, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, err
+	}
+	read, err := reader.reader.Read(buffer)
+	if contextErr := reader.ctx.Err(); contextErr != nil {
+		return read, contextErr
+	}
+	return read, err
+}
+
+func parseJCRCSV(
+	ctx context.Context,
+	source io.Reader,
+	limits JCRImportLimits,
+) ([]parsedJCRRow, error) {
+	reader := csv.NewReader(&contextReader{ctx: ctx, reader: source})
 	header, err := reader.Read()
 	if errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%w: CSV is empty", ErrInvalidJCRCSV)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: read CSV header: %v", ErrInvalidJCRCSV, err)
+		return nil, fmt.Errorf("%w: read CSV header: %w", ErrInvalidJCRCSV, err)
 	}
 	if len(header) > 0 {
 		header[0] = strings.TrimPrefix(header[0], "\uFEFF")
+	}
+	if err := validateJCRFields(header, 1, limits.MaxFieldBytes); err != nil {
+		return nil, err
 	}
 
 	indexes := make(map[string]int, len(header))
@@ -770,11 +862,21 @@ func parseJCRCSV(contents []byte) ([]parsedJCRRow, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%w: CSV row %d: %v", ErrInvalidJCRCSV, line, err)
+			return nil, fmt.Errorf("%w: CSV row %d: %w", ErrInvalidJCRCSV, line, err)
 		}
-		row, err := parseJCRRow(record, indexes)
+		if len(rows) >= limits.MaxRows {
+			return nil, fmt.Errorf(
+				"%w: input exceeds maximum rows %d",
+				ErrJCRLimitExceeded,
+				limits.MaxRows,
+			)
+		}
+		if err := validateJCRFields(record, line, limits.MaxFieldBytes); err != nil {
+			return nil, err
+		}
+		row, err := parseJCRRow(record, indexes, limits.MaxDecimalPlaces)
 		if err != nil {
-			return nil, fmt.Errorf("%w: CSV row %d: %v", ErrInvalidJCRCSV, line, err)
+			return nil, fmt.Errorf("%w: CSV row %d: %w", ErrInvalidJCRCSV, line, err)
 		}
 		rows = append(rows, row)
 	}
@@ -784,7 +886,26 @@ func parseJCRCSV(contents []byte) ([]parsedJCRRow, error) {
 	return rows, nil
 }
 
-func parseJCRRow(record []string, indexes map[string]int) (parsedJCRRow, error) {
+func validateJCRFields(record []string, line int, maxFieldBytes int) error {
+	for column, field := range record {
+		if len(field) > maxFieldBytes {
+			return fmt.Errorf(
+				"%w: CSV row %d field %d exceeds maximum field bytes %d",
+				ErrJCRLimitExceeded,
+				line,
+				column+1,
+				maxFieldBytes,
+			)
+		}
+	}
+	return nil
+}
+
+func parseJCRRow(
+	record []string,
+	indexes map[string]int,
+	maxDecimalPlaces int,
+) (parsedJCRRow, error) {
 	field := func(name string) string {
 		return strings.TrimSpace(record[indexes[name]])
 	}
@@ -845,6 +966,14 @@ func parseJCRRow(record []string, indexes map[string]int) (parsedJCRRow, error) 
 		if jifRaw == "" || quartileRaw == "" {
 			return parsedJCRRow{}, errors.New("known metric requires JIF and quartile")
 		}
+		if decimalPlaces(jifRaw) > maxDecimalPlaces {
+			return parsedJCRRow{}, fmt.Errorf(
+				"%w: JIF %q exceeds maximum decimal places %d",
+				ErrJCRLimitExceeded,
+				jifRaw,
+				maxDecimalPlaces,
+			)
+		}
 		parsedJIF, err := ParseDecimal(jifRaw)
 		if err != nil {
 			return parsedJCRRow{}, fmt.Errorf("invalid JIF: %w", err)
@@ -874,6 +1003,14 @@ func parseJCRRow(record []string, indexes map[string]int) (parsedJCRRow, error) 
 		status:      status,
 		source:      source,
 	}, nil
+}
+
+func decimalPlaces(raw string) int {
+	_, fraction, found := strings.Cut(strings.TrimSpace(raw), ".")
+	if !found {
+		return 0
+	}
+	return len(fraction)
 }
 
 func uniqueVenues(values []Venue) []Venue {

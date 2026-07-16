@@ -56,6 +56,7 @@ var expectedSchemaTables = []string{
 	"venue_policy_assessments",
 	"jcr_import_receipts",
 	"jcr_import_receipt_aliases",
+	"jcr_import_receipt_metrics",
 	"fulltext_assets",
 }
 
@@ -105,6 +106,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 1, name: "initial"},
 		{version: 2, name: "integrity_hardening"},
 		{version: 3, name: "jcr_import_receipts"},
+		{version: 4, name: "venue_policy_semantics"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -140,7 +142,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 	}
 }
 
-func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRReceipts(t *testing.T) {
+func TestEmbeddedMigrationsPreservePriorChecksumsAndAddVenuePolicySemantics(t *testing.T) {
 	migrations, err := EmbeddedMigrations()
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
@@ -148,8 +150,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRReceipts(t *testing.T)
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 3 {
-		t.Fatalf("embedded migration count = %d, want 3", len(migrations))
+	if len(migrations) != 4 {
+		t.Fatalf("embedded migration count = %d, want 4", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -159,6 +161,9 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRReceipts(t *testing.T)
 	}
 	if migrations[2].Version != 3 || migrations[2].Name != "jcr_import_receipts" {
 		t.Fatalf("third migration = %#v, want 000003_jcr_import_receipts", migrations[2])
+	}
+	if migrations[3].Version != 4 || migrations[3].Name != "venue_policy_semantics" {
+		t.Fatalf("fourth migration = %#v, want 000004_venue_policy_semantics", migrations[3])
 	}
 }
 
@@ -229,6 +234,9 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"jcr_import_receipt_aliases_import_receipt_id_fkey",
 		"jcr_import_receipt_aliases_venue_alias_id_fkey",
 		"jcr_import_receipt_aliases_import_receipt_id_venue_alias_id_key",
+		"jcr_import_receipt_metrics_import_receipt_id_fkey",
+		"jcr_import_receipt_metrics_metric_snapshot_id_fkey",
+		"jcr_import_receipt_metrics_receipt_metric_key",
 		"fulltext_assets_public_reusable_check",
 	})
 	assertNamesExist(t, pool, `
@@ -242,6 +250,8 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"venue_policy_versions_immutable",
 		"jcr_import_receipts_immutable",
 		"jcr_import_receipt_aliases_immutable",
+		"jcr_import_receipt_metrics_immutable",
+		"venue_policy_assessments_venue_type_semantics",
 	})
 	assertNamesExist(t, pool, `
 		SELECT indexname
@@ -257,24 +267,27 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"idx_venue_metric_snapshots_lookup",
 		"idx_venue_metric_snapshots_import_receipt",
 		"idx_jcr_import_receipt_aliases_alias",
+		"idx_jcr_import_receipt_metrics_metric",
 		"idx_fulltext_assets_public",
 	})
 
 	expectedDeleteRules := map[string]string{
-		"source_record_works_source_record_id_fkey":         "r",
-		"source_record_works_work_id_fkey":                  "c",
-		"field_assertions_work_id_fkey":                     "n",
-		"paper_versions_source_record_id_fkey":              "r",
-		"field_assertions_source_record_id_fkey":            "r",
-		"paper_versions_source_record_work_fkey":            "a",
-		"field_assertions_source_record_work_fkey":          "a",
-		"work_code_repositories_work_id_fkey":               "c",
-		"work_code_repositories_repository_id_fkey":         "r",
-		"venue_metric_snapshots_venue_id_fkey":              "r",
-		"venue_metric_snapshots_jcr_import_receipt_id_fkey": "r",
-		"venue_policy_assessments_policy_version_fkey":      "r",
-		"jcr_import_receipt_aliases_import_receipt_id_fkey": "r",
-		"jcr_import_receipt_aliases_venue_alias_id_fkey":    "r",
+		"source_record_works_source_record_id_fkey":          "r",
+		"source_record_works_work_id_fkey":                   "c",
+		"field_assertions_work_id_fkey":                      "n",
+		"paper_versions_source_record_id_fkey":               "r",
+		"field_assertions_source_record_id_fkey":             "r",
+		"paper_versions_source_record_work_fkey":             "a",
+		"field_assertions_source_record_work_fkey":           "a",
+		"work_code_repositories_work_id_fkey":                "c",
+		"work_code_repositories_repository_id_fkey":          "r",
+		"venue_metric_snapshots_venue_id_fkey":               "r",
+		"venue_metric_snapshots_jcr_import_receipt_id_fkey":  "r",
+		"venue_policy_assessments_policy_version_fkey":       "r",
+		"jcr_import_receipt_aliases_import_receipt_id_fkey":  "r",
+		"jcr_import_receipt_aliases_venue_alias_id_fkey":     "r",
+		"jcr_import_receipt_metrics_import_receipt_id_fkey":  "r",
+		"jcr_import_receipt_metrics_metric_snapshot_id_fkey": "r",
 	}
 	for name, want := range expectedDeleteRules {
 		var actual string
@@ -288,6 +301,22 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		if actual != want {
 			t.Errorf("%s delete rule = %q, want %q", name, actual, want)
 		}
+	}
+
+	var metricReceiptDeferrable, metricReceiptDeferred bool
+	if err := pool.QueryRow(ctx, `
+		SELECT condeferrable, condeferred
+		FROM pg_constraint
+		WHERE conname = 'venue_metric_snapshots_jcr_import_receipt_id_fkey'
+	`).Scan(&metricReceiptDeferrable, &metricReceiptDeferred); err != nil {
+		t.Fatalf("query metric receipt FK deferral: %v", err)
+	}
+	if !metricReceiptDeferrable || !metricReceiptDeferred {
+		t.Fatalf(
+			"metric receipt FK deferral = %v/%v, want true/true",
+			metricReceiptDeferrable,
+			metricReceiptDeferred,
+		)
 	}
 }
 
@@ -339,6 +368,12 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 	`, receiptID, aliasID); err != nil {
 		t.Fatalf("link imported alias to receipt: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_metrics (import_receipt_id, metric_snapshot_id)
+		VALUES ($1, $2)
+	`, receiptID, metricID); err != nil {
+		t.Fatalf("link imported metric to receipt: %v", err)
+	}
 
 	var tracedSHA, jif string
 	var tracedImportedAt time.Time
@@ -367,6 +402,8 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 		`DELETE FROM jcr_import_receipts WHERE id = $1`,
 		`UPDATE jcr_import_receipt_aliases SET venue_alias_id = venue_alias_id WHERE import_receipt_id = $1`,
 		`DELETE FROM jcr_import_receipt_aliases WHERE import_receipt_id = $1`,
+		`UPDATE jcr_import_receipt_metrics SET metric_snapshot_id = metric_snapshot_id WHERE import_receipt_id = $1`,
+		`DELETE FROM jcr_import_receipt_metrics WHERE import_receipt_id = $1`,
 	} {
 		if _, err := pool.Exec(ctx, query, receiptID); err == nil {
 			t.Fatalf("immutable JCR import provenance mutation was accepted: %s", query)
@@ -402,7 +439,7 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 			matched_rules, evidence, assessed_at
 		) VALUES (
 			$1, $2, 2025, 'not_applicable', '[]',
-			'{"reason":"journal_policy_not_applicable","venue_type":"conference"}',
+			'{"reason":"venue_type_not_journal","venue_type":"conference"}',
 			now()
 		)
 	`, conferenceID, policyID); err != nil {
@@ -414,7 +451,7 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 			matched_rules, evidence, assessed_at
 		 ) VALUES (
 			$1, $2, 2026, 'not_applicable', '["jcr_q1"]',
-			'{"reason":"journal_policy_not_applicable","venue_type":"conference"}',
+			'{"reason":"venue_type_not_journal","venue_type":"conference"}',
 			now()
 		 )`,
 		`INSERT INTO venue_policy_assessments (
@@ -429,6 +466,224 @@ func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *t
 		if _, err := pool.Exec(ctx, query, conferenceID, policyID); err == nil {
 			t.Fatalf("invalid not_applicable assessment was accepted: %s", query)
 		}
+	}
+}
+
+func TestVenuePolicyAssessmentMigrationEnforcesActualVenueType(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	var journalID, conferenceID, preprintID, policyID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Policy Journal')
+		RETURNING id
+	`), &journalID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('conference', 'Policy Conference')
+		RETURNING id
+	`), &conferenceID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('preprint', 'Policy Preprint')
+		RETURNING id
+	`), &preprintID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_policy_versions (policy_name, version_number, definition, effective_at)
+		VALUES ('venue-type-policy', 1, '{"accept":["jif_gte_10","jcr_q1"]}', now())
+		RETURNING id
+	`), &policyID)
+
+	validAssessments := []struct {
+		venueID    string
+		metricYear int
+		decision   string
+		matched    string
+		evidence   string
+	}{
+		{
+			venueID:    journalID,
+			metricYear: 2025,
+			decision:   "accepted",
+			matched:    `["jif_gte_10"]`,
+			evidence:   `{"venue_type":"journal","categories":["AI"]}`,
+		},
+		{
+			venueID:    journalID,
+			metricYear: 2026,
+			decision:   "rejected",
+			matched:    `[]`,
+			evidence:   `{"venue_type":"journal","categories":["AI"]}`,
+		},
+		{
+			venueID:    journalID,
+			metricYear: 2027,
+			decision:   "unknown",
+			matched:    `[]`,
+			evidence:   `{"venue_type":"journal","reason":"missing_metric"}`,
+		},
+		{
+			venueID:    conferenceID,
+			metricYear: 2025,
+			decision:   "not_applicable",
+			matched:    `[]`,
+			evidence:   `{"venue_type":"conference","reason":"venue_type_not_journal"}`,
+		},
+		{
+			venueID:    preprintID,
+			metricYear: 2025,
+			decision:   "not_applicable",
+			matched:    `[]`,
+			evidence:   `{"venue_type":"preprint","reason":"venue_type_not_journal"}`,
+		},
+	}
+	for _, assessment := range validAssessments {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO venue_policy_assessments (
+				venue_id, policy_version_id, metric_year, decision,
+				matched_rules, evidence, assessed_at
+			) VALUES ($1, $2, $3, $4, $5, $6, now())
+		`,
+			assessment.venueID,
+			policyID,
+			assessment.metricYear,
+			assessment.decision,
+			assessment.matched,
+			assessment.evidence,
+		); err != nil {
+			t.Fatalf("persist valid %s assessment: %v", assessment.decision, err)
+		}
+	}
+
+	invalidAssessments := []struct {
+		name         string
+		venueID      string
+		metricYear   int
+		decision     string
+		matchedRules string
+		evidence     string
+	}{
+		{
+			name:         "journal not applicable",
+			venueID:      journalID,
+			metricYear:   2028,
+			decision:     "not_applicable",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"journal","reason":"venue_type_not_journal"}`,
+		},
+		{
+			name:         "conference accepted",
+			venueID:      conferenceID,
+			metricYear:   2026,
+			decision:     "accepted",
+			matchedRules: `["jcr_q1"]`,
+			evidence:     `{"venue_type":"conference"}`,
+		},
+		{
+			name:         "preprint unknown",
+			venueID:      preprintID,
+			metricYear:   2026,
+			decision:     "unknown",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"preprint","reason":"missing_metric"}`,
+		},
+		{
+			name:         "mismatched evidence type",
+			venueID:      conferenceID,
+			metricYear:   2027,
+			decision:     "not_applicable",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"preprint","reason":"venue_type_not_journal"}`,
+		},
+		{
+			name:         "wrong not applicable reason",
+			venueID:      conferenceID,
+			metricYear:   2028,
+			decision:     "not_applicable",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"conference","reason":"journal_policy_not_applicable"}`,
+		},
+		{
+			name:         "journal evidence type mismatch",
+			venueID:      journalID,
+			metricYear:   2029,
+			decision:     "unknown",
+			matchedRules: `[]`,
+			evidence:     `{"venue_type":"conference","reason":"missing_metric"}`,
+		},
+	}
+	for _, assessment := range invalidAssessments {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO venue_policy_assessments (
+				venue_id, policy_version_id, metric_year, decision,
+				matched_rules, evidence, assessed_at
+			) VALUES ($1, $2, $3, $4, $5, $6, now())
+		`,
+			assessment.venueID,
+			policyID,
+			assessment.metricYear,
+			assessment.decision,
+			assessment.matchedRules,
+			assessment.evidence,
+		)
+		if err == nil {
+			t.Fatalf("invalid assessment %q was accepted", assessment.name)
+		}
+	}
+}
+
+func TestVenuePolicySemanticsMigrationBackfillsMetricReceiptLinks(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:3]); err != nil {
+		t.Fatalf("apply migrations through 000003: %v", err)
+	}
+
+	var venueID, receiptID, metricID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('journal', 'Pre-000004 Receipt Journal')
+		RETURNING id
+	`), &venueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES (
+			'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+			'synthetic-jcr-fixture', now(), 1, 1, 0
+		)
+		RETURNING id
+	`), &receiptID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at, jcr_import_receipt_id
+		) VALUES (
+			$1, 2025, 'Legacy Receipt Category', 10, 'Q1', 'known',
+			'synthetic-jcr-fixture', 'synthetic-only', now(), $2
+		)
+		RETURNING id
+	`, venueID, receiptID), &metricID)
+
+	if err := UpMigrations(ctx, pool, migrations); err != nil {
+		t.Fatalf("upgrade through 000004: %v", err)
+	}
+	var links int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM jcr_import_receipt_metrics
+		WHERE import_receipt_id = $1
+		  AND metric_snapshot_id = $2
+	`, receiptID, metricID).Scan(&links); err != nil {
+		t.Fatalf("query backfilled receipt metric link: %v", err)
+	}
+	if links != 1 {
+		t.Fatalf("backfilled receipt metric links = %d, want 1", links)
 	}
 }
 
@@ -449,7 +704,7 @@ func TestMigrationSecondRunIsIdempotent(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*), min(checksum) FROM schema_migrations").Scan(&afterCount, &afterChecksum); err != nil {
 		t.Fatalf("query migration state after second run: %v", err)
 	}
-	if beforeCount != 3 || afterCount != beforeCount || afterChecksum != beforeChecksum {
+	if beforeCount != 4 || afterCount != beforeCount || afterChecksum != beforeChecksum {
 		t.Fatalf("migration state changed: before=(%d,%s) after=(%d,%s)", beforeCount, beforeChecksum, afterCount, afterChecksum)
 	}
 }
@@ -522,8 +777,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 3 {
-		t.Fatalf("embedded migration count = %d, want 3", len(migrations))
+	if len(migrations) != 4 {
+		t.Fatalf("embedded migration count = %d, want 4", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -637,9 +892,9 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	`).Scan(&appliedCount, &preservedChecksum); err != nil {
 		t.Fatalf("query upgraded migration records: %v", err)
 	}
-	if appliedCount != 3 || preservedChecksum != initialMigrationChecksum {
+	if appliedCount != 4 || preservedChecksum != initialMigrationChecksum {
 		t.Fatalf(
-			"upgraded migrations = count %d, initial checksum %s; want 3, %s",
+			"upgraded migrations = count %d, initial checksum %s; want 4, %s",
 			appliedCount,
 			preservedChecksum,
 			initialMigrationChecksum,
@@ -2016,7 +2271,11 @@ func TestVenueMetricsPoliciesAndFulltextConstraints(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO venue_policy_assessments (
 			venue_id, policy_version_id, metric_year, decision, matched_rules, evidence, assessed_at
-		) VALUES ($1, $2, 2025, 'unknown', '[]', '{"reason":"missing licensed metric"}', now())
+		) VALUES (
+			$1, $2, 2025, 'unknown', '[]',
+			'{"reason":"missing licensed metric","venue_type":"journal"}',
+			now()
+		)
 	`, venueID, policyID); err != nil {
 		t.Fatalf("insert unknown policy assessment: %v", err)
 	}

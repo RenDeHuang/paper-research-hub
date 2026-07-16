@@ -106,6 +106,7 @@ func TestPostgresJCRStoreImportsFixtureWithReceiptTraceability(t *testing.T) {
 		inputRows, inserted, unchanged      int
 		metricCount, linkedMetricCount      int
 		zeroJIFCount, aliasCount, linkCount int
+		metricReceiptLinkCount              int
 	)
 	if err := pool.QueryRow(ctx, `
 		SELECT id::text, source, imported_at, input_rows, inserted_rows, unchanged_rows
@@ -172,6 +173,16 @@ func TestPostgresJCRStoreImportsFixtureWithReceiptTraceability(t *testing.T) {
 	if aliasCount != 3 || linkCount != 3 {
 		t.Fatalf("persisted aliases/links = %d/%d, want 3/3", aliasCount, linkCount)
 	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM jcr_import_receipt_metrics
+		WHERE import_receipt_id = $1
+	`, receiptID).Scan(&metricReceiptLinkCount); err != nil {
+		t.Fatalf("count receipt metric links: %v", err)
+	}
+	if metricReceiptLinkCount != 5 {
+		t.Fatalf("receipt metric links = %d, want 5", metricReceiptLinkCount)
+	}
 
 	foundReceipt, found, err := store.FindImport(ctx, result.FileSHA256())
 	if err != nil || !found {
@@ -216,56 +227,65 @@ func TestPostgresJCRStoreImportsFixtureWithReceiptTraceability(t *testing.T) {
 
 func TestPostgresJCRStoreConcurrentDuplicateFileIsIdempotent(t *testing.T) {
 	pool := openMigratedVenueTestPool(t)
-	insertSyntheticFixtureVenues(t, pool)
-	store, err := NewPostgresJCRStore(pool, PostgresJCRStoreConfig{
-		SourceLicense: "synthetic-only",
-	})
+	venueID := insertSingleStoreVenue(t, pool)
+	store := mustNewPostgresJCRStore(t, pool)
+	metric := mustMetricSnapshot(
+		t,
+		venueID,
+		2025,
+		"AI",
+		"10",
+		QuartileQ1,
+		MetricStatusKnown,
+		"synthetic-jcr-fixture",
+	)
+	batch := mustJCRImport(
+		t,
+		strings.Repeat("a", 64),
+		2026,
+		[]MetricSnapshot{metric},
+		nil,
+	)
+	lockKey, err := postgresJCRImportAdvisoryKey(batch.FileSHA256())
 	if err != nil {
-		t.Fatalf("NewPostgresJCRStore() error = %v", err)
+		t.Fatalf("postgresJCRImportAdvisoryKey() error = %v", err)
 	}
-	fixture := readCommittedJCRFixture(t)
-	start := make(chan struct{})
-	results := make(chan ImportResult, 2)
+	ctx := venueTestContext(t)
+	blocker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire same-hash lock blocker: %v", err)
+	}
+	defer blocker.Release()
+	if _, err := blocker.Exec(ctx, "SELECT pg_advisory_lock($1)", lockKey); err != nil {
+		t.Fatalf("acquire same-hash advisory blocker: %v", err)
+	}
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			_, _ = blocker.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", lockKey)
+		}
+	}()
+
+	results := make(chan ImportReceipt, 2)
 	errorsFound := make(chan error, 2)
 	var wait sync.WaitGroup
 	wait.Add(2)
-	for index := range 2 {
-		index := index
+	for range 2 {
 		go func() {
 			defer wait.Done()
-			importer, importerErr := NewJCRImporter(
-				store,
-				store,
-				func() time.Time {
-					return time.Date(
-						2026,
-						time.July,
-						16,
-						11,
-						index,
-						0,
-						0,
-						time.UTC,
-					)
-				},
-			)
-			if importerErr != nil {
-				errorsFound <- importerErr
-				return
-			}
-			<-start
-			result, importErr := importer.Import(
-				context.Background(),
-				bytes.NewReader(fixture),
-			)
-			if importErr != nil {
-				errorsFound <- importErr
+			result, persistErr := store.PersistJCRImport(context.Background(), batch)
+			if persistErr != nil {
+				errorsFound <- persistErr
 				return
 			}
 			results <- result
 		}()
 	}
-	close(start)
+	waitForBlockedPostgresQueries(t, pool, "pg_advisory_xact_lock", 2)
+	if _, err := blocker.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey); err != nil {
+		t.Fatalf("release same-hash advisory blocker: %v", err)
+	}
+	lockHeld = false
 	wait.Wait()
 	close(results)
 	close(errorsFound)
@@ -290,24 +310,271 @@ func TestPostgresJCRStoreConcurrentDuplicateFileIsIdempotent(t *testing.T) {
 		}
 	}
 
-	ctx := venueTestContext(t)
-	var receipts, metrics, aliases int
+	var receipts, metrics, metricLinks int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipts").Scan(&receipts); err != nil {
 		t.Fatalf("count concurrent receipts: %v", err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_metric_snapshots").Scan(&metrics); err != nil {
 		t.Fatalf("count concurrent metrics: %v", err)
 	}
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_aliases").Scan(&aliases); err != nil {
-		t.Fatalf("count concurrent aliases: %v", err)
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_metrics").Scan(&metricLinks); err != nil {
+		t.Fatalf("count concurrent receipt metric links: %v", err)
 	}
-	if receipts != 1 || metrics != 5 || aliases != 3 {
+	if receipts != 1 || metrics != 1 || metricLinks != 1 {
 		t.Fatalf(
-			"concurrent persistence = receipts %d metrics %d aliases %d, want 1/5/3",
+			"concurrent persistence = receipts %d metrics %d links %d, want 1/1/1",
 			receipts,
 			metrics,
-			aliases,
+			metricLinks,
 		)
+	}
+}
+
+func TestPostgresJCRStoreConcurrentDifferentHashesCompeteOnMetricKey(t *testing.T) {
+	t.Run("identical metric creates two receipt associations", func(t *testing.T) {
+		pool := openMigratedVenueTestPool(t)
+		venueID := insertSingleStoreVenue(t, pool)
+		store := mustNewPostgresJCRStore(t, pool)
+		metric := mustMetricSnapshot(
+			t,
+			venueID,
+			2025,
+			"AI",
+			"10",
+			QuartileQ1,
+			MetricStatusKnown,
+			"synthetic-jcr-fixture",
+		)
+		batches := []JCRImport{
+			mustJCRImport(t, strings.Repeat("b", 64), 2026, []MetricSnapshot{metric}, nil),
+			mustJCRImport(t, strings.Repeat("c", 64), 2027, []MetricSnapshot{metric}, nil),
+		}
+
+		results, errorsFound := persistBatchesBlockedOnVenue(t, pool, venueID, store, batches)
+		for _, err := range errorsFound {
+			if err != nil {
+				t.Fatalf("concurrent identical PersistJCRImport() error = %v", err)
+			}
+		}
+		if len(results) != 2 {
+			t.Fatalf("concurrent identical receipts = %d, want 2", len(results))
+		}
+		var inserted, unchanged int
+		for _, receipt := range results {
+			inserted += receipt.InsertedRows()
+			unchanged += receipt.UnchangedRows()
+		}
+		if inserted != 1 || unchanged != 1 {
+			t.Fatalf(
+				"concurrent identical counts = inserted %d unchanged %d, want 1/1",
+				inserted,
+				unchanged,
+			)
+		}
+
+		ctx := venueTestContext(t)
+		var receipts, metrics, links int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipts").Scan(&receipts); err != nil {
+			t.Fatalf("count different-hash receipts: %v", err)
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_metric_snapshots").Scan(&metrics); err != nil {
+			t.Fatalf("count different-hash metrics: %v", err)
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_metrics").Scan(&links); err != nil {
+			t.Fatalf("count different-hash metric links: %v", err)
+		}
+		if receipts != 2 || metrics != 1 || links != 2 {
+			t.Fatalf(
+				"different-hash identical persistence = receipts %d metrics %d links %d, want 2/1/2",
+				receipts,
+				metrics,
+				links,
+			)
+		}
+	})
+
+	t.Run("different metric returns domain conflict and rolls back loser", func(t *testing.T) {
+		pool := openMigratedVenueTestPool(t)
+		venueID := insertSingleStoreVenue(t, pool)
+		store := mustNewPostgresJCRStore(t, pool)
+		firstMetric := mustMetricSnapshot(
+			t,
+			venueID,
+			2025,
+			"AI",
+			"9.999",
+			QuartileQ2,
+			MetricStatusKnown,
+			"synthetic-jcr-fixture",
+		)
+		secondMetric := mustMetricSnapshot(
+			t,
+			venueID,
+			2025,
+			"AI",
+			"10",
+			QuartileQ1,
+			MetricStatusKnown,
+			"synthetic-jcr-fixture",
+		)
+		batches := []JCRImport{
+			mustJCRImport(t, strings.Repeat("d", 64), 2026, []MetricSnapshot{firstMetric}, nil),
+			mustJCRImport(t, strings.Repeat("e", 64), 2027, []MetricSnapshot{secondMetric}, nil),
+		}
+
+		results, errorsFound := persistBatchesBlockedOnVenue(t, pool, venueID, store, batches)
+		if len(results) != 1 || len(errorsFound) != 2 {
+			t.Fatalf(
+				"concurrent conflict results/errors = %d/%d, want 1/2",
+				len(results),
+				len(errorsFound),
+			)
+		}
+		var nilErrors, conflicts int
+		for _, err := range errorsFound {
+			switch {
+			case err == nil:
+				nilErrors++
+			case errors.Is(err, ErrConflictingMetric):
+				conflicts++
+			default:
+				t.Fatalf("concurrent conflict error = %v, want ErrConflictingMetric", err)
+			}
+		}
+		if nilErrors != 1 || conflicts != 1 {
+			t.Fatalf("concurrent errors = nil %d conflict %d, want 1/1", nilErrors, conflicts)
+		}
+
+		ctx := venueTestContext(t)
+		var receipts, metrics, links int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipts").Scan(&receipts); err != nil {
+			t.Fatalf("count conflict receipts: %v", err)
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_metric_snapshots").Scan(&metrics); err != nil {
+			t.Fatalf("count conflict metrics: %v", err)
+		}
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_metrics").Scan(&links); err != nil {
+			t.Fatalf("count conflict metric links: %v", err)
+		}
+		if receipts != 1 || metrics != 1 || links != 1 {
+			t.Fatalf(
+				"different-hash conflict persistence = receipts %d metrics %d links %d, want 1/1/1",
+				receipts,
+				metrics,
+				links,
+			)
+		}
+	})
+}
+
+func TestPostgresJCRStoreRejectsIdenticalMetricWithDifferentSourceLicense(t *testing.T) {
+	pool := openMigratedVenueTestPool(t)
+	venueID := insertSingleStoreVenue(t, pool)
+	firstStore, err := NewPostgresJCRStore(pool, PostgresJCRStoreConfig{
+		SourceLicense: "license-a",
+	})
+	if err != nil {
+		t.Fatalf("NewPostgresJCRStore(first) error = %v", err)
+	}
+	secondStore, err := NewPostgresJCRStore(pool, PostgresJCRStoreConfig{
+		SourceLicense: "license-b",
+	})
+	if err != nil {
+		t.Fatalf("NewPostgresJCRStore(second) error = %v", err)
+	}
+	metric := mustMetricSnapshot(
+		t,
+		venueID,
+		2025,
+		"AI",
+		"10",
+		QuartileQ1,
+		MetricStatusKnown,
+		"synthetic-jcr-fixture",
+	)
+	first := mustJCRImport(t, strings.Repeat("f", 64), 2026, []MetricSnapshot{metric}, nil)
+	second := mustJCRImport(t, first.FileSHA256(), 2027, []MetricSnapshot{metric}, nil)
+	if _, err := firstStore.PersistJCRImport(context.Background(), first); err != nil {
+		t.Fatalf("PersistJCRImport(first license) error = %v", err)
+	}
+	if _, err := secondStore.PersistJCRImport(context.Background(), second); !errors.Is(err, ErrConflictingMetric) {
+		t.Fatalf("PersistJCRImport(second license) error = %v, want ErrConflictingMetric", err)
+	}
+
+	ctx := venueTestContext(t)
+	var receipts, metrics, links int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipts").Scan(&receipts); err != nil {
+		t.Fatalf("count license receipts: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_metric_snapshots").Scan(&metrics); err != nil {
+		t.Fatalf("count license metrics: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_metrics").Scan(&links); err != nil {
+		t.Fatalf("count license links: %v", err)
+	}
+	if receipts != 1 || metrics != 1 || links != 1 {
+		t.Fatalf(
+			"license conflict persistence = receipts %d metrics %d links %d, want 1/1/1",
+			receipts,
+			metrics,
+			links,
+		)
+	}
+}
+
+func TestPostgresJCRStoreMapsMetricUniqueViolationToDomainConflict(t *testing.T) {
+	pool := openMigratedVenueTestPool(t)
+	venueID := insertSingleStoreVenue(t, pool)
+	store := mustNewPostgresJCRStore(t, pool)
+	ctx := venueTestContext(t)
+	if _, err := pool.Exec(ctx, `
+		CREATE UNIQUE INDEX venue_metric_snapshots_casefold_test_key
+		ON venue_metric_snapshots (venue_id, metric_year, lower(category))
+	`); err != nil {
+		t.Fatalf("create competing metric unique index: %v", err)
+	}
+	firstMetric := mustMetricSnapshot(
+		t,
+		venueID,
+		2025,
+		"AI",
+		"10",
+		QuartileQ1,
+		MetricStatusKnown,
+		"synthetic-jcr-fixture",
+	)
+	if _, err := store.PersistJCRImport(
+		context.Background(),
+		mustJCRImport(t, strings.Repeat("1", 64), 2026, []MetricSnapshot{firstMetric}, nil),
+	); err != nil {
+		t.Fatalf("PersistJCRImport(first metric) error = %v", err)
+	}
+	casefoldConflict := mustMetricSnapshot(
+		t,
+		venueID,
+		2025,
+		"ai",
+		"10",
+		QuartileQ1,
+		MetricStatusKnown,
+		"synthetic-jcr-fixture",
+	)
+	conflictSHA := strings.Repeat("2", 64)
+	_, err := store.PersistJCRImport(
+		context.Background(),
+		mustJCRImport(t, conflictSHA, 2027, []MetricSnapshot{casefoldConflict}, nil),
+	)
+	if !errors.Is(err, ErrConflictingMetric) {
+		t.Fatalf("PersistJCRImport(unique violation) error = %v, want ErrConflictingMetric", err)
+	}
+	var conflictingReceipts int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM jcr_import_receipts WHERE file_sha256 = $1
+	`, conflictSHA).Scan(&conflictingReceipts); err != nil {
+		t.Fatalf("count unique-violation receipt: %v", err)
+	}
+	if conflictingReceipts != 0 {
+		t.Fatalf("unique-violation receipts = %d, want rollback to 0", conflictingReceipts)
 	}
 }
 
@@ -354,7 +621,7 @@ func TestPostgresJCRStoreClassifiesIdenticalRowsAndRollsBackConflicts(t *testing
 				receipt.UnchangedRows(),
 			)
 		}
-		var receipts, metrics int
+		var receipts, metrics, links int
 		ctx := venueTestContext(t)
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipts").Scan(&receipts); err != nil {
 			t.Fatalf("count identical receipts: %v", err)
@@ -362,8 +629,16 @@ func TestPostgresJCRStoreClassifiesIdenticalRowsAndRollsBackConflicts(t *testing
 		if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_metric_snapshots").Scan(&metrics); err != nil {
 			t.Fatalf("count identical metrics: %v", err)
 		}
-		if receipts != 2 || metrics != 1 {
-			t.Fatalf("identical persistence = receipts %d metrics %d, want 2/1", receipts, metrics)
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM jcr_import_receipt_metrics").Scan(&links); err != nil {
+			t.Fatalf("count identical metric receipt links: %v", err)
+		}
+		if receipts != 2 || metrics != 1 || links != 2 {
+			t.Fatalf(
+				"identical persistence = receipts %d metrics %d links %d, want 2/1/2",
+				receipts,
+				metrics,
+				links,
+			)
 		}
 	})
 
@@ -496,7 +771,7 @@ func TestPostgresSchemaPersistsNotApplicableAssessment(t *testing.T) {
 			matched_rules, evidence, assessed_at
 		) VALUES (
 			$1, $2, 2025, 'not_applicable', '[]',
-			'{"reason":"journal_policy_not_applicable","venue_type":"preprint"}',
+			'{"reason":"venue_type_not_journal","venue_type":"preprint"}',
 			now()
 		)
 	`, venueID, policyID); err != nil {
@@ -573,6 +848,99 @@ func venueTestContext(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+func waitForBlockedPostgresQueries(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	queryFragment string,
+	want int,
+) {
+	t.Helper()
+	ctx := venueTestContext(t)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_stat_activity
+			WHERE datname = current_database()
+			  AND pid <> pg_backend_pid()
+			  AND wait_event_type = 'Lock'
+			  AND query LIKE '%' || $1 || '%'
+		`, queryFragment).Scan(&blocked); err != nil {
+			t.Fatalf("query blocked PostgreSQL sessions: %v", err)
+		}
+		if blocked >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"blocked PostgreSQL queries containing %q = %d, want at least %d",
+				queryFragment,
+				blocked,
+				want,
+			)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func persistBatchesBlockedOnVenue(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	venueID string,
+	store *PostgresJCRStore,
+	batches []JCRImport,
+) ([]ImportReceipt, []error) {
+	t.Helper()
+	ctx := venueTestContext(t)
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin Venue lock blocker: %v", err)
+	}
+	defer func() {
+		_ = blocker.Rollback(context.Background())
+	}()
+	var lockedVenue string
+	if err := blocker.QueryRow(ctx, `
+		SELECT id::text FROM venues WHERE id = $1 FOR UPDATE
+	`, venueID).Scan(&lockedVenue); err != nil {
+		t.Fatalf("lock Venue row: %v", err)
+	}
+
+	results := make(chan ImportReceipt, len(batches))
+	errorsFound := make(chan error, len(batches))
+	var wait sync.WaitGroup
+	wait.Add(len(batches))
+	for _, batch := range batches {
+		batch := batch
+		go func() {
+			defer wait.Done()
+			receipt, persistErr := store.PersistJCRImport(context.Background(), batch)
+			if persistErr == nil {
+				results <- receipt
+			}
+			errorsFound <- persistErr
+		}()
+	}
+	waitForBlockedPostgresQueries(t, pool, "INSERT INTO venue_metric_snapshots", len(batches))
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatalf("release Venue row blocker: %v", err)
+	}
+	wait.Wait()
+	close(results)
+	close(errorsFound)
+
+	collectedResults := make([]ImportReceipt, 0, len(results))
+	for result := range results {
+		collectedResults = append(collectedResults, result)
+	}
+	collectedErrors := make([]error, 0, len(errorsFound))
+	for err := range errorsFound {
+		collectedErrors = append(collectedErrors, err)
+	}
+	return collectedResults, collectedErrors
 }
 
 func insertSyntheticFixtureVenues(t *testing.T, pool *pgxpool.Pool) {
