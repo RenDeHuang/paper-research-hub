@@ -16,11 +16,21 @@ import (
 func TestDecimalComparisonIsExactAtJIFThreshold(t *testing.T) {
 	t.Parallel()
 
+	zero := mustParseDecimal(t, "0.000")
 	below := mustParseDecimal(t, "9.999999999999999999")
 	threshold := mustParseDecimal(t, "10")
 	equal := mustParseDecimal(t, "10.000000000000000000")
 	above := mustParseDecimal(t, "10.000000000000000001")
 
+	if !zero.Valid() {
+		t.Fatal("Decimal zero is not valid")
+	}
+	if zero.String() != "0" {
+		t.Fatalf("zero.String() = %q, want %q", zero.String(), "0")
+	}
+	if zero.Cmp(below) >= 0 {
+		t.Fatalf("%s compares at or above %s", zero, below)
+	}
 	if below.Cmp(threshold) >= 0 {
 		t.Fatalf("%s compares at or above %s", below, threshold)
 	}
@@ -99,6 +109,9 @@ func TestJCRImporterPreservesCategoriesUnknownRowsAndImportMetadata(t *testing.T
 	wantSHA := hex.EncodeToString(digest[:])
 	if result.FileSHA256() != wantSHA {
 		t.Fatalf("ImportResult.FileSHA256() = %q, want %q", result.FileSHA256(), wantSHA)
+	}
+	if result.Source() != "synthetic-jcr" {
+		t.Fatalf("ImportResult.Source() = %q, want %q", result.Source(), "synthetic-jcr")
 	}
 	if !result.ImportedAt().Equal(importedAt) {
 		t.Fatalf("ImportResult.ImportedAt() = %v, want %v", result.ImportedAt(), importedAt)
@@ -325,6 +338,33 @@ func TestJCRImporterRequiresStrictSchemaAndConsistentRows(t *testing.T) {
 	}
 }
 
+func TestJCRImporterRejectsMixedFileSources(t *testing.T) {
+	t.Parallel()
+
+	item := venueForTest(
+		t,
+		"venue-alpha",
+		"Synthetic Journal",
+		"1234-5679",
+		"1234-5679",
+		"2049-3630",
+	)
+	repository := &fakeJCRRepository{venues: []Venue{item}}
+	sink := &fakeJCRSink{}
+	importer := mustNewJCRImporter(t, repository, sink)
+	input := validJCRHeader +
+		"Synthetic Journal,1234-5679,1234-5679,2049-3630,2025,AI,12.5,Q1,known,synthetic-jcr\n" +
+		"Synthetic Journal,1234-5679,1234-5679,2049-3630,2025,Robotics,12.5,Q2,known,other-source\n"
+
+	_, err := importer.Import(context.Background(), strings.NewReader(input))
+	if err == nil || !strings.Contains(err.Error(), "single source") {
+		t.Fatalf("Import() error = %v, want single-source error", err)
+	}
+	if sink.calls != 0 {
+		t.Fatalf("JCRSink calls = %d for mixed sources, want 0", sink.calls)
+	}
+}
+
 func TestJCRImporterTreatsIdenticalDuplicatesAsIdempotent(t *testing.T) {
 	t.Parallel()
 
@@ -511,7 +551,14 @@ func TestJCRImporterReturnsOriginalReceiptForIdenticalFile(t *testing.T) {
 	digest := sha256.Sum256([]byte(input))
 	fileSHA := hex.EncodeToString(digest[:])
 	originalTime := time.Date(2025, time.December, 1, 8, 0, 0, 0, time.UTC)
-	receipt, err := NewImportReceipt(fileSHA, originalTime, 1, 1, 0)
+	receipt, err := NewImportReceipt(
+		fileSHA,
+		"synthetic-jcr",
+		originalTime,
+		1,
+		1,
+		0,
+	)
 	if err != nil {
 		t.Fatalf("NewImportReceipt() error = %v", err)
 	}
@@ -606,20 +653,27 @@ func TestCommittedSyntheticJCRFixtureCoversPolicyOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import(committed fixture) error = %v", err)
 	}
-	if result.InputRows() != 4 || result.InsertedRows() != 4 {
+	if result.InputRows() != 5 || result.InsertedRows() != 5 {
 		t.Fatalf(
-			"fixture row counts = input %d inserted %d, want 4/4",
+			"fixture row counts = input %d inserted %d, want 5/5",
 			result.InputRows(),
 			result.InsertedRows(),
 		)
 	}
 
 	rowsByVenue := make(map[string][]MetricSnapshot)
+	foundZeroJIF := false
 	for _, row := range sink.batch.Rows() {
 		rowsByVenue[row.VenueID()] = append(rowsByVenue[row.VenueID()], row)
 		if row.Source() != "synthetic-jcr-fixture" {
 			t.Fatalf("fixture source = %q, want explicit synthetic source", row.Source())
 		}
+		if row.HasJIF() && row.JIF().String() == "0" {
+			foundZeroJIF = true
+		}
+	}
+	if !foundZeroJIF {
+		t.Fatal("fixture does not contain an exact zero JIF row")
 	}
 	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
 	if err != nil {
@@ -715,6 +769,7 @@ func (sink *fakeJCRSink) PersistJCRImport(
 	}
 	return NewImportReceipt(
 		batch.FileSHA256(),
+		batch.Source(),
 		batch.ImportedAt(),
 		batch.InputRows(),
 		len(batch.Rows()),

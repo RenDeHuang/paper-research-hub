@@ -62,6 +62,9 @@ func (value Decimal) Valid() bool {
 			return false
 		}
 	}
+	if value.digits == "0" {
+		return value.scale == 0
+	}
 	return value.digits[0] != '0'
 }
 
@@ -305,6 +308,7 @@ func (snapshot MetricSnapshot) Equal(other MetricSnapshot) bool {
 
 type ImportReceipt struct {
 	fileSHA256    string
+	source        string
 	importedAt    time.Time
 	inputRows     int
 	insertedRows  int
@@ -315,6 +319,7 @@ type ImportResult = ImportReceipt
 
 func NewImportReceipt(
 	fileSHA256 string,
+	source string,
 	importedAt time.Time,
 	inputRows int,
 	insertedRows int,
@@ -324,6 +329,10 @@ func NewImportReceipt(
 	decoded, err := hex.DecodeString(normalizedSHA)
 	if err != nil || len(decoded) != sha256.Size {
 		return ImportReceipt{}, errors.New("import receipt requires a SHA-256 hex digest")
+	}
+	normalizedSource := strings.TrimSpace(source)
+	if normalizedSource == "" {
+		return ImportReceipt{}, errors.New("import receipt source is required")
 	}
 	if importedAt.IsZero() {
 		return ImportReceipt{}, errors.New("import receipt requires an import timestamp")
@@ -341,6 +350,7 @@ func NewImportReceipt(
 	}
 	return ImportReceipt{
 		fileSHA256:    normalizedSHA,
+		source:        normalizedSource,
 		importedAt:    importedAt.UTC(),
 		inputRows:     inputRows,
 		insertedRows:  insertedRows,
@@ -350,6 +360,10 @@ func NewImportReceipt(
 
 func (receipt ImportReceipt) FileSHA256() string {
 	return receipt.fileSHA256
+}
+
+func (receipt ImportReceipt) Source() string {
+	return receipt.source
 }
 
 func (receipt ImportReceipt) ImportedAt() time.Time {
@@ -371,6 +385,7 @@ func (receipt ImportReceipt) UnchangedRows() int {
 func (receipt ImportReceipt) Valid() bool {
 	_, err := NewImportReceipt(
 		receipt.fileSHA256,
+		receipt.source,
 		receipt.importedAt,
 		receipt.inputRows,
 		receipt.insertedRows,
@@ -405,6 +420,7 @@ func (evidence VenueAliasEvidence) Alias() Alias {
 
 type JCRImport struct {
 	fileSHA256    string
+	source        string
 	importedAt    time.Time
 	inputRows     int
 	unchangedRows int
@@ -414,6 +430,7 @@ type JCRImport struct {
 
 func newJCRImport(
 	fileSHA256 string,
+	source string,
 	importedAt time.Time,
 	inputRows int,
 	unchangedRows int,
@@ -426,6 +443,7 @@ func newJCRImport(
 	}
 	receipt, err := NewImportReceipt(
 		fileSHA256,
+		source,
 		importedAt,
 		inputRows,
 		len(rows),
@@ -436,6 +454,7 @@ func newJCRImport(
 	}
 	return JCRImport{
 		fileSHA256:    receipt.FileSHA256(),
+		source:        receipt.Source(),
 		importedAt:    receipt.ImportedAt(),
 		inputRows:     inputRows,
 		unchangedRows: unchangedRows,
@@ -446,6 +465,10 @@ func newJCRImport(
 
 func (batch JCRImport) FileSHA256() string {
 	return batch.fileSHA256
+}
+
+func (batch JCRImport) Source() string {
+	return batch.source
 }
 
 func (batch JCRImport) ImportedAt() time.Time {
@@ -543,6 +566,18 @@ func (importer *JCRImporter) Import(
 	parsedRows, err := parseJCRCSV(contents)
 	if err != nil {
 		return ImportResult{}, err
+	}
+	fileSource := parsedRows[0].source
+	for index, row := range parsedRows[1:] {
+		if row.source != fileSource {
+			return ImportResult{}, fmt.Errorf(
+				"%w: CSV rows must use a single source; row 2 has %q and row %d has %q",
+				ErrInvalidJCRCSV,
+				fileSource,
+				index+3,
+				row.source,
+			)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return ImportResult{}, err
@@ -653,6 +688,7 @@ func (importer *JCRImporter) Import(
 	}
 	batch, err := newJCRImport(
 		fileSHA256,
+		fileSource,
 		importedAt,
 		len(parsedRows),
 		unchangedRows,
@@ -669,10 +705,8 @@ func (importer *JCRImporter) Import(
 	}
 	if !receipt.Valid() ||
 		receipt.FileSHA256() != batch.FileSHA256() ||
-		!receipt.ImportedAt().Equal(batch.ImportedAt()) ||
-		receipt.InputRows() != batch.InputRows() ||
-		receipt.InsertedRows() != len(batch.Rows()) ||
-		receipt.UnchangedRows() != batch.UnchangedRows() {
+		receipt.Source() != batch.Source() ||
+		receipt.InputRows() != batch.InputRows() {
 		return ImportResult{}, errors.New("JCR sink returned an inconsistent import receipt")
 	}
 	return receipt, nil

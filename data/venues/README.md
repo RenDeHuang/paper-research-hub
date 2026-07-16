@@ -31,8 +31,11 @@ all three ISSN roles, source, and status.
 ## Persistence contract
 
 The Go importer reads through a `JCRRepository` and writes one atomic
-`JCRImport` through a `JCRSink`; it does not define a second database
-migration. Persistence implementations must:
+`JCRImport` through a `JCRSink`. Migration `000003_jcr_import_receipts`
+extends the existing Venue schema with immutable import receipts and
+receipt-to-alias provenance; `PostgresJCRStore` persists against that schema
+without introducing a parallel database model. Persistence implementations
+must:
 
 - resolve exactly one pre-existing Venue from the three role-labelled ISSNs;
 - append `(venue_id, metric_year, category)` snapshots without overwriting
@@ -40,7 +43,11 @@ migration. Persistence implementations must:
 - treat normalized identical rows and identical file SHA-256 values as
   idempotent;
 - reject conflicting rows explicitly;
-- atomically record the input SHA-256 and import timestamp with inserted rows.
+- atomically record source, input SHA-256, import timestamp, row counts,
+  metric receipt links, and imported alias evidence.
+
+The PostgreSQL store requires an explicit `SourceLicense` configuration. The
+fixture and schema make no implicit claim about production JCR licensing.
 
 ## Decimal representation
 
@@ -51,10 +58,11 @@ misclassified by binary floating-point rounding.
 
 ## Covered synthetic outcomes
 
-The fixture has four rows covering:
+The fixture has five rows covering:
 
 - a high-JIF journal (`12.5`) that is not dependent on Q1;
 - a second category for the same journal that is Q1;
 - a multi-category journal with both policy rules visible;
 - an explicit `unknown` metric row;
-- a known `9.999`, Q2 row that evaluates to `rejected`.
+- a known `9.999`, Q2 row that evaluates to `rejected`;
+- a checksum-valid known row with exact decimal JIF `0`.

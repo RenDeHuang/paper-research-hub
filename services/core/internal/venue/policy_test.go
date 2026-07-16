@@ -162,6 +162,66 @@ func TestJournalPolicyUsesThreeValuedUnknownSemantics(t *testing.T) {
 	}
 }
 
+func TestJournalPolicyJIFBoundaryUsesExactDecimalValues(t *testing.T) {
+	t.Parallel()
+
+	item := venueForTest(
+		t,
+		"venue-alpha",
+		"Synthetic Journal",
+		"1234-5679",
+		"1234-5679",
+		"2049-3630",
+	)
+	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
+	if err != nil {
+		t.Fatalf("NewJournalPolicy() error = %v", err)
+	}
+	evaluatedAt := time.Date(2026, time.July, 16, 14, 0, 0, 0, time.UTC)
+
+	for _, test := range []struct {
+		jif      string
+		decision PolicyDecision
+	}{
+		{jif: "0", decision: PolicyDecisionRejected},
+		{jif: "9.999", decision: PolicyDecisionRejected},
+		{jif: "10", decision: PolicyDecisionAccepted},
+	} {
+		test := test
+		t.Run(test.jif, func(t *testing.T) {
+			t.Parallel()
+
+			metric := mustMetricSnapshot(
+				t,
+				item.ID(),
+				2025,
+				"AI",
+				test.jif,
+				QuartileQ2,
+				MetricStatusKnown,
+				"synthetic-jcr",
+			)
+			result, evaluateErr := policy.Evaluate(
+				item,
+				2025,
+				[]MetricSnapshot{metric},
+				evaluatedAt,
+			)
+			if evaluateErr != nil {
+				t.Fatalf("Evaluate() error = %v", evaluateErr)
+			}
+			if result.Decision() != test.decision {
+				t.Fatalf(
+					"JIF %s decision = %q, want %q",
+					test.jif,
+					result.Decision(),
+					test.decision,
+				)
+			}
+		})
+	}
+}
+
 func TestJournalPolicyReturnsNotApplicableForNonJournals(t *testing.T) {
 	t.Parallel()
 

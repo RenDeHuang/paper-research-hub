@@ -54,6 +54,8 @@ var expectedSchemaTables = []string{
 	"venue_metric_snapshots",
 	"venue_policy_versions",
 	"venue_policy_assessments",
+	"jcr_import_receipts",
+	"jcr_import_receipt_aliases",
 	"fulltext_assets",
 }
 
@@ -102,6 +104,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 	}{
 		{version: 1, name: "initial"},
 		{version: 2, name: "integrity_hardening"},
+		{version: 3, name: "jcr_import_receipts"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -137,7 +140,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 	}
 }
 
-func TestEmbeddedMigrationsPreserveInitialChecksumAndAddForwardHardening(t *testing.T) {
+func TestEmbeddedMigrationsPreservePriorChecksumsAndAddJCRReceipts(t *testing.T) {
 	migrations, err := EmbeddedMigrations()
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
@@ -145,14 +148,17 @@ func TestEmbeddedMigrationsPreserveInitialChecksumAndAddForwardHardening(t *test
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 2 {
-		t.Fatalf("embedded migration count = %d, want 2", len(migrations))
+	if len(migrations) != 3 {
+		t.Fatalf("embedded migration count = %d, want 3", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
 	}
 	if migrations[1].Version != 2 || migrations[1].Name != "integrity_hardening" {
 		t.Fatalf("second migration = %#v, want 000002_integrity_hardening", migrations[1])
+	}
+	if migrations[2].Version != 3 || migrations[2].Name != "jcr_import_receipts" {
+		t.Fatalf("third migration = %#v, want 000003_jcr_import_receipts", migrations[2])
 	}
 }
 
@@ -215,6 +221,14 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"venue_metric_snapshots_jif_check",
 		"venue_metric_snapshots_quartile_check",
 		"venue_policy_assessments_decision_check",
+		"venue_policy_assessments_decision_semantics_check",
+		"jcr_import_receipts_file_sha256_key",
+		"jcr_import_receipts_file_sha256_check",
+		"jcr_import_receipts_counts_check",
+		"venue_metric_snapshots_jcr_import_receipt_id_fkey",
+		"jcr_import_receipt_aliases_import_receipt_id_fkey",
+		"jcr_import_receipt_aliases_venue_alias_id_fkey",
+		"jcr_import_receipt_aliases_import_receipt_id_venue_alias_id_key",
 		"fulltext_assets_public_reusable_check",
 	})
 	assertNamesExist(t, pool, `
@@ -226,6 +240,8 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"works_status_monotonic",
 		"venue_metric_snapshots_immutable",
 		"venue_policy_versions_immutable",
+		"jcr_import_receipts_immutable",
+		"jcr_import_receipt_aliases_immutable",
 	})
 	assertNamesExist(t, pool, `
 		SELECT indexname
@@ -239,21 +255,26 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		"idx_ranking_snapshots_generated_at",
 		"idx_ingestion_jobs_dequeue",
 		"idx_venue_metric_snapshots_lookup",
+		"idx_venue_metric_snapshots_import_receipt",
+		"idx_jcr_import_receipt_aliases_alias",
 		"idx_fulltext_assets_public",
 	})
 
 	expectedDeleteRules := map[string]string{
-		"source_record_works_source_record_id_fkey":    "r",
-		"source_record_works_work_id_fkey":             "c",
-		"field_assertions_work_id_fkey":                "n",
-		"paper_versions_source_record_id_fkey":         "r",
-		"field_assertions_source_record_id_fkey":       "r",
-		"paper_versions_source_record_work_fkey":       "a",
-		"field_assertions_source_record_work_fkey":     "a",
-		"work_code_repositories_work_id_fkey":          "c",
-		"work_code_repositories_repository_id_fkey":    "r",
-		"venue_metric_snapshots_venue_id_fkey":         "r",
-		"venue_policy_assessments_policy_version_fkey": "r",
+		"source_record_works_source_record_id_fkey":         "r",
+		"source_record_works_work_id_fkey":                  "c",
+		"field_assertions_work_id_fkey":                     "n",
+		"paper_versions_source_record_id_fkey":              "r",
+		"field_assertions_source_record_id_fkey":            "r",
+		"paper_versions_source_record_work_fkey":            "a",
+		"field_assertions_source_record_work_fkey":          "a",
+		"work_code_repositories_work_id_fkey":               "c",
+		"work_code_repositories_repository_id_fkey":         "r",
+		"venue_metric_snapshots_venue_id_fkey":              "r",
+		"venue_metric_snapshots_jcr_import_receipt_id_fkey": "r",
+		"venue_policy_assessments_policy_version_fkey":      "r",
+		"jcr_import_receipt_aliases_import_receipt_id_fkey": "r",
+		"jcr_import_receipt_aliases_venue_alias_id_fkey":    "r",
 	}
 	for name, want := range expectedDeleteRules {
 		var actual string
@@ -266,6 +287,147 @@ func TestMigrationCreatesCriticalConstraintsTriggersIndexesAndDeleteRules(t *tes
 		}
 		if actual != want {
 			t.Errorf("%s delete rule = %q, want %q", name, actual, want)
+		}
+	}
+}
+
+func TestJCRReceiptMigrationAddsTraceabilityAndNotApplicablePolicySemantics(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	var journalID, conferenceID, aliasID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l, issn, eissn)
+		VALUES ('journal', 'Synthetic Zero JIF Journal', '0000-0108', '0000-0116', '0000-0124')
+		RETURNING id
+	`), &journalID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title)
+		VALUES ('conference', 'Synthetic Conference')
+		RETURNING id
+	`), &conferenceID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_aliases (venue_id, alias, source)
+		VALUES ($1, 'Synthetic Zero JIF Journal', 'synthetic-jcr-fixture')
+		RETURNING id
+	`, journalID), &aliasID)
+
+	const fileSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	importedAt := time.Date(2026, time.July, 16, 9, 30, 0, 0, time.UTC)
+	var receiptID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO jcr_import_receipts (
+			file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows
+		) VALUES ($1, 'synthetic-jcr-fixture', $2, 1, 1, 0)
+		RETURNING id
+	`, fileSHA, importedAt), &receiptID)
+
+	var metricID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, captured_at, jcr_import_receipt_id
+		) VALUES (
+			$1, 2025, 'Zero JIF Studies', 0, 'Q2', 'known',
+			'synthetic-jcr-fixture', 'synthetic-only', $2, $3
+		)
+		RETURNING id
+	`, journalID, importedAt, receiptID), &metricID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_aliases (import_receipt_id, venue_alias_id)
+		VALUES ($1, $2)
+	`, receiptID, aliasID); err != nil {
+		t.Fatalf("link imported alias to receipt: %v", err)
+	}
+
+	var tracedSHA, jif string
+	var tracedImportedAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT receipt.file_sha256, receipt.imported_at, metric.jif::text
+		FROM venue_metric_snapshots AS metric
+		JOIN jcr_import_receipts AS receipt
+		  ON receipt.id = metric.jcr_import_receipt_id
+		WHERE metric.id = $1
+	`, metricID).Scan(&tracedSHA, &tracedImportedAt, &jif); err != nil {
+		t.Fatalf("query metric import provenance: %v", err)
+	}
+	if tracedSHA != fileSHA || !tracedImportedAt.Equal(importedAt) || jif != "0" {
+		t.Fatalf(
+			"metric provenance = SHA %q imported_at %v JIF %q, want %q %v 0",
+			tracedSHA,
+			tracedImportedAt,
+			jif,
+			fileSHA,
+			importedAt,
+		)
+	}
+
+	for _, query := range []string{
+		`UPDATE jcr_import_receipts SET input_rows = 2 WHERE id = $1`,
+		`DELETE FROM jcr_import_receipts WHERE id = $1`,
+		`UPDATE jcr_import_receipt_aliases SET venue_alias_id = venue_alias_id WHERE import_receipt_id = $1`,
+		`DELETE FROM jcr_import_receipt_aliases WHERE import_receipt_id = $1`,
+	} {
+		if _, err := pool.Exec(ctx, query, receiptID); err == nil {
+			t.Fatalf("immutable JCR import provenance mutation was accepted: %s", query)
+		}
+	}
+	for _, query := range []string{
+		`INSERT INTO jcr_import_receipts
+		 (file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows)
+		 VALUES ('short', 'fixture', now(), 1, 1, 0)`,
+		`INSERT INTO jcr_import_receipts
+		 (file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows)
+		 VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+		         'fixture', now(), 2, 1, 0)`,
+		`INSERT INTO jcr_import_receipts
+		 (file_sha256, source, imported_at, input_rows, inserted_rows, unchanged_rows)
+		 VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+		         'fixture', now(), 1, 1, 0)`,
+	} {
+		if _, err := pool.Exec(ctx, query); err == nil {
+			t.Fatalf("invalid JCR import receipt was accepted: %s", query)
+		}
+	}
+
+	var policyID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_policy_versions (policy_name, version_number, definition, effective_at)
+		VALUES ('curated-journal', 99, '{"accept":["jif_gte_10","jcr_q1"]}', now())
+		RETURNING id
+	`), &policyID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO venue_policy_assessments (
+			venue_id, policy_version_id, metric_year, decision,
+			matched_rules, evidence, assessed_at
+		) VALUES (
+			$1, $2, 2025, 'not_applicable', '[]',
+			'{"reason":"journal_policy_not_applicable","venue_type":"conference"}',
+			now()
+		)
+	`, conferenceID, policyID); err != nil {
+		t.Fatalf("persist not_applicable policy assessment: %v", err)
+	}
+	for _, query := range []string{
+		`INSERT INTO venue_policy_assessments (
+			venue_id, policy_version_id, metric_year, decision,
+			matched_rules, evidence, assessed_at
+		 ) VALUES (
+			$1, $2, 2026, 'not_applicable', '["jcr_q1"]',
+			'{"reason":"journal_policy_not_applicable","venue_type":"conference"}',
+			now()
+		 )`,
+		`INSERT INTO venue_policy_assessments (
+			venue_id, policy_version_id, metric_year, decision,
+			matched_rules, evidence, assessed_at
+		 ) VALUES (
+			$1, $2, 2027, 'not_applicable', '[]',
+			'{"venue_type":"conference"}',
+			now()
+		 )`,
+	} {
+		if _, err := pool.Exec(ctx, query, conferenceID, policyID); err == nil {
+			t.Fatalf("invalid not_applicable assessment was accepted: %s", query)
 		}
 	}
 }
@@ -287,7 +449,7 @@ func TestMigrationSecondRunIsIdempotent(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT count(*), min(checksum) FROM schema_migrations").Scan(&afterCount, &afterChecksum); err != nil {
 		t.Fatalf("query migration state after second run: %v", err)
 	}
-	if beforeCount != 2 || afterCount != beforeCount || afterChecksum != beforeChecksum {
+	if beforeCount != 3 || afterCount != beforeCount || afterChecksum != beforeChecksum {
 		t.Fatalf("migration state changed: before=(%d,%s) after=(%d,%s)", beforeCount, beforeChecksum, afterCount, afterChecksum)
 	}
 }
@@ -360,8 +522,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 2 {
-		t.Fatalf("embedded migration count = %d, want 2", len(migrations))
+	if len(migrations) != 3 {
+		t.Fatalf("embedded migration count = %d, want 3", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -475,9 +637,9 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	`).Scan(&appliedCount, &preservedChecksum); err != nil {
 		t.Fatalf("query upgraded migration records: %v", err)
 	}
-	if appliedCount != 2 || preservedChecksum != initialMigrationChecksum {
+	if appliedCount != 3 || preservedChecksum != initialMigrationChecksum {
 		t.Fatalf(
-			"upgraded migrations = count %d, initial checksum %s; want 2, %s",
+			"upgraded migrations = count %d, initial checksum %s; want 3, %s",
 			appliedCount,
 			preservedChecksum,
 			initialMigrationChecksum,
