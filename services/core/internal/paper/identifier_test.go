@@ -347,20 +347,58 @@ func TestNewIdentifierRejectsUnsupportedOrInvalidIdentifiers(t *testing.T) {
 func TestCanonicalIdentityUsesDeterministicPrecedence(t *testing.T) {
 	t.Parallel()
 
-	identifiers := Identifiers{
-		DOI:             []string{"10.1000/priority"},
-		ArXiv:           []string{"2401.01234"},
-		OpenReview:      []string{"Forum_AbC123"},
-		SemanticScholar: []string{"0123456789abcdef0123456789abcdef01234567"},
-		OpenAlex:        []string{"W123"},
+	tests := []struct {
+		name        string
+		identifiers Identifiers
+		want        string
+	}{
+		{
+			name: "doi over arxiv",
+			identifiers: Identifiers{
+				DOI:   []string{"10.1000/priority"},
+				ArXiv: []string{"2401.01234"},
+			},
+			want: "doi:10.1000/priority",
+		},
+		{
+			name: "arxiv over openreview without doi",
+			identifiers: Identifiers{
+				ArXiv:      []string{"2401.01234"},
+				OpenReview: []string{"Forum_AbC123"},
+			},
+			want: "arxiv:2401.01234",
+		},
+		{
+			name: "openreview over semantic scholar without doi or arxiv",
+			identifiers: Identifiers{
+				OpenReview:      []string{"Forum_AbC123"},
+				SemanticScholar: []string{"0123456789abcdef0123456789abcdef01234567"},
+			},
+			want: "openreview:Forum_AbC123",
+		},
+		{
+			name: "semantic scholar over openalex",
+			identifiers: Identifiers{
+				SemanticScholar: []string{"0123456789abcdef0123456789abcdef01234567"},
+				OpenAlex:        []string{"W123"},
+			},
+			want: "s2:0123456789abcdef0123456789abcdef01234567",
+		},
 	}
 
-	got, ok := CanonicalIdentity(identifiers, "Planning Agents with Tool Use")
-	if !ok {
-		t.Fatal("CanonicalIdentity() ok = false, want true")
-	}
-	if got.CanonicalKey() != "doi:10.1000/priority" {
-		t.Fatalf("CanonicalIdentity() = %q, want DOI identity", got.CanonicalKey())
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := CanonicalIdentity(tt.identifiers, "Planning Agents with Tool Use")
+			if !ok {
+				t.Fatal("CanonicalIdentity() ok = false, want true")
+			}
+			if got.CanonicalKey() != tt.want {
+				t.Fatalf("CanonicalIdentity() = %q, want %q", got.CanonicalKey(), tt.want)
+			}
+		})
 	}
 }
 
