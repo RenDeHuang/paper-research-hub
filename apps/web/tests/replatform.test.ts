@@ -1,15 +1,21 @@
 import { mountSuspended } from "@nuxt/test-utils/runtime"
 import { describe, expect, it } from "vitest"
 
-import App from "../app/app.vue"
+import DefaultLayout from "../app/layouts/default.vue"
 
-describe("replatform baseline", () => {
-  it("associates the main landmark with its unique status heading", async () => {
-    const wrapper = await mountSuspended(App)
-    const main = wrapper.get("main")
+describe("default application shell", () => {
+  it("provides skip navigation and the expected landmarks", async () => {
+    const wrapper = await mountSuspended(DefaultLayout, {
+      route: "/",
+      slots: {
+        default: "<h1>Shell verification</h1>",
+      },
+    })
 
-    expect(main.attributes("aria-labelledby")).toBe("replatform-heading")
-    expect(wrapper.findAll("#replatform-heading")).toHaveLength(1)
-    expect(wrapper.get("h1#replatform-heading").text()).toBe("Go + Nuxt 重构中")
+    expect(wrapper.get('a[href="#main-content"]').text()).toBe("跳到主要内容")
+    expect(wrapper.get("header").exists()).toBe(true)
+    expect(wrapper.get('nav[aria-label="一级导航"]').exists()).toBe(true)
+    expect(wrapper.get("main#main-content").attributes("tabindex")).toBe("-1")
+    expect(wrapper.get("footer").exists()).toBe(true)
   })
 })
