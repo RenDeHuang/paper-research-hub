@@ -123,6 +123,51 @@ func TestUnmatchedAPIRouteReturnsProblemDetails(t *testing.T) {
 	}
 }
 
+func TestAPIRootReturnsProblemDetailsWithoutRedirect(t *testing.T) {
+	t.Parallel()
+
+	response := serve(t, http.MethodGet, "/api", "")
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want %q", contentType, "application/problem+json")
+	}
+
+	var problem struct {
+		Type      string `json:"type"`
+		Title     string `json:"title"`
+		Status    int    `json:"status"`
+		Detail    string `json:"detail"`
+		Instance  string `json:"instance"`
+		RequestID string `json:"request_id"`
+	}
+	decodeJSON(t, response, &problem)
+
+	if problem.Type == "" {
+		t.Error("type is empty")
+	}
+	if problem.Title != "Not Found" {
+		t.Errorf("title = %q, want %q", problem.Title, "Not Found")
+	}
+	if problem.Status != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", problem.Status, http.StatusNotFound)
+	}
+	if problem.Detail != "The requested API resource was not found." {
+		t.Errorf("detail = %q, want generic not-found detail", problem.Detail)
+	}
+	if problem.Instance != "/api" {
+		t.Errorf("instance = %q, want %q", problem.Instance, "/api")
+	}
+	if problem.RequestID == "" {
+		t.Error("request_id is empty")
+	}
+	if headerRequestID := response.Header().Get("X-Request-ID"); problem.RequestID != headerRequestID {
+		t.Errorf("request_id = %q, want response header value %q", problem.RequestID, headerRequestID)
+	}
+}
+
 func serve(t *testing.T, method, target, requestID string) *httptest.ResponseRecorder {
 	t.Helper()
 

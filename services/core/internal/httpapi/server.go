@@ -18,6 +18,7 @@ type Dependencies struct{}
 func NewServer(_ Dependencies) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", health)
+	mux.HandleFunc("/api", apiNotFound)
 	mux.HandleFunc("/api/", apiNotFound)
 
 	return requestIDMiddleware(mux)
