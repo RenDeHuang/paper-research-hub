@@ -197,6 +197,85 @@ func TestParseReportsMalformedRequiredPMIDWithRecordPosition(t *testing.T) {
 	}
 }
 
+func TestParseRelationAllowsAbsentPMIDButRejectsMalformedPMIDWithRecordPosition(t *testing.T) {
+	t.Parallel()
+
+	record, err := pubmed.ParseRecord([]byte(`<PubmedArticle>
+  <MedlineCitation>
+    <PMID>123</PMID>
+    <Article/>
+    <CommentsCorrectionsList>
+      <CommentsCorrections RefType="CommentIn"><RefSource>Unindexed editorial comment</RefSource></CommentsCorrections>
+    </CommentsCorrectionsList>
+  </MedlineCitation>
+</PubmedArticle>`))
+	if err != nil {
+		t.Fatalf("ParseRecord() error = %v", err)
+	}
+	want := []source.Relation{{
+		Type: "CommentIn",
+		Note: "Unindexed editorial comment",
+	}}
+	if !slices.Equal(record.Relations, want) {
+		t.Fatalf("Relations = %#v, want %#v", record.Relations, want)
+	}
+
+	_, err = pubmed.Parse([]byte(`<PubmedArticleSet>
+  <PubmedArticle><MedlineCitation><PMID>123</PMID><Article/></MedlineCitation></PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>456</PMID><Article/>
+      <CommentsCorrectionsList>
+        <CommentsCorrections RefType="UpdateIn"><RefSource>Malformed target</RefSource><PMID>bad-id</PMID></CommentsCorrections>
+      </CommentsCorrectionsList>
+    </MedlineCitation>
+  </PubmedArticle>
+</PubmedArticleSet>`))
+	if err == nil {
+		t.Fatal("Parse() accepted malformed optional relation PMID")
+	}
+	if !strings.Contains(err.Error(), "record 2") ||
+		!strings.Contains(err.Error(), "relation") ||
+		!strings.Contains(err.Error(), "bad-id") {
+		t.Fatalf("Parse() error = %v, want record position and malformed relation PMID", err)
+	}
+}
+
+func TestParseRejectsSourceInvalidELocationDOIFromIdentityWithProvenance(t *testing.T) {
+	t.Parallel()
+
+	record, err := pubmed.ParseRecord([]byte(`<PubmedArticle>
+  <MedlineCitation>
+    <PMID>123</PMID>
+    <Article>
+      <ArticleTitle>Invalidated DOI assertion</ArticleTitle>
+      <ELocationID EIdType="doi" ValidYN="N">10.1000/must-not-merge</ELocationID>
+    </Article>
+  </MedlineCitation>
+</PubmedArticle>`))
+	if err != nil {
+		t.Fatalf("ParseRecord() error = %v", err)
+	}
+	if record.Identity.Valid() {
+		t.Fatalf("Identity = %q, source-invalid DOI must not become canonical", record.Identity)
+	}
+	if !slices.Equal(record.Identifiers, []source.Identifier{{
+		Scheme: source.IdentifierPMID,
+		Value:  "123",
+	}}) {
+		t.Fatalf("Identifiers = %#v, source-invalid DOI must not be asserted", record.Identifiers)
+	}
+	wantRejected := []source.RejectedIdentifierAssertion{{
+		Scheme:     source.IdentifierDOI,
+		Value:      "10.1000/must-not-merge",
+		SourcePath: "/PubmedArticle/MedlineCitation/Article/ELocationID",
+		Reason:     source.IdentifierRejectionSourceInvalid,
+	}}
+	if !slices.Equal(record.RejectedIdentifiers, wantRejected) {
+		t.Fatalf("RejectedIdentifiers = %#v, want %#v", record.RejectedIdentifiers, wantRejected)
+	}
+}
+
 func TestParseLeavesAbsentOptionalPubMedFieldsUnknown(t *testing.T) {
 	t.Parallel()
 
@@ -255,6 +334,12 @@ func TestParsePreservesPartialAndMedlinePublicationDatesWithoutInventingDay(t *t
 			pubDate:   `<MedlineDate>2025 Dec-2026 Jan</MedlineDate>`,
 			want:      source.SourceDate{Raw: "2025 Dec-2026 Jan", Precision: source.DatePrecisionText},
 			precision: source.DatePrecisionText,
+		},
+		{
+			name:      "season precision",
+			pubDate:   `<Year>2025</Year><Season>Winter</Season>`,
+			want:      source.SourceDate{Year: 2025, Season: "Winter", Precision: source.DatePrecisionSeason},
+			precision: source.DatePrecisionSeason,
 		},
 	}
 

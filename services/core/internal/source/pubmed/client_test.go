@@ -78,7 +78,7 @@ func TestSearchUsesHistoryServerIdentityDateWindowAndStableBatches(t *testing.T)
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
 	}
-	if got := captured.Get("term"); got != "agents AND (0028-0836[issn])" {
+	if got := captured.Get("term"); got != "(agents) AND (0028-0836[issn])" {
 		t.Fatalf("term = %q", got)
 	}
 }

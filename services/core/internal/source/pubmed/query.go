@@ -68,7 +68,7 @@ func (query SearchQuery) Values() (url.Values, error) {
 		if term == "" {
 			term = journalFilter
 		} else {
-			term += " AND " + journalFilter
+			term = "(" + term + ") AND " + journalFilter
 		}
 	}
 	if term != "" {

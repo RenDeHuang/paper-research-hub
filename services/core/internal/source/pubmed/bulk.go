@@ -13,19 +13,25 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
 const (
-	maxBulkRecordBytes            = 64 << 20
+	DefaultMaxBulkRecordBytes     = int64(64 << 20)
 	DefaultMaxCompressedFileBytes = int64(1 << 30)
+	fileTransactionAbortTimeout   = 5 * time.Second
 )
 
 var (
-	bulkFilePattern     = regexp.MustCompile(`^pubmed([0-9]{2})n([0-9]{4})\.xml\.gz$`)
-	sha256Pattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	ErrBulkFileTooLarge = errors.New("PubMed compressed bulk file exceeds configured spool limit")
+	bulkFilePattern       = regexp.MustCompile(`^pubmed([0-9]{2})n([0-9]{4})\.xml\.gz$`)
+	sha256Pattern         = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	ErrBulkFileTooLarge   = errors.New("PubMed compressed bulk file exceeds configured spool limit")
+	ErrBulkRecordTooLarge = errors.New(
+		"PubMed expanded bulk record exceeds configured capture limit",
+	)
+	ErrCheckpointConflict = errors.New("PubMed checkpoint conflict")
 )
 
 type BulkFile struct {
@@ -53,10 +59,20 @@ type Deletion struct {
 	Raw      source.RawRecord
 }
 
+type CheckpointExpectation struct {
+	Exists   bool
+	Revision uint64
+	Sequence int
+}
+
 // Sink starts one isolated transaction for an already SHA256-verified source
 // file. No staged mutation may become visible before FileTransaction.Commit.
 type Sink interface {
-	BeginFile(context.Context, SourcePosition) (FileTransaction, error)
+	BeginFile(
+		context.Context,
+		SourcePosition,
+		CheckpointExpectation,
+	) (FileTransaction, error)
 }
 
 // FileTransaction stages all projection replacements and deletion audit events
@@ -66,7 +82,12 @@ type Sink interface {
 type FileTransaction interface {
 	Replace(context.Context, Upsert) error
 	Delete(context.Context, Deletion) error
-	Commit(context.Context, Checkpoint, Progress) error
+	Commit(
+		context.Context,
+		Checkpoint,
+		CheckpointExpectation,
+		Progress,
+	) error
 	Abort(context.Context) error
 }
 
@@ -75,16 +96,17 @@ type Progress struct {
 	FileName string
 	SHA256   string
 	Sequence int
+	Revision uint64
 	Ordinal  int64
 	Complete bool
 }
 
 // Checkpoint persists the last durable source position for one import job.
-// Save is a FileTransaction.Commit participant; the importer never advances
-// progress independently of the file transaction.
+// CompareAndSwap is a FileTransaction.Commit participant. Implementations must
+// compare the expected existence, revision, and sequence before advancing.
 type Checkpoint interface {
 	Load(context.Context, string) (Progress, bool, error)
-	Save(context.Context, Progress) error
+	CompareAndSwap(context.Context, CheckpointExpectation, Progress) error
 }
 
 type BaselineImport struct {
@@ -102,18 +124,21 @@ type Importer struct {
 	sink                   Sink
 	checkpoints            Checkpoint
 	maxCompressedFileBytes int64
+	maxRecordBytes         int64
 	tempDir                string
 }
 
 func NewImporter(sink Sink, checkpoints Checkpoint) (*Importer, error) {
 	return NewImporterWithConfig(sink, checkpoints, ImporterConfig{
 		MaxCompressedFileBytes: DefaultMaxCompressedFileBytes,
+		MaxRecordBytes:         DefaultMaxBulkRecordBytes,
 		TempDir:                os.TempDir(),
 	})
 }
 
 type ImporterConfig struct {
 	MaxCompressedFileBytes int64
+	MaxRecordBytes         int64
 	TempDir                string
 }
 
@@ -131,6 +156,13 @@ func NewImporterWithConfig(
 	if config.MaxCompressedFileBytes <= 0 {
 		return nil, errors.New("PubMed compressed bulk file spool limit must be positive")
 	}
+	maxRecordBytes := config.MaxRecordBytes
+	if maxRecordBytes == 0 {
+		maxRecordBytes = DefaultMaxBulkRecordBytes
+	}
+	if maxRecordBytes < 0 {
+		return nil, errors.New("PubMed expanded bulk record capture limit must be positive")
+	}
 	tempDir := strings.TrimSpace(config.TempDir)
 	if tempDir == "" {
 		tempDir = os.TempDir()
@@ -139,6 +171,7 @@ func NewImporterWithConfig(
 		sink:                   sink,
 		checkpoints:            checkpoints,
 		maxCompressedFileBytes: config.MaxCompressedFileBytes,
+		maxRecordBytes:         maxRecordBytes,
 		tempDir:                tempDir,
 	}, nil
 }
@@ -235,6 +268,7 @@ func validateDurableProgress(job string, progress Progress) error {
 		)
 	}
 	if progress.Sequence <= 0 ||
+		progress.Revision == 0 ||
 		progress.Ordinal < 0 ||
 		strings.TrimSpace(progress.FileName) == "" ||
 		!sha256Pattern.MatchString(progress.SHA256) {
@@ -386,6 +420,7 @@ func (importer *Importer) importFiles(
 	progress Progress,
 	hasProgress bool,
 ) error {
+	expected := checkpointExpectation(progress, hasProgress)
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -405,21 +440,37 @@ func (importer *Importer) importFiles(
 			continue
 		}
 
-		nextProgress, err := importer.importFile(ctx, job, file)
+		nextProgress, err := importer.importFile(ctx, job, file, expected)
 		if err != nil {
 			return err
 		}
 		progress = nextProgress
 		hasProgress = true
+		expected = checkpointExpectation(progress, true)
 	}
 	return nil
+}
+
+func checkpointExpectation(
+	progress Progress,
+	exists bool,
+) CheckpointExpectation {
+	if !exists {
+		return CheckpointExpectation{}
+	}
+	return CheckpointExpectation{
+		Exists:   true,
+		Revision: progress.Revision,
+		Sequence: progress.Sequence,
+	}
 }
 
 func (importer *Importer) importFile(
 	ctx context.Context,
 	job string,
 	file orderedBulkFile,
-) (Progress, error) {
+	expected CheckpointExpectation,
+) (result Progress, returnErr error) {
 	spool, actualSHA256, err := importer.spoolFile(ctx, file)
 	if err != nil {
 		return Progress{}, err
@@ -445,7 +496,7 @@ func (importer *Importer) importFile(
 		SHA256:   file.SHA256,
 		Sequence: file.sequence,
 	}
-	transaction, err := importer.sink.BeginFile(ctx, filePosition)
+	transaction, err := importer.sink.BeginFile(ctx, filePosition, expected)
 	if err != nil {
 		return Progress{}, fmt.Errorf(
 			"begin PubMed file transaction for %q: %w",
@@ -461,12 +512,36 @@ func (importer *Importer) importFile(
 	}
 	committed := false
 	defer func() {
-		if !committed {
-			_ = transaction.Abort(context.WithoutCancel(ctx))
+		if committed {
+			return
+		}
+		abortCtx, cancel := context.WithTimeout(
+			context.Background(),
+			fileTransactionAbortTimeout,
+		)
+		defer cancel()
+		if abortErr := transaction.Abort(abortCtx); abortErr != nil {
+			wrapped := fmt.Errorf(
+				"abort PubMed file transaction for %q: %w",
+				file.Name,
+				abortErr,
+			)
+			if returnErr == nil {
+				returnErr = wrapped
+			} else {
+				returnErr = errors.Join(returnErr, wrapped)
+			}
 		}
 	}()
 
-	lastOrdinal, err := importSpooledFile(ctx, file, filePosition, spool, transaction)
+	lastOrdinal, err := importSpooledFile(
+		ctx,
+		file,
+		filePosition,
+		spool,
+		transaction,
+		importer.maxRecordBytes,
+	)
 	if err != nil {
 		return Progress{}, err
 	}
@@ -479,10 +554,16 @@ func (importer *Importer) importFile(
 		FileName: file.Name,
 		SHA256:   file.SHA256,
 		Sequence: file.sequence,
+		Revision: expected.Revision + 1,
 		Ordinal:  lastOrdinal,
 		Complete: true,
 	}
-	if err := transaction.Commit(ctx, importer.checkpoints, progress); err != nil {
+	if err := transaction.Commit(
+		ctx,
+		importer.checkpoints,
+		expected,
+		progress,
+	); err != nil {
 		return Progress{}, fmt.Errorf(
 			"commit PubMed file transaction for %q: %w",
 			file.Name,
@@ -579,6 +660,7 @@ func importSpooledFile(
 	filePosition SourcePosition,
 	spool io.Reader,
 	transaction FileTransaction,
+	maxRecordBytes int64,
 ) (int64, error) {
 	gzipReader, err := gzip.NewReader(spool)
 	if err != nil {
@@ -586,7 +668,7 @@ func importSpooledFile(
 	}
 
 	var lastOrdinal int64
-	scanErr := scanBulkEvents(gzipReader, func(event bulkEvent) error {
+	scanErr := scanBulkEvents(gzipReader, maxRecordBytes, func(event bulkEvent) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -661,8 +743,15 @@ type bulkEvent struct {
 	raw     []byte
 }
 
-func scanBulkEvents(reader io.Reader, yield func(bulkEvent) error) error {
-	capture := newCaptureReader(reader)
+func scanBulkEvents(
+	reader io.Reader,
+	maxRecordBytes int64,
+	yield func(bulkEvent) error,
+) error {
+	if maxRecordBytes <= 0 {
+		return errors.New("PubMed expanded bulk record capture limit must be positive")
+	}
+	capture := newCaptureReader(reader, maxRecordBytes)
 	decoder := xml.NewDecoder(capture)
 	depth := 0
 	var ordinal int64
@@ -682,6 +771,14 @@ func scanBulkEvents(reader io.Reader, yield func(bulkEvent) error) error {
 			if depth == 1 &&
 				(value.Name.Local == "PubmedArticle" ||
 					value.Name.Local == "DeleteCitation") {
+				capture.discardBefore(startOffset)
+				if err := capture.beginCapture(startOffset); err != nil {
+					return fmt.Errorf(
+						"capture PubMed bulk %s element: %w",
+						value.Name.Local,
+						err,
+					)
+				}
 				eventKind := bulkEventUpsert
 				if value.Name.Local == "DeleteCitation" {
 					eventKind = bulkEventDelete
@@ -704,17 +801,11 @@ func scanBulkEvents(reader io.Reader, yield func(bulkEvent) error) error {
 					}
 				}
 				endOffset := decoder.InputOffset()
-				if endOffset-startOffset > maxBulkRecordBytes {
-					return fmt.Errorf(
-						"PubMed bulk %s element exceeds %d bytes",
-						value.Name.Local,
-						maxBulkRecordBytes,
-					)
-				}
 				raw, err := capture.slice(startOffset, endOffset)
 				if err != nil {
 					return err
 				}
+				capture.endCapture()
 				ordinal++
 				if err := yield(bulkEvent{
 					kind:    eventKind,
@@ -730,6 +821,7 @@ func scanBulkEvents(reader io.Reader, yield func(bulkEvent) error) error {
 		case xml.EndElement:
 			depth--
 		}
+		capture.discardBefore(decoder.InputOffset())
 	}
 }
 

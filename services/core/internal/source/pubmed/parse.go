@@ -114,6 +114,7 @@ type dateXML struct {
 	Year        string `xml:"Year"`
 	Month       string `xml:"Month"`
 	Day         string `xml:"Day"`
+	Season      string `xml:"Season"`
 	MedlineDate string `xml:"MedlineDate"`
 }
 
@@ -161,6 +162,7 @@ func (element *namedElementXML) UnmarshalXML(
 type identifierTextXML struct {
 	Type   string
 	Source string
+	Valid  string
 	Value  string
 }
 
@@ -174,6 +176,8 @@ func (identifier *identifierTextXML) UnmarshalXML(
 			identifier.Type = strings.TrimSpace(attribute.Value)
 		case "Source":
 			identifier.Source = strings.TrimSpace(attribute.Value)
+		case "ValidYN":
+			identifier.Valid = strings.TrimSpace(attribute.Value)
 		}
 	}
 	var value mixedText
@@ -272,7 +276,7 @@ func ParseRecord(raw []byte) (source.Record, error) {
 		return source.Record{}, err
 	}
 
-	dois, pmcids, err := parseArticleIdentifiers(pmid, article)
+	dois, pmcids, rejectedIdentifiers, err := parseArticleIdentifiers(pmid, article)
 	if err != nil {
 		return source.Record{}, err
 	}
@@ -357,6 +361,7 @@ func ParseRecord(raw []byte) (source.Record, error) {
 		SourceRecordID:            pmid,
 		Identity:                  identity,
 		Identifiers:               identifiers,
+		RejectedIdentifiers:       rejectedIdentifiers,
 		Raw:                       rawRecord,
 		Title:                     normalizeText(string(article.MedlineCitation.Article.Title)),
 		Abstract:                  strings.Join(abstractParts, "\n\n"),
@@ -396,22 +401,19 @@ func requiredPMID(raw string) (string, error) {
 func parseArticleIdentifiers(
 	requiredPMID string,
 	article pubmedArticleXML,
-) ([]string, []string, error) {
+) ([]string, []string, []source.RejectedIdentifierAssertion, error) {
 	dois := make([]string, 0)
 	pmcids := make([]string, 0)
-	candidates := append(
-		append([]identifierTextXML(nil), article.PubmedData.ArticleIDs...),
-		article.MedlineCitation.Article.ELocationIDs...,
-	)
-	for _, candidate := range candidates {
+	rejected := make([]source.RejectedIdentifierAssertion, 0)
+	parseCandidate := func(candidate identifierTextXML) error {
 		switch strings.ToLower(candidate.Type) {
 		case "pubmed":
 			pmid, err := requiredPMIDValue(candidate.Value)
 			if err != nil {
-				return nil, nil, err
+				return err
 			}
 			if pmid != requiredPMID {
-				return nil, nil, fmt.Errorf(
+				return fmt.Errorf(
 					"conflicting PubMed PMID %s and ArticleId %s",
 					requiredPMID,
 					pmid,
@@ -420,25 +422,46 @@ func parseArticleIdentifiers(
 		case "doi":
 			identifier, err := paper.NewIdentifier(paper.SchemeDOI, candidate.Value)
 			if err != nil {
-				return nil, nil, fmt.Errorf("invalid PubMed DOI %q: %w", candidate.Value, err)
+				return fmt.Errorf("invalid PubMed DOI %q: %w", candidate.Value, err)
 			}
 			dois = appendUnique(dois, identifier.Value())
 		case "pmc", "pmcid":
 			pmcid := strings.ToUpper(strings.TrimSpace(candidate.Value))
 			if !pmcidPattern.MatchString(pmcid) {
-				return nil, nil, fmt.Errorf("invalid PubMed PMCID %q", candidate.Value)
+				return fmt.Errorf("invalid PubMed PMCID %q", candidate.Value)
 			}
 			pmcids = appendUnique(pmcids, pmcid)
 		}
+		return nil
+	}
+	for _, candidate := range article.PubmedData.ArticleIDs {
+		if err := parseCandidate(candidate); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	for _, candidate := range article.MedlineCitation.Article.ELocationIDs {
+		if strings.EqualFold(candidate.Type, "doi") &&
+			strings.EqualFold(candidate.Valid, "N") {
+			rejected = append(rejected, source.RejectedIdentifierAssertion{
+				Scheme:     source.IdentifierDOI,
+				Value:      strings.TrimSpace(candidate.Value),
+				SourcePath: "/PubmedArticle/MedlineCitation/Article/ELocationID",
+				Reason:     source.IdentifierRejectionSourceInvalid,
+			})
+			continue
+		}
+		if err := parseCandidate(candidate); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	if len(dois) > 1 {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"%w: PubMed record has DOI values %s",
 			paper.ErrConflictingIdentifiers,
 			strings.Join(dois, ", "),
 		)
 	}
-	return dois, pmcids, nil
+	return dois, pmcids, rejected, nil
 }
 
 func requiredPMIDValue(raw string) (string, error) {
@@ -602,9 +625,13 @@ func parseRelations(values []commentsCorrectionXML) ([]source.Relation, bool, er
 	result := make([]source.Relation, 0, len(values))
 	retracted := false
 	for _, value := range values {
-		pmid, err := requiredPMIDValue(value.PMID)
-		if err != nil {
-			return nil, false, fmt.Errorf("invalid PubMed relation: %w", err)
+		var pmid string
+		if strings.TrimSpace(value.PMID) != "" {
+			var err error
+			pmid, err = requiredPMIDValue(value.PMID)
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid PubMed relation: %w", err)
+			}
 		}
 		relationType := strings.TrimSpace(value.Type)
 		result = append(result, source.Relation{
@@ -639,9 +666,10 @@ func parseDate(value dateXML) (*source.SourceDate, *time.Time, error) {
 	yearText := strings.TrimSpace(value.Year)
 	monthText := strings.TrimSpace(value.Month)
 	dayText := strings.TrimSpace(value.Day)
+	season := normalizeText(value.Season)
 	medlineDate := normalizeText(value.MedlineDate)
 	if medlineDate != "" {
-		if yearText != "" || monthText != "" || dayText != "" {
+		if yearText != "" || monthText != "" || dayText != "" || season != "" {
 			return nil, nil, errors.New("date cannot combine MedlineDate with structured fields")
 		}
 		return &source.SourceDate{
@@ -649,7 +677,7 @@ func parseDate(value dateXML) (*source.SourceDate, *time.Time, error) {
 			Precision: source.DatePrecisionText,
 		}, nil, nil
 	}
-	if yearText == "" && monthText == "" && dayText == "" {
+	if yearText == "" && monthText == "" && dayText == "" && season == "" {
 		return nil, nil, nil
 	}
 	if yearText == "" {
@@ -662,6 +690,14 @@ func parseDate(value dateXML) (*source.SourceDate, *time.Time, error) {
 	date := &source.SourceDate{
 		Year:      year,
 		Precision: source.DatePrecisionYear,
+	}
+	if season != "" {
+		if monthText != "" || dayText != "" {
+			return nil, nil, errors.New("structured date season cannot combine with month or day")
+		}
+		date.Season = season
+		date.Precision = source.DatePrecisionSeason
+		return date, nil, nil
 	}
 	if monthText == "" {
 		if dayText != "" {
@@ -774,7 +810,7 @@ func scanElements(
 	elementName string,
 	yield func(ordinal int64, raw []byte) error,
 ) error {
-	capture := newCaptureReader(reader)
+	capture := newCaptureReader(reader, DefaultMaxBulkRecordBytes)
 	decoder := xml.NewDecoder(capture)
 	var ordinal int64
 
@@ -789,7 +825,12 @@ func scanElements(
 		}
 		start, ok := token.(xml.StartElement)
 		if !ok || start.Name.Local != elementName {
+			capture.discardBefore(decoder.InputOffset())
 			continue
+		}
+		capture.discardBefore(startOffset)
+		if err := capture.beginCapture(startOffset); err != nil {
+			return fmt.Errorf("capture PubMed %s element: %w", elementName, err)
 		}
 
 		depth := 1
@@ -810,6 +851,7 @@ func scanElements(
 		if err != nil {
 			return err
 		}
+		capture.endCapture()
 		ordinal++
 		if err := yield(ordinal, raw); err != nil {
 			return err
@@ -819,19 +861,69 @@ func scanElements(
 }
 
 type captureReader struct {
-	reader io.Reader
-	base   int64
-	data   []byte
+	reader          io.Reader
+	base            int64
+	data            []byte
+	maxCaptureBytes int64
+	captureStart    int64
+	capturing       bool
 }
 
-func newCaptureReader(reader io.Reader) *captureReader {
-	return &captureReader{reader: reader}
+func newCaptureReader(reader io.Reader, maxCaptureBytes int64) *captureReader {
+	return &captureReader{
+		reader:          reader,
+		maxCaptureBytes: maxCaptureBytes,
+	}
 }
 
 func (reader *captureReader) Read(payload []byte) (int, error) {
+	const maxReadBytes = 32 << 10
+	readLimit := int64(maxReadBytes)
+	if reader.maxCaptureBytes < readLimit {
+		readLimit = reader.maxCaptureBytes
+	}
+	if int64(len(payload)) > readLimit {
+		payload = payload[:readLimit]
+	}
+	retained := int64(len(reader.data))
+	if reader.capturing {
+		retained = reader.base + int64(len(reader.data)) - reader.captureStart
+	}
+	remaining := reader.maxCaptureBytes - retained
+	if remaining <= 0 {
+		return 0, ErrBulkRecordTooLarge
+	}
+	if int64(len(payload)) > remaining {
+		payload = payload[:remaining]
+	}
 	count, err := reader.reader.Read(payload)
 	reader.data = append(reader.data, payload[:count]...)
 	return count, err
+}
+
+func (reader *captureReader) beginCapture(start int64) error {
+	if reader.capturing {
+		return errors.New("PubMed XML capture is already active")
+	}
+	if start < reader.base {
+		return fmt.Errorf(
+			"PubMed XML capture start %d precedes buffered offset %d",
+			start,
+			reader.base,
+		)
+	}
+	buffered := reader.base + int64(len(reader.data)) - start
+	if buffered > reader.maxCaptureBytes {
+		return ErrBulkRecordTooLarge
+	}
+	reader.captureStart = start
+	reader.capturing = true
+	return nil
+}
+
+func (reader *captureReader) endCapture() {
+	reader.capturing = false
+	reader.captureStart = 0
 }
 
 func (reader *captureReader) slice(start, end int64) ([]byte, error) {

@@ -25,7 +25,7 @@ func TestSearchQueryBuildsExplicitEntrezDateAndValidatedISSNFilter(t *testing.T)
 	if err != nil {
 		t.Fatalf("Values() error = %v", err)
 	}
-	if got := values.Get("term"); got != "agent systems AND (0028-0836[issn] OR 0140-6736[issn])" {
+	if got := values.Get("term"); got != "(agent systems) AND (0028-0836[issn] OR 0140-6736[issn])" {
 		t.Fatalf("term = %q, want validated ISSN journal filter", got)
 	}
 	if got := values.Get("datetype"); got != "edat" {
@@ -36,6 +36,26 @@ func TestSearchQueryBuildsExplicitEntrezDateAndValidatedISSNFilter(t *testing.T)
 	}
 	if got := values.Get("maxdate"); got != "2026/07/16" {
 		t.Fatalf("maxdate = %q", got)
+	}
+}
+
+func TestSearchQueryParenthesizesBaseQueryBeforeISSNFilter(t *testing.T) {
+	t.Parallel()
+
+	values, err := (pubmed.SearchQuery{
+		Term:         "cancer OR diabetes",
+		JournalISSNs: []string{"0028-0836"},
+		DateWindow: pubmed.DateWindow{
+			From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+			To:   time.Date(2026, time.July, 16, 0, 0, 0, 0, time.UTC),
+		},
+		MaxResults: 10,
+	}).Values()
+	if err != nil {
+		t.Fatalf("Values() error = %v", err)
+	}
+	if got := values.Get("term"); got != "(cancer OR diabetes) AND (0028-0836[issn])" {
+		t.Fatalf("term = %q, want explicit OR precedence", got)
 	}
 }
 

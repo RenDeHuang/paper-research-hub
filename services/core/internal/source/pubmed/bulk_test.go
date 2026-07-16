@@ -2,6 +2,7 @@ package pubmed_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/pubmed"
@@ -65,6 +67,7 @@ func TestBaselineRequiresYearAndPersistsDurableSourcePosition(t *testing.T) {
 		progress.FileName != "pubmed26n0001.xml.gz" ||
 		progress.SHA256 != file.SHA256 ||
 		progress.Sequence != 1 ||
+		progress.Revision != 1 ||
 		progress.Ordinal != 2 ||
 		!progress.Complete {
 		t.Fatalf("progress = %#v, want durable completed file/ordinal", progress)
@@ -324,16 +327,15 @@ func TestDailyRejectsPreviousSequenceThatConflictsWithDurableCheckpoint(t *testi
 
 	sink := newMemorySink()
 	checkpoints := newMemoryCheckpoint()
-	if err := checkpoints.Save(context.Background(), pubmed.Progress{
+	checkpoints.Seed(pubmed.Progress{
 		Job:      "daily-conflict",
 		FileName: "pubmed26n0002.xml.gz",
 		SHA256:   strings.Repeat("a", 64),
 		Sequence: 2,
+		Revision: 7,
 		Ordinal:  2,
 		Complete: true,
-	}); err != nil {
-		t.Fatalf("Save() error = %v", err)
-	}
+	})
 	var opens atomic.Int32
 	file := fixtureBulkFile(t, "update.xml.gz", "pubmed26n0101.xml.gz")
 	originalOpen := file.Open
@@ -373,6 +375,185 @@ func TestDailyRejectsPreviousSequenceThatConflictsWithDurableCheckpoint(t *testi
 	}
 }
 
+func TestImporterAbortsOversizedExpandedRecordWithoutDurableMutation(t *testing.T) {
+	t.Parallel()
+
+	payload := `<PubmedArticleSet><PubmedArticle><MedlineCitation>` +
+		`<PMID>123</PMID><Article><Unknown>` +
+		strings.Repeat("x", 1<<20) +
+		`</Unknown></Article></MedlineCitation></PubmedArticle></PubmedArticleSet>`
+	file := compressedBulkFile(t, "pubmed26n0001.xml.gz", []byte(payload))
+	sink := newMemorySink()
+	checkpoints := newMemoryCheckpoint()
+	importer, err := pubmed.NewImporterWithConfig(sink, checkpoints, pubmed.ImporterConfig{
+		MaxCompressedFileBytes: int64(len(payload)),
+		MaxRecordBytes:         512,
+	})
+	if err != nil {
+		t.Fatalf("NewImporterWithConfig() error = %v", err)
+	}
+
+	err = importer.ImportBaseline(context.Background(), pubmed.BaselineImport{
+		Job:  "oversized-expanded-record",
+		Year: 2026,
+	}, []pubmed.BulkFile{file})
+	if !errors.Is(err, pubmed.ErrBulkRecordTooLarge) {
+		t.Fatalf("ImportBaseline() error = %v, want ErrBulkRecordTooLarge", err)
+	}
+	if sink.Aborts() != 1 {
+		t.Fatalf("transaction aborts = %d, want 1", sink.Aborts())
+	}
+	if len(sink.Upserts()) != 0 || len(sink.Deletions()) != 0 {
+		t.Fatal("oversized expanded record committed mutations")
+	}
+	if _, ok, loadErr := checkpoints.Load(context.Background(), "oversized-expanded-record"); loadErr != nil || ok {
+		t.Fatalf("checkpoint after oversized record = ok %v, error %v", ok, loadErr)
+	}
+}
+
+func TestConcurrentImportersUseCheckpointCASWithoutDuplicateEvents(t *testing.T) {
+	t.Parallel()
+
+	sink := newMemorySink()
+	stored := newMemoryCheckpoint()
+	stored.Seed(pubmed.Progress{
+		Job:      "daily-cas",
+		FileName: "pubmed26n0002.xml.gz",
+		SHA256:   strings.Repeat("a", 64),
+		Sequence: 2,
+		Revision: 7,
+		Ordinal:  2,
+		Complete: true,
+	})
+	checkpoints := newLoadBarrierCheckpoint(stored, 2)
+	file := fixtureBulkFile(t, "update.xml.gz", "pubmed26n0003.xml.gz")
+	spec := pubmed.DailyImport{
+		Job:              "daily-cas",
+		Year:             2026,
+		PreviousSequence: 2,
+	}
+
+	importers := make([]*pubmed.Importer, 2)
+	for index := range importers {
+		importer, err := pubmed.NewImporter(sink, checkpoints)
+		if err != nil {
+			t.Fatalf("NewImporter() error = %v", err)
+		}
+		importers[index] = importer
+	}
+
+	errs := make(chan error, len(importers))
+	for _, importer := range importers {
+		go func(importer *pubmed.Importer) {
+			errs <- importer.ImportDaily(context.Background(), spec, []pubmed.BulkFile{file})
+		}(importer)
+	}
+	checkpoints.WaitForLoads()
+	checkpoints.Release()
+
+	results := []error{<-errs, <-errs}
+	successes := 0
+	conflicts := 0
+	for _, err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, pubmed.ErrCheckpointConflict):
+			conflicts++
+		default:
+			t.Fatalf("ImportDaily() errors = %v, want success and checkpoint conflict", results)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("ImportDaily() errors = %v, want one success and one conflict", results)
+	}
+	if got := upsertPMIDs(sink.Upserts()); !slices.Equal(got, []string{"1001"}) {
+		t.Fatalf("committed upserts = %v, want exactly one revision event", got)
+	}
+	if deletions := sink.Deletions(); len(deletions) != 1 ||
+		!slices.Equal(deletions[0].PMIDs, []string{"1002"}) {
+		t.Fatalf("committed deletions = %#v, want exactly one deletion event", deletions)
+	}
+	if sink.Aborts() != 1 {
+		t.Fatalf("loser transaction aborts = %d, want 1", sink.Aborts())
+	}
+	progress, ok, err := stored.Load(context.Background(), spec.Job)
+	if err != nil || !ok {
+		t.Fatalf("Load() = %#v, %v, %v", progress, ok, err)
+	}
+	if progress.Sequence != 3 || progress.Revision != 8 {
+		t.Fatalf("progress = %#v, want sequence 3 revision 8", progress)
+	}
+}
+
+func TestImporterAbortUsesIndependentTimeoutAndJoinsFailure(t *testing.T) {
+	t.Parallel()
+
+	replaceErr := errors.New("replace failed")
+	abortErr := errors.New("abort failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	transaction := &abortProbeTransaction{
+		cancelParent: cancel,
+		replaceErr:   replaceErr,
+		abortErr:     abortErr,
+	}
+	importer, err := pubmed.NewImporter(
+		&singleTransactionSink{transaction: transaction},
+		newMemoryCheckpoint(),
+	)
+	if err != nil {
+		t.Fatalf("NewImporter() error = %v", err)
+	}
+	file := fixtureBulkFile(t, "baseline.xml.gz", "pubmed26n0001.xml.gz")
+
+	err = importer.ImportBaseline(ctx, pubmed.BaselineImport{
+		Job:  "abort-context",
+		Year: 2026,
+	}, []pubmed.BulkFile{file})
+	if !errors.Is(err, replaceErr) || !errors.Is(err, abortErr) {
+		t.Fatalf("ImportBaseline() error = %v, want joined replace and abort failures", err)
+	}
+	if transaction.abortContextErr != nil {
+		t.Fatalf("Abort() context error at entry = %v, want independent live context", transaction.abortContextErr)
+	}
+	if !transaction.abortHasDeadline {
+		t.Fatal("Abort() context has no deadline")
+	}
+	if transaction.abortTimeout < 4*time.Second || transaction.abortTimeout > 5*time.Second {
+		t.Fatalf("Abort() timeout = %v, want independent 5s timeout", transaction.abortTimeout)
+	}
+}
+
+func TestSuccessfulAbortDoesNotMaskImportFailure(t *testing.T) {
+	t.Parallel()
+
+	replaceErr := errors.New("replace failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	transaction := &abortProbeTransaction{
+		cancelParent: cancel,
+		replaceErr:   replaceErr,
+	}
+	importer, err := pubmed.NewImporter(
+		&singleTransactionSink{transaction: transaction},
+		newMemoryCheckpoint(),
+	)
+	if err != nil {
+		t.Fatalf("NewImporter() error = %v", err)
+	}
+	file := fixtureBulkFile(t, "baseline.xml.gz", "pubmed26n0001.xml.gz")
+
+	err = importer.ImportBaseline(ctx, pubmed.BaselineImport{
+		Job:  "abort-success",
+		Year: 2026,
+	}, []pubmed.BulkFile{file})
+	if !errors.Is(err, replaceErr) {
+		t.Fatalf("ImportBaseline() error = %v, want original replace failure", err)
+	}
+	if transaction.abortCalls != 1 {
+		t.Fatalf("Abort() calls = %d, want 1", transaction.abortCalls)
+	}
+}
+
 func fixtureBulkFile(t *testing.T, fixtureName, fileName string) pubmed.BulkFile {
 	t.Helper()
 
@@ -391,11 +572,34 @@ func fixtureBulkFile(t *testing.T, fixtureName, fileName string) pubmed.BulkFile
 	}
 }
 
+func compressedBulkFile(t *testing.T, fileName string, payload []byte) pubmed.BulkFile {
+	t.Helper()
+
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatalf("gzip Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("gzip Close() error = %v", err)
+	}
+	data := compressed.Bytes()
+	digest := sha256.Sum256(data)
+	return pubmed.BulkFile{
+		Name:   fileName,
+		SHA256: hex.EncodeToString(digest[:]),
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		},
+	}
+}
+
 type memorySink struct {
 	mu           sync.Mutex
 	projection   map[string]source.Record
 	upserts      []pubmed.Upsert
 	deletions    []pubmed.Deletion
+	aborts       int
 	failPMIDOnce string
 	failed       bool
 }
@@ -407,12 +611,14 @@ func newMemorySink() *memorySink {
 func (sink *memorySink) BeginFile(
 	_ context.Context,
 	_ pubmed.SourcePosition,
+	expected pubmed.CheckpointExpectation,
 ) (pubmed.FileTransaction, error) {
-	return &memoryFileTransaction{sink: sink}, nil
+	return &memoryFileTransaction{sink: sink, expected: expected}, nil
 }
 
 type memoryFileTransaction struct {
 	sink      *memorySink
+	expected  pubmed.CheckpointExpectation
 	upserts   []pubmed.Upsert
 	deletions []pubmed.Deletion
 	closed    bool
@@ -450,12 +656,16 @@ func (transaction *memoryFileTransaction) Delete(
 func (transaction *memoryFileTransaction) Commit(
 	ctx context.Context,
 	checkpoint pubmed.Checkpoint,
+	expected pubmed.CheckpointExpectation,
 	progress pubmed.Progress,
 ) error {
 	if transaction.closed {
 		return errors.New("transaction is closed")
 	}
-	if err := checkpoint.Save(ctx, progress); err != nil {
+	if expected != transaction.expected {
+		return errors.New("checkpoint expectation changed after BeginFile")
+	}
+	if err := checkpoint.CompareAndSwap(ctx, expected, progress); err != nil {
 		return err
 	}
 	sink := transaction.sink
@@ -479,6 +689,9 @@ func (transaction *memoryFileTransaction) Abort(context.Context) error {
 	if transaction.closed {
 		return nil
 	}
+	transaction.sink.mu.Lock()
+	transaction.sink.aborts++
+	transaction.sink.mu.Unlock()
 	transaction.upserts = nil
 	transaction.deletions = nil
 	transaction.closed = true
@@ -505,6 +718,12 @@ func (sink *memorySink) Deletions() []pubmed.Deletion {
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
 	return append([]pubmed.Deletion(nil), sink.deletions...)
+}
+
+func (sink *memorySink) Aborts() int {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.aborts
 }
 
 func upsertPMIDs(upserts []pubmed.Upsert) []string {
@@ -534,18 +753,138 @@ func (checkpoint *memoryCheckpoint) Load(
 	return progress, ok, nil
 }
 
-func (checkpoint *memoryCheckpoint) Save(
+func (checkpoint *memoryCheckpoint) CompareAndSwap(
 	_ context.Context,
+	expected pubmed.CheckpointExpectation,
 	progress pubmed.Progress,
 ) error {
 	checkpoint.mu.Lock()
 	defer checkpoint.mu.Unlock()
+	current, exists := checkpoint.progress[progress.Job]
+	if exists != expected.Exists ||
+		(exists &&
+			(current.Revision != expected.Revision ||
+				current.Sequence != expected.Sequence)) ||
+		(!exists && (expected.Revision != 0 || expected.Sequence != 0)) {
+		return pubmed.ErrCheckpointConflict
+	}
+	if progress.Revision != expected.Revision+1 {
+		return errors.New("checkpoint revision must advance exactly once")
+	}
 	checkpoint.progress[progress.Job] = progress
 	return nil
+}
+
+func (checkpoint *memoryCheckpoint) Seed(progress pubmed.Progress) {
+	checkpoint.mu.Lock()
+	defer checkpoint.mu.Unlock()
+	checkpoint.progress[progress.Job] = progress
+}
+
+type loadBarrierCheckpoint struct {
+	stored  *memoryCheckpoint
+	loaded  sync.WaitGroup
+	release chan struct{}
+}
+
+func newLoadBarrierCheckpoint(
+	stored *memoryCheckpoint,
+	loads int,
+) *loadBarrierCheckpoint {
+	checkpoint := &loadBarrierCheckpoint{
+		stored:  stored,
+		release: make(chan struct{}),
+	}
+	checkpoint.loaded.Add(loads)
+	return checkpoint
+}
+
+func (checkpoint *loadBarrierCheckpoint) Load(
+	ctx context.Context,
+	job string,
+) (pubmed.Progress, bool, error) {
+	progress, ok, err := checkpoint.stored.Load(ctx, job)
+	checkpoint.loaded.Done()
+	select {
+	case <-checkpoint.release:
+		return progress, ok, err
+	case <-ctx.Done():
+		return pubmed.Progress{}, false, ctx.Err()
+	}
+}
+
+func (checkpoint *loadBarrierCheckpoint) CompareAndSwap(
+	ctx context.Context,
+	expected pubmed.CheckpointExpectation,
+	progress pubmed.Progress,
+) error {
+	return checkpoint.stored.CompareAndSwap(ctx, expected, progress)
+}
+
+func (checkpoint *loadBarrierCheckpoint) WaitForLoads() {
+	checkpoint.loaded.Wait()
+}
+
+func (checkpoint *loadBarrierCheckpoint) Release() {
+	close(checkpoint.release)
+}
+
+type singleTransactionSink struct {
+	transaction pubmed.FileTransaction
+}
+
+func (sink *singleTransactionSink) BeginFile(
+	context.Context,
+	pubmed.SourcePosition,
+	pubmed.CheckpointExpectation,
+) (pubmed.FileTransaction, error) {
+	return sink.transaction, nil
+}
+
+type abortProbeTransaction struct {
+	cancelParent     context.CancelFunc
+	replaceErr       error
+	abortErr         error
+	abortCalls       int
+	abortContextErr  error
+	abortHasDeadline bool
+	abortTimeout     time.Duration
+}
+
+func (transaction *abortProbeTransaction) Replace(context.Context, pubmed.Upsert) error {
+	transaction.cancelParent()
+	return transaction.replaceErr
+}
+
+func (*abortProbeTransaction) Delete(context.Context, pubmed.Deletion) error {
+	return nil
+}
+
+func (*abortProbeTransaction) Commit(
+	context.Context,
+	pubmed.Checkpoint,
+	pubmed.CheckpointExpectation,
+	pubmed.Progress,
+) error {
+	return errors.New("unexpected Commit call")
+}
+
+func (transaction *abortProbeTransaction) Abort(ctx context.Context) error {
+	transaction.abortCalls++
+	transaction.abortContextErr = ctx.Err()
+	deadline, ok := ctx.Deadline()
+	transaction.abortHasDeadline = ok
+	if ok {
+		transaction.abortTimeout = time.Until(deadline)
+	}
+	return transaction.abortErr
 }
 
 var (
 	_ pubmed.Sink            = (*memorySink)(nil)
 	_ pubmed.FileTransaction = (*memoryFileTransaction)(nil)
 	_ pubmed.Checkpoint      = (*memoryCheckpoint)(nil)
+	_ pubmed.Checkpoint      = (*loadBarrierCheckpoint)(nil)
+	_ pubmed.Sink            = (*singleTransactionSink)(nil)
+	_ pubmed.FileTransaction = (*abortProbeTransaction)(nil)
 )

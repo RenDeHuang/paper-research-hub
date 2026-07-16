@@ -175,18 +175,29 @@ type FieldEvidence struct {
 type DatePrecision string
 
 const (
-	DatePrecisionYear  DatePrecision = "year"
-	DatePrecisionMonth DatePrecision = "month"
-	DatePrecisionDay   DatePrecision = "day"
-	DatePrecisionText  DatePrecision = "text"
+	DatePrecisionYear   DatePrecision = "year"
+	DatePrecisionMonth  DatePrecision = "month"
+	DatePrecisionDay    DatePrecision = "day"
+	DatePrecisionSeason DatePrecision = "season"
+	DatePrecisionText   DatePrecision = "text"
 )
 
 type SourceDate struct {
 	Year      int
 	Month     time.Month
 	Day       int
+	Season    string
 	Raw       string
 	Precision DatePrecision
+}
+
+const IdentifierRejectionSourceInvalid = "source_marked_invalid"
+
+type RejectedIdentifierAssertion struct {
+	Scheme     IdentifierScheme
+	Value      string
+	SourcePath string
+	Reason     string
 }
 
 type Record struct {
@@ -194,6 +205,7 @@ type Record struct {
 	SourceRecordID            string
 	Identity                  paper.Identifier
 	Identifiers               []Identifier
+	RejectedIdentifiers       []RejectedIdentifierAssertion
 	Raw                       RawRecord
 	Evidence                  []FieldEvidence
 	Title                     string
