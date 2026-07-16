@@ -1,29 +1,24 @@
-ENV_FILE ?= .env
-
--include $(ENV_FILE)
-
-export DATABASE_URL NEXT_PUBLIC_API_URL UVICORN_HOST UVICORN_PORT
-export OPENALEX_CONTACT_EMAIL OPENALEX_API_KEY
-
-.PHONY: install dev-api dev-web test test-api test-web build
+.PHONY: install dev-web build build-core build-web typecheck lint-web test-web
 
 install:
 	pnpm install
-	uv sync --project services/api
-
-dev-api:
-	uv run --directory services/api uvicorn paper_hub.main:app --reload --reload-dir src
 
 dev-web:
-	pnpm --dir apps/web dev
+	pnpm dev:web
 
-test: test-api test-web
+build: build-core build-web
 
-test-api:
-	uv run --directory services/api pytest -v
+build-core:
+	go -C services/core build ./...
+
+build-web:
+	pnpm --dir apps/web build
+
+typecheck:
+	pnpm typecheck
+
+lint-web:
+	pnpm --dir apps/web lint
 
 test-web:
-	pnpm --dir apps/web test
-
-build:
-	pnpm --dir apps/web build
+	pnpm test:web

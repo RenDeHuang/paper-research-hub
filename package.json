@@ -1,14 +1,18 @@
 {
-  "name": "paper-hub",
+  "name": "paper-research-hub",
   "private": true,
   "packageManager": "pnpm@10.29.2",
   "engines": {
-    "node": ">=22.13.0 <23"
+    "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "pnpm --dir apps/web build",
-    "test": "pnpm test:api && pnpm test:web",
-    "test:api": "uv run --directory services/api pytest -v",
+    "dev:web": "pnpm --dir apps/web dev",
+    "preview:web": "pnpm --dir apps/web preview",
+    "build": "pnpm build:core && pnpm build:web",
+    "build:core": "go -C services/core build ./...",
+    "build:web": "pnpm --dir apps/web build",
+    "typecheck": "pnpm --dir apps/web typecheck",
+    "lint": "pnpm --dir apps/web lint",
     "test:web": "pnpm --dir apps/web test"
   }
 }
