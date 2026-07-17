@@ -355,54 +355,140 @@ func TestPublicationEventAssertionSchema(t *testing.T) {
 		}
 	}
 
-	expectedConstraintColumns := map[string][]string{
+	type foreignKeyExpectation struct {
+		childColumns      []string
+		referencedTable   string
+		referencedColumns []string
+	}
+	expectedForeignKeys := map[string]foreignKeyExpectation{
 		"work_publication_event_assertions_projection_provenance_fkey": {
-			"projection_assertion_id",
-			"normalized_assertion_id",
-			"source_record_id",
-			"work_id",
+			childColumns: []string{
+				"projection_assertion_id",
+				"normalized_assertion_id",
+				"source_record_id",
+				"work_id",
+			},
+			referencedTable: "ingestion_projection_assertions",
+			referencedColumns: []string{
+				"id",
+				"normalized_assertion_id",
+				"source_record_uuid",
+				"work_id",
+			},
 		},
 		"work_publication_event_assertions_normalized_source_fkey": {
-			"normalized_assertion_id",
-			"source_record_id",
+			childColumns: []string{
+				"normalized_assertion_id",
+				"source_record_id",
+			},
+			referencedTable: "ingestion_normalized_records",
+			referencedColumns: []string{
+				"id",
+				"source_record_uuid",
+			},
 		},
 		"work_publication_event_assertions_source_record_work_fkey": {
-			"source_record_id",
-			"work_id",
+			childColumns: []string{
+				"source_record_id",
+				"work_id",
+			},
+			referencedTable: "source_record_works",
+			referencedColumns: []string{
+				"source_record_id",
+				"work_id",
+			},
 		},
 		"work_publication_states_projection_provenance_fkey": {
-			"projection_assertion_id",
-			"normalized_assertion_id",
-			"source_record_id",
-			"work_id",
+			childColumns: []string{
+				"projection_assertion_id",
+				"normalized_assertion_id",
+				"source_record_id",
+				"work_id",
+			},
+			referencedTable: "ingestion_projection_assertions",
+			referencedColumns: []string{
+				"id",
+				"normalized_assertion_id",
+				"source_record_uuid",
+				"work_id",
+			},
 		},
 		"work_publication_states_normalized_source_fkey": {
-			"normalized_assertion_id",
-			"source_record_id",
+			childColumns: []string{
+				"normalized_assertion_id",
+				"source_record_id",
+			},
+			referencedTable: "ingestion_normalized_records",
+			referencedColumns: []string{
+				"id",
+				"source_record_uuid",
+			},
 		},
 		"work_publication_states_source_record_work_fkey": {
-			"source_record_id",
-			"work_id",
+			childColumns: []string{
+				"source_record_id",
+				"work_id",
+			},
+			referencedTable: "source_record_works",
+			referencedColumns: []string{
+				"source_record_id",
+				"work_id",
+			},
 		},
 	}
-	for constraint, columns := range expectedConstraintColumns {
-		var definition string
+	for constraint, expected := range expectedForeignKeys {
+		var referencedTable string
+		var childColumns, referencedColumns []string
 		if err := pool.QueryRow(ctx, `
-			SELECT pg_get_constraintdef(oid)
-			FROM pg_constraint
-			WHERE conname = $1
-		`, constraint).Scan(&definition); err != nil {
+			SELECT
+				referenced_relation.relname,
+				array_agg(
+					child_attribute.attname
+					ORDER BY key_position.ordinality
+				),
+				array_agg(
+					referenced_attribute.attname
+					ORDER BY key_position.ordinality
+				)
+			FROM pg_constraint AS constraint_row
+			JOIN pg_class AS referenced_relation
+			  ON referenced_relation.oid = constraint_row.confrelid
+			JOIN LATERAL generate_subscripts(
+				constraint_row.conkey,
+				1
+			) AS key_position(ordinality)
+			  ON true
+			JOIN pg_attribute AS child_attribute
+			  ON child_attribute.attrelid = constraint_row.conrelid
+			 AND child_attribute.attnum =
+			     constraint_row.conkey[key_position.ordinality]
+			JOIN pg_attribute AS referenced_attribute
+			  ON referenced_attribute.attrelid = constraint_row.confrelid
+			 AND referenced_attribute.attnum =
+			     constraint_row.confkey[key_position.ordinality]
+			WHERE constraint_row.conname = $1
+			  AND constraint_row.contype = 'f'
+			GROUP BY referenced_relation.relname
+		`, constraint).Scan(
+			&referencedTable,
+			&childColumns,
+			&referencedColumns,
+		); err != nil {
 			t.Fatalf("query constraint %s: %v", constraint, err)
 		}
-		for _, column := range columns {
-			if !strings.Contains(definition, column) {
-				t.Errorf(
-					"constraint %s = %q, want column %s",
-					constraint,
-					definition,
-					column,
-				)
-			}
+		if referencedTable != expected.referencedTable ||
+			!slices.Equal(childColumns, expected.childColumns) ||
+			!slices.Equal(referencedColumns, expected.referencedColumns) {
+			t.Errorf(
+				"constraint %s = child %v REFERENCES %s%v, want child %v REFERENCES %s%v",
+				constraint,
+				childColumns,
+				referencedTable,
+				referencedColumns,
+				expected.childColumns,
+				expected.referencedTable,
+				expected.referencedColumns,
+			)
 		}
 	}
 
@@ -485,6 +571,26 @@ func TestPublicationEventAssertionSchema(t *testing.T) {
 	`, projectionAssertionID).Scan(&normalizedAssertionID); err != nil {
 		t.Fatalf("query publication normalized assertion: %v", err)
 	}
+	mismatchedProjectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
+		workID,
+		sourceRecordID,
+		"publication-event-mismatched-normalized",
+	)
+	var mismatchedNormalizedAssertionID string
+	if err := pool.QueryRow(ctx, `
+		SELECT normalized_assertion_id::text
+		FROM ingestion_projection_assertions
+		WHERE id = $1
+	`, mismatchedProjectionAssertionID).Scan(
+		&mismatchedNormalizedAssertionID,
+	); err != nil {
+		t.Fatalf("query mismatched publication normalized assertion: %v", err)
+	}
+	if mismatchedNormalizedAssertionID == normalizedAssertionID {
+		t.Fatal("publication projection fixtures reused one normalized assertion")
+	}
 
 	var eventAssertionID string
 	mustScanID(t, pool.QueryRow(ctx, `
@@ -518,22 +624,38 @@ func TestPublicationEventAssertionSchema(t *testing.T) {
 	), &eventAssertionID)
 
 	var sourceDatePreserved bool
-	var sourcePath string
+	var sourcePath, statusRaw, publicationModelRaw string
+	var ordinal int
 	if err := pool.QueryRow(ctx, `
 		SELECT
 			source_date = '{"year":2026,"month":7,"day":15}'::jsonb,
-			source_path
+			source_path,
+			status_raw,
+			publication_model_raw,
+			ordinal
 		FROM work_publication_event_assertions
 		WHERE id = $1
-	`, eventAssertionID).Scan(&sourceDatePreserved, &sourcePath); err != nil {
+	`, eventAssertionID).Scan(
+		&sourceDatePreserved,
+		&sourcePath,
+		&statusRaw,
+		&publicationModelRaw,
+		&ordinal,
+	); err != nil {
 		t.Fatalf("query preserved publication event evidence: %v", err)
 	}
 	if !sourceDatePreserved ||
-		sourcePath != "/PubmedArticle/PubmedData/History/PubMedPubDate[1]" {
+		sourcePath != "/PubmedArticle/PubmedData/History/PubMedPubDate[1]" ||
+		statusRaw != "accepted" ||
+		publicationModelRaw != "Print-Electronic" ||
+		ordinal != 1 {
 		t.Fatalf(
-			"preserved publication evidence = source date %t, path %q",
+			"preserved publication evidence = source date %t, path %q, status %q, model %q, ordinal %d",
 			sourceDatePreserved,
 			sourcePath,
+			statusRaw,
+			publicationModelRaw,
+			ordinal,
 		)
 	}
 
@@ -716,6 +838,28 @@ func TestPublicationEventAssertionSchema(t *testing.T) {
 			assertPostgresError(t, provenanceErr, "23503", "")
 		})
 	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_publication_event_assertions (
+			projection_assertion_id, normalized_assertion_id,
+			source_record_id, work_id, event_kind, event_date,
+			date_precision, source_date, status_raw, source_path, ordinal
+		) VALUES (
+			$1, $2, $3, $4, 'accepted', DATE '2026-07-15',
+			'day', '{"year":2026,"month":7,"day":15}', 'accepted',
+			'/PubmedArticle/PubmedData/History/PubMedPubDate[10]', 9
+		)
+	`,
+		projectionAssertionID,
+		mismatchedNormalizedAssertionID,
+		sourceRecordID,
+		workID,
+	)
+	assertPostgresError(
+		t,
+		err,
+		"23503",
+		"work_publication_event_assertions_projection_provenance_fkey",
+	)
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO work_publication_states (
@@ -756,6 +900,90 @@ func TestPublicationEventAssertionSchema(t *testing.T) {
 		"23514",
 		"work_publication_states_electronic_state_check",
 	)
+
+	stateShapes := []struct {
+		name        string
+		dateColumn  string
+		stateColumn string
+		constraint  string
+	}{
+		{
+			name:        "print published",
+			dateColumn:  "print_published_on",
+			stateColumn: "print_published_state",
+			constraint:  "work_publication_states_print_state_check",
+		},
+		{
+			name:        "electronic published",
+			dateColumn:  "electronic_published_on",
+			stateColumn: "electronic_published_state",
+			constraint:  "work_publication_states_electronic_state_check",
+		},
+		{
+			name:        "ahead of print",
+			dateColumn:  "ahead_of_print_on",
+			stateColumn: "ahead_of_print_state",
+			constraint:  "work_publication_states_ahead_of_print_state_check",
+		},
+		{
+			name:        "accepted",
+			dateColumn:  "accepted_on",
+			stateColumn: "accepted_state",
+			constraint:  "work_publication_states_accepted_state_check",
+		},
+	}
+	invalidStateShapes := []struct {
+		name       string
+		dateValue  string
+		stateValue string
+	}{
+		{
+			name:       "known without date",
+			dateValue:  "NULL",
+			stateValue: "known",
+		},
+		{
+			name:       "missing with date",
+			dateValue:  "DATE '2026-07-15'",
+			stateValue: "missing",
+		},
+		{
+			name:       "conflict with date",
+			dateValue:  "DATE '2026-07-15'",
+			stateValue: "conflict",
+		},
+	}
+	for _, stateShape := range stateShapes {
+		for _, invalidShape := range invalidStateShapes {
+			t.Run(
+				stateShape.name+" rejects "+invalidShape.name,
+				func(t *testing.T) {
+					query := fmt.Sprintf(`
+						UPDATE work_publication_states
+						SET %s = %s,
+						    %s = $2
+						WHERE work_id = $1
+					`,
+						stateShape.dateColumn,
+						invalidShape.dateValue,
+						stateShape.stateColumn,
+					)
+					_, shapeErr := pool.Exec(
+						ctx,
+						query,
+						workID,
+						invalidShape.stateValue,
+					)
+					assertPostgresError(
+						t,
+						shapeErr,
+						"23514",
+						stateShape.constraint,
+					)
+				},
+			)
+		}
+	}
 
 	if _, err := pool.Exec(ctx, `
 		UPDATE work_publication_states
