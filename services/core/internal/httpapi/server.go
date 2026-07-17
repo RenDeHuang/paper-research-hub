@@ -24,6 +24,7 @@ func NewServer(dependencies Dependencies) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", getOnly(health))
 	registerCatalogRoutes(mux, dependencies.Catalog)
+	mux.HandleFunc("/", exactRoot(getOnly(discovery)))
 	mux.HandleFunc("/api", apiNotFound)
 	mux.HandleFunc("/api/", apiNotFound)
 
@@ -76,8 +77,33 @@ func health(writer http.ResponseWriter, _ *http.Request) {
 		Service string `json:"service"`
 	}{
 		Status:  "ok",
-		Service: "paper-hub-api",
+		Service: "medpaperhub-api",
 	})
+}
+
+func discovery(writer http.ResponseWriter, _ *http.Request) {
+	writer.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(writer).Encode(struct {
+		Service    string `json:"service"`
+		Status     string `json:"status"`
+		APIVersion string `json:"api_version"`
+		Health     string `json:"health"`
+	}{
+		Service:    "medpaperhub-api",
+		Status:     "ok",
+		APIVersion: "v1",
+		Health:     "/health",
+	})
+}
+
+func exactRoot(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/" {
+			http.NotFound(writer, request)
+			return
+		}
+		next(writer, request)
+	}
 }
 
 func apiNotFound(writer http.ResponseWriter, request *http.Request) {

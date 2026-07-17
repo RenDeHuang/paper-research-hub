@@ -25,6 +25,7 @@ services:
       - smoke
     environment:
       API_HEALTH_URL: http://api:${API_PORT:-8080}/health
+      API_ROOT_URL: http://api:${API_PORT:-8080}/
       WEB_HEALTH_URL: http://web:${NUXT_PORT:-3000}/health
     depends_on:
       postgres:
@@ -41,11 +42,26 @@ services:
       - |
         api_payload="$$(curl --fail --silent --show-error "$${API_HEALTH_URL}")"
         printf '%s' "$${api_payload}" | grep -q '"status":"ok"'
-        printf '%s' "$${api_payload}" | grep -q '"service":"paper-hub-api"'
+        printf '%s' "$${api_payload}" | grep -q '"service":"medpaperhub-api"'
+
+        api_root_headers="$$(mktemp)"
+        api_root_body="$$(mktemp)"
+        api_root_status="$$(curl --silent --show-error \
+          --dump-header "$${api_root_headers}" \
+          --output "$${api_root_body}" \
+          --write-out '%{http_code}' \
+          "$${API_ROOT_URL}")"
+        test "$${api_root_status}" = '200'
+        if grep -qi '^location:' "$${api_root_headers}"; then
+          echo 'API root discovery must not redirect' >&2
+          exit 1
+        fi
+        api_root_payload="$$(cat "$${api_root_body}")"
+        test "$${api_root_payload}" = '{"service":"medpaperhub-api","status":"ok","api_version":"v1","health":"/health"}'
 
         web_payload="$$(curl --fail --silent --show-error "$${WEB_HEALTH_URL}")"
         printf '%s' "$${web_payload}" | grep -q '"status":"ok"'
-        printf '%s' "$${web_payload}" | grep -q '"service":"paper-hub-web"'
+        printf '%s' "$${web_payload}" | grep -q '"service":"medpaperhub-web"'
 
         catalog_headers="$$(mktemp)"
         catalog_body="$$(mktemp)"

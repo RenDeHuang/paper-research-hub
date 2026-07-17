@@ -20,6 +20,103 @@ func TestNewServerReturnsHTTPHandler(t *testing.T) {
 	}
 }
 
+func TestRootDiscoveryReturnsExactPublicContract(t *testing.T) {
+	t.Parallel()
+
+	response := serve(t, http.MethodGet, "/", "")
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q", contentType, "application/json")
+	}
+	if location := response.Header().Get("Location"); location != "" {
+		t.Fatalf("Location = %q, want no redirect", location)
+	}
+
+	var body struct {
+		Service    string `json:"service"`
+		Status     string `json:"status"`
+		APIVersion string `json:"api_version"`
+		Health     string `json:"health"`
+	}
+	decodeJSON(t, response, &body)
+
+	if body.Service != "medpaperhub-api" {
+		t.Errorf("service = %q, want %q", body.Service, "medpaperhub-api")
+	}
+	if body.Status != "ok" {
+		t.Errorf("status = %q, want %q", body.Status, "ok")
+	}
+	if body.APIVersion != "v1" {
+		t.Errorf("api_version = %q, want %q", body.APIVersion, "v1")
+	}
+	if body.Health != "/health" {
+		t.Errorf("health = %q, want %q", body.Health, "/health")
+	}
+}
+
+func TestRootDiscoveryRejectsPOSTWithProblemDetails(t *testing.T) {
+	t.Parallel()
+
+	response := serve(t, http.MethodPost, "/", "")
+
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
+	}
+	if contentType := response.Header().Get("Content-Type"); contentType != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want %q", contentType, "application/problem+json")
+	}
+	if allow := response.Header().Get("Allow"); allow != http.MethodGet {
+		t.Fatalf("Allow = %q, want %q", allow, http.MethodGet)
+	}
+
+	var problem problemDetails
+	decodeJSON(t, response, &problem)
+	if problem.Type != "urn:paper-hub:problem:method-not-allowed" {
+		t.Errorf("type = %q, want method-not-allowed problem", problem.Type)
+	}
+	if problem.Title != "Method Not Allowed" {
+		t.Errorf("title = %q, want %q", problem.Title, "Method Not Allowed")
+	}
+	if problem.Status != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", problem.Status, http.StatusMethodNotAllowed)
+	}
+	if problem.Code != "method_not_allowed" {
+		t.Errorf("code = %q, want %q", problem.Code, "method_not_allowed")
+	}
+	if problem.Detail != "The requested resource only supports GET." {
+		t.Errorf("detail = %q, want GET-only detail", problem.Detail)
+	}
+	if problem.Instance != "/" {
+		t.Errorf("instance = %q, want %q", problem.Instance, "/")
+	}
+	if problem.RequestID == "" {
+		t.Error("request_id is empty")
+	}
+}
+
+func TestRootDiscoveryDoesNotClaimUnknownPaths(t *testing.T) {
+	t.Parallel()
+
+	response := serve(t, http.MethodGet, "/not-a-route", "")
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestRootDiscoveryChecksUnknownPathBeforeMethod(t *testing.T) {
+	t.Parallel()
+
+	response := serve(t, http.MethodPost, "/not-a-route", "")
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
 func TestHealth(t *testing.T) {
 	t.Parallel()
 
@@ -44,8 +141,8 @@ func TestHealth(t *testing.T) {
 	if body.Status != "ok" {
 		t.Errorf("status = %q, want %q", body.Status, "ok")
 	}
-	if body.Service != "paper-hub-api" {
-		t.Errorf("service = %q, want %q", body.Service, "paper-hub-api")
+	if body.Service != "medpaperhub-api" {
+		t.Errorf("service = %q, want %q", body.Service, "medpaperhub-api")
 	}
 }
 

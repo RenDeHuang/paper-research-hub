@@ -18,7 +18,7 @@ describe("/health", () => {
     expect(response.headers.get("content-type")).toBe("application/json")
     await expect(response.json()).resolves.toEqual({
       status: "ok",
-      service: "paper-hub-web",
+      service: "medpaperhub-web",
     })
   })
 

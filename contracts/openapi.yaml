@@ -1,7 +1,7 @@
 openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
-  title: Paper Research Hub Public API
+  title: medpaperhub Public API
   version: 1.0.0
   description: |
     Public read-only contract for the currently published catalog generation.
@@ -21,6 +21,30 @@ tags:
   - name: Trends
   - name: Research Opportunities
 paths:
+  /:
+    get:
+      tags:
+        - System
+      operationId: getDiscovery
+      summary: Discover the public API
+      parameters:
+        - $ref: "#/components/parameters/RequestID"
+      responses:
+        "200":
+          description: Stable discovery metadata for the public API.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscoveryResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
+        default:
+          $ref: "#/components/responses/InternalProblem"
   /health:
     get:
       tags:
@@ -923,6 +947,27 @@ components:
               $ref: "#/components/schemas/PaperType"
         - $ref: "#/components/schemas/UnknownCatalogValue"
         - $ref: "#/components/schemas/MissingCatalogValue"
+    DiscoveryResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - service
+        - status
+        - api_version
+        - health
+      properties:
+        service:
+          type: string
+          const: medpaperhub-api
+        status:
+          type: string
+          const: ok
+        api_version:
+          type: string
+          const: v1
+        health:
+          type: string
+          const: /health
     HealthResponse:
       type: object
       additionalProperties: false
@@ -935,7 +980,7 @@ components:
           const: ok
         service:
           type: string
-          const: paper-hub-api
+          const: medpaperhub-api
     StatsResponse:
       type: object
       additionalProperties: false

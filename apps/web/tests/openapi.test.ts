@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest"
 import { parse } from "yaml"
 
 const requestIDParameterRef = "#/components/parameters/RequestID"
+const discoveryResponseRef = "#/components/schemas/DiscoveryResponse"
 const taxonomyItemRef = "#/components/schemas/TaxonomyItem"
 const taxonomySlugRef = "#/components/schemas/TaxonomySlug"
 const openAPIPath = fileURLToPath(
@@ -46,6 +47,88 @@ describe("OpenAPI contract", () => {
         $ref: requestIDParameterRef,
       })
     }
+  })
+
+  it("documents only the implemented GET root discovery contract", () => {
+    const rootPath = getRecord(document, "paths", "/")
+    expect(Object.keys(rootPath)).toEqual(["get"])
+
+    const operation = getRecord(rootPath, "get")
+    expect(operation).toMatchObject({
+      operationId: "getDiscovery",
+      parameters: [
+        {
+          $ref: requestIDParameterRef,
+        },
+      ],
+    })
+
+    const responses = getRecord(operation, "responses")
+    expect(Object.keys(responses)).toEqual(["200", "400", "405", "default"])
+    expect(
+      getRecord(responses, "200", "headers", "X-Request-ID"),
+    ).toEqual({
+      $ref: "#/components/headers/XRequestID",
+    })
+    expect(responses["400"]).toEqual({
+      $ref: "#/components/responses/InvalidRequestIDProblem",
+    })
+    expect(responses["405"]).toEqual({
+      $ref: "#/components/responses/MethodNotAllowedProblem",
+    })
+    expect(responses.default).toEqual({
+      $ref: "#/components/responses/InternalProblem",
+    })
+
+    expect(
+      getRecord(operation, "responses", "200", "content", "application/json"),
+    ).toEqual({
+      schema: {
+        $ref: discoveryResponseRef,
+      },
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "DiscoveryResponse"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: ["service", "status", "api_version", "health"],
+      properties: {
+        service: {
+          type: "string",
+          const: "medpaperhub-api",
+        },
+        status: {
+          type: "string",
+          const: "ok",
+        },
+        api_version: {
+          type: "string",
+          const: "v1",
+        },
+        health: {
+          type: "string",
+          const: "/health",
+        },
+      },
+    })
+  })
+
+  it("publishes the medpaperhub API health identity", () => {
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "HealthResponse",
+        "properties",
+        "service",
+      ),
+    ).toEqual({
+      type: "string",
+      const: "medpaperhub-api",
+    })
   })
 
   it("reuses TaxonomySlug and TaxonomyItem without schema drift", () => {

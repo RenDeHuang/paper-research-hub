@@ -68,7 +68,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - wget -q -O - "http://127.0.0.1:$${API_PORT}/health" | grep -q '"service":"paper-hub-api"'
+        - wget -q -O - "http://127.0.0.1:$${API_PORT}/health" | grep -q '"service":"medpaperhub-api"'
       interval: 5s
       timeout: 5s
       retries: 24
@@ -109,8 +109,8 @@ services:
         - -e
         - >-
           const checks = [
-            ['http://127.0.0.1:' + (process.env.PORT || '3000') + '/health', 'paper-hub-web'],
-            [(process.env.INTERNAL_API_BASE_URL || 'http://api:8080') + '/health', 'paper-hub-api']
+            ['http://127.0.0.1:' + (process.env.PORT || '3000') + '/health', 'medpaperhub-web'],
+            [(process.env.INTERNAL_API_BASE_URL || 'http://api:8080') + '/health', 'medpaperhub-api']
           ];
           Promise.all(checks.map(async ([url, service]) => {
             const response = await fetch(url);
