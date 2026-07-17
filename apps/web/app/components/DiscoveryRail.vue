@@ -16,10 +16,10 @@ export type DiscoveryRailCollection =
     }
 
 const props = defineProps<{
-  popularMethods: DiscoveryRailCollection
-  popularTopics: DiscoveryRailCollection
+  activeJournals: DiscoveryRailCollection
   quickFilters: DiscoveryRailCollection
   savedViews: DiscoveryRailCollection
+  trendingSubjects: DiscoveryRailCollection
 }>()
 
 function resolveCollection(
@@ -49,16 +49,16 @@ const groups = computed(() => [
     title: "快捷筛选",
   },
   {
-    id: "popular-topics",
-    ...resolveCollection(props.popularTopics, "当前没有热门 Topic"),
-    slotName: "popular-topics",
-    title: "热门 Topic",
+    id: "trending-subjects",
+    ...resolveCollection(props.trendingSubjects, "当前没有学科趋势"),
+    slotName: "trending-subjects",
+    title: "学科趋势",
   },
   {
-    id: "popular-methods",
-    ...resolveCollection(props.popularMethods, "当前没有热门 Method"),
-    slotName: "popular-methods",
-    title: "热门 Method",
+    id: "active-journals",
+    ...resolveCollection(props.activeJournals, "当前没有活跃期刊"),
+    slotName: "active-journals",
+    title: "活跃期刊",
   },
   {
     id: "saved-views",

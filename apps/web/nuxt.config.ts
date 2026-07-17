@@ -11,6 +11,8 @@ export default defineNuxtConfig({
   },
   app: {
     head: {
+      title: "medpaperhub",
+      titleTemplate: "%s · medpaperhub",
       htmlAttrs: {
         lang: "zh-CN",
       },

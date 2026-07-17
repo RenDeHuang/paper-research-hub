@@ -8,7 +8,9 @@ describe("minimal home shell", () => {
   it("renders search and an explicit recovery path without fixture papers", async () => {
     const wrapper = await mountSuspended(IndexPage)
 
-    expect(wrapper.get("h1").text()).toBe("论文研究情报，从发现到证据")
+    expect(wrapper.get("h1").text()).toBe(
+      "医学生物学研究情报，从新论文到可验证趋势",
+    )
     expect(wrapper.get('form[role="search"]').exists()).toBe(true)
     expect(wrapper.get('[data-state="error"] h2').text()).toBe("暂时无法加载")
     expect(wrapper.get('[data-state="error"] button').text()).toBe("重试")

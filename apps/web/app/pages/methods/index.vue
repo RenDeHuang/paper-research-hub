@@ -7,7 +7,7 @@ definePageMeta({
 })
 
 useHead({
-  title: "Method · Paper Research Hub",
+  title: "研究方法",
   meta: [
     {
       name: "description",

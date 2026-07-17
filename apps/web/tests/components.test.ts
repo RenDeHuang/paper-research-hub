@@ -20,20 +20,22 @@ describe("AppHeader", () => {
 
     expect(links.map((link) => link.text())).toEqual([
       "首页",
+      "学科",
+      "期刊",
       "论文",
-      "Topic",
-      "Method",
       "趋势",
       "研究机会",
     ])
     expect(links.map((link) => link.attributes("href"))).toEqual([
       "/",
+      "/subjects",
+      "/journals",
       "/papers",
-      "/topics",
-      "/methods",
       "/trends",
       "/opportunities",
     ])
+    expect(wrapper.get(".app-header__brand").text()).toBe("medpaperhub")
+    expect(wrapper.text()).not.toContain("Paper Research Hub")
     expect(links[0]?.attributes("aria-current")).toBe("page")
     expect(wrapper.get(".app-header__route-name").text()).toBe("首页")
     const searchLink = wrapper.get('a[href="/#global-search"]')
@@ -72,9 +74,8 @@ describe("AppHeader", () => {
 
   it.each([
     ["/papers/paper-1", "论文详情"],
-    ["/topics/agent", "Topic"],
-    ["/methods/rag", "Method"],
-    ["/venues/nature", "Venue"],
+    ["/subjects/oncology", "学科"],
+    ["/journals/nature-medicine", "期刊"],
   ])("renders the explicit dynamic route label for %s", async (path, label) => {
     const wrapper = await mountSuspended(AppHeader, { route: path })
 
@@ -87,12 +88,12 @@ describe("DiscoveryRail", () => {
   it("renders the four discovery contracts from caller-provided items", async () => {
     const wrapper = await mountSuspended(DiscoveryRail, {
       props: {
-        popularMethods: {
-          items: [{ label: "检索增强生成", to: "/methods/rag" }],
+        activeJournals: {
+          items: [{ label: "Nature Medicine", to: "/journals/nature-medicine" }],
           state: "known",
         },
-        popularTopics: {
-          items: [{ label: "Agent", to: "/topics/agent" }],
+        trendingSubjects: {
+          items: [{ label: "肿瘤学", to: "/subjects/oncology" }],
           state: "known",
         },
         quickFilters: {
@@ -115,20 +116,20 @@ describe("DiscoveryRail", () => {
     expect(wrapper.get("aside").attributes("aria-label")).toBe("发现导航")
     expect(groups.map((group) => group.attributes("data-discovery-group"))).toEqual([
       "quick-filters",
-      "popular-topics",
-      "popular-methods",
+      "trending-subjects",
+      "active-journals",
       "saved-views",
     ])
     expect(groups.map((group) => group.get("h2").text())).toEqual([
       "快捷筛选",
-      "热门 Topic",
-      "热门 Method",
+      "学科趋势",
+      "活跃期刊",
       "保存视图",
     ])
     expect(wrapper.findAll("a > span").map((label) => label.text())).toEqual([
       "JIF ≥ 10",
-      "Agent",
-      "检索增强生成",
+      "肿瘤学",
+      "Nature Medicine",
       "我的高影响力视图",
     ])
     expect(wrapper.text()).not.toContain("浏览论文")
@@ -139,12 +140,12 @@ describe("DiscoveryRail", () => {
   it("keeps known-empty, missing, and unknown discovery states distinct", async () => {
     const wrapper = await mountSuspended(DiscoveryRail, {
       props: {
-        popularMethods: {
-          label: "热门 Method 尚未生成",
+        activeJournals: {
+          label: "活跃期刊尚未生成",
           state: "missing",
         },
-        popularTopics: {
-          label: "热门 Topic 来源未覆盖",
+        trendingSubjects: {
+          label: "学科趋势来源未覆盖",
           state: "unknown",
         },
         quickFilters: {
@@ -161,8 +162,8 @@ describe("DiscoveryRail", () => {
 
     expect(states.map((state) => state.attributes("data-discovery-empty"))).toEqual([
       "quick-filters",
-      "popular-topics",
-      "popular-methods",
+      "trending-subjects",
+      "active-journals",
       "saved-views",
     ])
     expect(
@@ -170,8 +171,8 @@ describe("DiscoveryRail", () => {
     ).toEqual(["empty", "unknown", "missing", "empty"])
     expect(states.map((state) => state.text())).toEqual([
       "暂无快捷筛选",
-      "热门 Topic 来源未覆盖",
-      "热门 Method 尚未生成",
+      "学科趋势来源未覆盖",
+      "活跃期刊尚未生成",
       "暂无保存视图",
     ])
   })
@@ -212,6 +213,8 @@ describe("AppFooter", () => {
     const wrapper = await mountSuspended(AppFooter, { route: "/" })
     const searchLink = wrapper.get('a[href="/#global-search"]')
 
+    expect(wrapper.get(".app-footer__brand").text()).toBe("medpaperhub")
+    expect(wrapper.text()).not.toContain("Paper Research Hub")
     expect(searchLink.text()).toBe("返回搜索")
     expect(searchLink.attributes("aria-current")).toBeUndefined()
   })

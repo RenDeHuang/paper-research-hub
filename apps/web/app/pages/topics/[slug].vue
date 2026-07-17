@@ -58,8 +58,8 @@ const description = computed(() =>
 
 useHead(() => ({
   title: readyData.value
-    ? `${readyData.value.topic.name} · Topic · Paper Research Hub`
-    : "Topic 详情 · Paper Research Hub",
+    ? `${readyData.value.topic.name} · 研究主题`
+    : "研究主题详情",
 }))
 </script>
 

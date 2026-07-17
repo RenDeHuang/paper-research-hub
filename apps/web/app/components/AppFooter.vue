@@ -2,10 +2,10 @@
   <footer class="app-footer">
     <div class="app-footer__inner shell-container">
       <p class="app-footer__brand">
-        Paper Research Hub
+        medpaperhub
       </p>
       <p>
-        论文、趋势与研究机会均以可追溯来源、明确覆盖和独立缺失状态呈现。
+        医学与生物学论文、期刊趋势和研究机会均以可追溯来源、明确覆盖和独立缺失状态呈现。
       </p>
       <a href="/#global-search">
         返回搜索

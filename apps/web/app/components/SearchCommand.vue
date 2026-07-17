@@ -54,7 +54,7 @@ const props = withDefaults(
     loadingMessage: "正在加载搜索建议",
     modelValue: undefined,
     noMatchMessage: "没有匹配结果",
-    placeholder: "例如：agent、single-cell、DOI 或作者名",
+    placeholder: "例如：肿瘤免疫、单细胞、DOI 或作者名",
     submitLabel: "搜索",
     suggestionGroups: () => [],
     suggestionsState: "unavailable",

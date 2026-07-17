@@ -6,19 +6,19 @@ const main = useTemplateRef<HTMLElement>("main")
 const routeLabel = computed(() => resolveRouteLabel(route))
 const quickFilters = {
   items: [
-    { label: "有代码", to: "/papers?has_code=true" },
-    { label: "有数据", to: "/papers?has_data=true" },
-    { label: "有 Benchmark", to: "/papers?has_benchmark=true" },
+    { label: "最新精选", to: "/papers?sort=published_at_desc" },
+    { label: "引用优先", to: "/papers?sort=citations_desc" },
     { label: "趋势优先", to: "/papers?sort=trend_desc" },
+    { label: "研究机会", to: "/opportunities" },
   ],
   state: "known" as const,
 }
-const popularTopics = {
-  label: "请在 Topic 页加载真实目录",
+const trendingSubjects = {
+  label: "等待学科趋势生成",
   state: "unknown" as const,
 }
-const popularMethods = {
-  label: "请在 Method 页加载真实目录",
+const activeJournals = {
+  label: "等待期刊活跃度生成",
   state: "unknown" as const,
 }
 const savedViews = {
@@ -43,10 +43,10 @@ watch(
     <AppHeader :route-label="routeLabel" />
     <div class="app-shell__content shell-container">
       <DiscoveryRail
+        :active-journals="activeJournals"
         :quick-filters="quickFilters"
-        :popular-topics="popularTopics"
-        :popular-methods="popularMethods"
         :saved-views="savedViews"
+        :trending-subjects="trendingSubjects"
       />
       <main id="main-content" ref="main" class="app-shell__main" tabindex="-1">
         <slot />

@@ -28,8 +28,8 @@ describe("default application shell", () => {
         .map((group) => group.attributes("data-discovery-group")),
     ).toEqual([
       "quick-filters",
-      "popular-topics",
-      "popular-methods",
+      "trending-subjects",
+      "active-journals",
       "saved-views",
     ])
     expect(
@@ -43,25 +43,25 @@ describe("default application shell", () => {
       wrapper
         .findAll('aside[aria-label="发现导航"] a')
         .map((link) => link.text()),
-    ).toEqual(["有代码", "有数据", "有 Benchmark", "趋势优先"])
+    ).toEqual(["最新精选", "引用优先", "趋势优先", "研究机会"])
     expect(
       wrapper
         .findAll('aside[aria-label="发现导航"] a')
         .map((link) => link.attributes("href")),
     ).toEqual([
-      "/papers?has_code=true",
-      "/papers?has_data=true",
-      "/papers?has_benchmark=true",
+      "/papers?sort=published_at_desc",
+      "/papers?sort=citations_desc",
       "/papers?sort=trend_desc",
+      "/opportunities",
     ])
     expect(wrapper.get('aside[aria-label="发现导航"]').text()).not.toContain(
       "浏览论文",
     )
     expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
-      "请在 Topic 页加载真实目录",
+      "等待学科趋势生成",
     )
     expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
-      "请在 Method 页加载真实目录",
+      "等待期刊活跃度生成",
     )
     expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
       "暂无保存视图",
@@ -90,9 +90,8 @@ describe("default application shell", () => {
 
     for (const [path, expected] of [
       ["/papers/paper-1", "论文详情"],
-      ["/topics/agent", "Topic"],
-      ["/methods/rag", "Method"],
-      ["/venues/nature", "Venue"],
+      ["/subjects/oncology", "学科"],
+      ["/journals/nature-medicine", "期刊"],
     ] as const) {
       router.addRoute({
         component: { template: `<h1>${expected}</h1>` },

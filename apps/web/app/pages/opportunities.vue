@@ -18,7 +18,7 @@ definePageMeta({
 })
 
 useHead({
-  title: "研究机会 · Paper Research Hub",
+  title: "研究机会",
   meta: [
     {
       name: "description",

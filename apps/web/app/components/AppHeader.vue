@@ -14,9 +14,9 @@ const props = defineProps<{
 
 const navigation = [
   { label: "首页", to: "/" },
+  { label: "学科", to: "/subjects" },
+  { label: "期刊", to: "/journals" },
   { label: "论文", to: "/papers" },
-  { label: "Topic", to: "/topics" },
-  { label: "Method", to: "/methods" },
   { label: "趋势", to: "/trends" },
   { label: "研究机会", to: "/opportunities" },
 ] as const
@@ -85,8 +85,8 @@ onBeforeUnmount(() => {
   <header class="app-header" @keydown.esc="closeMenu({ restoreFocus: true })">
     <div class="app-header__inner shell-container">
       <div class="app-header__identity">
-        <NuxtLink class="app-header__brand" to="/" aria-label="Paper Research Hub 首页">
-          Paper Research Hub
+        <NuxtLink class="app-header__brand" to="/" aria-label="medpaperhub 首页">
+          medpaperhub
         </NuxtLink>
         <span class="app-header__route-name">
           {{ currentRouteLabel }}

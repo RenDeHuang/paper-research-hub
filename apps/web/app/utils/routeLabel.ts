@@ -5,9 +5,11 @@ interface RouteLabelSource {
 
 const fixedRouteLabels: Record<string, string> = {
   "/": "首页",
+  "/journals": "期刊",
   "/methods": "Method",
   "/opportunities": "研究机会",
   "/papers": "论文",
+  "/subjects": "学科",
   "/topics": "Topic",
   "/trends": "趋势",
 }
@@ -17,9 +19,10 @@ const dynamicRouteLabels: Array<{
   pattern: RegExp
 }> = [
   { label: "论文详情", pattern: /^\/papers\/[^/]+$/ },
+  { label: "学科", pattern: /^\/subjects\/[^/]+$/ },
+  { label: "期刊", pattern: /^\/journals\/[^/]+$/ },
   { label: "Topic", pattern: /^\/topics\/[^/]+$/ },
   { label: "Method", pattern: /^\/methods\/[^/]+$/ },
-  { label: "Venue", pattern: /^\/venues\/[^/]+$/ },
 ]
 
 export function resolveRouteLabel(route: RouteLabelSource) {

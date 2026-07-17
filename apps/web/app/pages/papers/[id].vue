@@ -65,8 +65,8 @@ const curation = computed<
 
 useHead(() => ({
   title: paper.value
-    ? `${paper.value.title} · Paper Research Hub`
-    : "论文详情 · Paper Research Hub",
+    ? paper.value.title
+    : "论文详情",
 }))
 </script>
 

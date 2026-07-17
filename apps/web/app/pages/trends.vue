@@ -8,7 +8,7 @@ definePageMeta({
 })
 
 useHead({
-  title: "趋势 · Paper Research Hub",
+  title: "趋势",
   meta: [
     {
       name: "description",

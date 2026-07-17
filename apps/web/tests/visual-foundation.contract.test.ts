@@ -116,4 +116,32 @@ describe("Nuxt visual foundation contract", () => {
     expect(source).toMatch(/<NuxtLink\s+:to="item\.to"/)
     expect(source).not.toMatch(/<a\s+:href="item\.to"/)
   })
+
+  it("locks the public shell brand and biomedical first-level navigation", () => {
+    const header = readFileSync(
+      `${webRoot}/app/components/AppHeader.vue`,
+      "utf8",
+    )
+    const footer = readFileSync(
+      `${webRoot}/app/components/AppFooter.vue`,
+      "utf8",
+    )
+    const config = readFileSync(`${webRoot}/nuxt.config.ts`, "utf8")
+
+    expect(header).toContain("medpaperhub")
+    expect(footer).toContain("medpaperhub")
+    expect(config).toContain("medpaperhub")
+    expect(header).not.toContain("Paper Research Hub")
+    expect(footer).not.toContain("Paper Research Hub")
+    for (const destination of [
+      'label: "首页"',
+      'label: "学科"',
+      'label: "期刊"',
+      'label: "论文"',
+      'label: "趋势"',
+      'label: "研究机会"',
+    ]) {
+      expect(header).toContain(destination)
+    }
+  })
 })

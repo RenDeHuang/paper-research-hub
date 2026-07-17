@@ -8,11 +8,11 @@ import {
 import { settleCatalogRequest } from "~/utils/catalogResult"
 
 useHead({
-  title: "Paper Research Hub",
+  title: "医学生物学研究情报",
   meta: [
     {
       name: "description",
-      content: "以来源、覆盖和证据为边界的论文研究情报门户。",
+      content: "聚合 JCR Q1 或 JIF 不低于 10 的医学与生物学期刊论文、引用和趋势证据。",
     },
   ],
 })
@@ -88,13 +88,13 @@ const stats = computed(() => {
   <div class="home-page portal-page">
     <section class="home-page__intro" aria-labelledby="home-heading">
       <p class="page-eyebrow">
-        Paper Research Hub
+        medpaperhub
       </p>
       <h1 id="home-heading">
-        论文研究情报，从发现到证据
+        医学生物学研究情报，从新论文到可验证趋势
       </h1>
       <p class="page-lede">
-        搜索真实公开目录，核查论文、Topic、Method、趋势、研究机会及其覆盖边界。
+        查看重点学科和期刊最近发表了什么、哪些论文引用增长更快，以及哪些研究方向仍有明确证据缺口。
       </p>
       <SearchCommand
         suggestions-state="unavailable"

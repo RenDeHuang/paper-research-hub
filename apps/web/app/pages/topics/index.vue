@@ -7,7 +7,7 @@ definePageMeta({
 })
 
 useHead({
-  title: "Topic · Paper Research Hub",
+  title: "研究主题",
   meta: [
     {
       name: "description",
