@@ -492,9 +492,13 @@ func TestParseAcceptsPlainTextOrStrictJATSAbstractOnly(t *testing.T) {
 		abstract string
 	}{
 		{name: "malformed", abstract: `<jats:p>unclosed`},
-		{name: "multiple roots", abstract: `<jats:p>one</jats:p><jats:p>two</jats:p>`},
 		{name: "HTML", abstract: `<p>not JATS</p>`},
 		{name: "unknown JATS", abstract: `<jats:script>alert(1)</jats:script>`},
+		{
+			name: "inline element as fragment root",
+			abstract: `<jats:title>Abstract</jats:title>` +
+				`<jats:italic>not a block root</jats:italic>`,
+		},
 		{name: "doctype", abstract: `<!DOCTYPE foo><jats:p>text</jats:p>`},
 	} {
 		test := test
@@ -512,6 +516,36 @@ func TestParseAcceptsPlainTextOrStrictJATSAbstractOnly(t *testing.T) {
 				t.Fatalf("Parse() accepted non-strict abstract %q", test.abstract)
 			}
 		})
+	}
+}
+
+func TestParseAcceptsStrictCrossrefJATSAbstractFragment(t *testing.T) {
+	t.Parallel()
+
+	abstract := `<jats:title>Abstract</jats:title>` +
+		`<jats:sec sec-type="background">` +
+		`<jats:title>Background</jats:title>` +
+		`<jats:p>Agents preserve evidence.</jats:p>` +
+		`</jats:sec>` +
+		`<jats:sec sec-type="objective">` +
+		`<jats:title>Objective</jats:title>` +
+		`<jats:p>Verify the complete ingestion path.</jats:p>` +
+		`</jats:sec>`
+	raw, err := json.Marshal(map[string]any{
+		"DOI":      "10.1000/jats-fragment",
+		"abstract": abstract,
+	})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	record, err := crossref.Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	const want = "Abstract Background Agents preserve evidence. Objective Verify the complete ingestion path."
+	if record.Abstract != want {
+		t.Fatalf("Abstract = %q, want %q", record.Abstract, want)
 	}
 }
 

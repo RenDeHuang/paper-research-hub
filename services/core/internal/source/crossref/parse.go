@@ -522,8 +522,11 @@ func parseJATSAbstract(value string) (string, error) {
 		case xml.StartElement:
 			if depth == 0 {
 				roots++
-				if roots > 1 {
-					return "", errors.New("JATS abstract must contain exactly one root element")
+				if !validJATSRoot(typed.Name) {
+					return "", fmt.Errorf(
+						"JATS abstract root %q is not allowed",
+						typed.Name.Local,
+					)
 				}
 			}
 			if !validJATSElement(typed.Name) {
@@ -576,8 +579,8 @@ func parseJATSAbstract(value string) (string, error) {
 			return "", errors.New("JATS abstract contains unsupported markup")
 		}
 	}
-	if roots != 1 || depth != 0 {
-		return "", errors.New("JATS abstract must contain exactly one complete root element")
+	if roots == 0 || depth != 0 {
+		return "", errors.New("JATS abstract must contain at least one complete root element")
 	}
 	return normalizeText(text.String()), nil
 }
@@ -587,7 +590,7 @@ func validJATSRoot(name xml.Name) bool {
 		return false
 	}
 	switch name.Local {
-	case "abstract", "p", "sec":
+	case "abstract", "p", "sec", "title":
 		return true
 	default:
 		return false
