@@ -31,17 +31,10 @@ function routeText(parameter: string) {
 }
 
 const filters = reactive({
-  has_benchmark: routeText("has_benchmark"),
-  has_code: routeText("has_code"),
-  has_data: routeText("has_data"),
-  method: routeText("method"),
   published_from: routeText("published_from"),
   published_to: routeText("published_to"),
   q: routeText("q"),
   sort: routeText("sort") || "published_at_desc",
-  source: routeText("source"),
-  status: routeText("status"),
-  topic: routeText("topic"),
   type: routeText("type"),
 })
 
@@ -75,13 +68,11 @@ const {
 const readyData = computed(() =>
   result.value?.state === "ready" ? result.value.data : undefined,
 )
-const topicOptions = computed(() => readyData.value?.facets.topics ?? [])
-const methodOptions = computed(() => readyData.value?.facets.methods ?? [])
 
 async function applyFilters() {
   const query: Record<string, string> = {}
   for (const [key, value] of Object.entries(filters)) {
-    const normalized = key === "q" ? value.trim() : value.trim()
+    const normalized = value.trim()
     if (normalized.length > 0) {
       query[key] = normalized
     }
@@ -98,7 +89,7 @@ async function applyFilters() {
       </p>
       <h1>论文</h1>
       <p class="page-lede">
-        搜索词、时间、分类、证据可用性、生命周期、来源与排序均直接映射到 Go API query。
+        搜索医学生物学已准入期刊中的有效研究论文与综述，并按日期、引用、趋势或相关度排序。
       </p>
     </header>
 
@@ -142,94 +133,6 @@ async function applyFilters() {
           <option value="">全部类型</option>
           <option value="research_article">研究论文</option>
           <option value="review">综述</option>
-          <option value="preprint">预印本</option>
-          <option value="dataset">数据集论文</option>
-          <option value="benchmark">Benchmark 论文</option>
-        </select>
-      </div>
-      <div>
-        <label for="paper-topic">Topic slug</label>
-        <select id="paper-topic" v-model="filters.topic" name="topic">
-          <option value="">全部 Topic</option>
-          <option
-            v-if="filters.topic && !topicOptions.some((item) => item.key === filters.topic)"
-            :value="filters.topic"
-          >
-            {{ filters.topic }}
-          </option>
-          <option v-for="item in topicOptions" :key="item.key" :value="item.key">
-            {{ item.label }}（{{ item.count }}）
-          </option>
-        </select>
-      </div>
-      <div>
-        <label for="paper-method">Method slug</label>
-        <select id="paper-method" v-model="filters.method" name="method">
-          <option value="">全部 Method</option>
-          <option
-            v-if="filters.method && !methodOptions.some((item) => item.key === filters.method)"
-            :value="filters.method"
-          >
-            {{ filters.method }}
-          </option>
-          <option v-for="item in methodOptions" :key="item.key" :value="item.key">
-            {{ item.label }}（{{ item.count }}）
-          </option>
-        </select>
-      </div>
-      <div>
-        <label for="has-code">代码状态</label>
-        <select id="has-code" v-model="filters.has_code" name="has_code">
-          <option value="">不限</option>
-          <option value="true">有代码</option>
-          <option value="false">无代码</option>
-        </select>
-      </div>
-      <div>
-        <label for="has-data">数据状态</label>
-        <select id="has-data" v-model="filters.has_data" name="has_data">
-          <option value="">不限</option>
-          <option value="true">有数据</option>
-          <option value="false">无数据</option>
-        </select>
-      </div>
-      <div>
-        <label for="has-benchmark">Benchmark 状态</label>
-        <select
-          id="has-benchmark"
-          v-model="filters.has_benchmark"
-          name="has_benchmark"
-        >
-          <option value="">不限</option>
-          <option value="true">有 Benchmark</option>
-          <option value="false">无 Benchmark</option>
-        </select>
-      </div>
-      <div>
-        <label for="paper-status">生命周期</label>
-        <select id="paper-status" v-model="filters.status" name="status">
-          <option value="">全部状态</option>
-          <option value="active">有效</option>
-          <option value="withdrawn">已撤回</option>
-          <option value="retracted">已撤稿</option>
-          <option value="rejected">已拒绝</option>
-          <option value="superseded">已被替代</option>
-        </select>
-      </div>
-      <div>
-        <label for="paper-source">来源</label>
-        <select id="paper-source" v-model="filters.source" name="source">
-          <option value="">全部来源</option>
-          <option value="crossref">Crossref</option>
-          <option value="arxiv">arXiv</option>
-          <option value="openreview">OpenReview</option>
-          <option value="s2">Semantic Scholar</option>
-          <option value="pubmed">PubMed</option>
-          <option value="pmc">PMC</option>
-          <option value="openalex">OpenAlex</option>
-          <option value="springer_nature">Springer Nature</option>
-          <option value="elsevier">Elsevier</option>
-          <option value="manual">人工录入</option>
         </select>
       </div>
       <div>

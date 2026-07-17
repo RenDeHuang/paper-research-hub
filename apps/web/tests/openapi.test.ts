@@ -1,17 +1,34 @@
 // @vitest-environment node
 
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
+import ts from "typescript"
 import { describe, expect, it } from "vitest"
 import { parse } from "yaml"
 
 const requestIDParameterRef = "#/components/parameters/RequestID"
 const discoveryResponseRef = "#/components/schemas/DiscoveryResponse"
+const journalReferenceRef = "#/components/schemas/JournalReference"
+const stringCatalogValueRef = "#/components/schemas/StringCatalogValue"
 const taxonomyItemRef = "#/components/schemas/TaxonomyItem"
+const taxonomyReferenceRef = "#/components/schemas/TaxonomyReference"
 const taxonomySlugRef = "#/components/schemas/TaxonomySlug"
 const openAPIPath = fileURLToPath(
   new URL("../../../contracts/openapi.yaml", import.meta.url),
+)
+const generatedTypesPath = fileURLToPath(
+  new URL("../app/types/openapi.generated.ts", import.meta.url),
+)
+const generatorPath = fileURLToPath(
+  new URL("../scripts/generate-openapi-types.mjs", import.meta.url),
+)
+const catalogTypesPath = fileURLToPath(
+  new URL("../app/types/catalog.ts", import.meta.url),
+)
+const biomedicalTypesPath = fileURLToPath(
+  new URL("../app/types/biomedical.ts", import.meta.url),
 )
 const document = parse(readFileSync(openAPIPath, "utf8")) as unknown
 
@@ -173,6 +190,638 @@ describe("OpenAPI contract", () => {
       })
     }
   })
+
+  it("declares biomedical paper summary fields in the public contract", () => {
+    const paperSummary = getRecord(
+      document,
+      "components",
+      "schemas",
+      "PaperSummary",
+    )
+    expect(paperSummary).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: expect.arrayContaining([
+        "citation_source",
+        "citation_snapshots",
+        "citation_velocity",
+        "citation_percentile",
+      ]),
+    })
+    expect(getRecord(paperSummary, "properties")).toMatchObject({
+      abstract_snippet: {
+        $ref: stringCatalogValueRef,
+      },
+      citation_analysis_evidence: {
+        $ref: "#/components/schemas/CitationAnalysisEvidenceCatalogValue",
+      },
+      citation_percentile: {
+        $ref: "#/components/schemas/CitationPercentileCatalogValue",
+      },
+      citation_snapshots: {
+        $ref: "#/components/schemas/CitationSnapshotsCatalogValue",
+      },
+      citation_source: {
+        $ref: stringCatalogValueRef,
+      },
+      citation_velocity: {
+        $ref: "#/components/schemas/CitationVelocityCatalogValue",
+      },
+      journal: {
+        $ref: journalReferenceRef,
+      },
+      publication_types: {
+        type: "array",
+        items: {
+          type: "string",
+          minLength: 1,
+        },
+      },
+      subjects: {
+        type: "array",
+        items: {
+          $ref: taxonomyReferenceRef,
+        },
+      },
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "JournalReference"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: ["id", "slug", "title"],
+      properties: {
+        id: {
+          type: "string",
+          format: "uuid",
+        },
+        slug: {
+          $ref: taxonomySlugRef,
+        },
+        title: {
+          type: "string",
+          minLength: 1,
+        },
+      },
+    })
+  })
+
+  it("declares every biomedical field emitted by the paper publisher", () => {
+    const emittedFields = {
+      mesh_headings:
+        "#/components/schemas/MeshHeadingsCatalogValue",
+      publication_types_state:
+        "#/components/schemas/PublicationTypesCatalogValue",
+      jcr_assessment:
+        "#/components/schemas/BiomedicalEligibilityRevisionCatalogValue",
+      article_usage:
+        "#/components/schemas/MissingCatalogValue",
+      open_fulltext:
+        "#/components/schemas/MissingCatalogValue",
+    }
+
+    for (const schemaName of ["PaperSummary", "PaperDetail"]) {
+      const paper = getRecord(
+        document,
+        "components",
+        "schemas",
+        schemaName,
+      )
+      expect(paper).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+        required: expect.arrayContaining(Object.keys(emittedFields)),
+      })
+
+      const properties = getRecord(paper, "properties")
+      for (const [field, reference] of Object.entries(emittedFields)) {
+        expect(properties[field], `${schemaName}.${field}`).toEqual({
+          $ref: reference,
+        })
+      }
+    }
+  })
+
+  it("constrains public trend scores to normalized ratios", () => {
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "TrendItem",
+        "properties",
+        "score",
+      ),
+    ).toEqual({
+      type: "number",
+      minimum: 0,
+      maximum: 1,
+    })
+  })
+
+  it("declares citation evidence on summary and detail payloads", () => {
+    for (const schemaName of ["PaperSummary", "PaperDetail"]) {
+      const paper = getRecord(
+        document,
+        "components",
+        "schemas",
+        schemaName,
+      )
+      expect(paper).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+        required: expect.arrayContaining([
+          "citation_source",
+          "citation_snapshots",
+          "citation_velocity",
+          "citation_percentile",
+        ]),
+        properties: {
+          citation_analysis_evidence: {
+            $ref: "#/components/schemas/CitationAnalysisEvidenceCatalogValue",
+          },
+          citation_percentile: {
+            $ref: "#/components/schemas/CitationPercentileCatalogValue",
+          },
+          citation_source: {
+            $ref: stringCatalogValueRef,
+          },
+          citation_snapshots: {
+            $ref: "#/components/schemas/CitationSnapshotsCatalogValue",
+          },
+          citation_velocity: {
+            $ref: "#/components/schemas/CitationVelocityCatalogValue",
+          },
+        },
+      })
+    }
+
+    expect(
+      getRecord(document, "components", "schemas", "CitationSnapshot"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "source",
+        "observed_at",
+        "count",
+        "source_record_id",
+        "ingestion_job_id",
+        "retrieved_at",
+        "coverage",
+        "definition_version",
+        "dataset_version",
+      ],
+      properties: {
+        source: {
+          type: "string",
+          minLength: 1,
+        },
+        observed_at: {
+          type: "string",
+          format: "date-time",
+        },
+        count: {
+          type: "integer",
+          minimum: 0,
+        },
+        source_record_id: {
+          type: "string",
+          format: "uuid",
+        },
+        ingestion_job_id: {
+          type: "string",
+          format: "uuid",
+        },
+        retrieved_at: {
+          type: "string",
+          format: "date-time",
+        },
+        coverage: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+        },
+        definition_version: {
+          type: "string",
+          minLength: 1,
+        },
+        dataset_version: {
+          type: "string",
+          minLength: 1,
+        },
+      },
+    })
+
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "CitationSnapshotsCatalogValue",
+      ),
+    ).toEqual({
+      oneOf: [
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["state", "value"],
+          properties: {
+            state: {
+              type: "string",
+              const: "known",
+            },
+            value: {
+              type: "array",
+              minItems: 1,
+              items: {
+                $ref: "#/components/schemas/CitationSnapshot",
+              },
+            },
+          },
+        },
+        {
+          $ref: "#/components/schemas/UnknownCatalogValue",
+        },
+        {
+          $ref: "#/components/schemas/MissingCatalogValue",
+        },
+      ],
+    })
+  })
+
+  it("models citation analysis values and run evidence without inferred fields", () => {
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "CitationAnalysisEvidence",
+      ),
+    ).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "analysis_run_id",
+        "source",
+        "as_of",
+        "generated_at",
+        "formula_version",
+        "source_revision",
+        "velocity",
+        "percentile",
+      ],
+      properties: {
+        analysis_run_id: {
+          type: "string",
+          format: "uuid",
+        },
+        source: {
+          type: "string",
+          minLength: 1,
+        },
+        as_of: {
+          type: "string",
+          format: "date-time",
+        },
+        generated_at: {
+          type: "string",
+          format: "date-time",
+        },
+        formula_version: {
+          type: "string",
+          minLength: 1,
+        },
+        source_revision: {
+          type: "string",
+          pattern: "^[0-9a-f]{64}$",
+        },
+        velocity: {
+          $ref: "#/components/schemas/CitationVelocityEvidence",
+        },
+        percentile: {
+          $ref: "#/components/schemas/CitationPercentileEvidence",
+        },
+      },
+    })
+
+    for (const [schemaName, knownSchema] of [
+      ["CitationVelocityCatalogValue", {
+        type: "number",
+      }],
+      ["CitationPercentileCatalogValue", {
+        type: "number",
+        minimum: 0,
+        maximum: 100,
+      }],
+    ] as const) {
+      const catalogValue = getRecord(
+        document,
+        "components",
+        "schemas",
+        schemaName,
+      )
+      expect(catalogValue).toMatchObject({
+        oneOf: expect.arrayContaining([
+          expect.objectContaining({
+            type: "object",
+            additionalProperties: false,
+            required: ["state", "value"],
+            properties: {
+              state: {
+                type: "string",
+                const: "known",
+              },
+              value: knownSchema,
+            },
+          }),
+          {
+            $ref: "#/components/schemas/InsufficientEvidenceCatalogValue",
+          },
+          {
+            $ref: "#/components/schemas/UnknownCatalogValue",
+          },
+          {
+            $ref: "#/components/schemas/MissingCatalogValue",
+          },
+        ]),
+      })
+    }
+  })
+
+  it("extends analysis metadata with run identity and cohort windows", () => {
+    expect(
+      getRecord(document, "components", "schemas", "AnalysisMetadata"),
+    ).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "coverage_ratio",
+        "generated_at",
+        "missing_signals",
+        "sample_size",
+        "sources",
+        "window_days",
+      ],
+      properties: {
+        analysis_run_id: {
+          type: "string",
+          format: "uuid",
+        },
+        analysis_type: {
+          type: "string",
+          minLength: 1,
+        },
+        baseline_window_days: {
+          type: "integer",
+          minimum: 0,
+        },
+        cohort_revision: {
+          type: "string",
+          pattern: "^[0-9a-f]{64}$",
+        },
+        recent_window_days: {
+          type: "integer",
+          minimum: 0,
+        },
+      },
+    })
+  })
+
+  it("publishes trend and entity estimates with support counts and uncertainty", () => {
+    for (const schemaName of ["SubjectTrendEstimate", "EntityMomentumItem"]) {
+      const schema = getRecord(document, "components", "schemas", schemaName)
+      expect(schema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+        required: expect.arrayContaining([
+          "baseline_count",
+          "confidence_interval",
+          "estimate",
+          "model_family",
+          "p_value",
+          "adjusted_p_value",
+          "recent_count",
+          "independent_journal_count",
+          "independent_team_count",
+        ]),
+        properties: {
+          adjusted_p_value: {
+            $ref: "#/components/schemas/NumberCatalogValue",
+          },
+          baseline_count: {
+            $ref: "#/components/schemas/IntegerCatalogValue",
+          },
+          confidence_interval: {
+            $ref: "#/components/schemas/ConfidenceInterval",
+          },
+          model_family: {
+            type: "string",
+            minLength: 1,
+          },
+          p_value: {
+            $ref: "#/components/schemas/NumberCatalogValue",
+          },
+          recent_count: {
+            $ref: "#/components/schemas/IntegerCatalogValue",
+          },
+        },
+      })
+    }
+  })
+
+  it("adds editorial interpretation metadata without causal framing", () => {
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "EditorialPatternEstimate",
+      ),
+    ).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: expect.arrayContaining([
+        "adjusted_p_value",
+        "confidence_interval",
+        "coverage_ratio",
+        "field_baseline_count",
+        "interpretation_kind",
+        "minimum_support_count",
+        "p_value",
+      ]),
+      properties: {
+        interpretation_kind: {
+          type: "string",
+          const: "editorial_pattern",
+        },
+        p_value: {
+          $ref: "#/components/schemas/NumberCatalogValue",
+        },
+        field_baseline_count: {
+          $ref: "#/components/schemas/IntegerCatalogValue",
+        },
+        minimum_support_count: {
+          $ref: "#/components/schemas/IntegerCatalogValue",
+        },
+      },
+    })
+  })
+
+  it("restructures research opportunities around rules, estimates and support work IDs", () => {
+    const opportunity = getRecord(
+      document,
+      "components",
+      "schemas",
+      "ResearchOpportunity",
+    )
+    expect(opportunity).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: expect.arrayContaining([
+        "analysis_run_id",
+        "coverage_ratio",
+        "estimates",
+        "formula_version",
+        "generated_at",
+        "id",
+        "status",
+        "supporting_work_ids",
+        "target_id",
+        "target_kind",
+        "title",
+        "trigger_rule",
+      ]),
+      properties: {
+        analysis_run_id: {
+          type: "string",
+          format: "uuid",
+        },
+        coverage_ratio: {
+          $ref: "#/components/schemas/RatioCatalogValue",
+        },
+        estimates: {
+          type: "array",
+          minItems: 1,
+          items: {
+            $ref: "#/components/schemas/ResearchOpportunityEstimate",
+          },
+        },
+        supporting_work_ids: {
+          type: "array",
+          minItems: 1,
+          uniqueItems: true,
+          items: {
+            type: "string",
+            format: "uuid",
+          },
+        },
+        target_kind: {
+          type: "string",
+          minLength: 1,
+        },
+        trigger_rule: {
+          $ref: "#/components/schemas/ResearchOpportunityTriggerRule",
+        },
+      },
+    })
+
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "ResearchOpportunityListResponse",
+      ),
+    ).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["analysis", "items", "pagination"],
+      properties: {
+        analysis: {
+          $ref: "#/components/schemas/AnalysisMetadata",
+        },
+      },
+    })
+  })
+})
+
+describe("generated OpenAPI TypeScript types", () => {
+  it("are synchronized with contracts/openapi.yaml", () => {
+    const result = spawnSync(process.execPath, [generatorPath, "--check"], {
+      encoding: "utf8",
+    })
+
+    expect(
+      result.status,
+      [result.stdout, result.stderr].filter(Boolean).join("\n"),
+    ).toBe(0)
+  })
+
+  it("contain no explicit any type", () => {
+    expect(
+      existsSync(generatedTypesPath),
+      "apps/web/app/types/openapi.generated.ts must be generated",
+    ).toBe(true)
+
+    const sourceFile = ts.createSourceFile(
+      generatedTypesPath,
+      readFileSync(generatedTypesPath, "utf8"),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    )
+    const explicitAnyLocations: string[] = []
+
+    visitTypeScriptNodes(sourceFile, (node) => {
+      if (node.kind === ts.SyntaxKind.AnyKeyword) {
+        const position = sourceFile.getLineAndCharacterOfPosition(node.getStart())
+        explicitAnyLocations.push(`${position.line + 1}:${position.character + 1}`)
+      }
+    })
+
+    expect(explicitAnyLocations).toEqual([])
+  })
+
+  it("keeps biomedical venue evidence narrower than unknown", () => {
+    const venueEvidence = getGeneratedComponentSchemaType(
+      "BiomedicalEligibilityVenueEvidence",
+    )
+    const unknownLocations: string[] = []
+
+    visitTypeScriptNodes(venueEvidence.type, (node) => {
+      if (node.kind === ts.SyntaxKind.UnknownKeyword) {
+        const position = venueEvidence.sourceFile.getLineAndCharacterOfPosition(
+          node.getStart(),
+        )
+        unknownLocations.push(`${position.line + 1}:${position.character + 1}`)
+      }
+    })
+
+    expect(unknownLocations).toEqual([])
+  })
+
+  it("exposes API responses as generated component schema aliases", () => {
+    expectComponentSchemaAliases(catalogTypesPath, {
+      MethodListResponse: "MethodListResponse",
+      PaperDetail: "PaperDetail",
+      PaperListResponse: "PaperListResponse",
+      PaperSummary: "PaperSummary",
+      ProblemDetails: "ProblemDetails",
+      ResearchOpportunityListResponse: "ResearchOpportunityListResponse",
+      StatsResponse: "StatsResponse",
+      TopicListResponse: "TopicListResponse",
+      TrendListResponse: "TrendListResponse",
+    })
+    expectComponentSchemaAliases(biomedicalTypesPath, {
+      HomeResponse: "HomeResponse",
+      JournalDetailResponse: "JournalDetailResponse",
+      JournalListResponse: "JournalListResponse",
+      SubjectDetailResponse: "SubjectDetailResponse",
+      SubjectListResponse: "SubjectListResponse",
+    })
+  })
 })
 
 function publicOperations(value: unknown) {
@@ -272,4 +921,119 @@ function getRecord(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function visitTypeScriptNodes(
+  node: ts.Node,
+  visitor: (node: ts.Node) => void,
+) {
+  visitor(node)
+  node.forEachChild((child) => visitTypeScriptNodes(child, visitor))
+}
+
+function expectComponentSchemaAliases(
+  path: string,
+  expectedAliases: Record<string, string>,
+) {
+  const sourceFile = ts.createSourceFile(
+    path,
+    readFileSync(path, "utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  )
+  const aliases = new Map(
+    sourceFile.statements
+      .filter(ts.isTypeAliasDeclaration)
+      .map((declaration) => [
+        declaration.name.text,
+        indexedAccessPath(declaration.type),
+      ]),
+  )
+
+  for (const [aliasName, schemaName] of Object.entries(expectedAliases)) {
+    expect(aliases.get(aliasName), aliasName).toEqual([
+      "components",
+      "schemas",
+      schemaName,
+    ])
+  }
+}
+
+function getGeneratedComponentSchemaType(schemaName: string) {
+  const sourceFile = ts.createSourceFile(
+    generatedTypesPath,
+    readFileSync(generatedTypesPath, "utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  )
+  const components = sourceFile.statements.find(
+    (statement): statement is ts.InterfaceDeclaration =>
+      ts.isInterfaceDeclaration(statement)
+      && statement.name.text === "components",
+  )
+  if (components === undefined) {
+    throw new Error("generated components interface is missing")
+  }
+
+  const schemas = findPropertySignature(components.members, "schemas")
+  if (schemas.type === undefined || !ts.isTypeLiteralNode(schemas.type)) {
+    throw new Error("generated components.schemas type is missing")
+  }
+
+  const schema = findPropertySignature(schemas.type.members, schemaName)
+  if (schema.type === undefined) {
+    throw new Error(`generated schema type is missing: ${schemaName}`)
+  }
+  return {
+    sourceFile,
+    type: schema.type,
+  }
+}
+
+function findPropertySignature(
+  members: ts.NodeArray<ts.TypeElement>,
+  name: string,
+) {
+  const property = members.find(
+    (member): member is ts.PropertySignature =>
+      ts.isPropertySignature(member)
+      && propertyNameText(member.name) === name,
+  )
+  if (property === undefined) {
+    throw new Error(`generated property is missing: ${name}`)
+  }
+  return property
+}
+
+function propertyNameText(name: ts.PropertyName) {
+  if (
+    ts.isIdentifier(name)
+    || ts.isStringLiteral(name)
+    || ts.isNumericLiteral(name)
+  ) {
+    return name.text
+  }
+  return undefined
+}
+
+function indexedAccessPath(node: ts.TypeNode): string[] | undefined {
+  if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
+    return [node.typeName.text]
+  }
+  if (!ts.isIndexedAccessTypeNode(node)) {
+    return undefined
+  }
+
+  const objectPath = indexedAccessPath(node.objectType)
+  const argument = node.indexType
+  if (
+    objectPath === undefined
+    || !ts.isLiteralTypeNode(argument)
+    || !ts.isStringLiteral(argument.literal)
+  ) {
+    return undefined
+  }
+  return [...objectPath, argument.literal.text]
 }

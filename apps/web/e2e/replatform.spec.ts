@@ -14,7 +14,7 @@ for (const width of [375, 768, 1024, 1440]) {
     await expect(
       page.getByRole("heading", {
         level: 1,
-        name: "论文研究情报，从发现到证据",
+        name: "医学生物学研究情报，从新论文到可验证趋势",
       }),
     ).toBeVisible()
     await expect(page.locator('nav[aria-label="一级导航"]')).toBeAttached()
@@ -154,7 +154,7 @@ test("loads a shareable search query and submits the trimmed default URL", async
   await page.goto("/?q=shared%20query")
   await waitForNuxtHydration(page)
   const search = page.getByRole("combobox", {
-    name: "搜索论文与研究实体",
+    name: "搜索医学生物学论文",
   })
 
   await expect(search).toHaveValue("shared query")
@@ -168,7 +168,7 @@ test("restores the homepage search query through browser history", async ({
   page,
 }) => {
   const search = page.getByRole("combobox", {
-    name: "搜索论文与研究实体",
+    name: "搜索医学生物学论文",
   })
 
   await page.goto("/?q=first")
@@ -217,26 +217,17 @@ for (const route of [
   })
 }
 
-test("restores every supported paper filter from the shareable URL", async ({
+test("restores the admitted biomedical paper filters from the shareable URL", async ({
   page,
 }) => {
   await page.goto(
-    "/papers?q=agent&type=research_article&topic=agents&method=causal-inference"
-    + "&has_code=true&has_data=false&has_benchmark=true&status=active"
-    + "&source=openalex&sort=relevance"
+    "/papers?q=oncology&type=research_article&sort=relevance"
     + "&published_from=2026-07-01T00%3A00%3A00Z"
     + "&published_to=2026-07-16T23%3A59%3A59Z",
   )
 
-  await expect(page.locator('[name="q"]')).toHaveValue("agent")
+  await expect(page.locator('[name="q"]')).toHaveValue("oncology")
   await expect(page.locator('[name="type"]')).toHaveValue("research_article")
-  await expect(page.locator('[name="topic"]')).toHaveValue("agents")
-  await expect(page.locator('[name="method"]')).toHaveValue("causal-inference")
-  await expect(page.locator('[name="has_code"]')).toHaveValue("true")
-  await expect(page.locator('[name="has_data"]')).toHaveValue("false")
-  await expect(page.locator('[name="has_benchmark"]')).toHaveValue("true")
-  await expect(page.locator('[name="status"]')).toHaveValue("active")
-  await expect(page.locator('[name="source"]')).toHaveValue("openalex")
   await expect(page.locator('[name="sort"]')).toHaveValue("relevance")
   await expect(page.locator('[name="published_from"]')).toHaveValue(
     "2026-07-01T00:00:00Z",
@@ -244,6 +235,22 @@ test("restores every supported paper filter from the shareable URL", async ({
   await expect(page.locator('[name="published_to"]')).toHaveValue(
     "2026-07-16T23:59:59Z",
   )
+  await expect(page.locator('[name="type"] option')).toHaveText([
+    "全部类型",
+    "研究论文",
+    "综述",
+  ])
+  for (const removed of [
+    "topic",
+    "method",
+    "has_code",
+    "has_data",
+    "has_benchmark",
+    "status",
+    "source",
+  ]) {
+    await expect(page.locator(`[name="${removed}"]`)).toHaveCount(0)
+  }
   await expect(page.locator('[name="jif_min"]')).toHaveCount(0)
   await expect(page.locator('[name="jcr_quartile"]')).toHaveCount(0)
 })
@@ -253,24 +260,20 @@ test("submits paper filters as exact Go API query names", async ({ page }) => {
   const submitButton = page.getByRole("button", { name: "应用筛选" })
   await expect(submitButton).toBeEnabled()
 
-  await page.locator('[name="q"]').fill("agent evaluation")
-  await page.locator('[name="has_code"]').selectOption("true")
-  await page.locator('[name="status"]').selectOption("active")
-  await page.locator('[name="source"]').selectOption("openalex")
+  await page.locator('[name="q"]').fill("oncology cohort")
+  await page.locator('[name="type"]').selectOption("review")
   await page.locator('[name="sort"]').selectOption("relevance")
   await submitButton.click()
 
   await expect
     .poll(() => new URL(page.url()).searchParams.get("q"))
-    .toBe("agent evaluation")
+    .toBe("oncology cohort")
   expect(new URL(page.url()).pathname).toBe("/papers")
   const query = new URL(page.url()).searchParams
   expect(Object.fromEntries(query)).toEqual({
-    has_code: "true",
-    q: "agent evaluation",
+    q: "oncology cohort",
     sort: "relevance",
-    source: "openalex",
-    status: "active",
+    type: "review",
   })
 })
 

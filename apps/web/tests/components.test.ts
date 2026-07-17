@@ -221,6 +221,33 @@ describe("AppFooter", () => {
 })
 
 describe("SearchCommand", () => {
+  it("uses conservative biomedical copy for its q-only default search contract", async () => {
+    const wrapper = await mountSuspended(SearchCommand)
+    const input = wrapper.get('input[name="q"]')
+
+    expect(wrapper.get('label[for="global-search"]').text()).toBe(
+      "搜索医学生物学论文",
+    )
+    expect(wrapper.get("#global-search-helper").text()).toBe(
+      "输入标题、作者、期刊或 DOI/PMID 关键词。",
+    )
+    expect(input.attributes("name")).toBe("q")
+
+    for (const unsupportedClaim of [
+      "Topic",
+      "Method",
+      "Dataset",
+      "Benchmark",
+      "Venue",
+      "MeSH",
+      "Publication Type",
+    ]) {
+      expect(wrapper.get(".search-command").text()).not.toContain(
+        unsupportedClaim,
+      )
+    }
+  })
+
   it("associates a visible label and helper text with the search field", async () => {
     const wrapper = await mountSuspended(SearchCommand, {
       props: {
@@ -1123,6 +1150,40 @@ describe("OpportunityMatrix", () => {
         )[0]
         ?.attributes("aria-label"),
     ).toContain("缺失信号 外部验证；长期随访")
+  })
+
+  it("keeps an omitted missing-signal collection distinct from an explicit empty collection", async () => {
+    const wrapper = await mountSuspended(OpportunityMatrix, {
+      props: {
+        points: [
+          {
+            id: "uncovered-signals",
+            label: "方向 H",
+            status: "proceed-with-caution",
+            x: { state: "known", value: 40 },
+            y: { state: "known", value: 60 },
+          },
+          {
+            id: "no-missing-signals",
+            label: "方向 I",
+            missingSignals: [],
+            status: "worth-pursuing",
+            x: { state: "known", value: 20 },
+            y: { state: "known", value: 80 },
+          },
+        ],
+        summary: "区分未覆盖与明确空集合。",
+        title: "缺失信号覆盖测试",
+        xAxisLabel: "竞争密度",
+        yAxisLabel: "增长信号",
+      },
+    })
+
+    const signalCells = wrapper.findAll("tbody [data-missing-signals]")
+    expect(signalCells.map((cell) => cell.text())).toEqual(["未覆盖", "无"])
+    expect(
+      signalCells.map((cell) => cell.attributes("data-value-state")),
+    ).toEqual(["unknown", "known"])
   })
 
   it("renders an explicit empty state without a matrix overview", async () => {

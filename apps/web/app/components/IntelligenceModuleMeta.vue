@@ -36,6 +36,37 @@ const generatedAt = computed<DataValue<string>>(() => {
     value: formatCatalogDate(value.value),
   }
 })
+const analysisRunID = computed(() =>
+  catalogDataValue(props.analysis.analysis_run_id),
+)
+const analysisType = computed(() =>
+  catalogDataValue(props.analysis.analysis_type),
+)
+const cohortRevision = computed(() =>
+  catalogDataValue(props.analysis.cohort_revision),
+)
+const recentWindowDays = computed<DataValue<number>>(() => {
+  const value = catalogDataValue(props.analysis.recent_window_days)
+  if (value.state !== "known") {
+    return value
+  }
+  return {
+    state: "known",
+    suffix: " 天",
+    value: value.value,
+  }
+})
+const baselineWindowDays = computed<DataValue<number>>(() => {
+  const value = catalogDataValue(props.analysis.baseline_window_days)
+  if (value.state !== "known") {
+    return value
+  }
+  return {
+    state: "known",
+    suffix: " 天",
+    value: value.value,
+  }
+})
 const sampleSize = computed(() =>
   catalogDataValue(props.analysis.sample_size),
 )
@@ -45,6 +76,12 @@ const coverage = computed(() =>
 const sources = computed(() =>
   catalogDataValue(props.analysis.sources),
 )
+const formulaVersion = computed(() =>
+  catalogDataValue(
+    props.analysis.formula_version,
+    "公式版本字段未覆盖",
+  ),
+)
 const missingSignals = computed(() =>
   missingSignalLabels(props.analysis.missing_signals),
 )
@@ -53,12 +90,57 @@ const missingSignals = computed(() =>
 <template>
   <dl class="intelligence-meta" aria-label="分析范围与覆盖">
     <div>
+      <dt>分析 run ID</dt>
+      <dd
+        data-analysis-run-id
+        :data-value-state="analysisRunID.state"
+      >
+        {{ presentDataValue(analysisRunID).text }}
+      </dd>
+    </div>
+    <div>
+      <dt>分析类型</dt>
+      <dd
+        data-analysis-type
+        :data-value-state="analysisType.state"
+      >
+        {{ presentDataValue(analysisType).text }}
+      </dd>
+    </div>
+    <div>
+      <dt>cohort revision</dt>
+      <dd
+        data-cohort-revision
+        :data-value-state="cohortRevision.state"
+      >
+        {{ presentDataValue(cohortRevision).text }}
+      </dd>
+    </div>
+    <div>
       <dt>统计窗口</dt>
       <dd
         data-window
         :data-value-state="windowValue.state"
       >
         {{ presentDataValue(windowValue).text }}
+      </dd>
+    </div>
+    <div>
+      <dt>最近窗口</dt>
+      <dd
+        data-recent-window-days
+        :data-value-state="recentWindowDays.state"
+      >
+        {{ presentDataValue(recentWindowDays).text }}
+      </dd>
+    </div>
+    <div>
+      <dt>基线窗口</dt>
+      <dd
+        data-baseline-window-days
+        :data-value-state="baselineWindowDays.state"
+      >
+        {{ presentDataValue(baselineWindowDays).text }}
       </dd>
     </div>
     <div>
@@ -92,6 +174,15 @@ const missingSignals = computed(() =>
       <dt>数据来源</dt>
       <dd :data-value-state="sources.state">
         {{ presentDataValue(sources).text }}
+      </dd>
+    </div>
+    <div>
+      <dt>公式版本</dt>
+      <dd
+        data-formula-version
+        :data-value-state="formulaVersion.state"
+      >
+        {{ presentDataValue(formulaVersion).text }}
       </dd>
     </div>
     <div>

@@ -19,9 +19,14 @@ const journalPages = import.meta.glob<{ default: Component }>(
 const generatedAt = "2026-07-17T08:30:00Z"
 const known = <T>(value: T) => ({ state: "known" as const, value })
 const analysis = {
+  analysis_run_id: "11111111-1111-4111-8111-111111111111",
+  analysis_type: "journal_editorial_pattern",
+  baseline_window_days: 90,
   coverage_ratio: known(0.88),
+  cohort_revision: "a".repeat(64),
   generated_at: generatedAt,
   missing_signals: [],
+  recent_window_days: 90,
   sample_size: known(112),
   sources: ["PubMed", "JCR"],
   window_days: 90,
@@ -66,12 +71,13 @@ const journal = {
     policy_name: "biomedical-journal-admission",
     policy_version: 3,
   },
-  editorial_patterns: {
+    editorial_patterns: {
     analysis,
     items: [
       {
         adjusted_p_value: known(0.012),
         baseline: "同 JCR Category、同 90 天窗口期刊",
+        field_baseline_count: known(86),
         confidence_interval: {
           lower: 1.24,
           upper: 2.31,
@@ -80,7 +86,10 @@ const journal = {
         dimension: "MeSH",
         estimate: known(1.69),
         estimate_kind: "odds_ratio",
+        interpretation_kind: "editorial_pattern",
         label: "Lung Neoplasms",
+        minimum_support_count: known(18),
+        p_value: known(0.008),
         support_papers: known(28),
       },
     ],
@@ -185,9 +194,12 @@ describe("journal intelligence pages", () => {
       "最近论文",
       "编辑与选题模式估计",
       "同 JCR Category、同 90 天窗口期刊",
+      "editorial_pattern",
       "支持论文数",
       "覆盖率",
       "证据缺口",
+      "领域基线数",
+      "最低支持数",
     ]) {
       expect(wrapper.text()).toContain(label)
     }

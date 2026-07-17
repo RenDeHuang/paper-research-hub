@@ -13,12 +13,20 @@ defineProps<{
   patterns: AnalysisCollection<EditorialPatternEstimate>
 }>()
 
+const numberFormatter = new Intl.NumberFormat("zh-CN", {
+  maximumFractionDigits: 3,
+})
+
 function estimateText(item: EditorialPatternEstimate) {
   const value = catalogDataValue(item.estimate)
   if (value.state !== "known") {
     return presentDataValue(value).text
   }
-  return `${value.value.toFixed(2)}×`
+  return `${numberFormatter.format(value.value)}×`
+}
+
+function intervalText(interval: EditorialPatternEstimate["confidence_interval"]) {
+  return `${numberFormatter.format(interval.lower)}–${numberFormatter.format(interval.upper)}`
 }
 </script>
 
@@ -56,37 +64,45 @@ function estimateText(item: EditorialPatternEstimate) {
           <tr>
             <th scope="col">维度</th>
             <th scope="col">实体</th>
-            <th scope="col">估计类型</th>
+            <th scope="col">解释</th>
             <th scope="col">估计值</th>
             <th scope="col">95% 区间</th>
-            <th scope="col">基线</th>
+            <th scope="col">p 值</th>
+            <th scope="col">校正 p 值</th>
+            <th scope="col">领域基线</th>
+            <th scope="col">领域基线数</th>
+            <th scope="col">最低支持数</th>
             <th scope="col">支持论文数</th>
             <th scope="col">覆盖率</th>
-            <th scope="col">校正 p 值</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="item in patterns.items" :key="`${item.dimension}:${item.label}`">
             <td>{{ item.dimension }}</td>
             <th scope="row">{{ item.label }}</th>
-            <td>
-              {{ item.estimate_kind === "odds_ratio" ? "odds ratio" : "rate ratio" }}
-            </td>
+            <td>{{ item.interpretation_kind }}</td>
             <td :data-value-state="catalogDataValue(item.estimate).state">
               {{ estimateText(item) }}
             </td>
-            <td>
-              {{ item.confidence_interval.lower.toFixed(2) }}–{{ item.confidence_interval.upper.toFixed(2) }}
+            <td>{{ intervalText(item.confidence_interval) }}</td>
+            <td :data-value-state="catalogDataValue(item.p_value).state">
+              {{ presentDataValue(catalogDataValue(item.p_value)).text }}
+            </td>
+            <td :data-value-state="catalogDataValue(item.adjusted_p_value).state">
+              {{ presentDataValue(catalogDataValue(item.adjusted_p_value)).text }}
             </td>
             <td>{{ item.baseline }}</td>
+            <td :data-value-state="catalogDataValue(item.field_baseline_count).state">
+              {{ presentDataValue(catalogDataValue(item.field_baseline_count)).text }}
+            </td>
+            <td :data-value-state="catalogDataValue(item.minimum_support_count).state">
+              {{ presentDataValue(catalogDataValue(item.minimum_support_count)).text }}
+            </td>
             <td :data-value-state="catalogDataValue(item.support_papers).state">
               {{ presentDataValue(catalogDataValue(item.support_papers)).text }}
             </td>
             <td :data-value-state="percentageDataValue(item.coverage_ratio).state">
               {{ presentDataValue(percentageDataValue(item.coverage_ratio)).text }}
-            </td>
-            <td :data-value-state="catalogDataValue(item.adjusted_p_value).state">
-              {{ presentDataValue(catalogDataValue(item.adjusted_p_value)).text }}
             </td>
           </tr>
         </tbody>

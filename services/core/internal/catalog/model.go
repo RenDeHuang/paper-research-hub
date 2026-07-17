@@ -19,13 +19,19 @@ var (
 )
 
 type PublishInput struct {
-	FormulaVersion     string
-	GeneratedAt        time.Time
-	JCRMetricYear      int
-	VenuePolicyName    string
-	VenuePolicyVersion int
-	SubjectVersion     string
-	JCRImportReceipt   uuid.UUID
+	FormulaVersion           string
+	GeneratedAt              time.Time
+	JCRMetricYear            int
+	VenuePolicyName          string
+	VenuePolicyVersion       int
+	EligibilityPolicyVersion string
+	SubjectVersion           string
+	JCRImportReceipt         uuid.UUID
+	CitationSource           string
+	CitationAnalysisRunID    uuid.UUID
+	TrendAnalysisRunID       uuid.UUID
+	JournalAnalysisRunID     uuid.UUID
+	OpportunityAnalysisRunID uuid.UUID
 }
 
 type Generation struct {
@@ -75,6 +81,13 @@ type TaxonomyPage struct {
 	Pagination Pagination
 }
 
+type BiomedicalPage struct {
+	Generation Generation
+	Metadata   json.RawMessage
+	Items      []json.RawMessage
+	Pagination Pagination
+}
+
 type TrendPage struct {
 	Generation Generation
 	WindowDays int
@@ -84,6 +97,7 @@ type TrendPage struct {
 
 type OpportunityPage struct {
 	Generation Generation
+	Analysis   json.RawMessage
 	Items      []json.RawMessage
 	Pagination Pagination
 }

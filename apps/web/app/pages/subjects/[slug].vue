@@ -215,6 +215,9 @@ function distributionValue(item: DistributionBucket) {
         <div v-else class="trend-estimate-grid">
           <article v-for="item in readyData.trend_estimates.items" :key="item.label">
             <h3>{{ item.label ?? "趋势估计" }}</h3>
+            <p class="metric-card__model">
+              模型：{{ item.model_family }}
+            </p>
             <p :data-value-state="catalogDataValue(item.estimate).state">
               {{
                 catalogDataValue(item.estimate).state === "known"

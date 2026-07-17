@@ -1,6 +1,4 @@
 <script setup lang="ts">
-import { formatCatalogDate } from "~/utils/catalogPresentation"
-import { trendQueryFromRoute } from "~/utils/catalogQuery"
 import { settleCatalogRequest } from "~/utils/catalogResult"
 
 definePageMeta({
@@ -12,88 +10,35 @@ useHead({
   meta: [
     {
       name: "description",
-      content: "查看真实公开目录中的论文、Topic 与 Method 趋势排名。",
+      content: "查看 medpaperhub 医学生物学学科、引用及疾病、靶点和方法趋势。",
     },
   ],
 })
 
-const route = useRoute()
-const router = useRouter()
 const client = useCatalogApi()
-const windowDays = ref(
-  typeof route.query.window_days === "string"
-    ? route.query.window_days
-    : "30",
-)
-
-watch(
-  () => route.query.window_days,
-  (value) => {
-    windowDays.value = typeof value === "string" ? value : "30"
-  },
-)
-
 const {
   data: result,
   status,
   refresh,
-} = await useAsyncData(
-  "trends-catalog",
-  () =>
-    settleCatalogRequest(async () => {
-      const query = trendQueryFromRoute(route.query)
-      const [papers, topics, methods] = await Promise.all([
-        client.listPaperTrends(query),
-        client.listTopicTrends(query),
-        client.listMethodTrends(query),
-      ])
-      return { methods, papers, topics }
-    }),
-  {
-    watch: [() => route.fullPath],
-  },
+} = await useAsyncData("trends-home-catalog", () =>
+  settleCatalogRequest(() => client.getHome()),
 )
 const readyData = computed(() =>
   result.value?.state === "ready" ? result.value.data : undefined,
 )
-
-async function applyWindow() {
-  await router.push({
-    path: "/trends",
-    query: {
-      window_days: windowDays.value,
-    },
-  })
-}
 </script>
 
 <template>
-  <div class="portal-page">
+  <div class="trend-overview portal-page">
     <header class="page-header">
       <p class="page-eyebrow">
-        分析快照
+        medpaperhub intelligence
       </p>
-      <h1>趋势</h1>
+      <h1>医学生物学趋势总览</h1>
       <p class="page-lede">
-        展示 API 已计算的排名、分数、名次变化与缺失信号；页面不会生成时间序列或补齐趋势。
+        同一目录快照汇总学科发表率、论文引用增速，以及疾病、靶点和方法实体趋势。每个模块保留 API 给出的独立统计窗口、来源与缺失状态。
       </p>
     </header>
-
-    <form class="compact-filter" @submit.prevent="applyWindow">
-      <div>
-        <label for="trend-window">排名窗口</label>
-        <select id="trend-window" v-model="windowDays" name="window_days">
-          <option value="7">7 天</option>
-          <option value="30">30 天</option>
-          <option value="90">90 天</option>
-          <option value="180">180 天</option>
-          <option value="365">365 天</option>
-        </select>
-      </div>
-      <button class="button button--primary" type="submit">
-        更新窗口
-      </button>
-    </form>
 
     <CatalogState
       :result="result"
@@ -103,46 +48,39 @@ async function applyWindow() {
     />
 
     <template v-if="readyData">
-      <section class="analysis-meta" aria-label="趋势生成信息">
-        <dl class="detail-list">
-          <div>
-            <dt>论文趋势生成时间</dt>
-            <dd>{{ formatCatalogDate(readyData.papers.generated_at) }}</dd>
-          </div>
-          <div>
-            <dt>Topic 趋势生成时间</dt>
-            <dd>{{ formatCatalogDate(readyData.topics.generated_at) }}</dd>
-          </div>
-          <div>
-            <dt>Method 趋势生成时间</dt>
-            <dd>{{ formatCatalogDate(readyData.methods.generated_at) }}</dd>
-          </div>
-          <div>
-            <dt>窗口</dt>
-            <dd>{{ readyData.papers.window_days }} 天</dd>
-          </div>
-        </dl>
-      </section>
-
-      <div class="trend-sections">
-        <TrendRankingList title="论文趋势" :items="readyData.papers.items" />
-        <TrendRankingList title="Topic 趋势" :items="readyData.topics.items" />
-        <TrendRankingList title="Method 趋势" :items="readyData.methods.items" />
+      <div class="trend-overview__primary">
+        <SubjectMomentumGrid :momentum="readyData.subject_momentum" />
+        <CitationMomentumList :momentum="readyData.citation_momentum" />
       </div>
+      <EntityMomentumGrid :momentum="readyData.entity_momentum" />
     </template>
   </div>
 </template>
 
 <style scoped>
-.analysis-meta {
-  padding: var(--space-4);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
+.page-header {
+  display: grid;
+  gap: var(--space-4);
+  max-width: 840px;
 }
 
-.trend-sections {
+h1 {
+  max-width: 18ch;
+  margin: 0;
+  color: var(--color-text-strong);
+  font-size: clamp(var(--text-2xl-size), 7vw, var(--text-4xl-size));
+  line-height: var(--text-4xl-line);
+  overflow-wrap: anywhere;
+}
+
+.trend-overview__primary {
   display: grid;
-  gap: var(--space-10);
+  gap: var(--space-8);
+}
+
+@media (min-width: 1440px) {
+  .trend-overview__primary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 </style>

@@ -105,10 +105,22 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 			"journal-jif-or-q1",
 			"--venue-policy-version",
 			"1",
+			"--eligibility-policy-version",
+			"biomedical-public-eligibility/v1",
 			"--subject-version",
 			"biomedical-jcr-subjects/v1",
 			"--jcr-import-receipt",
 			"00000000-0000-0000-0000-000000000501",
+			"--citation-source",
+			"openalex",
+			"--citation-analysis-run-id",
+			"00000000-0000-0000-0000-000000000701",
+			"--trend-analysis-run-id",
+			"00000000-0000-0000-0000-000000000702",
+			"--journal-analysis-run-id",
+			"00000000-0000-0000-0000-000000000703",
+			"--opportunity-analysis-run-id",
+			"00000000-0000-0000-0000-000000000704",
 		},
 		&stdout,
 		&stderr,
@@ -142,8 +154,19 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 	if received.MetricYear != 2025 ||
 		received.VenuePolicyName != "journal-jif-or-q1" ||
 		received.VenuePolicyVersion != 1 ||
+		received.EligibilityPolicyVersion !=
+			"biomedical-public-eligibility/v1" ||
 		received.SubjectVersion != "biomedical-jcr-subjects/v1" ||
-		received.JCRReceipt != "00000000-0000-0000-0000-000000000501" {
+		received.JCRReceipt != "00000000-0000-0000-0000-000000000501" ||
+		received.CitationSource != "openalex" ||
+		received.CitationAnalysisRunID !=
+			"00000000-0000-0000-0000-000000000701" ||
+		received.TrendAnalysisRunID !=
+			"00000000-0000-0000-0000-000000000702" ||
+		received.JournalAnalysisRunID !=
+			"00000000-0000-0000-0000-000000000703" ||
+		received.OpportunityAnalysisRunID !=
+			"00000000-0000-0000-0000-000000000704" {
 		t.Fatalf("Catalog curation inputs = %#v", received)
 	}
 

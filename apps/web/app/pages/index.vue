@@ -3,7 +3,6 @@ import type { DataValue } from "~/utils/dataValue"
 import {
   catalogDataValue,
   formatCatalogDate,
-  opportunityStatusPresentation,
   percentageDataValue,
 } from "~/utils/catalogPresentation"
 import { settleCatalogRequest } from "~/utils/catalogResult"
@@ -72,13 +71,6 @@ const syncStatus = computed<{
   }
 })
 
-const entityTypeLabels = {
-  disease: "疾病",
-  method: "方法",
-  publication_type: "Publication Type",
-  study_design: "研究设计",
-  target: "靶点",
-} as const
 </script>
 
 <template>
@@ -137,47 +129,7 @@ const entityTypeLabels = {
 
       <JournalActivityList :activity="readyData.active_journals" />
 
-      <section
-        class="intelligence-module entity-momentum"
-        data-intelligence-module="entity-momentum"
-        aria-labelledby="entity-momentum-heading"
-      >
-        <div class="section-heading">
-          <div>
-            <p class="section-kicker">
-              医学语义与研究方法
-            </p>
-            <h2 id="entity-momentum-heading">
-              热门疾病/靶点/方法
-            </h2>
-          </div>
-        </div>
-
-        <IntelligenceModuleMeta :analysis="readyData.entity_momentum.analysis" />
-
-        <DataState
-          v-if="readyData.entity_momentum.items.length === 0"
-          state="empty"
-          title="当前窗口没有实体趋势"
-          message="API 已成功返回空集合；页面不会从论文标题推断疾病、靶点或方法。"
-        />
-        <div v-else class="entity-momentum__grid">
-          <article
-            v-for="item in readyData.entity_momentum.items"
-            :key="`${item.entity_type}:${item.label}`"
-          >
-            <p>{{ entityTypeLabels[item.entity_type] }}</p>
-            <h3>{{ item.label }}</h3>
-            <strong :data-value-state="catalogDataValue(item.estimate).state">
-              {{
-                catalogDataValue(item.estimate).state === "known"
-                  ? `${presentDataValue(catalogDataValue(item.estimate)).text}×`
-                  : presentDataValue(catalogDataValue(item.estimate)).text
-              }}
-            </strong>
-          </article>
-        </div>
-      </section>
+      <EntityMomentumGrid :momentum="readyData.entity_momentum" />
 
       <section
         class="intelligence-module home-opportunities"
@@ -193,45 +145,13 @@ const entityTypeLabels = {
               研究机会
             </h2>
           </div>
-          <NuxtLink class="button button--secondary" to="/opportunities">
-            查看全部机会
-          </NuxtLink>
-        </div>
-
-        <IntelligenceModuleMeta :analysis="readyData.research_opportunities.analysis" />
-
-        <DataState
-          v-if="readyData.research_opportunities.items.length === 0"
-          state="empty"
-          title="当前没有研究机会"
-          message="API 已成功返回空集合；页面不会自由生成研究建议。"
-        />
-        <div v-else class="home-opportunities__grid">
-          <article
-            v-for="item in readyData.research_opportunities.items"
-            :key="item.id"
-          >
-            <div class="home-opportunities__topline">
-              <span>{{ opportunityStatusPresentation(item.status) }}</span>
-              <code>{{ item.formula_version }}</code>
-            </div>
-            <h3>{{ item.title }}</h3>
-            <p :data-value-state="item.summary === undefined ? 'unknown' : 'known'">
-              {{ item.summary ?? "摘要字段未覆盖" }}
-            </p>
-            <p>
-              证据论文 {{ item.evidence_ids.length }} 篇
-            </p>
-            <p>
-              缺失信号：
-              {{
-                item.missing_signals?.length
-                  ? item.missing_signals.join("、")
-                  : "API 明确返回空集合"
-              }}
-            </p>
-          </article>
-        </div>
+        <NuxtLink class="button button--secondary" to="/opportunities">
+          查看全部机会
+        </NuxtLink>
+      </div>
+      <ResearchOpportunityBoard
+        :collection="readyData.research_opportunities"
+      />
       </section>
 
       <section
@@ -329,14 +249,12 @@ h1 {
   gap: var(--space-8);
 }
 
-.entity-momentum__grid,
 .home-opportunities__grid,
 .coverage-panel__grid {
   display: grid;
   gap: var(--space-3);
 }
 
-.entity-momentum article,
 .home-opportunities article,
 .coverage-panel__grid > div {
   display: grid;
@@ -348,8 +266,6 @@ h1 {
   background: var(--color-surface);
 }
 
-.entity-momentum p,
-.entity-momentum h3,
 .home-opportunities h3,
 .home-opportunities p,
 .coverage-panel__grid,
@@ -357,23 +273,14 @@ h1 {
   margin: 0;
 }
 
-.entity-momentum p,
 .coverage-panel__grid dt {
   color: var(--color-text-muted);
   font-size: var(--text-sm-size);
 }
 
-.entity-momentum h3,
 .home-opportunities h3 {
   color: var(--color-text-strong);
   font-size: var(--text-lg-size);
-}
-
-.entity-momentum strong {
-  color: var(--color-positive);
-  font-family: var(--font-data);
-  font-size: var(--text-xl-size);
-  font-variant-numeric: tabular-nums;
 }
 
 .home-opportunities__topline {
@@ -417,7 +324,6 @@ h1 {
 }
 
 @media (min-width: 768px) {
-  .entity-momentum__grid,
   .home-opportunities__grid,
   .coverage-panel__grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -429,7 +335,6 @@ h1 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .entity-momentum__grid,
   .coverage-panel__grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }

@@ -327,6 +327,12 @@ func TestTaxonomyTrendAndOpportunityQueriesUseBoundedCursors(t *testing.T) {
 			len(opportunities.Items),
 		)
 	}
+	assertJSONField(
+		t,
+		opportunities.Analysis,
+		"analysis_run_id",
+		"00000000-0000-0000-0000-000000000704",
+	)
 	assertJSONField(t, opportunities.Items[0], "status", "insufficient_evidence")
 }
 
@@ -424,6 +430,32 @@ func insertCatalogFixture(
 		) VALUES ($1, $2, 'public-catalog/v1', $3, '{"scope":"demo"}')
 	`, fixture.generationID, sourceRevision, generatedAt); err != nil {
 		t.Fatalf("insert catalog generation: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO public_catalog_home (generation_id, payload)
+		VALUES (
+			$1,
+			'{
+				"research_opportunities":{
+					"analysis":{
+						"analysis_run_id":"00000000-0000-0000-0000-000000000704",
+						"coverage_ratio":{"state":"known","value":1},
+						"formula_version":{"state":"known","value":"biomedical-opportunities/v1"},
+						"generated_at":{"state":"known","value":"2026-07-16T05:00:00Z"},
+						"missing_signals":[],
+						"sample_size":{"state":"known","value":2},
+						"sources":{"state":"known","value":["pubmed","openalex"]},
+						"window_days":{
+							"state":"missing",
+							"reason":"analysis does not use a publication window"
+						}
+					},
+					"items":[]
+				}
+			}'
+		)
+	`, fixture.generationID); err != nil {
+		t.Fatalf("insert catalog Home opportunity metadata: %v", err)
 	}
 
 	statsPayload := fmt.Sprintf(

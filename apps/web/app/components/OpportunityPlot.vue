@@ -8,7 +8,7 @@ type OpportunityStatus =
 interface OpportunityPlotPoint {
   id: string
   label: string
-  missingSignals: string[]
+  missingSignals?: string[]
   status: OpportunityStatus
   x: number
   y: number
@@ -62,8 +62,11 @@ function yTickPosition(value: number) {
 }
 
 function pointLabel(point: OpportunityPlotPoint) {
-  const missingSignals =
-    point.missingSignals.length > 0 ? point.missingSignals.join("；") : "无"
+  const missingSignals = point.missingSignals === undefined
+    ? "未覆盖"
+    : point.missingSignals.length > 0
+      ? point.missingSignals.join("；")
+      : "无"
   return `${point.label}，${statusLabels[point.status]}，${props.xAxisLabel} ${point.x}，${props.yAxisLabel} ${point.y}，缺失信号 ${missingSignals}`
 }
 </script>

@@ -178,6 +178,24 @@ func (repository *Repository) ResearchOpportunities(
 		if err != nil {
 			return OpportunityPage{}, err
 		}
+		var analysisPayload []byte
+		if err := tx.QueryRow(ctx, `
+			SELECT payload -> 'research_opportunities' -> 'analysis'
+			FROM public_catalog_home
+			WHERE generation_id = $1
+		`, generation.ID).Scan(&analysisPayload); err != nil {
+			return OpportunityPage{}, fmt.Errorf(
+				"query public catalog research opportunity analysis metadata: %w",
+				err,
+			)
+		}
+		if len(analysisPayload) == 0 ||
+			!json.Valid(analysisPayload) ||
+			string(analysisPayload) == "null" {
+			return OpportunityPage{}, fmt.Errorf(
+				"public catalog research opportunity analysis metadata is invalid",
+			)
+		}
 
 		var cursor cursorPayload
 		if query.Cursor != "" {
@@ -285,6 +303,7 @@ func (repository *Repository) ResearchOpportunities(
 		}
 		return OpportunityPage{
 			Generation: generation,
+			Analysis:   json.RawMessage(analysisPayload),
 			Items:      items,
 			Pagination: Pagination{
 				Limit:      limit,

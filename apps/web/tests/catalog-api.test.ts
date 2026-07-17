@@ -14,38 +14,25 @@ import {
 import { settleCatalogRequest } from "../app/utils/catalogResult"
 
 describe("catalog query contract", () => {
-  it("maps every supported paper filter to the exact Go API query name", () => {
+  it("maps the biomedical paper catalog query and fixes lifecycle to active", () => {
     expect(
       paperListQueryFromRoute({
         cursor: "opaque-cursor",
-        has_benchmark: "false",
-        has_code: "true",
-        has_data: "false",
         limit: "40",
-        method: "causal-inference",
         published_from: "2026-07-01T00:00:00Z",
         published_to: "2026-07-16T23:59:59Z",
-        q: "agent evaluation",
+        q: "oncology cohort",
         sort: "relevance",
-        source: "openalex",
-        status: "active",
-        topic: "agents",
         type: "research_article",
       }),
     ).toEqual({
       cursor: "opaque-cursor",
-      has_benchmark: false,
-      has_code: true,
-      has_data: false,
       limit: 40,
-      method: "causal-inference",
       published_from: "2026-07-01T00:00:00Z",
       published_to: "2026-07-16T23:59:59Z",
-      q: "agent evaluation",
+      q: "oncology cohort",
       sort: "relevance",
-      source: "openalex",
       status: "active",
-      topic: "agents",
       type: "research_article",
     })
   })
@@ -54,9 +41,18 @@ describe("catalog query contract", () => {
     [{ unknown: "value" }, "unknown"],
     [{ q: ["agent", "safety"] }, "q"],
     [{ q: " agent" }, "q"],
-    [{ has_code: "1" }, "has_code"],
     [{ limit: "0" }, "limit"],
     [{ sort: "relevance" }, "sort"],
+    [{ type: "preprint" }, "type"],
+    [{ type: "dataset" }, "type"],
+    [{ type: "benchmark" }, "type"],
+    [{ topic: "oncology" }, "topic"],
+    [{ method: "causal-inference" }, "method"],
+    [{ has_code: "true" }, "has_code"],
+    [{ has_data: "true" }, "has_data"],
+    [{ has_benchmark: "true" }, "has_benchmark"],
+    [{ status: "retracted" }, "status"],
+    [{ source: "arxiv" }, "source"],
     [
       {
         published_from: "2026-07-17T00:00:00Z",

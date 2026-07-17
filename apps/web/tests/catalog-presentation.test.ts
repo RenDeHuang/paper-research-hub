@@ -5,6 +5,7 @@ import CatalogState from "../app/components/CatalogState.vue"
 import {
   catalogDataValue,
   paperAuthors,
+  paperSources,
   paperTaxonomyLabels,
 } from "../app/utils/catalogPresentation"
 
@@ -50,6 +51,49 @@ describe("catalog value presentation", () => {
       ]),
     ).toEqual(["Agents", "safety"])
     expect(paperTaxonomyLabels(undefined)).toEqual([])
+  })
+
+  it("preserves provenance catalog states and reads known source values", () => {
+    const provenance = {
+      event_key: "crossref:paper-1",
+      normalization_policy_version: "normalize-v2",
+      projection_policy_version: "project-v3",
+      scope_policy_version: "scope-v1",
+      source: "crossref",
+      source_record_id: "00000000-0000-0000-0000-000000000001",
+      source_time: "2026-07-17T08:30:00Z",
+    }
+
+    expect(
+      paperSources({
+        state: "known",
+        value: [
+          provenance,
+          {
+            ...provenance,
+            event_key: "crossref:paper-1-refresh",
+          },
+          {
+            ...provenance,
+            event_key: "pubmed:paper-1",
+            source: "pubmed",
+          },
+        ],
+      }),
+    ).toEqual({
+      state: "known",
+      value: ["crossref", "pubmed"],
+    })
+    expect(paperSources({ state: "missing" })).toEqual({
+      state: "missing",
+    })
+    expect(paperSources({ state: "unknown" })).toEqual({
+      state: "unknown",
+    })
+    expect(paperSources(undefined)).toEqual({
+      label: "来源字段未覆盖",
+      state: "unknown",
+    })
   })
 })
 

@@ -10,12 +10,20 @@ defineProps<{
   momentum: AnalysisCollection<SubjectTrendEstimate>
 }>()
 
+const numberFormatter = new Intl.NumberFormat("zh-CN", {
+  maximumFractionDigits: 3,
+})
+
 function estimateText(item: SubjectTrendEstimate) {
   const value = catalogDataValue(item.estimate)
   if (value.state !== "known") {
     return presentDataValue(value).text
   }
-  return `${value.value.toFixed(2)}×`
+  return `${numberFormatter.format(value.value)}×`
+}
+
+function intervalText(interval: SubjectTrendEstimate["confidence_interval"]) {
+  return `${numberFormatter.format(interval.lower)}–${numberFormatter.format(interval.upper)}`
 }
 </script>
 
@@ -67,6 +75,9 @@ function estimateText(item: SubjectTrendEstimate) {
             学科标识未覆盖
           </template>
         </h3>
+        <p class="metric-card__model">
+          模型：{{ item.model_family }}
+        </p>
         <p
           class="metric-card__value"
           :data-value-state="catalogDataValue(item.estimate).state"
@@ -75,9 +86,31 @@ function estimateText(item: SubjectTrendEstimate) {
         </p>
         <dl>
           <div>
+            <dt>最近窗口</dt>
+            <dd :data-value-state="catalogDataValue(item.recent_count).state">
+              {{ presentDataValue(catalogDataValue(item.recent_count)).text }}
+            </dd>
+          </div>
+          <div>
+            <dt>基线窗口</dt>
+            <dd :data-value-state="catalogDataValue(item.baseline_count).state">
+              {{ presentDataValue(catalogDataValue(item.baseline_count)).text }}
+            </dd>
+          </div>
+          <div>
             <dt>95% 区间</dt>
-            <dd>
-              {{ item.confidence_interval.lower.toFixed(2) }}–{{ item.confidence_interval.upper.toFixed(2) }}
+            <dd>{{ intervalText(item.confidence_interval) }}</dd>
+          </div>
+          <div>
+            <dt>p 值</dt>
+            <dd :data-value-state="catalogDataValue(item.p_value).state">
+              {{ presentDataValue(catalogDataValue(item.p_value)).text }}
+            </dd>
+          </div>
+          <div>
+            <dt>校正 p 值</dt>
+            <dd :data-value-state="catalogDataValue(item.adjusted_p_value).state">
+              {{ presentDataValue(catalogDataValue(item.adjusted_p_value)).text }}
             </dd>
           </div>
           <div>
@@ -99,6 +132,11 @@ function estimateText(item: SubjectTrendEstimate) {
 </template>
 
 <style scoped>
+.subject-momentum {
+  display: grid;
+  gap: var(--space-4);
+}
+
 .subject-momentum__grid {
   display: grid;
   gap: var(--space-3);
@@ -107,6 +145,7 @@ function estimateText(item: SubjectTrendEstimate) {
 .metric-card {
   display: grid;
   gap: var(--space-2);
+  min-width: 0;
   padding: var(--space-4);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
@@ -117,6 +156,12 @@ function estimateText(item: SubjectTrendEstimate) {
 .metric-card dl,
 .metric-card dd {
   margin: 0;
+}
+
+.metric-card__label,
+.metric-card__model {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm-size);
 }
 
 .metric-card__label {

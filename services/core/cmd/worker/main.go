@@ -22,8 +22,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/analysis"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/catalog"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/citation"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/config"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/ingestion"
@@ -38,34 +40,59 @@ import (
 type commandKind string
 
 const (
-	commandSyncOpenAlex   commandKind = "sync_openalex"
-	commandSyncPubMed     commandKind = "sync_pubmed"
-	commandSyncCrossref   commandKind = "sync_crossref"
-	commandImportJCR      commandKind = "import_jcr"
-	commandImportSubjects commandKind = "import_subjects"
-	commandAssessVenues   commandKind = "assess_venues"
-	commandPublishCatalog commandKind = "publish_catalog"
-	maxSyncResults                    = 1000
+	commandSyncOpenAlex                commandKind = "sync_openalex"
+	commandSyncPubMed                  commandKind = "sync_pubmed"
+	commandSyncCrossref                commandKind = "sync_crossref"
+	commandImportJCR                   commandKind = "import_jcr"
+	commandImportSubjects              commandKind = "import_subjects"
+	commandAssessVenues                commandKind = "assess_venues"
+	commandAssessBiomedicalEligibility commandKind = "assess_biomedical_eligibility"
+	commandAnalyzeCitations            commandKind = "analyze_citations"
+	commandAnalyzeTrends               commandKind = "analyze_trends"
+	commandAnalyzeJournals             commandKind = "analyze_journals"
+	commandAnalyzeOpportunities        commandKind = "analyze_opportunities"
+	commandPublishCatalog              commandKind = "publish_catalog"
+	maxSyncResults                                 = 1000
 )
 
 type workerCommand struct {
-	Kind               commandKind
-	Query              string
-	Filter             string
-	FromDate           time.Time
-	ToDate             time.Time
-	ISSNs              []string
-	MaxResults         int
-	File               string
-	FormulaVersion     string
-	GeneratedAt        time.Time
-	MetricYear         int
-	PolicyVersion      string
-	AssessedAt         time.Time
-	JCRReceipt         string
-	VenuePolicyName    string
-	VenuePolicyVersion int
-	SubjectVersion     string
+	Kind                           commandKind
+	Query                          string
+	Filter                         string
+	FromDate                       time.Time
+	ToDate                         time.Time
+	ISSNs                          []string
+	MaxResults                     int
+	File                           string
+	FormulaVersion                 string
+	GeneratedAt                    time.Time
+	MetricYear                     int
+	PolicyVersion                  string
+	AssessedAt                     time.Time
+	JCRReceipt                     string
+	VenuePolicyName                string
+	VenuePolicyVersion             int
+	EligibilityPolicyVersion       string
+	SubjectVersion                 string
+	CitationSource                 string
+	CitationAnalysisRunID          string
+	TrendAnalysisRunID             string
+	JournalAnalysisRunID           string
+	OpportunityAnalysisRunID       string
+	AsOf                           time.Time
+	VelocityWindowDays             int
+	MinimumCohortSize              int
+	RecentWindowDays               int
+	BaselineWindowDays             int
+	WindowDays                     int
+	MinimumPaperCount              int
+	MinimumIndependentJournalCount int
+	MinimumIndependentTeamCount    int
+	TrendModelSelectionRule        string
+	TrendDispersionThreshold       float64
+	MinimumSupportCount            int
+	MinimumFieldBaselineCount      int
+	RuleSetVersion                 string
 }
 
 type commandRunner func(
@@ -126,18 +153,44 @@ func realMain(
 func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	if len(args) < 2 {
 		return workerCommand{}, "", errors.New(
-			"usage: paper-hub-worker <sync|import|assess|publish> <source> [flags]",
+			"usage: paper-hub-worker <sync|import|assess|analyze|publish> <source> [flags]",
 		)
 	}
-	if args[0] == "assess" {
-		if args[1] != "venues" {
+	if args[0] == "analyze" {
+		switch args[1] {
+		case "citations":
+			command, err := parseCitationAnalysisCommand(args[2:])
+			return command, config.RoleCitationAnalysis, err
+		case "trends":
+			command, err := parseTrendAnalysisCommand(args[2:])
+			return command, config.RoleBiomedicalAnalysis, err
+		case "journals":
+			command, err := parseJournalAnalysisCommand(args[2:])
+			return command, config.RoleBiomedicalAnalysis, err
+		case "opportunities":
+			command, err := parseOpportunityAnalysisCommand(args[2:])
+			return command, config.RoleBiomedicalAnalysis, err
+		default:
 			return workerCommand{}, "", fmt.Errorf(
-				"unsupported assess target %q; expected venues",
+				"unsupported analyze target %q; expected citations, trends, journals, or opportunities",
 				args[1],
 			)
 		}
-		command, err := parseVenueAssessmentCommand(args[2:])
-		return command, config.RoleVenueAssessment, err
+	}
+	if args[0] == "assess" {
+		switch args[1] {
+		case "venues":
+			command, err := parseVenueAssessmentCommand(args[2:])
+			return command, config.RoleVenueAssessment, err
+		case "biomedical-eligibility":
+			command, err := parseBiomedicalEligibilityCommand(args[2:])
+			return command, config.RoleVenueAssessment, err
+		default:
+			return workerCommand{}, "", fmt.Errorf(
+				"unsupported assess target %q; expected venues or biomedical-eligibility",
+				args[1],
+			)
+		}
 	}
 	if args[0] == "publish" {
 		if args[1] != "catalog" {
@@ -166,7 +219,7 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	}
 	if args[0] != "sync" {
 		return workerCommand{}, "", errors.New(
-			"usage: paper-hub-worker <sync|import|assess|publish> <source> [flags]",
+			"usage: paper-hub-worker <sync|import|assess|analyze|publish> <source> [flags]",
 		)
 	}
 	switch args[1] {
@@ -185,6 +238,618 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 			args[1],
 		)
 	}
+}
+
+func parseCitationAnalysisCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("analyze citations", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	var asOf string
+	set.StringVar(
+		&asOf,
+		"as-of",
+		"",
+		"explicit RFC3339Nano analysis boundary",
+	)
+	set.StringVar(
+		&command.CitationSource,
+		"source",
+		"",
+		"exact citation evidence source",
+	)
+	set.IntVar(
+		&command.VelocityWindowDays,
+		"velocity-window-days",
+		0,
+		"citation velocity boundary window in days",
+	)
+	set.IntVar(
+		&command.MinimumCohortSize,
+		"minimum-cohort-size",
+		0,
+		"minimum exact cohort size for percentile publication",
+	)
+	set.StringVar(
+		&command.FormulaVersion,
+		"formula-version",
+		"",
+		"deterministic citation analysis formula version",
+	)
+	set.StringVar(
+		&command.SubjectVersion,
+		"subject-version",
+		"",
+		"exact biomedical Subject registry version",
+	)
+	set.StringVar(
+		&command.EligibilityPolicyVersion,
+		"eligibility-policy-version",
+		"",
+		"biomedical public eligibility policy version",
+	)
+	set.IntVar(
+		&command.MetricYear,
+		"jcr-metric-year",
+		0,
+		"authorized JCR metric year",
+	)
+	set.StringVar(
+		&command.JCRReceipt,
+		"jcr-import-receipt",
+		"",
+		"authorized JCR import receipt UUID",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"parse citation analysis flags: %w",
+			err,
+		)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected citation analysis arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+
+	command.Kind = commandAnalyzeCitations
+	if asOf == "" {
+		return workerCommand{}, errors.New(
+			"citation analysis requires an explicit --as-of",
+		)
+	}
+	if asOf != strings.TrimSpace(asOf) {
+		return workerCommand{}, errors.New(
+			"citation analysis as-of must be trimmed",
+		)
+	}
+	parsedAsOf, err := time.Parse(time.RFC3339Nano, asOf)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"citation analysis as-of must use RFC3339Nano: %w",
+			err,
+		)
+	}
+	command.AsOf = parsedAsOf.UTC()
+	if command.CitationSource == "" {
+		return workerCommand{}, errors.New(
+			"citation analysis requires an explicit --source",
+		)
+	}
+	if command.CitationSource != strings.TrimSpace(command.CitationSource) {
+		return workerCommand{}, errors.New(
+			"citation analysis source must be trimmed",
+		)
+	}
+	if command.VelocityWindowDays < 1 ||
+		command.VelocityWindowDays > 3650 {
+		return workerCommand{}, errors.New(
+			"citation analysis --velocity-window-days must be between 1 and 3650",
+		)
+	}
+	if command.MinimumCohortSize < 2 ||
+		command.MinimumCohortSize > 1_000_000 {
+		return workerCommand{}, errors.New(
+			"citation analysis --minimum-cohort-size must be between 2 and 1000000",
+		)
+	}
+	if command.FormulaVersion !=
+		citation.CitationIntelligenceFormulaVersion {
+		return workerCommand{}, fmt.Errorf(
+			"citation analysis --formula-version must equal %s",
+			citation.CitationIntelligenceFormulaVersion,
+		)
+	}
+	if command.SubjectVersion == "" {
+		return workerCommand{}, errors.New(
+			"citation analysis requires an explicit --subject-version",
+		)
+	}
+	if command.SubjectVersion != strings.TrimSpace(command.SubjectVersion) {
+		return workerCommand{}, errors.New(
+			"citation analysis subject-version must be trimmed",
+		)
+	}
+	if command.EligibilityPolicyVersion !=
+		biomed.BiomedicalPublicEligibilityPolicyVersion {
+		return workerCommand{}, fmt.Errorf(
+			"citation analysis --eligibility-policy-version must equal %s",
+			biomed.BiomedicalPublicEligibilityPolicyVersion,
+		)
+	}
+	if command.MetricYear < 1900 || command.MetricYear > 3000 {
+		return workerCommand{}, errors.New(
+			"citation analysis requires --jcr-metric-year between 1900 and 3000",
+		)
+	}
+	if command.JCRReceipt == "" {
+		return workerCommand{}, errors.New(
+			"citation analysis requires an explicit --jcr-import-receipt",
+		)
+	}
+	if command.JCRReceipt != strings.TrimSpace(command.JCRReceipt) {
+		return workerCommand{}, errors.New(
+			"citation analysis jcr-import-receipt must be trimmed",
+		)
+	}
+	parsedReceipt, err := uuid.Parse(command.JCRReceipt)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"citation analysis jcr-import-receipt must be a UUID: %w",
+			err,
+		)
+	}
+	command.JCRReceipt = parsedReceipt.String()
+	return command, nil
+}
+
+const (
+	biomedicalTrendFormulaVersion    = analysis.PublicationTrendFormulaVersion
+	biomedicalJournalFormulaVersion  = analysis.JournalPatternFormulaVersion
+	biomedicalOpportunityVersion     = analysis.OpportunityFormulaVersion
+	biomedicalOpportunityRuleSet     = analysis.OpportunityRuleSetVersion
+	biomedicalJournalMinimumCoverage = 0.8
+)
+
+type biomedicalAnalysisScopeFlags struct {
+	asOf string
+}
+
+func registerBiomedicalAnalysisScopeFlags(
+	set *flag.FlagSet,
+	command *workerCommand,
+) *biomedicalAnalysisScopeFlags {
+	flags := &biomedicalAnalysisScopeFlags{}
+	set.StringVar(
+		&flags.asOf,
+		"as-of",
+		"",
+		"explicit RFC3339Nano analysis boundary",
+	)
+	set.StringVar(
+		&command.SubjectVersion,
+		"subject-version",
+		"",
+		"exact biomedical Subject registry version",
+	)
+	set.StringVar(
+		&command.EligibilityPolicyVersion,
+		"eligibility-policy-version",
+		"",
+		"biomedical public eligibility policy version",
+	)
+	set.IntVar(
+		&command.MetricYear,
+		"jcr-metric-year",
+		0,
+		"authorized JCR metric year",
+	)
+	set.StringVar(
+		&command.JCRReceipt,
+		"jcr-import-receipt",
+		"",
+		"authorized JCR import receipt UUID",
+	)
+	set.StringVar(
+		&command.VenuePolicyName,
+		"venue-policy-name",
+		"",
+		"exact Venue eligibility policy name",
+	)
+	set.IntVar(
+		&command.VenuePolicyVersion,
+		"venue-policy-version",
+		0,
+		"exact Venue eligibility policy version",
+	)
+	return flags
+}
+
+func validateBiomedicalAnalysisScope(
+	command workerCommand,
+	asOf string,
+	target string,
+) (workerCommand, error) {
+	if asOf == "" {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis requires an explicit --as-of",
+			target,
+		)
+	}
+	if asOf != strings.TrimSpace(asOf) {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis as-of must be trimmed",
+			target,
+		)
+	}
+	parsedAsOf, err := time.Parse(time.RFC3339Nano, asOf)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis as-of must use RFC3339Nano: %w",
+			target,
+			err,
+		)
+	}
+	command.AsOf = parsedAsOf.UTC()
+	if command.SubjectVersion == "" {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis requires an explicit --subject-version",
+			target,
+		)
+	}
+	if command.SubjectVersion != strings.TrimSpace(command.SubjectVersion) {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis subject-version must be trimmed",
+			target,
+		)
+	}
+	if command.EligibilityPolicyVersion !=
+		biomed.BiomedicalPublicEligibilityPolicyVersion {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis --eligibility-policy-version must equal %s",
+			target,
+			biomed.BiomedicalPublicEligibilityPolicyVersion,
+		)
+	}
+	if command.MetricYear < 1900 || command.MetricYear > 3000 {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis requires --jcr-metric-year between 1900 and 3000",
+			target,
+		)
+	}
+	if command.JCRReceipt == "" {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis requires an explicit --jcr-import-receipt",
+			target,
+		)
+	}
+	if command.JCRReceipt != strings.TrimSpace(command.JCRReceipt) {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis jcr-import-receipt must be trimmed",
+			target,
+		)
+	}
+	parsedReceipt, err := uuid.Parse(command.JCRReceipt)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis jcr-import-receipt must be a UUID: %w",
+			target,
+			err,
+		)
+	}
+	command.JCRReceipt = parsedReceipt.String()
+	if command.VenuePolicyName == "" {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis requires an explicit --venue-policy-name",
+			target,
+		)
+	}
+	if command.VenuePolicyName != strings.TrimSpace(
+		command.VenuePolicyName,
+	) {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis venue-policy-name must be trimmed",
+			target,
+		)
+	}
+	if command.VenuePolicyVersion < 1 {
+		return workerCommand{}, fmt.Errorf(
+			"%s analysis requires a positive --venue-policy-version",
+			target,
+		)
+	}
+	return command, nil
+}
+
+func parseTrendAnalysisCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("analyze trends", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	scope := registerBiomedicalAnalysisScopeFlags(set, &command)
+	set.IntVar(
+		&command.RecentWindowDays,
+		"recent-window-days",
+		0,
+		"recent publication window in days",
+	)
+	set.IntVar(
+		&command.BaselineWindowDays,
+		"baseline-window-days",
+		0,
+		"historical baseline window in days",
+	)
+	set.IntVar(
+		&command.MinimumPaperCount,
+		"minimum-paper-count",
+		0,
+		"minimum paper count for a published estimate",
+	)
+	set.IntVar(
+		&command.MinimumIndependentJournalCount,
+		"minimum-independent-journal-count",
+		0,
+		"minimum independent journal count",
+	)
+	set.IntVar(
+		&command.MinimumIndependentTeamCount,
+		"minimum-independent-team-count",
+		0,
+		"minimum independent team count",
+	)
+	set.StringVar(
+		&command.TrendModelSelectionRule,
+		"model-selection",
+		"",
+		"predeclared publication trend model-selection rule",
+	)
+	set.Float64Var(
+		&command.TrendDispersionThreshold,
+		"dispersion-threshold",
+		0,
+		"predeclared dispersion threshold for model selection",
+	)
+	set.StringVar(
+		&command.FormulaVersion,
+		"formula-version",
+		"",
+		"deterministic publication trend formula version",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf("parse trend analysis flags: %w", err)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected trend analysis arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+	command.Kind = commandAnalyzeTrends
+	if command.RecentWindowDays < 1 || command.RecentWindowDays > 3650 {
+		return workerCommand{}, errors.New(
+			"trend analysis --recent-window-days must be between 1 and 3650",
+		)
+	}
+	if command.BaselineWindowDays <= command.RecentWindowDays ||
+		command.BaselineWindowDays > 3650 {
+		return workerCommand{}, errors.New(
+			"trend analysis --baseline-window-days must be greater than recent-window-days and at most 3650",
+		)
+	}
+	if command.MinimumPaperCount < 1 {
+		return workerCommand{}, errors.New(
+			"trend analysis --minimum-paper-count must be at least 1",
+		)
+	}
+	if command.MinimumIndependentJournalCount < 1 {
+		return workerCommand{}, errors.New(
+			"trend analysis --minimum-independent-journal-count must be at least 1",
+		)
+	}
+	if command.MinimumIndependentTeamCount < 1 {
+		return workerCommand{}, errors.New(
+			"trend analysis --minimum-independent-team-count must be at least 1",
+		)
+	}
+	switch analysis.TrendModelSelectionRule(command.TrendModelSelectionRule) {
+	case analysis.TrendModelSelectionFixedPoisson,
+		analysis.TrendModelSelectionFixedNegativeBinomial:
+		if command.TrendDispersionThreshold != 0 {
+			return workerCommand{}, errors.New(
+				"trend analysis --dispersion-threshold must be zero for a fixed model selection",
+			)
+		}
+	case analysis.TrendModelSelectionDispersionThreshold:
+		if command.TrendDispersionThreshold <= 0 {
+			return workerCommand{}, errors.New(
+				"trend analysis --dispersion-threshold must be positive for predeclared_dispersion_threshold",
+			)
+		}
+	default:
+		return workerCommand{}, errors.New(
+			"trend analysis --model-selection must be fixed_poisson, fixed_negative_binomial, or predeclared_dispersion_threshold",
+		)
+	}
+	if command.FormulaVersion != biomedicalTrendFormulaVersion {
+		return workerCommand{}, fmt.Errorf(
+			"trend analysis --formula-version must equal %s",
+			biomedicalTrendFormulaVersion,
+		)
+	}
+	return validateBiomedicalAnalysisScope(command, scope.asOf, "trend")
+}
+
+func parseJournalAnalysisCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("analyze journals", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	scope := registerBiomedicalAnalysisScopeFlags(set, &command)
+	set.IntVar(
+		&command.WindowDays,
+		"window-days",
+		0,
+		"journal editorial-pattern window in days",
+	)
+	set.IntVar(
+		&command.MinimumSupportCount,
+		"minimum-support-count",
+		0,
+		"minimum within-journal support count",
+	)
+	set.IntVar(
+		&command.MinimumFieldBaselineCount,
+		"minimum-field-baseline-count",
+		0,
+		"minimum field baseline count",
+	)
+	set.StringVar(
+		&command.FormulaVersion,
+		"formula-version",
+		"",
+		"deterministic journal editorial-pattern formula version",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf("parse journal analysis flags: %w", err)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected journal analysis arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+	command.Kind = commandAnalyzeJournals
+	if command.WindowDays < 1 || command.WindowDays > 3650 {
+		return workerCommand{}, errors.New(
+			"journal analysis --window-days must be between 1 and 3650",
+		)
+	}
+	if command.MinimumSupportCount < 1 {
+		return workerCommand{}, errors.New(
+			"journal analysis --minimum-support-count must be at least 1",
+		)
+	}
+	if command.MinimumFieldBaselineCount < command.MinimumSupportCount {
+		return workerCommand{}, errors.New(
+			"journal analysis --minimum-field-baseline-count must be at least minimum-support-count",
+		)
+	}
+	if command.FormulaVersion != biomedicalJournalFormulaVersion {
+		return workerCommand{}, fmt.Errorf(
+			"journal analysis --formula-version must equal %s",
+			biomedicalJournalFormulaVersion,
+		)
+	}
+	return validateBiomedicalAnalysisScope(command, scope.asOf, "journal")
+}
+
+func parseOpportunityAnalysisCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("analyze opportunities", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	scope := registerBiomedicalAnalysisScopeFlags(set, &command)
+	set.StringVar(
+		&command.RuleSetVersion,
+		"rule-set-version",
+		"",
+		"predefined biomedical opportunity rule-set version",
+	)
+	set.StringVar(
+		&command.FormulaVersion,
+		"formula-version",
+		"",
+		"deterministic opportunity formula version",
+	)
+	set.StringVar(
+		&command.CitationAnalysisRunID,
+		"citation-analysis-run-id",
+		"",
+		"exact succeeded citation analysis run UUID",
+	)
+	set.StringVar(
+		&command.TrendAnalysisRunID,
+		"trend-analysis-run-id",
+		"",
+		"exact succeeded trend analysis run UUID",
+	)
+	set.StringVar(
+		&command.JournalAnalysisRunID,
+		"journal-analysis-run-id",
+		"",
+		"exact succeeded journal analysis run UUID",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"parse opportunity analysis flags: %w",
+			err,
+		)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected opportunity analysis arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+	command.Kind = commandAnalyzeOpportunities
+	if command.RuleSetVersion != biomedicalOpportunityRuleSet {
+		return workerCommand{}, fmt.Errorf(
+			"opportunity analysis --rule-set-version must equal %s",
+			biomedicalOpportunityRuleSet,
+		)
+	}
+	if command.FormulaVersion != biomedicalOpportunityVersion {
+		return workerCommand{}, fmt.Errorf(
+			"opportunity analysis --formula-version must equal %s",
+			biomedicalOpportunityVersion,
+		)
+	}
+	var err error
+	command.CitationAnalysisRunID, err = parseRequiredRunID(
+		command.CitationAnalysisRunID,
+		"opportunity analysis",
+		"citation-analysis-run-id",
+	)
+	if err != nil {
+		return workerCommand{}, err
+	}
+	command.TrendAnalysisRunID, err = parseRequiredRunID(
+		command.TrendAnalysisRunID,
+		"opportunity analysis",
+		"trend-analysis-run-id",
+	)
+	if err != nil {
+		return workerCommand{}, err
+	}
+	command.JournalAnalysisRunID, err = parseRequiredRunID(
+		command.JournalAnalysisRunID,
+		"opportunity analysis",
+		"journal-analysis-run-id",
+	)
+	if err != nil {
+		return workerCommand{}, err
+	}
+	return validateBiomedicalAnalysisScope(command, scope.asOf, "opportunity")
+}
+
+func parseRequiredRunID(value string, contextName string, flagName string) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf(
+			"%s requires an explicit --%s",
+			contextName,
+			flagName,
+		)
+	}
+	if value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("%s %s must be trimmed", contextName, flagName)
+	}
+	parsed, err := uuid.Parse(value)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%s %s must be a UUID: %w",
+			contextName,
+			flagName,
+			err,
+		)
+	}
+	return parsed.String(), nil
 }
 
 func parseVenueAssessmentCommand(args []string) (workerCommand, error) {
@@ -281,6 +946,112 @@ func parseVenueAssessmentCommand(args []string) (workerCommand, error) {
 	return command, nil
 }
 
+func parseBiomedicalEligibilityCommand(
+	args []string,
+) (workerCommand, error) {
+	set := flag.NewFlagSet(
+		"assess biomedical-eligibility",
+		flag.ContinueOnError,
+	)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	var assessedAt string
+	set.IntVar(
+		&command.MetricYear,
+		"metric-year",
+		0,
+		"authorized JCR metric year",
+	)
+	set.StringVar(
+		&command.SubjectVersion,
+		"subject-version",
+		"",
+		"exact biomedical Subject registry version",
+	)
+	set.StringVar(
+		&command.PolicyVersion,
+		"policy-version",
+		"",
+		"biomedical public eligibility policy version",
+	)
+	set.StringVar(
+		&assessedAt,
+		"assessed-at",
+		"",
+		"explicit RFC3339Nano assessment time",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"parse biomedical eligibility flags: %w",
+			err,
+		)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected biomedical eligibility arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+
+	command.Kind = commandAssessBiomedicalEligibility
+	if command.MetricYear < 1900 || command.MetricYear > 3000 {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility requires --metric-year between 1900 and 3000",
+		)
+	}
+	if command.SubjectVersion == "" {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility requires an explicit --subject-version",
+		)
+	}
+	if command.SubjectVersion != strings.TrimSpace(command.SubjectVersion) {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility subject-version must be trimmed",
+		)
+	}
+	if command.PolicyVersion == "" {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility requires an explicit --policy-version",
+		)
+	}
+	if command.PolicyVersion != strings.TrimSpace(command.PolicyVersion) {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility policy-version must be trimmed",
+		)
+	}
+	if command.PolicyVersion !=
+		biomed.BiomedicalPublicEligibilityPolicyVersion {
+		return workerCommand{}, fmt.Errorf(
+			"biomedical eligibility --policy-version must equal %s",
+			biomed.BiomedicalPublicEligibilityPolicyVersion,
+		)
+	}
+	if assessedAt == "" {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility requires an explicit --assessed-at",
+		)
+	}
+	if assessedAt != strings.TrimSpace(assessedAt) {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility assessed-at must be trimmed",
+		)
+	}
+	parsedAssessedAt, err := time.Parse(time.RFC3339Nano, assessedAt)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"biomedical eligibility assessed-at must use RFC3339Nano: %w",
+			err,
+		)
+	}
+	if parsedAssessedAt.IsZero() {
+		return workerCommand{}, errors.New(
+			"biomedical eligibility assessed-at must be non-zero",
+		)
+	}
+	command.AssessedAt = parsedAssessedAt
+	return command, nil
+}
+
 func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 	set := flag.NewFlagSet("publish catalog", flag.ContinueOnError)
 	set.SetOutput(io.Discard)
@@ -317,6 +1088,12 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 		"Venue policy version number",
 	)
 	set.StringVar(
+		&command.EligibilityPolicyVersion,
+		"eligibility-policy-version",
+		"",
+		"biomedical public eligibility policy version",
+	)
+	set.StringVar(
 		&command.SubjectVersion,
 		"subject-version",
 		"",
@@ -327,6 +1104,36 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 		"jcr-import-receipt",
 		"",
 		"authorized JCR import receipt UUID",
+	)
+	set.StringVar(
+		&command.CitationSource,
+		"citation-source",
+		"",
+		"exact citation evidence source to publish",
+	)
+	set.StringVar(
+		&command.CitationAnalysisRunID,
+		"citation-analysis-run-id",
+		"",
+		"exact succeeded citation analysis run UUID",
+	)
+	set.StringVar(
+		&command.TrendAnalysisRunID,
+		"trend-analysis-run-id",
+		"",
+		"exact succeeded trend analysis run UUID",
+	)
+	set.StringVar(
+		&command.JournalAnalysisRunID,
+		"journal-analysis-run-id",
+		"",
+		"exact succeeded journal analysis run UUID",
+	)
+	set.StringVar(
+		&command.OpportunityAnalysisRunID,
+		"opportunity-analysis-run-id",
+		"",
+		"exact succeeded opportunity analysis run UUID",
 	)
 	if err := set.Parse(args); err != nil {
 		return workerCommand{}, fmt.Errorf("parse catalog publish flags: %w", err)
@@ -386,6 +1193,24 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 			"catalog publish requires a positive --venue-policy-version",
 		)
 	}
+	if command.EligibilityPolicyVersion == "" {
+		return workerCommand{}, errors.New(
+			"catalog publish requires an explicit --eligibility-policy-version",
+		)
+	}
+	if command.EligibilityPolicyVersion !=
+		strings.TrimSpace(command.EligibilityPolicyVersion) {
+		return workerCommand{}, errors.New(
+			"catalog eligibility-policy-version must be trimmed",
+		)
+	}
+	if command.EligibilityPolicyVersion !=
+		biomed.BiomedicalPublicEligibilityPolicyVersion {
+		return workerCommand{}, fmt.Errorf(
+			"catalog --eligibility-policy-version must equal %s",
+			biomed.BiomedicalPublicEligibilityPolicyVersion,
+		)
+	}
 	if command.SubjectVersion == "" {
 		return workerCommand{}, errors.New(
 			"catalog publish requires an explicit --subject-version",
@@ -410,6 +1235,48 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 		)
 	}
 	command.JCRReceipt = parsedReceipt.String()
+	if command.CitationSource == "" {
+		return workerCommand{}, errors.New(
+			"catalog publish requires an explicit --citation-source",
+		)
+	}
+	if command.CitationSource != strings.TrimSpace(command.CitationSource) {
+		return workerCommand{}, errors.New(
+			"catalog citation-source must be trimmed",
+		)
+	}
+	command.CitationAnalysisRunID, err = parseRequiredRunID(
+		command.CitationAnalysisRunID,
+		"catalog publish",
+		"citation-analysis-run-id",
+	)
+	if err != nil {
+		return workerCommand{}, err
+	}
+	command.TrendAnalysisRunID, err = parseRequiredRunID(
+		command.TrendAnalysisRunID,
+		"catalog publish",
+		"trend-analysis-run-id",
+	)
+	if err != nil {
+		return workerCommand{}, err
+	}
+	command.JournalAnalysisRunID, err = parseRequiredRunID(
+		command.JournalAnalysisRunID,
+		"catalog publish",
+		"journal-analysis-run-id",
+	)
+	if err != nil {
+		return workerCommand{}, err
+	}
+	command.OpportunityAnalysisRunID, err = parseRequiredRunID(
+		command.OpportunityAnalysisRunID,
+		"catalog publish",
+		"opportunity-analysis-run-id",
+	)
+	if err != nil {
+		return workerCommand{}, err
+	}
 	return command, nil
 }
 
@@ -633,8 +1500,18 @@ func runCommand(
 	}
 	defer pool.Close()
 	switch command.Kind {
+	case commandAnalyzeCitations:
+		return runCitationAnalysis(ctx, pool, command)
+	case commandAnalyzeTrends:
+		return runTrendAnalysis(ctx, pool, command)
+	case commandAnalyzeJournals:
+		return runJournalAnalysis(ctx, pool, command)
+	case commandAnalyzeOpportunities:
+		return runOpportunityAnalysis(ctx, pool, command)
 	case commandPublishCatalog:
 		return runCatalogPublish(ctx, pool, command)
+	case commandAssessBiomedicalEligibility:
+		return runBiomedicalEligibility(ctx, pool, command)
 	case commandAssessVenues:
 		return runVenueAssessment(ctx, pool, command)
 	case commandImportJCR:
@@ -643,6 +1520,295 @@ func runCommand(
 		return runSubjectImport(ctx, pool, command)
 	default:
 		return runSync(ctx, pool, cfg, command)
+	}
+}
+
+func runCitationAnalysis(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	command workerCommand,
+) (map[string]any, error) {
+	service, err := citation.NewPostgresAnalysisService(pool, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create citation analysis service: %w",
+			err,
+		)
+	}
+	summary, err := service.Analyze(ctx, citationAnalysisInput(command))
+	if err != nil {
+		return nil, fmt.Errorf("analyze citations: %w", err)
+	}
+	return citationAnalysisResult(command, summary), nil
+}
+
+func citationAnalysisInput(command workerCommand) citation.AnalysisInput {
+	return citation.AnalysisInput{
+		AsOf:                     command.AsOf,
+		Source:                   command.CitationSource,
+		VelocityWindowDays:       command.VelocityWindowDays,
+		MinimumCohortSize:        command.MinimumCohortSize,
+		FormulaVersion:           command.FormulaVersion,
+		SubjectVersion:           command.SubjectVersion,
+		EligibilityPolicyVersion: command.EligibilityPolicyVersion,
+		JCRMetricYear:            command.MetricYear,
+		JCRImportReceipt:         uuid.MustParse(command.JCRReceipt),
+	}
+}
+
+func citationAnalysisResult(
+	command workerCommand,
+	summary citation.AnalysisSummary,
+) map[string]any {
+	return map[string]any{
+		"analysis_run_id":         summary.RunID.String(),
+		"source":                  command.CitationSource,
+		"as_of":                   command.AsOf.UTC().Format(time.RFC3339Nano),
+		"velocity_window_days":    command.VelocityWindowDays,
+		"minimum_cohort_size":     command.MinimumCohortSize,
+		"formula_version":         command.FormulaVersion,
+		"subject_version":         command.SubjectVersion,
+		"eligibility_policy":      command.EligibilityPolicyVersion,
+		"jcr_metric_year":         command.MetricYear,
+		"jcr_import_receipt":      command.JCRReceipt,
+		"total_works":             summary.TotalWorks,
+		"known_citation_counts":   summary.KnownCitationCounts,
+		"known_velocities":        summary.KnownVelocities,
+		"insufficient_velocity":   summary.InsufficientVelocity,
+		"percentile_rows":         summary.PercentileRows,
+		"known_percentiles":       summary.KnownPercentiles,
+		"insufficient_percentile": summary.InsufficientPercentile,
+	}
+}
+
+func runTrendAnalysis(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	command workerCommand,
+) (map[string]any, error) {
+	service, err := analysis.NewPostgresAnalysisService(pool, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create publication trend analysis service: %w",
+			err,
+		)
+	}
+	summary, err := service.AnalyzePublicationTrends(
+		ctx,
+		trendAnalysisInput(command),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("analyze publication trends: %w", err)
+	}
+	return biomedicalAnalysisResult(command, summary), nil
+}
+
+func trendAnalysisInput(command workerCommand) analysis.TrendAnalysisInput {
+	return analysis.TrendAnalysisInput{
+		AsOf:                     command.AsOf,
+		FormulaVersion:           command.FormulaVersion,
+		ModelSelectionRule:       analysis.TrendModelSelectionRule(command.TrendModelSelectionRule),
+		DispersionThreshold:      command.TrendDispersionThreshold,
+		SubjectVersion:           command.SubjectVersion,
+		EligibilityPolicyVersion: command.EligibilityPolicyVersion,
+		JCRMetricYear:            command.MetricYear,
+		JCRImportReceipt:         uuid.MustParse(command.JCRReceipt),
+		VenuePolicyName:          command.VenuePolicyName,
+		VenuePolicyVersion:       command.VenuePolicyVersion,
+		RecentWindowDays:         command.RecentWindowDays,
+		BaselineWindowDays:       command.BaselineWindowDays,
+		MinimumPaperCount:        command.MinimumPaperCount,
+		MinimumIndependentJournalCount: command.
+			MinimumIndependentJournalCount,
+		MinimumIndependentTeamCount: command.
+			MinimumIndependentTeamCount,
+	}
+}
+
+func runJournalAnalysis(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	command workerCommand,
+) (map[string]any, error) {
+	service, err := analysis.NewPostgresAnalysisService(pool, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create journal analysis service: %w",
+			err,
+		)
+	}
+	summary, err := service.AnalyzeJournalPatterns(
+		ctx,
+		journalAnalysisInput(command),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"analyze journal editorial patterns: %w",
+			err,
+		)
+	}
+	return biomedicalAnalysisResult(command, summary), nil
+}
+
+func journalAnalysisInput(
+	command workerCommand,
+) analysis.JournalPatternAnalysisInput {
+	return analysis.JournalPatternAnalysisInput{
+		AsOf:                      command.AsOf,
+		FormulaVersion:            command.FormulaVersion,
+		SubjectVersion:            command.SubjectVersion,
+		EligibilityPolicyVersion:  command.EligibilityPolicyVersion,
+		JCRMetricYear:             command.MetricYear,
+		JCRImportReceipt:          uuid.MustParse(command.JCRReceipt),
+		VenuePolicyName:           command.VenuePolicyName,
+		VenuePolicyVersion:        command.VenuePolicyVersion,
+		WindowDays:                command.WindowDays,
+		MinimumSupportCount:       command.MinimumSupportCount,
+		MinimumFieldBaselineCount: command.MinimumFieldBaselineCount,
+		MinimumCoverage:           biomedicalJournalMinimumCoverage,
+	}
+}
+
+func runOpportunityAnalysis(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	command workerCommand,
+) (map[string]any, error) {
+	service, err := analysis.NewPostgresAnalysisService(pool, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create research opportunity analysis service: %w",
+			err,
+		)
+	}
+	summary, err := service.AnalyzeResearchOpportunities(
+		ctx,
+		opportunityAnalysisInput(command),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"analyze research opportunities: %w",
+			err,
+		)
+	}
+	return biomedicalAnalysisResult(command, summary), nil
+}
+
+func opportunityAnalysisInput(
+	command workerCommand,
+) analysis.OpportunityAnalysisInput {
+	return analysis.OpportunityAnalysisInput{
+		AsOf:                     command.AsOf,
+		FormulaVersion:           command.FormulaVersion,
+		RuleSetVersion:           command.RuleSetVersion,
+		SubjectVersion:           command.SubjectVersion,
+		EligibilityPolicyVersion: command.EligibilityPolicyVersion,
+		JCRMetricYear:            command.MetricYear,
+		JCRImportReceipt:         uuid.MustParse(command.JCRReceipt),
+		VenuePolicyName:          command.VenuePolicyName,
+		VenuePolicyVersion:       command.VenuePolicyVersion,
+		CitationAnalysisRunID: uuid.MustParse(
+			command.CitationAnalysisRunID,
+		),
+		TrendAnalysisRunID: uuid.MustParse(
+			command.TrendAnalysisRunID,
+		),
+		JournalAnalysisRunID: uuid.MustParse(
+			command.JournalAnalysisRunID,
+		),
+	}
+}
+
+func biomedicalAnalysisResult(
+	command workerCommand,
+	summary analysis.AnalysisRunSummary,
+) map[string]any {
+	return map[string]any{
+		"analysis_run_id": summary.RunID.String(),
+		"as_of": command.AsOf.UTC().Format(
+			time.RFC3339Nano,
+		),
+		"formula_version":            command.FormulaVersion,
+		"subject_version":            command.SubjectVersion,
+		"eligibility_policy_version": command.EligibilityPolicyVersion,
+		"jcr_metric_year":            command.MetricYear,
+		"jcr_import_receipt":         command.JCRReceipt,
+		"venue_policy_name":          command.VenuePolicyName,
+		"venue_policy_version":       command.VenuePolicyVersion,
+		"snapshot_count":             summary.SnapshotCount,
+		"cohort_revisions":           summary.SourceRevisions,
+	}
+}
+
+func runBiomedicalEligibility(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	command workerCommand,
+) (map[string]any, error) {
+	works, err := biomed.NewPostgresPublicEligibilityWorkEnumerator(pool)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create biomedical eligibility Work enumerator: %w",
+			err,
+		)
+	}
+	store, err := biomed.NewPostgresPublicEligibilityStore(pool)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create biomedical eligibility store: %w",
+			err,
+		)
+	}
+	eligibility, err := biomed.NewPublicEligibilityService(store)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create biomedical eligibility service: %w",
+			err,
+		)
+	}
+	batch, err := biomed.NewPublicEligibilityBatchService(
+		works,
+		eligibility,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create biomedical eligibility batch service: %w",
+			err,
+		)
+	}
+	summary, err := batch.AssessAll(
+		ctx,
+		biomed.PublicEligibilityBatchInput{
+			PolicyVersion:     command.PolicyVersion,
+			MetricYear:        command.MetricYear,
+			SubjectVersionKey: command.SubjectVersion,
+			AssessedAt:        command.AssessedAt,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"assess biomedical publication eligibility: %w",
+			err,
+		)
+	}
+	return biomedicalEligibilityResult(command, summary), nil
+}
+
+func biomedicalEligibilityResult(
+	command workerCommand,
+	summary biomed.PublicEligibilityBatchSummary,
+) map[string]any {
+	return map[string]any{
+		"metric_year":     command.MetricYear,
+		"subject_version": command.SubjectVersion,
+		"policy_version":  command.PolicyVersion,
+		"assessed_at": command.AssessedAt.UTC().Format(
+			time.RFC3339Nano,
+		),
+		"total":    summary.Total,
+		"accepted": summary.Accepted,
+		"rejected": summary.Rejected,
+		"missing":  summary.Missing,
 	}
 }
 
@@ -690,25 +1856,60 @@ func runCatalogPublish(
 	if err != nil {
 		return nil, fmt.Errorf("create catalog publisher: %w", err)
 	}
-	generation, err := publisher.PublishCurrent(ctx, catalog.PublishInput{
-		FormulaVersion:     command.FormulaVersion,
-		GeneratedAt:        command.GeneratedAt,
-		JCRMetricYear:      command.MetricYear,
-		VenuePolicyName:    command.VenuePolicyName,
-		VenuePolicyVersion: command.VenuePolicyVersion,
-		SubjectVersion:     command.SubjectVersion,
-		JCRImportReceipt:   uuid.MustParse(command.JCRReceipt),
-	})
+	generation, err := publisher.PublishCurrent(
+		ctx,
+		catalogPublishInput(command),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("publish current catalog: %w", err)
 	}
+	return catalogPublishResult(generation, command), nil
+}
+
+func catalogPublishInput(command workerCommand) catalog.PublishInput {
+	return catalog.PublishInput{
+		FormulaVersion:           command.FormulaVersion,
+		GeneratedAt:              command.GeneratedAt,
+		JCRMetricYear:            command.MetricYear,
+		VenuePolicyName:          command.VenuePolicyName,
+		VenuePolicyVersion:       command.VenuePolicyVersion,
+		EligibilityPolicyVersion: command.EligibilityPolicyVersion,
+		SubjectVersion:           command.SubjectVersion,
+		JCRImportReceipt:         uuid.MustParse(command.JCRReceipt),
+		CitationSource:           command.CitationSource,
+		CitationAnalysisRunID: uuid.MustParse(
+			command.CitationAnalysisRunID,
+		),
+		TrendAnalysisRunID: uuid.MustParse(
+			command.TrendAnalysisRunID,
+		),
+		JournalAnalysisRunID: uuid.MustParse(
+			command.JournalAnalysisRunID,
+		),
+		OpportunityAnalysisRunID: uuid.MustParse(
+			command.OpportunityAnalysisRunID,
+		),
+	}
+}
+
+func catalogPublishResult(
+	generation catalog.Generation,
+	command workerCommand,
+) map[string]any {
 	result := catalogGenerationResult(generation)
 	result["jcr_metric_year"] = command.MetricYear
 	result["venue_policy_name"] = command.VenuePolicyName
 	result["venue_policy_version"] = command.VenuePolicyVersion
+	result["eligibility_policy_version"] =
+		command.EligibilityPolicyVersion
 	result["subject_version"] = command.SubjectVersion
 	result["jcr_import_receipt"] = command.JCRReceipt
-	return result, nil
+	result["citation_source"] = command.CitationSource
+	result["citation_analysis_run_id"] = command.CitationAnalysisRunID
+	result["trend_analysis_run_id"] = command.TrendAnalysisRunID
+	result["journal_analysis_run_id"] = command.JournalAnalysisRunID
+	result["opportunity_analysis_run_id"] = command.OpportunityAnalysisRunID
+	return result
 }
 
 func catalogGenerationResult(generation catalog.Generation) map[string]any {

@@ -47,6 +47,14 @@ make compose-up
 
 API 与 Web 保持独立部署：`GET http://localhost:8080/` 只返回稳定的 API discovery JSON，不重定向也不托管 Nuxt 页面。API health 的公开 service identity 是 `medpaperhub-api`，Web health 的公开 service identity 是 `medpaperhub-web`；内部 Go module、二进制、镜像、Compose project 和数据库名称保持不变。
 
+`make compose-up` 会在启动后自动执行严格的部署边界验证。也可以对已经运行的服务单独执行：
+
+```bash
+make verify-local
+```
+
+如果源码已经新增路由但浏览器仍返回 404，仅刷新页面不会重建旧容器；重新执行 `make compose-up`。完整的端口、路由矩阵、历史 404 根因和陈旧镜像诊断见 [`docs/deployment/service-boundaries.md`](docs/deployment/service-boundaries.md)。
+
 停止服务：
 
 ```bash
@@ -63,86 +71,44 @@ cp .env.example .env
 
 本地 Web 与 API 分别监听 `3000` 和 `8080`，因此浏览器请求属于跨源访问。API 只向 `API_CORS_ALLOWED_ORIGINS` 中逐项列出的精确 origin 返回 CORS 头；默认值只允许 `http://localhost:3000`，不接受 `*`、路径、查询参数或带凭据 URL。修改 Web 域名或端口时，必须同步更新该 allowlist。
 
-## 完整 Catalog 操作顺序
+## Biomedical Catalog 严格流水线
 
-Catalog 的可运行闭环是：**启动数据库 → 执行迁移 → 显式同步/导入 → 显式发布 generation → 启动 API/Web → 验证公开响应**。不能跳过发布步骤，也不能让 API 启动过程代替发布。
+从空库到公开 Catalog 的唯一顺序是：
 
-### 1. 准备本地配置
+1. `paper-hub-migrate up`；
+2. `import subjects` 导入版本化 biomedical Subject CSV；
+3. `sync pubmed` 在一个命令内完成抓取、raw 持久化、规范化、范围判定与投影；
+4. `import jcr` 导入用户明确授权的 JCR CSV；
+5. JCR Category 与 Subject rule 的 exact-link reconciliation；该步骤由 Subject/JCR importer 在事务内自动执行，当前没有独立 `reconcile` 命令；
+6. `assess venues`；
+7. `assess biomedical-eligibility`；
+8. `analyze citations` 从一个明确来源生成不可变引用分析 run；
+9. `publish catalog` 显式绑定该引用来源和 analysis run；
+10. 启动并验证独立的 Go API 与 Nuxt Web。
 
-```bash
-cp .env.example .env
+完整 Docker volume mount、本地原生命令、全部 Worker flags、receipt 查询和验证 SQL 见 [`docs/deployment/biomedical-pipeline.md`](docs/deployment/biomedical-pipeline.md)。
+
+公开 Catalog 的唯一 Venue 准入门槛是：
+
+```text
+任一授权 JCR Category 为 Q1 OR exact JIF >= 10
 ```
 
-本地示例已经提供至少 32 bytes 的开发用 `CATALOG_CURSOR_SECRET`。该值仅用于本机 Compose，不得复制到生产环境。
+对应固定策略版本 `journal-jif-or-q1/v1`。Biomedical Subject exact-link 是公开范围约束，不是第二套期刊质量阈值；系统不会以引用数、OpenAlex `2yr_mean_citedness`、标题相似度或其他推断指标替代 JCR。
 
-### 2. 启动 PostgreSQL 并完成迁移
+`data/venues/jcr-q1.example.csv` 是纯合成测试 fixture，**禁止用于生产导入或 Catalog 发布**。如果没有用户授权的 JCR CSV，不能执行后续 assessment 或 publish；空库 API 的真实路由 `/api/v1/home`、`/api/v1/subjects`、`/api/v1/journals` 必须继续返回 `503 catalog_not_published`，Nuxt `/`、`/subjects`、`/journals` 只呈现等待状态，不生成假数据。
 
-```bash
-docker compose up -d --build postgres migrate
-docker compose wait migrate
-```
-
-`migrate` 必须成功退出后才能执行数据任务。迁移失败时不要启动 API，也不要尝试发布 Catalog。
-
-### 3. 显式同步至少一个授权数据源
-
-下面以 OpenAlex 为例；凭据由当前命令显式提供，不写入镜像：
-
-```bash
-docker compose run --rm \
-  --env OPENALEX_CONTACT_EMAIL=research@example.com \
-  --env OPENALEX_API_KEY=replace-with-openalex-api-key \
-  worker /app/paper-hub-worker sync openalex \
-  --query "agent evaluation" \
-  --max-results 100
-```
-
-也可以按后文说明执行 PubMed、Crossref 或授权 JCR 导入。发布器只读取已完成规范化、范围判定和 work 关联的当前数据库状态；没有可见 included work 时会严格拒绝发布。
-
-### 4. 显式发布 Catalog generation
-
-`--formula-version` 必须非空且无首尾空白；`--generated-at` 必须由操作者显式给出 RFC3339Nano 时间，命令不会回退到当前时间：
-
-```bash
-FORMULA_VERSION='public-catalog/v1'
-GENERATED_AT='2026-07-16T12:00:00.000000000Z'
-
-docker compose run --rm \
-  worker /app/paper-hub-worker publish catalog \
-  --formula-version "${FORMULA_VERSION}" \
-  --generated-at "${GENERATED_AT}"
-```
-
-请把示例时间替换为本次 generation 的确定性生成时间。成功时 stdout 只输出 generation JSON：
-
-```json
-{
-  "formula_version": "public-catalog/v1",
-  "generated_at": "2026-07-16T12:00:00Z",
-  "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-  "published_at": "2026-07-16T12:00:01Z",
-  "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-}
-```
-
-相同 source revision 会复用已经发布的 immutable generation；参数、数据库状态或发布不变量不满足时命令返回非零状态，不写伪成功结果。
-
-### 5. 启动 API 与 Web
+完成发布后启动服务并验证：
 
 ```bash
 docker compose up -d api web
+
+curl -i http://localhost:8080/api/v1/home
+curl -i http://localhost:8080/api/v1/subjects
+curl -i http://localhost:8080/api/v1/journals
 ```
 
-API 启动时会先打开真实 PostgreSQL pool，再用该 pool 和 `CATALOG_CURSOR_SECRET` 创建 `catalog.Repository`，最后才启动 HTTP server。数据库或 repository 初始化失败时不会监听端口。
-
-### 6. 验证 generation 与公开响应
-
-```bash
-curl -i http://localhost:8080/api/v1/stats
-curl -i 'http://localhost:8080/api/v1/papers?limit=20'
-```
-
-成功响应包含 `X-Request-ID` 和 `X-Catalog-Generation`。首次发布前 Catalog 路由返回 503；不可见、缺失或格式错误的 paper ID 统一返回 404；已知路由的非 GET 请求返回 405 和 `Allow: GET`；未知 `/api` 路由返回独立的 `route_not_found` 404。
+成功响应包含 `X-Request-ID` 和 `X-Catalog-Generation`。不可见、缺失或格式错误的 paper ID 统一返回 404；已知路由的非 GET 请求返回 405 和 `Allow: GET`；未知 `/api` 路由返回独立的 `route_not_found` 404。
 
 ## 容器烟测
 
@@ -190,14 +156,20 @@ make typecheck
 当前已经落地的命令：
 
 - **OpenAlex**：`sync openalex`，需要 `OPENALEX_CONTACT_EMAIL` 与 `OPENALEX_API_KEY`，用于论文发现与开放元数据同步。
-- **PubMed**：`sync pubmed`，需要 `NCBI_TOOL` 与 `NCBI_EMAIL`；可选 `NCBI_API_KEY` 只用于授权配额。
+- **PubMed**：`sync pubmed`，需要显式日期窗口、query 或 exact ISSN、`NCBI_TOOL` 与 `NCBI_EMAIL`；可选 `NCBI_API_KEY` 只用于授权配额。该命令已经串联抓取、raw、规范化与投影，不存在单独的 normalize/project CLI。
 - **Crossref**：`sync crossref`，需要 `CROSSREF_CONTACT_EMAIL`，用于 DOI、ISSN、许可和出版关系增强。
+- **Biomedical Subject**：`import subjects`，导入不可变、版本化、exact JCR Category allowlist，并在事务内执行 exact-link reconciliation。
 - **JCR**：`import jcr`，`JCR_IMPORT_PATH` 必须指向用户明确授权的 CSV，`JCR_SOURCE_LICENSE` 必须记录该导出的授权或许可依据。系统不会推断许可，也不会用推断指标替代 JCR 数据。
-- **Catalog**：`publish catalog`，从已收敛的规范数据显式生成并发布 immutable generation。
+- **Venue assessment**：`assess venues`，仅接受 `journal-jif-or-q1/v1`，并绑定明确的 JCR receipt 与 metric year。
+- **Biomedical eligibility**：`assess biomedical-eligibility`，对当前 Work 批量固化 exact Subject 资格决定。
+- **Citation analysis**：`analyze citations`，从一个明确 citation source 生成不可变 citation count、velocity 与 cohort percentile 结果；不会混合来源或把证据不足填成 `0`。
+- **Catalog**：`publish catalog`，要求显式传入 formula、时间、JCR 年份、Venue policy、eligibility policy、Subject version、JCR receipt、citation source 与 citation analysis run ID，生成并发布 immutable generation。
 
 尚未注册为 Worker 命令的规划能力：
 
 - PubMed Baseline/Daily Update 文件导入；
+- 独立 PubMed normalize/project 命令；
+- 独立 JCR/Subject reconciliation 命令；
 - PMC OA 全文同步；
 - Springer Nature 与 Elsevier 出版商增强。
 
@@ -222,6 +194,8 @@ docker compose run --rm \
 
 `JCR_HOST_PATH` 必须是宿主机上的绝对路径；容器内固定使用 `/imports/jcr.csv`。`JCR_SOURCE_LICENSE` 应保存可审计的授权或许可标识，不能留空，也不能由文件名、期刊指标或来源域名推断。Worker 会严格校验 `--file` 与 `JCR_IMPORT_PATH` 完全一致；路径不一致、许可为空或 CSV 未显式挂载时，导入会失败。
 
+不要把 `data/venues/jcr-q1.example.csv` 代入上述命令。生产文件必须来自用户授权导出，并且每一行都能通过 ISSN-L、print ISSN 或 eISSN 精确解析到一个已经由论文投影建立的 Venue。
+
 ## 生产部署边界
 
 - Web 与 API 分别部署和扩缩容；Worker 同步/导入任务由独立 Job 或调度器按需执行。
@@ -229,9 +203,11 @@ docker compose run --rm \
 - PostgreSQL 使用托管实例，并通过生产级 Secret 管理 `DATABASE_URL`。
 - API 必须通过生产 Secret 管理器注入独立的 `CATALOG_CURSOR_SECRET`。该 secret 必须至少 32 bytes、不能带首尾空白、不能写入日志，并且所有 API 副本必须使用同一稳定值；轮换会使轮换前签发的分页 cursor 失效。
 - API 必须显式配置 `API_CORS_ALLOWED_ORIGINS`。每个值都是浏览器可见 Web 的精确 `http://` 或 `https://` origin；生产环境不得使用通配符，也不得把内部容器地址加入浏览器 allowlist。
-- Catalog 发布 Job 使用只要求数据库配置的 `catalog-publish` role，并始终显式传入经过版本管理的 `--formula-version` 与确定性的 `--generated-at`；生产发布流程不得隐式使用当前时间。
+- Catalog 发布 Job 使用只要求数据库配置的 `catalog-publish` role，并始终显式传入经过版本管理的 `--formula-version`、确定性的 `--generated-at`、JCR/Subject/policy 版本和 JCR receipt；生产发布流程不得隐式使用当前时间。
 - 迁移在发布前作为独立作业运行；采用 expand/contract 迁移，旧版本应用必须能与扩展后的数据库并存。
 - Web 对浏览器暴露的 `NUXT_PUBLIC_API_BASE_URL` 必须是外部可解析的 HTTPS 地址；容器内部访问使用私有服务地址。
+- Subject 与 JCR CSV 只允许以只读 volume 挂载到对应的一次性 Worker Job；不得复制进运行镜像或由 API/Web 自动扫描。
+- 没有授权 JCR 时不得挂载 synthetic example、不得发布空或伪造 generation；保持 Catalog 未发布状态并向公开 Catalog API 返回 503。
 - 本地 Compose 文件不是生产 Secret 或高可用编排方案。
 
 ## CI 与发布
@@ -247,6 +223,8 @@ apps/web/                 Nuxt 4 Web
 services/core/            Go API、Worker、迁移与领域代码
 contracts/openapi.yaml    OpenAPI 3.1 契约
 data/venues/              授权 JCR 导入说明与合成示例
+data/subjects/            版本化 biomedical Subject registry
+docs/deployment/          部署边界与数据流水线
 docker-compose.yml        本地完整栈
 docker-compose.test.yml   隔离烟测覆盖
 ```

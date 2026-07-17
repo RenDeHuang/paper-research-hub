@@ -19,9 +19,14 @@ const subjectPages = import.meta.glob<{ default: Component }>(
 const generatedAt = "2026-07-17T08:30:00Z"
 const known = <T>(value: T) => ({ state: "known" as const, value })
 const analysis = {
+  analysis_run_id: "11111111-1111-4111-8111-111111111111",
+  analysis_type: "subject_trend",
+  baseline_window_days: 30,
   coverage_ratio: known(0.84),
+  cohort_revision: "a".repeat(64),
   generated_at: generatedAt,
   missing_signals: [],
+  recent_window_days: 7,
   sample_size: known(96),
   sources: ["PubMed", "JCR"],
   window_days: 30,
@@ -100,11 +105,16 @@ const subject = {
     analysis,
     items: [
       {
+        adjusted_p_value: known(0.018),
+        baseline_count: known(132),
         confidence_interval: {
           lower: 1.12,
           upper: 1.64,
         },
         estimate: known(1.36),
+        model_family: "negative_binomial",
+        p_value: known(0.009),
+        recent_count: known(41),
         independent_journal_count: known(9),
         independent_team_count: known(31),
         label: "论文发表率比",
@@ -181,6 +191,8 @@ describe("Subject intelligence pages", () => {
       expect(wrapper.text()).toContain(heading)
     }
     expect(wrapper.text()).toContain("1.12–1.64")
+    expect(wrapper.text()).toContain("negative_binomial")
+    expect(wrapper.text()).toContain("41")
     expect(wrapper.text()).toContain("31")
     expect(wrapper.text()).toContain("target_baseline")
     expect(wrapper.text()).toContain("jcr-biomedical-2025-v1")

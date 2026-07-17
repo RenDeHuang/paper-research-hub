@@ -16,6 +16,7 @@ info:
     Details response with `Allow: GET`.
 tags:
   - name: System
+  - name: Biomedical Catalog
   - name: Papers
   - name: Taxonomy
   - name: Trends
@@ -60,6 +61,142 @@ paths:
           $ref: "#/components/responses/InvalidRequestIDProblem"
         "405":
           $ref: "#/components/responses/MethodNotAllowedProblem"
+        default:
+          $ref: "#/components/responses/InternalProblem"
+  /api/v1/home:
+    get:
+      tags:
+        - Biomedical Catalog
+      operationId: getBiomedicalHome
+      summary: Get the complete biomedical Home snapshot
+      description: Returns the stored Home document from one immutable published generation.
+      parameters:
+        - $ref: "#/components/parameters/RequestID"
+      responses:
+        "200":
+          $ref: "#/components/responses/BiomedicalHomeOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
+        default:
+          $ref: "#/components/responses/InternalProblem"
+  /api/v1/subjects:
+    get:
+      tags:
+        - Biomedical Catalog
+      operationId: listBiomedicalSubjects
+      summary: List accepted biomedical Subjects
+      description: Uses the stable order `paper_count DESC, slug`.
+      parameters:
+        - $ref: "#/components/parameters/RequestID"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/BiomedicalSubjectListOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
+        "409":
+          $ref: "#/components/responses/CursorConflictProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
+        default:
+          $ref: "#/components/responses/InternalProblem"
+  /api/v1/subjects/{slug}:
+    get:
+      tags:
+        - Biomedical Catalog
+      operationId: getBiomedicalSubject
+      summary: Get one accepted biomedical Subject
+      description: |
+        `limit` and `cursor` paginate only the immutable
+        `detail_payload.recent_papers.items` array.
+      parameters:
+        - $ref: "#/components/parameters/RequestID"
+        - $ref: "#/components/parameters/Slug"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/BiomedicalSubjectOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "404":
+          $ref: "#/components/responses/NotFoundProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
+        "409":
+          $ref: "#/components/responses/CursorConflictProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
+        default:
+          $ref: "#/components/responses/InternalProblem"
+  /api/v1/journals:
+    get:
+      tags:
+        - Biomedical Catalog
+      operationId: listBiomedicalJournals
+      summary: List accepted biomedical Journals
+      description: Uses the stable order `paper_count DESC, slug`.
+      parameters:
+        - $ref: "#/components/parameters/RequestID"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/BiomedicalJournalListOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
+        "409":
+          $ref: "#/components/responses/CursorConflictProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
+        default:
+          $ref: "#/components/responses/InternalProblem"
+  /api/v1/journals/{slug}:
+    get:
+      tags:
+        - Biomedical Catalog
+      operationId: getBiomedicalJournal
+      summary: Get one accepted biomedical Journal
+      description: |
+        `limit` and `cursor` paginate only the immutable
+        `detail_payload.recent_papers.items` array.
+      parameters:
+        - $ref: "#/components/parameters/RequestID"
+        - $ref: "#/components/parameters/Slug"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/BiomedicalJournalOK"
+        "400":
+          $ref: "#/components/responses/InvalidRequestIDProblem"
+        "404":
+          $ref: "#/components/responses/NotFoundProblem"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowedProblem"
+        "409":
+          $ref: "#/components/responses/CursorConflictProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "503":
+          $ref: "#/components/responses/CatalogUnavailableProblem"
         default:
           $ref: "#/components/responses/InternalProblem"
   /api/v1/stats:
@@ -519,6 +656,61 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/HealthResponse"
+    BiomedicalHomeOK:
+      description: Complete Home document from the current biomedical generation.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/HomeResponse"
+    BiomedicalSubjectListOK:
+      description: Accepted biomedical Subjects from the current generation.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SubjectListResponse"
+    BiomedicalSubjectOK:
+      description: One accepted biomedical Subject with paginated recent papers.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SubjectDetailResponse"
+    BiomedicalJournalListOK:
+      description: Accepted biomedical Journals from the current generation.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JournalListResponse"
+    BiomedicalJournalOK:
+      description: One accepted biomedical Journal with paginated recent papers.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/XRequestID"
+        X-Catalog-Generation:
+          $ref: "#/components/headers/XCatalogGeneration"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/JournalDetailResponse"
     StatsOK:
       description: Statistics from the current catalog generation.
       headers:
@@ -947,6 +1139,328 @@ components:
               $ref: "#/components/schemas/PaperType"
         - $ref: "#/components/schemas/UnknownCatalogValue"
         - $ref: "#/components/schemas/MissingCatalogValue"
+    InsufficientEvidenceCatalogValue:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - reason
+      properties:
+        state:
+          type: string
+          const: insufficient_evidence
+        reason:
+          type: string
+          minLength: 1
+    CitationVelocityCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: number
+        - $ref: "#/components/schemas/InsufficientEvidenceCatalogValue"
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    CitationPercentileCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: number
+              minimum: 0
+              maximum: 100
+        - $ref: "#/components/schemas/InsufficientEvidenceCatalogValue"
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    CitationVelocityKnownEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - window_days
+        - current_snapshot_id
+        - baseline_snapshot_id
+        - elapsed_days
+      properties:
+        state:
+          type: string
+          const: known
+        window_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+        current_snapshot_id:
+          type: string
+          format: uuid
+        baseline_snapshot_id:
+          type: string
+          format: uuid
+        elapsed_days:
+          type: number
+          exclusiveMinimum: 0
+    CitationVelocityInsufficientEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - window_days
+        - reason
+        - missing
+      properties:
+        state:
+          type: string
+          const: insufficient_evidence
+        window_days:
+          type: integer
+          minimum: 1
+          maximum: 3650
+        reason:
+          type: string
+          minLength: 1
+        missing:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+    CitationVelocityEvidence:
+      oneOf:
+        - $ref: "#/components/schemas/CitationVelocityKnownEvidence"
+        - $ref: "#/components/schemas/CitationVelocityInsufficientEvidence"
+    CitationPercentileKnownEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - citation_snapshot_id
+        - subject_version_id
+        - subject_id
+        - publication_year
+        - publication_type_id
+        - cohort_key
+        - cohort_size
+        - minimum_cohort_size
+        - midrank
+        - supporting_work_ids
+      properties:
+        state:
+          type: string
+          const: known
+        citation_snapshot_id:
+          type: string
+          format: uuid
+        subject_version_id:
+          type: string
+          format: uuid
+        subject_id:
+          type: string
+          format: uuid
+        publication_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        publication_type_id:
+          type: string
+          format: uuid
+        cohort_key:
+          type: string
+          minLength: 1
+        cohort_size:
+          type: integer
+          minimum: 1
+        minimum_cohort_size:
+          type: integer
+          minimum: 2
+        midrank:
+          type: number
+          minimum: 1
+        supporting_work_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+    CitationPercentileInsufficientEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - citation_snapshot_id
+        - subject_version_id
+        - subject_id
+        - publication_year
+        - publication_type_id
+        - cohort_key
+        - cohort_size
+        - minimum_cohort_size
+        - reason
+        - supporting_work_ids
+      properties:
+        state:
+          type: string
+          const: insufficient_evidence
+        citation_snapshot_id:
+          type: string
+          format: uuid
+        subject_version_id:
+          type: string
+          format: uuid
+        subject_id:
+          type: string
+          format: uuid
+        publication_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        publication_type_id:
+          type: string
+          format: uuid
+        cohort_key:
+          type: string
+          minLength: 1
+        cohort_size:
+          type: integer
+          minimum: 1
+        minimum_cohort_size:
+          type: integer
+          minimum: 2
+        reason:
+          type: string
+          minLength: 1
+        supporting_work_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+    CitationPercentileEvidence:
+      oneOf:
+        - $ref: "#/components/schemas/CitationPercentileKnownEvidence"
+        - $ref: "#/components/schemas/CitationPercentileInsufficientEvidence"
+    CitationAnalysisEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis_run_id
+        - source
+        - as_of
+        - generated_at
+        - formula_version
+        - source_revision
+        - velocity
+        - percentile
+      properties:
+        analysis_run_id:
+          type: string
+          format: uuid
+        source:
+          type: string
+          minLength: 1
+        as_of:
+          type: string
+          format: date-time
+        generated_at:
+          type: string
+          format: date-time
+        formula_version:
+          type: string
+          minLength: 1
+        source_revision:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        velocity:
+          $ref: "#/components/schemas/CitationVelocityEvidence"
+        percentile:
+          $ref: "#/components/schemas/CitationPercentileEvidence"
+    CitationAnalysisEvidenceCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              $ref: "#/components/schemas/CitationAnalysisEvidence"
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    CitationSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        - source
+        - observed_at
+        - count
+        - source_record_id
+        - ingestion_job_id
+        - retrieved_at
+        - coverage
+        - definition_version
+        - dataset_version
+      properties:
+        source:
+          type: string
+          minLength: 1
+        observed_at:
+          type: string
+          format: date-time
+        count:
+          type: integer
+          minimum: 0
+        source_record_id:
+          type: string
+          format: uuid
+        ingestion_job_id:
+          type: string
+          format: uuid
+        retrieved_at:
+          type: string
+          format: date-time
+        coverage:
+          type: number
+          minimum: 0
+          maximum: 1
+        definition_version:
+          type: string
+          minLength: 1
+        dataset_version:
+          type: string
+          minLength: 1
+    CitationSnapshotsCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/CitationSnapshot"
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
     DiscoveryResponse:
       type: object
       additionalProperties: false
@@ -981,6 +1495,786 @@ components:
         service:
           type: string
           const: medpaperhub-api
+    StringArrayCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: array
+              items:
+                type: string
+                minLength: 1
+        - $ref: "#/components/schemas/UnknownCatalogValue"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    AnalysisMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - coverage_ratio
+        - generated_at
+        - missing_signals
+        - sample_size
+        - sources
+        - window_days
+      properties:
+        analysis_run_id:
+          type: string
+          format: uuid
+        analysis_type:
+          type: string
+          minLength: 1
+        baseline_window_days:
+          type: integer
+          minimum: 0
+        cohort_revision:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        coverage_ratio:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        formula_version:
+          $ref: "#/components/schemas/StringCatalogValue"
+        generated_at:
+          $ref: "#/components/schemas/StringCatalogValue"
+        missing_signals:
+          type: array
+          items:
+            oneOf:
+              - type: string
+                minLength: 1
+              - $ref: "#/components/schemas/MissingSignal"
+        recent_window_days:
+          type: integer
+          minimum: 0
+        sample_size:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        sources:
+          $ref: "#/components/schemas/StringArrayCatalogValue"
+        window_days:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+    ConfidenceInterval:
+      type: object
+      additionalProperties: false
+      required:
+        - lower
+        - upper
+      properties:
+        lower:
+          type: number
+        upper:
+          type: number
+    SubjectTrendEstimate:
+      type: object
+      additionalProperties: false
+      required:
+        - adjusted_p_value
+        - baseline_count
+        - confidence_interval
+        - estimate
+        - model_family
+        - p_value
+        - recent_count
+        - independent_journal_count
+        - independent_team_count
+      properties:
+        adjusted_p_value:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        baseline_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        confidence_interval:
+          $ref: "#/components/schemas/ConfidenceInterval"
+        estimate:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        model_family:
+          type: string
+          minLength: 1
+        p_value:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        independent_journal_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        independent_team_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        recent_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        label:
+          type: string
+          minLength: 1
+        subject:
+          $ref: "#/components/schemas/TaxonomyReference"
+    SubjectTrendCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubjectTrendEstimate"
+    CitationMomentumItem:
+      type: object
+      additionalProperties: false
+      required:
+        - citation_delta
+        - citations_per_day
+        - cohort_percentile
+        - paper
+      properties:
+        citation_delta:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        citations_per_day:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        cohort_percentile:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        paper:
+          $ref: "#/components/schemas/PaperSummary"
+    CitationMomentumCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CitationMomentumItem"
+    EntityMomentumItem:
+      type: object
+      additionalProperties: false
+      required:
+        - adjusted_p_value
+        - baseline_count
+        - confidence_interval
+        - entity_type
+        - estimate
+        - model_family
+        - p_value
+        - recent_count
+        - label
+        - independent_journal_count
+        - independent_team_count
+      properties:
+        adjusted_p_value:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        baseline_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        confidence_interval:
+          $ref: "#/components/schemas/ConfidenceInterval"
+        entity_type:
+          type: string
+          enum:
+            - disease
+            - method
+            - publication_type
+            - study_design
+            - target
+        estimate:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        independent_journal_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        independent_team_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        label:
+          type: string
+          minLength: 1
+        model_family:
+          type: string
+          minLength: 1
+        p_value:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        recent_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+    EntityMomentumCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/EntityMomentumItem"
+    JournalMetricCategory:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - quartile
+      properties:
+        name:
+          type: string
+          minLength: 1
+        quartile:
+          type: string
+          minLength: 1
+    JournalSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - slug
+        - title
+        - jcr_metric_year
+        - jif
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        title:
+          type: string
+          minLength: 1
+        aliases:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/JournalMetricCategory"
+        eissn:
+          $ref: "#/components/schemas/StringCatalogValue"
+        issn_l:
+          $ref: "#/components/schemas/StringCatalogValue"
+        issns:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        jcr_metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        jif:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        paper_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        publisher:
+          $ref: "#/components/schemas/StringCatalogValue"
+        taxonomy_version:
+          type: string
+          minLength: 1
+    JournalActivityItem:
+      type: object
+      additionalProperties: false
+      required:
+        - journal
+        - paper_count
+        - publication_change_ratio
+      properties:
+        journal:
+          $ref: "#/components/schemas/JournalSummary"
+        paper_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        publication_change_ratio:
+          $ref: "#/components/schemas/NumberCatalogValue"
+    JournalActivityCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/JournalActivityItem"
+    PaperAnalysisCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/PaperSummary"
+    ResearchOpportunityAnalysisCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResearchOpportunity"
+    HomeCoverage:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - citation_coverage_ratio
+        - jcr_metric_year
+        - mesh_coverage_ratio
+        - publication_type_coverage_ratio
+        - taxonomy_version
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        citation_coverage_ratio:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        jcr_metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        mesh_coverage_ratio:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        publication_type_coverage_ratio:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        taxonomy_version:
+          type: string
+          minLength: 1
+    HomeResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - active_journals
+        - catalog_generation
+        - citation_momentum
+        - coverage
+        - entity_momentum
+        - evidence_gaps
+        - generated_at
+        - latest_papers
+        - research_opportunities
+        - scope
+        - subject_momentum
+      properties:
+        active_journals:
+          $ref: "#/components/schemas/JournalActivityCollection"
+        catalog_generation:
+          type: string
+          minLength: 1
+        citation_momentum:
+          $ref: "#/components/schemas/CitationMomentumCollection"
+        coverage:
+          $ref: "#/components/schemas/HomeCoverage"
+        entity_momentum:
+          $ref: "#/components/schemas/EntityMomentumCollection"
+        evidence_gaps:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        generated_at:
+          type: string
+          format: date-time
+        latest_papers:
+          $ref: "#/components/schemas/PaperAnalysisCollection"
+        research_opportunities:
+          $ref: "#/components/schemas/ResearchOpportunityAnalysisCollection"
+        scope:
+          type: object
+          additionalProperties: false
+          required:
+            - jcr_metric_year
+            - taxonomy_version
+          properties:
+            jcr_metric_year:
+              type: integer
+              minimum: 1900
+              maximum: 3000
+            taxonomy_version:
+              type: string
+              minLength: 1
+        subject_momentum:
+          $ref: "#/components/schemas/SubjectTrendCollection"
+    SubjectSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - slug
+        - name
+        - description
+        - jcr_metric_year
+        - journal_count
+        - paper_count
+        - taxonomy_version
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        name:
+          type: string
+          minLength: 1
+        description:
+          $ref: "#/components/schemas/StringCatalogValue"
+        jcr_metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        journal_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        paper_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        taxonomy_version:
+          type: string
+          minLength: 1
+    SubjectListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - catalog_generation
+        - items
+        - jcr_metric_year
+        - pagination
+        - taxonomy_version
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        catalog_generation:
+          type: string
+          minLength: 1
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubjectSummary"
+        jcr_metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        taxonomy_version:
+          type: string
+          minLength: 1
+    DistributionBucket:
+      type: object
+      additionalProperties: false
+      required:
+        - count
+        - label
+        - ratio
+      properties:
+        count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        label:
+          type: string
+          minLength: 1
+        ratio:
+          $ref: "#/components/schemas/RatioCatalogValue"
+    DistributionCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DistributionBucket"
+    RecentPaperCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+        - pagination
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/PaperSummary"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+    SubjectDetailResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - slug
+        - name
+        - description
+        - jcr_metric_year
+        - journal_count
+        - paper_count
+        - taxonomy_version
+        - active_journals
+        - evidence_gaps
+        - mesh_distribution
+        - publication_type_distribution
+        - recent_papers
+        - trend_estimates
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        name:
+          type: string
+          minLength: 1
+        description:
+          $ref: "#/components/schemas/StringCatalogValue"
+        jcr_metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        journal_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        paper_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        taxonomy_version:
+          type: string
+          minLength: 1
+        active_journals:
+          $ref: "#/components/schemas/JournalActivityCollection"
+        evidence_gaps:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        mesh_distribution:
+          $ref: "#/components/schemas/DistributionCollection"
+        publication_type_distribution:
+          $ref: "#/components/schemas/DistributionCollection"
+        recent_papers:
+          $ref: "#/components/schemas/RecentPaperCollection"
+        trend_estimates:
+          $ref: "#/components/schemas/SubjectTrendCollection"
+    JournalCurationEvidenceItem:
+      type: object
+      additionalProperties: false
+      required:
+        - label
+        - value
+      properties:
+        label:
+          type: string
+          minLength: 1
+        value:
+          type: string
+          minLength: 1
+    JournalCuration:
+      type: object
+      additionalProperties: false
+      required:
+        - assessed_at
+        - decision
+        - evidence
+        - matched_rules
+        - metric_year
+        - policy_name
+        - policy_version
+      properties:
+        assessed_at:
+          type: string
+          format: date-time
+        decision:
+          type: string
+          const: accepted
+        evidence:
+          type: array
+          items:
+            $ref: "#/components/schemas/JournalCurationEvidenceItem"
+        matched_rules:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        policy_name:
+          type: string
+          minLength: 1
+        policy_version:
+          type: integer
+          minimum: 1
+    EditorialPatternEstimate:
+      type: object
+      additionalProperties: false
+      required:
+        - adjusted_p_value
+        - baseline
+        - confidence_interval
+        - coverage_ratio
+        - field_baseline_count
+        - dimension
+        - estimate
+        - estimate_kind
+        - interpretation_kind
+        - label
+        - minimum_support_count
+        - p_value
+        - support_papers
+      properties:
+        adjusted_p_value:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        baseline:
+          type: string
+          minLength: 1
+        confidence_interval:
+          $ref: "#/components/schemas/ConfidenceInterval"
+        coverage_ratio:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        field_baseline_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        dimension:
+          type: string
+          minLength: 1
+        estimate:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        estimate_kind:
+          type: string
+          enum:
+            - odds_ratio
+            - rate_ratio
+        interpretation_kind:
+          type: string
+          const: editorial_pattern
+        label:
+          type: string
+          minLength: 1
+        minimum_support_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        p_value:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        support_papers:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+    EditorialPatternCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/EditorialPatternEstimate"
+    JournalListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - catalog_generation
+        - items
+        - jcr_metric_year
+        - pagination
+        - taxonomy_version
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        catalog_generation:
+          type: string
+          minLength: 1
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/JournalSummary"
+        jcr_metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        taxonomy_version:
+          type: string
+          minLength: 1
+    JournalDetailResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - slug
+        - title
+        - jcr_metric_year
+        - jif
+        - curation
+        - editorial_patterns
+        - evidence_gaps
+        - recent_papers
+        - taxonomy_version
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        title:
+          type: string
+          minLength: 1
+        aliases:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/JournalMetricCategory"
+        eissn:
+          $ref: "#/components/schemas/StringCatalogValue"
+        issn_l:
+          $ref: "#/components/schemas/StringCatalogValue"
+        issns:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        jcr_metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        jif:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        paper_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        publisher:
+          $ref: "#/components/schemas/StringCatalogValue"
+        taxonomy_version:
+          type: string
+          minLength: 1
+        curation:
+          $ref: "#/components/schemas/JournalCuration"
+        editorial_patterns:
+          $ref: "#/components/schemas/EditorialPatternCollection"
+        evidence_gaps:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        recent_papers:
+          $ref: "#/components/schemas/RecentPaperCollection"
     StatsResponse:
       type: object
       additionalProperties: false
@@ -1083,17 +2377,12 @@ components:
       type: object
       additionalProperties: false
       required:
-        - generated_at
-        - formula_version
+        - analysis
         - items
         - pagination
       properties:
-        generated_at:
-          type: string
-          format: date-time
-        formula_version:
-          type: string
-          minLength: 1
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
         items:
           type: array
           items:
@@ -1112,6 +2401,15 @@ components:
         - has_code
         - has_data
         - has_benchmark
+        - citation_source
+        - citation_snapshots
+        - citation_velocity
+        - citation_percentile
+        - mesh_headings
+        - publication_types_state
+        - jcr_assessment
+        - article_usage
+        - open_fulltext
       properties:
         id:
           type: string
@@ -1130,6 +2428,8 @@ components:
           $ref: "#/components/schemas/PaperTypeCatalogValue"
         abstract:
           $ref: "#/components/schemas/StringCatalogValue"
+        abstract_snippet:
+          $ref: "#/components/schemas/StringCatalogValue"
         has_code:
           $ref: "#/components/schemas/BooleanCatalogValue"
         has_data:
@@ -1138,6 +2438,16 @@ components:
           $ref: "#/components/schemas/BooleanCatalogValue"
         citation_count:
           $ref: "#/components/schemas/IntegerCatalogValue"
+        citation_source:
+          $ref: "#/components/schemas/StringCatalogValue"
+        citation_snapshots:
+          $ref: "#/components/schemas/CitationSnapshotsCatalogValue"
+        citation_velocity:
+          $ref: "#/components/schemas/CitationVelocityCatalogValue"
+        citation_percentile:
+          $ref: "#/components/schemas/CitationPercentileCatalogValue"
+        citation_analysis_evidence:
+          $ref: "#/components/schemas/CitationAnalysisEvidenceCatalogValue"
         trend_score:
           $ref: "#/components/schemas/NumberCatalogValue"
         topics:
@@ -1152,12 +2462,434 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AuthorReference"
+        journal:
+          $ref: "#/components/schemas/JournalReference"
+        publication_types:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        publication_types_state:
+          $ref: "#/components/schemas/PublicationTypesCatalogValue"
+        mesh_headings:
+          $ref: "#/components/schemas/MeshHeadingsCatalogValue"
+        jcr_assessment:
+          $ref: "#/components/schemas/BiomedicalEligibilityRevisionCatalogValue"
+        article_usage:
+          $ref: "#/components/schemas/MissingCatalogValue"
+        open_fulltext:
+          $ref: "#/components/schemas/MissingCatalogValue"
+        subjects:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaxonomyReference"
         curation:
           $ref: "#/components/schemas/CurationCatalogValue"
         source_provenance:
           $ref: "#/components/schemas/SourceProvenanceCatalogValue"
     PaperDetail:
-      $ref: "#/components/schemas/PaperSummary"
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - title
+        - status
+        - published_at
+        - type
+        - has_code
+        - has_data
+        - has_benchmark
+        - citation_source
+        - citation_snapshots
+        - citation_velocity
+        - citation_percentile
+        - mesh_headings
+        - publication_types_state
+        - jcr_assessment
+        - article_usage
+        - open_fulltext
+      properties:
+        id:
+          type: string
+          format: uuid
+        canonical_key:
+          type: string
+          minLength: 1
+        title:
+          type: string
+          minLength: 1
+        status:
+          $ref: "#/components/schemas/PaperStatus"
+        published_at:
+          $ref: "#/components/schemas/DateTimeCatalogValue"
+        type:
+          $ref: "#/components/schemas/PaperTypeCatalogValue"
+        abstract:
+          $ref: "#/components/schemas/StringCatalogValue"
+        abstract_snippet:
+          $ref: "#/components/schemas/StringCatalogValue"
+        has_code:
+          $ref: "#/components/schemas/BooleanCatalogValue"
+        has_data:
+          $ref: "#/components/schemas/BooleanCatalogValue"
+        has_benchmark:
+          $ref: "#/components/schemas/BooleanCatalogValue"
+        citation_source:
+          $ref: "#/components/schemas/StringCatalogValue"
+        citation_count:
+          $ref: "#/components/schemas/IntegerCatalogValue"
+        citation_snapshots:
+          $ref: "#/components/schemas/CitationSnapshotsCatalogValue"
+        citation_velocity:
+          $ref: "#/components/schemas/CitationVelocityCatalogValue"
+        citation_percentile:
+          $ref: "#/components/schemas/CitationPercentileCatalogValue"
+        citation_analysis_evidence:
+          $ref: "#/components/schemas/CitationAnalysisEvidenceCatalogValue"
+        trend_score:
+          $ref: "#/components/schemas/NumberCatalogValue"
+        topics:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaxonomyReference"
+        methods:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaxonomyReference"
+        authors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuthorReference"
+        journal:
+          $ref: "#/components/schemas/JournalReference"
+        publication_types:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        publication_types_state:
+          $ref: "#/components/schemas/PublicationTypesCatalogValue"
+        mesh_headings:
+          $ref: "#/components/schemas/MeshHeadingsCatalogValue"
+        jcr_assessment:
+          $ref: "#/components/schemas/BiomedicalEligibilityRevisionCatalogValue"
+        article_usage:
+          $ref: "#/components/schemas/MissingCatalogValue"
+        open_fulltext:
+          $ref: "#/components/schemas/MissingCatalogValue"
+        subjects:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaxonomyReference"
+        curation:
+          $ref: "#/components/schemas/CurationCatalogValue"
+        source_provenance:
+          $ref: "#/components/schemas/SourceProvenanceCatalogValue"
+    JournalReference:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - slug
+        - title
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        title:
+          type: string
+          minLength: 1
+    MeshQualifier:
+      type: object
+      additionalProperties: false
+      required:
+        - qualifier_ui
+        - label
+        - is_major_topic
+        - source_path
+      properties:
+        qualifier_ui:
+          type: string
+          minLength: 1
+        label:
+          type: string
+          minLength: 1
+        is_major_topic:
+          type: boolean
+        source_path:
+          type: string
+          minLength: 1
+    MeshHeading:
+      type: object
+      additionalProperties: false
+      required:
+        - descriptor_ui
+        - label
+        - is_major_topic
+        - source_path
+        - qualifiers
+      properties:
+        descriptor_ui:
+          type: string
+          minLength: 1
+        label:
+          type: string
+          minLength: 1
+        is_major_topic:
+          type: boolean
+        source_path:
+          type: string
+          minLength: 1
+        qualifiers:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshQualifier"
+    MeshHeadingsCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: array
+              items:
+                $ref: "#/components/schemas/MeshHeading"
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    PublicationTypesCatalogValue:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - state
+            - value
+          properties:
+            state:
+              type: string
+              const: known
+            value:
+              type: array
+              items:
+                type: string
+                minLength: 1
+        - $ref: "#/components/schemas/MissingCatalogValue"
+    BiomedicalEligibilityVenueEvidenceWithISSNL:
+      type: object
+      additionalProperties: false
+      required:
+        - venue_id
+        - issn_l
+      properties:
+        venue_id:
+          type: string
+          format: uuid
+        issn_l:
+          type: string
+          minLength: 1
+        issn:
+          type: string
+          minLength: 1
+        eissn:
+          type: string
+          minLength: 1
+    BiomedicalEligibilityVenueEvidenceWithISSN:
+      type: object
+      additionalProperties: false
+      required:
+        - venue_id
+        - issn
+      properties:
+        venue_id:
+          type: string
+          format: uuid
+        issn_l:
+          type: string
+          minLength: 1
+        issn:
+          type: string
+          minLength: 1
+        eissn:
+          type: string
+          minLength: 1
+    BiomedicalEligibilityVenueEvidenceWithEISSN:
+      type: object
+      additionalProperties: false
+      required:
+        - venue_id
+        - eissn
+      properties:
+        venue_id:
+          type: string
+          format: uuid
+        issn_l:
+          type: string
+          minLength: 1
+        issn:
+          type: string
+          minLength: 1
+        eissn:
+          type: string
+          minLength: 1
+    BiomedicalEligibilityVenueEvidence:
+      anyOf:
+        - $ref: "#/components/schemas/BiomedicalEligibilityVenueEvidenceWithISSNL"
+        - $ref: "#/components/schemas/BiomedicalEligibilityVenueEvidenceWithISSN"
+        - $ref: "#/components/schemas/BiomedicalEligibilityVenueEvidenceWithEISSN"
+    BiomedicalEligibilityMetricEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - venue_metric_snapshot_id
+        - venue_id
+        - metric_year
+        - jcr_category
+      properties:
+        venue_metric_snapshot_id:
+          type: string
+          format: uuid
+        venue_id:
+          type: string
+          format: uuid
+        metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        jcr_category:
+          type: string
+          minLength: 1
+    BiomedicalEligibilitySubjectEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - journal_subject_metric_id
+        - venue_metric_snapshot_id
+        - venue_id
+        - metric_year
+        - subject_version_id
+        - subject_id
+        - subject_rule_id
+        - subject_slug
+        - jcr_category
+      properties:
+        journal_subject_metric_id:
+          type: string
+          format: uuid
+        venue_metric_snapshot_id:
+          type: string
+          format: uuid
+        venue_id:
+          type: string
+          format: uuid
+        metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        subject_version_id:
+          type: string
+          format: uuid
+        subject_id:
+          type: string
+          format: uuid
+        subject_rule_id:
+          type: string
+          format: uuid
+        subject_slug:
+          $ref: "#/components/schemas/TaxonomySlug"
+        jcr_category:
+          type: string
+          minLength: 1
+    BiomedicalEligibilityEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - policy_version
+        - metric_year
+        - subject_version_id
+        - subject_version_key
+        - venue
+        - metrics
+        - matches
+      properties:
+        policy_version:
+          type: string
+          minLength: 1
+        metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        subject_version_id:
+          type: string
+          format: uuid
+        subject_version_key:
+          type: string
+          minLength: 1
+        venue:
+          $ref: "#/components/schemas/BiomedicalEligibilityVenueEvidence"
+        metrics:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/BiomedicalEligibilityMetricEvidence"
+        matches:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/BiomedicalEligibilitySubjectEvidence"
+    BiomedicalEligibilityRevision:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - policy_version
+        - metric_year
+        - subject_version_id
+        - subject_version_key
+        - decision
+        - evidence
+        - assessed_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        policy_version:
+          type: string
+          minLength: 1
+        metric_year:
+          type: integer
+          minimum: 1900
+          maximum: 3000
+        subject_version_id:
+          type: string
+          format: uuid
+        subject_version_key:
+          type: string
+          minLength: 1
+        decision:
+          type: string
+          const: accepted
+        evidence:
+          $ref: "#/components/schemas/BiomedicalEligibilityEvidence"
+        assessed_at:
+          type: string
+          format: date-time
+    BiomedicalEligibilityRevisionCatalogValue:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - value
+      properties:
+        state:
+          type: string
+          const: known
+        value:
+          $ref: "#/components/schemas/BiomedicalEligibilityRevision"
     TaxonomyReference:
       type: object
       additionalProperties: false
@@ -1420,6 +3152,8 @@ components:
           minimum: 1
         score:
           type: number
+          minimum: 0
+          maximum: 1
         rank_change:
           type: integer
         subject_id:
@@ -1480,69 +3214,104 @@ components:
       type: object
       additionalProperties: false
       required:
-        - id
-        - title
-        - status
-        - evidence_ids
+        - analysis_run_id
+        - coverage_ratio
+        - estimates
         - formula_version
+        - generated_at
+        - id
+        - status
+        - supporting_work_ids
+        - target_id
+        - target_kind
+        - title
+        - trigger_rule
       properties:
-        id:
+        analysis_run_id:
           type: string
           format: uuid
-        title:
-          type: string
-          minLength: 1
-        summary:
-          type: string
-          minLength: 1
-        status:
-          $ref: "#/components/schemas/ResearchOpportunityStatus"
-        evidence_ids:
+        coverage_ratio:
+          $ref: "#/components/schemas/RatioCatalogValue"
+        estimates:
           type: array
           minItems: 1
-          uniqueItems: true
           items:
-            type: string
-            format: uuid
-        growth_score:
-          $ref: "#/components/schemas/RatioCatalogValue"
-        competition_density:
-          $ref: "#/components/schemas/RatioCatalogValue"
-        data_availability:
-          $ref: "#/components/schemas/RatioCatalogValue"
-        reproducibility:
-          $ref: "#/components/schemas/RatioCatalogValue"
-        missing_signals:
-          type: array
-          uniqueItems: true
-          items:
-            type: string
-            minLength: 1
-        limitations:
-          type: array
-          items:
-            type: string
-            minLength: 1
+            $ref: "#/components/schemas/ResearchOpportunityEstimate"
         formula_version:
           type: string
           minLength: 1
         generated_at:
           type: string
           format: date-time
-        evaluated_at:
+        id:
           type: string
-          format: date-time
-        window_start:
-          type: string
-          format: date-time
-        window_end:
-          type: string
-          format: date-time
+          format: uuid
+        limitations:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        missing_signals:
+          type: array
+          items:
+            type: string
+            minLength: 1
         recommended_next_steps:
           type: array
           items:
             type: string
             minLength: 1
+        summary:
+          type: string
+          minLength: 1
+        supporting_work_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        status:
+          $ref: "#/components/schemas/ResearchOpportunityStatus"
+        target_id:
+          type: string
+          minLength: 1
+        target_kind:
+          type: string
+          minLength: 1
+        title:
+          type: string
+          minLength: 1
+        trigger_rule:
+          $ref: "#/components/schemas/ResearchOpportunityTriggerRule"
+    ResearchOpportunityTriggerRule:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - version
+      properties:
+        code:
+          type: string
+          minLength: 1
+        version:
+          type: string
+          minLength: 1
+    ResearchOpportunityEstimate:
+      type: object
+      additionalProperties: false
+      required:
+        - confidence_interval
+        - metric
+        - value
+      properties:
+        confidence_interval:
+          $ref: "#/components/schemas/ConfidenceInterval"
+        metric:
+          type: string
+          minLength: 1
+        value:
+          type: number
     ProblemDetails:
       type: object
       additionalProperties: false

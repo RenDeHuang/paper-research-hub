@@ -33,10 +33,7 @@ const pageOperations = new Map([
   ["app/pages/topics/[slug].vue", ["getTopic", "listPapers"]],
   ["app/pages/methods/index.vue", ["listMethods"]],
   ["app/pages/methods/[slug].vue", ["getMethod", "listPapers"]],
-  [
-    "app/pages/trends.vue",
-    ["listPaperTrends", "listTopicTrends", "listMethodTrends"],
-  ],
+  ["app/pages/trends.vue", ["getHome"]],
   ["app/pages/opportunities.vue", ["listResearchOpportunities"]],
 ])
 
@@ -107,7 +104,7 @@ describe("public portal page contract", () => {
     }
   })
 
-  it("maps the papers form to supported Go query parameters only", () => {
+  it("exposes only the admitted biomedical journal-paper filters", () => {
     const source = readFileSync(
       `${webRoot}/app/pages/papers/index.vue`,
       "utf8",
@@ -117,6 +114,9 @@ describe("public portal page contract", () => {
       "published_from",
       "published_to",
       "type",
+      "sort",
+    ]
+    const removed = [
       "topic",
       "method",
       "has_code",
@@ -124,13 +124,54 @@ describe("public portal page contract", () => {
       "has_benchmark",
       "status",
       "source",
-      "sort",
     ]
 
     for (const parameter of supported) {
       expect(source).toContain(`name="${parameter}"`)
     }
+    for (const parameter of removed) {
+      expect(source).not.toContain(`name="${parameter}"`)
+    }
+    for (const paperType of ["preprint", "dataset", "benchmark"]) {
+      expect(source).not.toContain(`value="${paperType}"`)
+    }
+    for (const sourceName of [
+      "arxiv",
+      "openreview",
+      "s2",
+      "semantic_scholar",
+      "manual",
+    ]) {
+      expect(source).not.toContain(`value="${sourceName}"`)
+    }
     expect(source).not.toContain('name="jif_min"')
     expect(source).not.toContain('name="jcr_quartile"')
+  })
+
+  it("uses the generation-bound biomedical home snapshot for the trends overview", () => {
+    const source = readFileSync(
+      `${webRoot}/app/pages/trends.vue`,
+      "utf8",
+    )
+
+    for (const component of [
+      "SubjectMomentumGrid",
+      "CitationMomentumList",
+      "EntityMomentumGrid",
+    ]) {
+      expect(source).toContain(component)
+    }
+
+    for (const legacyContract of [
+      "listPaperTrends",
+      "listTopicTrends",
+      "listMethodTrends",
+      "trendQueryFromRoute",
+      'name="window_days"',
+      "Topic 趋势",
+      "Method 趋势",
+    ]) {
+      expect(source).not.toContain(legacyContract)
+    }
   })
 })

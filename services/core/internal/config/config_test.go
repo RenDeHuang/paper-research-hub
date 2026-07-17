@@ -171,6 +171,26 @@ func TestLoadForCatalogPublishRequiresOnlyDatabase(t *testing.T) {
 	}
 }
 
+func TestLoadForCitationAnalysisRequiresOnlyDatabase(t *testing.T) {
+	cfg, err := LoadFrom(RoleCitationAnalysis, mapLookup(map[string]string{
+		"DATABASE_URL": testDatabaseURL,
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if cfg.Database.URL != testDatabaseURL {
+		t.Errorf("Database.URL = %q, want supplied URL", cfg.Database.URL)
+	}
+	if cfg.Catalog.CursorSecret != "" ||
+		cfg.OpenAlex.APIKey != "" ||
+		cfg.PubMed.APIKey != "" {
+		t.Fatalf(
+			"citation analysis unexpectedly required API/source credentials: %+v",
+			cfg.Redacted(),
+		)
+	}
+}
+
 func TestLoadRequiresPostgreSQLDatabaseURLWithoutLeakingIt(t *testing.T) {
 	tests := []struct {
 		name string

@@ -1,12 +1,10 @@
 import type {
   OpportunityQuery,
   PageQuery,
-  PaperLifecycleStatus,
   PaperListQuery,
   PaperSort,
   PaperType,
   ResearchOpportunityStatus,
-  SourceName,
   TrendQuery,
 } from "~/types/catalog"
 
@@ -16,28 +14,6 @@ type RouteQuery = Record<string, RouteQueryValue>
 const paperTypes = new Set<PaperType>([
   "research_article",
   "review",
-  "preprint",
-  "dataset",
-  "benchmark",
-])
-const lifecycleStatuses = new Set<PaperLifecycleStatus>([
-  "active",
-  "withdrawn",
-  "retracted",
-  "rejected",
-  "superseded",
-])
-const sources = new Set<SourceName>([
-  "crossref",
-  "arxiv",
-  "openreview",
-  "s2",
-  "pubmed",
-  "pmc",
-  "openalex",
-  "springer_nature",
-  "elsevier",
-  "manual",
 ])
 const paperSorts = new Set<PaperSort>([
   "relevance",
@@ -51,7 +27,6 @@ const opportunityStatuses = new Set<ResearchOpportunityStatus>([
   "not_recommended_now",
   "insufficient_evidence",
 ])
-const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const rfc3339Pattern =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
 
@@ -107,20 +82,6 @@ function optionalInteger(
   return parsed
 }
 
-function optionalBoolean(query: RouteQuery, parameter: string) {
-  const value = singleValue(query, parameter)
-  if (value === undefined) {
-    return undefined
-  }
-  if (value === "true") {
-    return true
-  }
-  if (value === "false") {
-    return false
-  }
-  throw new CatalogQueryError(parameter, "布尔参数只能是 true 或 false")
-}
-
 function optionalEnum<T extends string>(
   query: RouteQuery,
   parameter: string,
@@ -134,17 +95,6 @@ function optionalEnum<T extends string>(
     throw new CatalogQueryError(parameter, "查询参数不在允许枚举内")
   }
   return value as T
-}
-
-function optionalSlug(query: RouteQuery, parameter: string) {
-  const value = singleValue(query, parameter)
-  if (value === undefined) {
-    return undefined
-  }
-  if (value.length > 120 || !slugPattern.test(value)) {
-    throw new CatalogQueryError(parameter, "分类 slug 格式无效")
-  }
-  return value
 }
 
 function optionalDateTime(query: RouteQuery, parameter: string) {
@@ -178,13 +128,6 @@ export function paperListQueryFromRoute(query: RouteQuery): PaperListQuery {
       "published_from",
       "published_to",
       "type",
-      "topic",
-      "method",
-      "has_code",
-      "has_data",
-      "has_benchmark",
-      "status",
-      "source",
       "sort",
       "limit",
       "cursor",
@@ -218,18 +161,12 @@ export function paperListQueryFromRoute(query: RouteQuery): PaperListQuery {
 
   return compact({
     cursor: optionalCursor(query),
-    has_benchmark: optionalBoolean(query, "has_benchmark"),
-    has_code: optionalBoolean(query, "has_code"),
-    has_data: optionalBoolean(query, "has_data"),
     limit: optionalLimit(query),
-    method: optionalSlug(query, "method"),
     published_from: publishedFrom,
     published_to: publishedTo,
     q,
     sort,
-    source: optionalEnum(query, "source", sources),
-    status: optionalEnum(query, "status", lifecycleStatuses),
-    topic: optionalSlug(query, "topic"),
+    status: "active",
     type: optionalEnum(query, "type", paperTypes),
   })
 }

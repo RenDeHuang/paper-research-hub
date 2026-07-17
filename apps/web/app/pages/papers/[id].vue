@@ -45,6 +45,15 @@ const abstract = computed(() =>
 const sources = computed(() =>
   paperSources(paper.value?.source_provenance),
 )
+const provenance = computed(() => paper.value?.source_provenance)
+const provenanceItems = computed(() =>
+  provenance.value?.state === "known"
+    ? provenance.value.value
+    : undefined,
+)
+const unavailableProvenanceState = computed<"missing" | "unknown">(() =>
+  provenance.value?.state === "missing" ? "missing" : "unknown",
+)
 const curation = computed<
   | { state: "known"; value: CurationPayload }
   | { state: "missing" | "unknown" }
@@ -86,6 +95,13 @@ useHead(() => ({
     />
 
     <template v-if="paper">
+      <header class="page-header">
+        <p class="page-eyebrow">
+          已准入期刊论文
+        </p>
+        <h1>{{ paper.title }}</h1>
+      </header>
+
       <CatalogPaperCard :paper="paper" />
 
       <section class="detail-section" aria-labelledby="abstract-heading">
@@ -126,30 +142,35 @@ useHead(() => ({
           </div>
         </dl>
         <DataState
-          v-if="paper.source_provenance === undefined"
-          state="unknown"
-          title="来源明细未覆盖"
-          message="当前 API 响应没有 source_provenance 明细，页面不会推断来源时间或策略版本。"
+          v-if="provenanceItems === undefined"
+          :state="unavailableProvenanceState"
+          :title="unavailableProvenanceState === 'missing'
+            ? '来源明细缺失'
+            : '来源明细未覆盖'"
+          :message="unavailableProvenanceState === 'missing'
+            ? '该记录预期存在来源明细，但当前数据缺失。'
+            : '当前 API 响应没有 source_provenance 明细，页面不会推断来源时间或策略版本。'"
         />
         <ul v-else class="provenance-list">
           <li
-            v-for="source in paper.source_provenance"
-            :key="typeof source === 'string' ? source : `${source.source}:${source.source_record_id}`"
+            v-for="source in provenanceItems"
+            :key="`${source.source}:${source.source_record_id}`"
           >
-            <template v-if="typeof source === 'string'">
-              {{ source }}
-            </template>
-            <template v-else>
-              <strong>{{ source.source }}</strong>
-              <span>记录：{{ source.source_record_id }}</span>
-              <span v-if="source.source_time">来源时间：{{ source.source_time }}</span>
-              <span v-if="source.normalization_policy_version">
-                归一化策略：{{ source.normalization_policy_version }}
-              </span>
-            </template>
+            <strong>{{ source.source }}</strong>
+            <span>记录：{{ source.source_record_id }}</span>
+            <span>来源时间：{{ source.source_time }}</span>
+            <span>
+              归一化策略：{{ source.normalization_policy_version }}
+            </span>
           </li>
         </ul>
       </section>
+
+      <MedicalEvidencePanel :paper="paper" />
+
+      <CitationEvidencePanel :paper="paper" />
+
+      <UsageEvidencePanel :paper="paper" />
 
       <section class="detail-section" aria-labelledby="curation-heading">
         <p class="section-kicker">

@@ -29,10 +29,12 @@ const (
 )
 
 var (
-	ErrTimeReversed   = errors.New("ranking time boundary is reversed")
-	ErrWindowMismatch = errors.New("ranking windows do not match")
-	ErrInvalidMetric  = errors.New("ranking metric is invalid")
-	ErrInvalidCohort  = errors.New("citation cohort key is invalid")
+	ErrTimeReversed        = errors.New("ranking time boundary is reversed")
+	ErrWindowMismatch      = errors.New("ranking windows do not match")
+	ErrInvalidMetric       = errors.New("ranking metric is invalid")
+	ErrInvalidCohort       = errors.New("citation cohort key is invalid")
+	ErrMixedMetricSource   = errors.New("citation metric snapshots mix sources")
+	ErrInvalidMetricSource = errors.New("citation metric source is invalid")
 )
 
 var taxonomySlugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
@@ -45,6 +47,18 @@ type MetricSnapshot struct {
 type CitationVelocityInput struct {
 	Start *MetricSnapshot
 	End   *MetricSnapshot
+}
+
+type SourceMetricSnapshot struct {
+	Source     string
+	ObservedAt time.Time
+	Value      decimal.Decimal
+}
+
+type SourceSpecificCitationVelocityInput struct {
+	Source string
+	Start  *SourceMetricSnapshot
+	End    *SourceMetricSnapshot
 }
 
 type CodeGrowthInput struct {
@@ -188,6 +202,38 @@ func CitationVelocity(input CitationVelocityInput) (decimal.Decimal, error) {
 	nanosecondsPerDay := decimal.NewFromInt(int64((24 * time.Hour).Nanoseconds()))
 	elapsedNanoseconds := decimal.NewFromInt(elapsed.Nanoseconds())
 	return change.Mul(nanosecondsPerDay).DivRound(elapsedNanoseconds, DivisionScale), nil
+}
+
+func SourceSpecificCitationVelocity(
+	input SourceSpecificCitationVelocityInput,
+) (decimal.Decimal, error) {
+	if input.Source == "" || input.Source != strings.TrimSpace(input.Source) {
+		return decimal.Zero, ErrInvalidMetricSource
+	}
+	if input.Start != nil && input.Start.Source != input.Source {
+		return decimal.Zero, ErrMixedMetricSource
+	}
+	if input.End != nil && input.End.Source != input.Source {
+		return decimal.Zero, ErrMixedMetricSource
+	}
+
+	var start, end *MetricSnapshot
+	if input.Start != nil {
+		start = &MetricSnapshot{
+			ObservedAt: input.Start.ObservedAt,
+			Value:      input.Start.Value,
+		}
+	}
+	if input.End != nil {
+		end = &MetricSnapshot{
+			ObservedAt: input.End.ObservedAt,
+			Value:      input.End.Value,
+		}
+	}
+	return CitationVelocity(CitationVelocityInput{
+		Start: start,
+		End:   end,
+	})
 }
 
 func CodeGrowth(input CodeGrowthInput) (decimal.Decimal, error) {

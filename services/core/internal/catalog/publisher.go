@@ -7,13 +7,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/analysis"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/citation"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/shopspring/decimal"
 )
 
 const publicCatalogPublisherLockID int64 = 0x50434154414c4f47
@@ -25,12 +31,19 @@ type Publisher struct {
 }
 
 type catalogSnapshot struct {
-	stats     json.RawMessage
-	papers    []publishedPaper
-	topics    []publishedTaxonomy
-	methods   []publishedTaxonomy
-	sources   []sourceRevisionFact
-	curations []curationRevisionFact
+	stats               json.RawMessage
+	home                json.RawMessage
+	subjectListMetadata json.RawMessage
+	journalListMetadata json.RawMessage
+	papers              []publishedPaper
+	topics              []publishedTaxonomy
+	methods             []publishedTaxonomy
+	subjects            []publishedBiomedicalResource
+	journals            []publishedBiomedicalResource
+	trends              []publishedTrend
+	opportunities       []publishedResearchOpportunity
+	sources             []sourceRevisionFact
+	curations           []curationRevisionFact
 }
 
 type sourceRevisionFact struct {
@@ -101,6 +114,16 @@ type publishedPaper struct {
 	TrendScoreValue    *string
 	SummaryPayload     json.RawMessage
 	DetailPayload      json.RawMessage
+	CitationTrend      citationTrendEvidence
+	biomedical         biomedicalPaperPayload
+}
+
+type publishedBiomedicalResource struct {
+	ID             uuid.UUID
+	Slug           string
+	PaperCount     int64
+	SummaryPayload json.RawMessage
+	DetailPayload  json.RawMessage
 }
 
 type publishedTaxonomy struct {
@@ -126,8 +149,91 @@ type assertionValue struct {
 }
 
 type catalogValue struct {
-	State string `json:"state"`
-	Value any    `json:"value,omitempty"`
+	State  string `json:"state"`
+	Value  any    `json:"value,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type citationSnapshotPayload struct {
+	Source            string    `json:"source"`
+	ObservedAt        string    `json:"observed_at"`
+	Count             int64     `json:"count"`
+	SourceRecordID    uuid.UUID `json:"source_record_id"`
+	IngestionJobID    uuid.UUID `json:"ingestion_job_id"`
+	RetrievedAt       string    `json:"retrieved_at"`
+	Coverage          float64   `json:"coverage"`
+	DefinitionVersion string    `json:"definition_version"`
+	DatasetVersion    string    `json:"dataset_version"`
+}
+
+type citationAnalysisRun struct {
+	ID                       uuid.UUID
+	Source                   string
+	AsOf                     time.Time
+	GeneratedAt              time.Time
+	VelocityWindowDays       int
+	MinimumCohortSize        int
+	FormulaVersion           string
+	SubjectVersion           string
+	EligibilityPolicyVersion string
+	JCRMetricYear            int
+	JCRImportReceipt         uuid.UUID
+	VenuePolicyName          string
+	VenuePolicyVersion       int
+}
+
+type citationVelocityKnownEvidence struct {
+	State              string    `json:"state"`
+	WindowDays         int       `json:"window_days"`
+	CurrentSnapshotID  uuid.UUID `json:"current_snapshot_id"`
+	BaselineSnapshotID uuid.UUID `json:"baseline_snapshot_id"`
+	ElapsedDays        float64   `json:"elapsed_days"`
+}
+
+type citationVelocityInsufficientEvidence struct {
+	State      string   `json:"state"`
+	WindowDays int      `json:"window_days"`
+	Reason     string   `json:"reason"`
+	Missing    []string `json:"missing"`
+}
+
+type citationPercentileKnownEvidence struct {
+	State              string      `json:"state"`
+	CitationSnapshotID uuid.UUID   `json:"citation_snapshot_id"`
+	SubjectVersionID   uuid.UUID   `json:"subject_version_id"`
+	SubjectID          uuid.UUID   `json:"subject_id"`
+	PublicationYear    int         `json:"publication_year"`
+	PublicationTypeID  uuid.UUID   `json:"publication_type_id"`
+	CohortKey          string      `json:"cohort_key"`
+	CohortSize         int         `json:"cohort_size"`
+	MinimumCohortSize  int         `json:"minimum_cohort_size"`
+	Midrank            json.Number `json:"midrank"`
+	SupportingWorkIDs  []uuid.UUID `json:"supporting_work_ids"`
+}
+
+type citationPercentileInsufficientEvidence struct {
+	State              string      `json:"state"`
+	CitationSnapshotID uuid.UUID   `json:"citation_snapshot_id"`
+	SubjectVersionID   uuid.UUID   `json:"subject_version_id"`
+	SubjectID          uuid.UUID   `json:"subject_id"`
+	PublicationYear    int         `json:"publication_year"`
+	PublicationTypeID  uuid.UUID   `json:"publication_type_id"`
+	CohortKey          string      `json:"cohort_key"`
+	CohortSize         int         `json:"cohort_size"`
+	MinimumCohortSize  int         `json:"minimum_cohort_size"`
+	Reason             string      `json:"reason"`
+	SupportingWorkIDs  []uuid.UUID `json:"supporting_work_ids"`
+}
+
+type citationAnalysisEvidencePayload struct {
+	AnalysisRunID  uuid.UUID `json:"analysis_run_id"`
+	Source         string    `json:"source"`
+	AsOf           string    `json:"as_of"`
+	GeneratedAt    string    `json:"generated_at"`
+	FormulaVersion string    `json:"formula_version"`
+	SourceRevision string    `json:"source_revision"`
+	Velocity       any       `json:"velocity"`
+	Percentile     any       `json:"percentile"`
 }
 
 type sourceProvenancePayload struct {
@@ -144,6 +250,36 @@ type taxonomyReference struct {
 	ID   uuid.UUID `json:"id"`
 	Slug string    `json:"slug"`
 	Name string    `json:"name"`
+}
+
+type journalReference struct {
+	ID    uuid.UUID `json:"id"`
+	Slug  string    `json:"slug"`
+	Title string    `json:"title"`
+}
+
+type meshQualifierPayload struct {
+	QualifierUI string `json:"qualifier_ui"`
+	Label       string `json:"label"`
+	MajorTopic  bool   `json:"is_major_topic"`
+	SourcePath  string `json:"source_path"`
+}
+
+type meshHeadingPayload struct {
+	DescriptorUI string                 `json:"descriptor_ui"`
+	Label        string                 `json:"label"`
+	MajorTopic   bool                   `json:"is_major_topic"`
+	SourcePath   string                 `json:"source_path"`
+	Qualifiers   []meshQualifierPayload `json:"qualifiers"`
+}
+
+type biomedicalPaperPayload struct {
+	Journal               journalReference
+	Subjects              []taxonomyReference
+	MeSHHeadings          catalogValue
+	PublicationTypes      []string
+	PublicationTypesState catalogValue
+	JCRAssessment         catalogValue
 }
 
 type authorReference struct {
@@ -167,9 +303,38 @@ type curationPayload struct {
 }
 
 type curationRevisionFact struct {
-	WorkID   uuid.UUID       `json:"work_id"`
-	VenueID  uuid.UUID       `json:"venue_id"`
-	Curation curationPayload `json:"curation"`
+	WorkID      uuid.UUID                     `json:"work_id"`
+	VenueID     uuid.UUID                     `json:"venue_id"`
+	Curation    curationPayload               `json:"curation"`
+	Eligibility biomedicalEligibilityRevision `json:"biomedical_eligibility"`
+}
+
+type jcrAssessmentCategoryEvidence struct {
+	Category   string  `json:"category"`
+	JIF        *string `json:"jif"`
+	Quartile   string  `json:"quartile,omitempty"`
+	Status     string  `json:"status"`
+	SourceName string  `json:"source_name"`
+}
+
+type jcrAssessmentEvidence struct {
+	JCRImportReceiptID string                          `json:"jcr_import_receipt_id"`
+	PolicyVersion      string                          `json:"policy_version"`
+	MetricYear         int                             `json:"metric_year"`
+	VenueType          string                          `json:"venue_type"`
+	Reason             string                          `json:"reason,omitempty"`
+	Categories         []jcrAssessmentCategoryEvidence `json:"categories"`
+}
+
+type biomedicalEligibilityRevision struct {
+	ID                uuid.UUID       `json:"id"`
+	PolicyVersion     string          `json:"policy_version"`
+	MetricYear        int             `json:"metric_year"`
+	SubjectVersionID  uuid.UUID       `json:"subject_version_id"`
+	SubjectVersionKey string          `json:"subject_version_key"`
+	Decision          string          `json:"decision"`
+	Evidence          json.RawMessage `json:"evidence"`
+	AssessedAt        string          `json:"assessed_at"`
 }
 
 func NewPublisher(database transactionBeginner) (*Publisher, error) {
@@ -266,6 +431,15 @@ func validatePublishInput(input PublishInput) error {
 			ErrCatalogNotReady,
 		)
 	}
+	if input.EligibilityPolicyVersion !=
+		biomed.BiomedicalPublicEligibilityPolicyVersion {
+		return fmt.Errorf(
+			"%w: unsupported biomedical eligibility policy version %q; expected %s",
+			ErrCatalogNotReady,
+			input.EligibilityPolicyVersion,
+			biomed.BiomedicalPublicEligibilityPolicyVersion,
+		)
+	}
 	if input.SubjectVersion == "" ||
 		input.SubjectVersion != strings.TrimSpace(input.SubjectVersion) {
 		return fmt.Errorf(
@@ -276,6 +450,37 @@ func validatePublishInput(input PublishInput) error {
 	if input.JCRImportReceipt == uuid.Nil {
 		return fmt.Errorf(
 			"%w: JCR import receipt is required",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.CitationSource == "" ||
+		input.CitationSource != strings.TrimSpace(input.CitationSource) {
+		return fmt.Errorf(
+			"%w: citation source must be non-empty and trimmed",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.CitationAnalysisRunID == uuid.Nil {
+		return fmt.Errorf(
+			"%w: citation analysis run is required",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.TrendAnalysisRunID == uuid.Nil {
+		return fmt.Errorf(
+			"%w: trend analysis run is required",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.JournalAnalysisRunID == uuid.Nil {
+		return fmt.Errorf(
+			"%w: journal analysis run is required",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.OpportunityAnalysisRunID == uuid.Nil {
+		return fmt.Errorf(
+			"%w: opportunity analysis run is required",
 			ErrCatalogNotReady,
 		)
 	}
@@ -301,12 +506,152 @@ func verifyPublisherTransaction(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
+func validateCitationAnalysisRun(
+	ctx context.Context,
+	tx pgx.Tx,
+	input PublishInput,
+) (citationAnalysisRun, error) {
+	var (
+		run           citationAnalysisRun
+		analysisType  string
+		modelProvider string
+		modelName     string
+		promptVersion string
+		status        string
+		rawInput      []byte
+		rawOutput     []byte
+		startedAt     time.Time
+		completedAt   time.Time
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT
+			id,
+			analysis_type,
+			model_provider,
+			model_name,
+			prompt_version,
+			status,
+			input_payload,
+			output_payload,
+			started_at,
+			completed_at
+		FROM analysis_runs
+		WHERE id = $1
+	`, input.CitationAnalysisRunID).Scan(
+		&run.ID,
+		&analysisType,
+		&modelProvider,
+		&modelName,
+		&promptVersion,
+		&status,
+		&rawInput,
+		&rawOutput,
+		&startedAt,
+		&completedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return citationAnalysisRun{}, fmt.Errorf(
+			"%w: citation analysis run %s does not exist",
+			ErrCatalogNotReady,
+			input.CitationAnalysisRunID,
+		)
+	}
+	if err != nil {
+		return citationAnalysisRun{}, fmt.Errorf(
+			"query citation analysis run %s: %w",
+			input.CitationAnalysisRunID,
+			err,
+		)
+	}
+	if analysisType != citation.CitationIntelligenceAnalysisType ||
+		modelProvider != "internal" ||
+		modelName != "deterministic" ||
+		promptVersion != citation.CitationIntelligenceFormulaVersion ||
+		status != "succeeded" ||
+		len(rawOutput) == 0 ||
+		startedAt.IsZero() ||
+		completedAt.IsZero() ||
+		completedAt.After(input.GeneratedAt) {
+		return citationAnalysisRun{}, fmt.Errorf(
+			"%w: citation analysis run %s is not an exact completed deterministic citation_intelligence run available at generated_at",
+			ErrCatalogNotReady,
+			input.CitationAnalysisRunID,
+		)
+	}
+
+	var payload struct {
+		Source                   string    `json:"source"`
+		AsOf                     string    `json:"as_of"`
+		VelocityWindowDays       int       `json:"velocity_window_days"`
+		MinimumCohortSize        int       `json:"minimum_cohort_size"`
+		FormulaVersion           string    `json:"formula_version"`
+		SubjectVersion           string    `json:"subject_version"`
+		EligibilityPolicyVersion string    `json:"eligibility_policy_version"`
+		JCRMetricYear            int       `json:"jcr_metric_year"`
+		JCRImportReceipt         uuid.UUID `json:"jcr_import_receipt"`
+		VenuePolicyName          string    `json:"venue_policy_name"`
+		VenuePolicyVersion       int       `json:"venue_policy_version"`
+	}
+	if err := decodeStrictJSONObject(rawInput, &payload); err != nil {
+		return citationAnalysisRun{}, fmt.Errorf(
+			"%w: decode exact citation analysis run %s input: %v",
+			ErrCatalogNotReady,
+			input.CitationAnalysisRunID,
+			err,
+		)
+	}
+	asOf, err := time.Parse(time.RFC3339Nano, payload.AsOf)
+	if err != nil {
+		return citationAnalysisRun{}, fmt.Errorf(
+			"%w: citation analysis run %s has invalid as_of",
+			ErrCatalogNotReady,
+			input.CitationAnalysisRunID,
+		)
+	}
+	if payload.Source != input.CitationSource ||
+		payload.FormulaVersion != citation.CitationIntelligenceFormulaVersion ||
+		payload.SubjectVersion != input.SubjectVersion ||
+		payload.EligibilityPolicyVersion !=
+			input.EligibilityPolicyVersion ||
+		payload.JCRMetricYear != input.JCRMetricYear ||
+		payload.JCRImportReceipt != input.JCRImportReceipt ||
+		payload.VenuePolicyName != input.VenuePolicyName ||
+		payload.VenuePolicyVersion != input.VenuePolicyVersion ||
+		payload.VelocityWindowDays < 1 ||
+		payload.VelocityWindowDays > 3650 ||
+		payload.MinimumCohortSize < 2 ||
+		asOf.After(input.GeneratedAt) {
+		return citationAnalysisRun{}, fmt.Errorf(
+			"%w: citation analysis run %s scope does not match this catalog publication",
+			ErrCatalogNotReady,
+			input.CitationAnalysisRunID,
+		)
+	}
+	run.Source = payload.Source
+	run.AsOf = asOf.UTC()
+	run.GeneratedAt = completedAt.UTC()
+	run.VelocityWindowDays = payload.VelocityWindowDays
+	run.MinimumCohortSize = payload.MinimumCohortSize
+	run.FormulaVersion = payload.FormulaVersion
+	run.SubjectVersion = payload.SubjectVersion
+	run.EligibilityPolicyVersion = payload.EligibilityPolicyVersion
+	run.JCRMetricYear = payload.JCRMetricYear
+	run.JCRImportReceipt = payload.JCRImportReceipt
+	run.VenuePolicyName = payload.VenuePolicyName
+	run.VenuePolicyVersion = payload.VenuePolicyVersion
+	return run, nil
+}
+
 func buildCurrentSnapshot(
 	ctx context.Context,
 	tx pgx.Tx,
 	input PublishInput,
 ) (catalogSnapshot, string, error) {
 	if err := validateCurationReferences(ctx, tx, input); err != nil {
+		return catalogSnapshot{}, "", err
+	}
+	analysisRun, err := validateCitationAnalysisRun(ctx, tx, input)
+	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
 	states, err := loadCurrentSourceStates(ctx, tx)
@@ -373,6 +718,10 @@ func buildCurrentSnapshot(
 	})
 	eligibleWorkIDs := make([]uuid.UUID, 0, len(workIDs))
 	curationsByWork := make(map[uuid.UUID]catalogValue, len(workIDs))
+	eligibilityByWork := make(
+		map[uuid.UUID]biomedicalEligibilityRevision,
+		len(workIDs),
+	)
 	curationFacts := make([]curationRevisionFact, 0, len(workIDs))
 	revisionSources := make([]sourceRevisionFact, 0)
 	for _, workID := range workIDs {
@@ -393,6 +742,7 @@ func buildCurrentSnapshot(
 			State: "known",
 			Value: curation.Curation,
 		}
+		eligibilityByWork[workID] = curation.Eligibility
 		curationFacts = append(curationFacts, curation)
 		for _, state := range visible[workID].states {
 			revisionSources = append(revisionSources, sourceRevisionFact{
@@ -416,6 +766,23 @@ func buildCurrentSnapshot(
 	if len(eligibleWorkIDs) == 0 {
 		return catalogSnapshot{}, "", ErrEmptyDomain
 	}
+	cohortRevision, err := biomedicalCohortRevision(
+		eligibleWorkIDs,
+		visible,
+		curationFacts,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
+	biomedicalRuns, err := validateBiomedicalAnalysisRuns(
+		ctx,
+		tx,
+		input,
+		cohortRevision,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
 	sort.Slice(revisionSources, func(i, j int) bool {
 		left, right := revisionSources[i], revisionSources[j]
 		if left.LogicalSource != right.LogicalSource {
@@ -434,6 +801,9 @@ func buildCurrentSnapshot(
 			workID,
 			visible[workID],
 			curationsByWork[workID],
+			eligibilityByWork[workID],
+			input.JCRImportReceipt,
+			analysisRun,
 		)
 		if err != nil {
 			return catalogSnapshot{}, "", err
@@ -449,6 +819,13 @@ func buildCurrentSnapshot(
 	sort.Slice(papers, func(i, j int) bool {
 		return papers[i].CanonicalKey < papers[j].CanonicalKey
 	})
+	papers, trends, citationMomentum, err := buildCitationMomentum(
+		analysisRun,
+		papers,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
 
 	topics, err := publishTaxonomies(topicFacts)
 	if err != nil {
@@ -462,20 +839,131 @@ func buildCurrentSnapshot(
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
+	home,
+		subjectListMetadata,
+		journalListMetadata,
+		subjects,
+		journals,
+		err := buildBiomedicalSnapshots(
+		ctx,
+		tx,
+		input,
+		papers,
+		curationFacts,
+		citationMomentum,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
+	home,
+		subjects,
+		journals,
+		opportunities,
+		err := publishBiomedicalAnalysisSnapshots(
+		ctx,
+		tx,
+		biomedicalRuns,
+		papers,
+		home,
+		subjects,
+		journals,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
 
 	snapshot := catalogSnapshot{
-		stats:     stats,
-		papers:    papers,
-		topics:    topics,
-		methods:   methods,
-		sources:   revisionSources,
-		curations: curationFacts,
+		stats:               stats,
+		home:                home,
+		subjectListMetadata: subjectListMetadata,
+		journalListMetadata: journalListMetadata,
+		papers:              papers,
+		topics:              topics,
+		methods:             methods,
+		subjects:            subjects,
+		journals:            journals,
+		trends:              trends,
+		opportunities:       opportunities,
+		sources:             revisionSources,
+		curations:           curationFacts,
 	}
 	sourceRevision, err := snapshotRevision(input, snapshot)
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
 	return snapshot, sourceRevision, nil
+}
+
+func biomedicalCohortRevision(
+	workIDs []uuid.UUID,
+	visible map[uuid.UUID]*workSources,
+	curations []curationRevisionFact,
+) (string, error) {
+	curationByWork := make(map[uuid.UUID]curationRevisionFact, len(curations))
+	for _, curation := range curations {
+		if curation.WorkID == uuid.Nil ||
+			curation.VenueID == uuid.Nil ||
+			curation.Eligibility.ID == uuid.Nil {
+			return "", fmt.Errorf(
+				"%w: biomedical cohort contains incomplete curation evidence",
+				ErrCatalogNotReady,
+			)
+		}
+		if _, duplicate := curationByWork[curation.WorkID]; duplicate {
+			return "", fmt.Errorf(
+				"%w: biomedical cohort contains duplicate curation for Work %s",
+				ErrCatalogNotReady,
+				curation.WorkID,
+			)
+		}
+		curationByWork[curation.WorkID] = curation
+	}
+
+	facts := make([]analysis.CohortWorkRevisionFact, 0, len(workIDs))
+	for _, workID := range workIDs {
+		curation, found := curationByWork[workID]
+		if !found {
+			return "", fmt.Errorf(
+				"%w: biomedical cohort Work %s lacks curation evidence",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		sources := visible[workID]
+		if sources == nil || len(sources.states) == 0 {
+			return "", fmt.Errorf(
+				"%w: biomedical cohort Work %s lacks current source evidence",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		assertionIDs := make([]uuid.UUID, 0, len(sources.states))
+		for _, state := range sources.states {
+			if state.normalizedAssertionID == uuid.Nil {
+				return "", fmt.Errorf(
+					"%w: biomedical cohort Work %s has a missing normalized assertion",
+					ErrCatalogNotReady,
+					workID,
+				)
+			}
+			assertionIDs = append(assertionIDs, state.normalizedAssertionID)
+		}
+		facts = append(facts, analysis.CohortWorkRevisionFact{
+			WorkID:                workID,
+			VenueID:               curation.VenueID,
+			EligibilityDecisionID: curation.Eligibility.ID,
+			SourceAssertionIDs:    assertionIDs,
+		})
+	}
+	revision, err := analysis.ComputeCohortRevision(facts)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%w: compute biomedical cohort revision: %v",
+			ErrCatalogNotReady,
+			err,
+		)
+	}
+	return revision, nil
 }
 
 func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, error) {
@@ -604,6 +1092,9 @@ func buildPaper(
 	workID uuid.UUID,
 	sources *workSources,
 	curation catalogValue,
+	eligibility biomedicalEligibilityRevision,
+	jcrImportReceipt uuid.UUID,
+	analysisRun citationAnalysisRun,
 ) (publishedPaper, []taxonomyFact, []taxonomyFact, error) {
 	var paper publishedPaper
 	err := tx.QueryRow(ctx, `
@@ -703,13 +1194,33 @@ func buildPaper(
 	paper.HasDataState, paper.HasDataValue = boolColumns(hasData)
 	paper.HasBenchmarkState, paper.HasBenchmarkValue = boolColumns(hasBenchmark)
 
-	citationValue, citationCount, err := loadCitationCount(ctx, tx, workID)
+	citationValue,
+		citationCount,
+		citationSnapshots,
+		citationVelocity,
+		citationPercentile,
+		citationAnalysisEvidence,
+		err := loadCitationAnalysisEvidence(
+		ctx,
+		tx,
+		workID,
+		analysisRun,
+	)
 	if err != nil {
 		return publishedPaper{}, nil, nil, err
 	}
 	paper.CitationCountState = citationValue.State
 	paper.CitationCountValue = citationCount
 	paper.TrendScoreState = "missing"
+	paper.CitationTrend, err = loadCitationTrendEvidence(
+		ctx,
+		tx,
+		workID,
+		analysisRun,
+	)
+	if err != nil {
+		return publishedPaper{}, nil, nil, err
+	}
 
 	topics, err := loadTaxonomyFacts(ctx, tx, "topics", workID, sources.sourceRecordIDs)
 	if err != nil {
@@ -728,25 +1239,49 @@ func buildPaper(
 		return publishedPaper{}, nil, nil, err
 	}
 	provenance := sourceProvenance(sources.states)
+	biomedical, err := loadBiomedicalPaperPayload(
+		ctx,
+		tx,
+		workID,
+		eligibility,
+		jcrImportReceipt,
+	)
+	if err != nil {
+		return publishedPaper{}, nil, nil, err
+	}
+	paper.biomedical = biomedical
 
 	paperPayload := map[string]any{
-		"id":                paper.ID,
-		"canonical_key":     paper.CanonicalKey,
-		"title":             paper.Title,
-		"status":            paper.LifecycleStatus,
-		"published_at":      publishedAtValue,
-		"type":              paperTypeValue,
-		"abstract":          abstractValue,
-		"has_code":          hasCode,
-		"has_data":          hasData,
-		"has_benchmark":     hasBenchmark,
-		"citation_count":    citationValue,
-		"trend_score":       catalogValue{State: "missing"},
-		"topics":            taxonomyReferences(topics),
-		"methods":           taxonomyReferences(methods),
-		"authors":           authors,
-		"curation":          curation,
-		"source_provenance": catalogValue{State: "known", Value: provenance},
+		"id":                         paper.ID,
+		"canonical_key":              paper.CanonicalKey,
+		"title":                      paper.Title,
+		"status":                     paper.LifecycleStatus,
+		"published_at":               publishedAtValue,
+		"type":                       paperTypeValue,
+		"abstract":                   abstractValue,
+		"has_code":                   hasCode,
+		"has_data":                   hasData,
+		"has_benchmark":              hasBenchmark,
+		"citation_source":            catalogValue{State: "known", Value: analysisRun.Source},
+		"citation_count":             citationValue,
+		"trend_score":                catalogValue{State: "missing"},
+		"topics":                     taxonomyReferences(topics),
+		"methods":                    taxonomyReferences(methods),
+		"authors":                    authors,
+		"curation":                   curation,
+		"journal":                    biomedical.Journal,
+		"subjects":                   biomedical.Subjects,
+		"mesh_headings":              biomedical.MeSHHeadings,
+		"publication_types":          biomedical.PublicationTypes,
+		"publication_types_state":    biomedical.PublicationTypesState,
+		"jcr_assessment":             biomedical.JCRAssessment,
+		"citation_snapshots":         citationSnapshots,
+		"citation_velocity":          citationVelocity,
+		"citation_percentile":        citationPercentile,
+		"citation_analysis_evidence": citationAnalysisEvidence,
+		"article_usage":              catalogValue{State: "missing"},
+		"open_fulltext":              catalogValue{State: "missing"},
+		"source_provenance":          catalogValue{State: "known", Value: provenance},
 	}
 	payload, err := marshalCatalogPayload(paperPayload)
 	if err != nil {
@@ -768,9 +1303,459 @@ func buildPaper(
 	for _, method := range methods {
 		searchParts = append(searchParts, method.Name)
 	}
+	searchParts = append(searchParts, biomedical.Journal.Title)
+	for _, subject := range biomedical.Subjects {
+		searchParts = append(searchParts, subject.Name)
+	}
+	if biomedical.MeSHHeadings.State == "known" {
+		headings, ok := biomedical.MeSHHeadings.Value.([]meshHeadingPayload)
+		if !ok {
+			return publishedPaper{}, nil, nil, fmt.Errorf(
+				"%w: work %s has invalid in-memory MeSH payload",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		for _, heading := range headings {
+			searchParts = append(searchParts, heading.Label)
+			for _, qualifier := range heading.Qualifiers {
+				searchParts = append(searchParts, qualifier.Label)
+			}
+		}
+	}
+	searchParts = append(searchParts, biomedical.PublicationTypes...)
 	searchParts = append(searchParts, paper.SourceNames...)
 	paper.SearchText = strings.Join(searchParts, " ")
 	return paper, topics, methods, nil
+}
+
+func loadBiomedicalPaperPayload(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+	eligibility biomedicalEligibilityRevision,
+	jcrImportReceipt uuid.UUID,
+) (biomedicalPaperPayload, error) {
+	if eligibility.ID == uuid.Nil ||
+		eligibility.Decision != "accepted" ||
+		eligibility.SubjectVersionID == uuid.Nil {
+		return biomedicalPaperPayload{}, fmt.Errorf(
+			"%w: work %s lacks accepted persisted biomedical eligibility",
+			ErrCatalogNotReady,
+			workID,
+		)
+	}
+
+	var journal journalReference
+	if err := tx.QueryRow(ctx, `
+		SELECT venue.id, venue.display_title
+		FROM works AS work
+		JOIN venues AS venue
+		  ON venue.id = work.venue_id
+		WHERE work.id = $1
+		  AND venue.id = (
+			SELECT decision.venue_id
+			FROM biomedical_publication_eligibility_decisions AS decision
+			WHERE decision.id = $2
+		  )
+	`, workID, eligibility.ID).Scan(&journal.ID, &journal.Title); err != nil {
+		return biomedicalPaperPayload{}, fmt.Errorf(
+			"query work %s biomedical journal identity: %w",
+			workID,
+			err,
+		)
+	}
+	if journal.Title == "" || journal.Title != strings.TrimSpace(journal.Title) {
+		return biomedicalPaperPayload{}, fmt.Errorf(
+			"%w: work %s journal has invalid display title",
+			ErrCatalogNotReady,
+			workID,
+		)
+	}
+	journal.Slug = "journal-" + strings.ReplaceAll(journal.ID.String(), "-", "")
+
+	subjects, err := loadEligibilitySubjects(
+		ctx,
+		tx,
+		eligibility,
+		jcrImportReceipt,
+	)
+	if err != nil {
+		return biomedicalPaperPayload{}, fmt.Errorf(
+			"load work %s biomedical Subjects: %w",
+			workID,
+			err,
+		)
+	}
+	meshHeadings, publicationTypes, publicationTypesState, err :=
+		loadCurrentBiomedicalSemantics(ctx, tx, workID)
+	if err != nil {
+		return biomedicalPaperPayload{}, err
+	}
+
+	return biomedicalPaperPayload{
+		Journal:               journal,
+		Subjects:              subjects,
+		MeSHHeadings:          meshHeadings,
+		PublicationTypes:      publicationTypes,
+		PublicationTypesState: publicationTypesState,
+		JCRAssessment: catalogValue{
+			State: "known",
+			Value: eligibility,
+		},
+	}, nil
+}
+
+func loadEligibilitySubjects(
+	ctx context.Context,
+	tx pgx.Tx,
+	eligibility biomedicalEligibilityRevision,
+	jcrImportReceipt uuid.UUID,
+) ([]taxonomyReference, error) {
+	var evidence struct {
+		Matches []struct {
+			JournalSubjectMetricID string `json:"journal_subject_metric_id"`
+			VenueMetricSnapshotID  string `json:"venue_metric_snapshot_id"`
+			VenueID                string `json:"venue_id"`
+			MetricYear             int    `json:"metric_year"`
+			SubjectVersionID       string `json:"subject_version_id"`
+			SubjectID              string `json:"subject_id"`
+			SubjectRuleID          string `json:"subject_rule_id"`
+			SubjectSlug            string `json:"subject_slug"`
+			JCRCategory            string `json:"jcr_category"`
+		} `json:"matches"`
+	}
+	if err := json.Unmarshal(eligibility.Evidence, &evidence); err != nil {
+		return nil, fmt.Errorf(
+			"%w: decode biomedical eligibility evidence: %v",
+			ErrCatalogNotReady,
+			err,
+		)
+	}
+	if len(evidence.Matches) == 0 {
+		return nil, fmt.Errorf(
+			"%w: accepted biomedical eligibility has no Subject matches",
+			ErrCatalogNotReady,
+		)
+	}
+
+	seen := make(map[uuid.UUID]struct{}, len(evidence.Matches))
+	subjects := make([]taxonomyReference, 0, len(evidence.Matches))
+	for _, match := range evidence.Matches {
+		subjectID, err := uuid.Parse(match.SubjectID)
+		linkID, linkErr := uuid.Parse(match.JournalSubjectMetricID)
+		metricID, metricErr := uuid.Parse(match.VenueMetricSnapshotID)
+		venueID, venueErr := uuid.Parse(match.VenueID)
+		subjectVersionID, versionErr := uuid.Parse(match.SubjectVersionID)
+		subjectRuleID, ruleErr := uuid.Parse(match.SubjectRuleID)
+		if err != nil ||
+			linkErr != nil ||
+			metricErr != nil ||
+			venueErr != nil ||
+			versionErr != nil ||
+			ruleErr != nil ||
+			subjectID == uuid.Nil ||
+			linkID == uuid.Nil ||
+			metricID == uuid.Nil ||
+			venueID == uuid.Nil ||
+			subjectVersionID != eligibility.SubjectVersionID ||
+			subjectRuleID == uuid.Nil ||
+			match.MetricYear != eligibility.MetricYear ||
+			match.JCRCategory == "" ||
+			match.JCRCategory != strings.TrimSpace(match.JCRCategory) ||
+			!validSlug(match.SubjectSlug) {
+			return nil, fmt.Errorf(
+				"%w: accepted biomedical eligibility has invalid Subject identity",
+				ErrCatalogNotReady,
+			)
+		}
+		if _, duplicate := seen[subjectID]; duplicate {
+			continue
+		}
+		seen[subjectID] = struct{}{}
+
+		var subject taxonomyReference
+		if err := tx.QueryRow(ctx, `
+			SELECT subject.id, subject.slug, subject.display_label
+			FROM jcr_import_receipt_metrics AS receipt_metric
+			JOIN venue_metric_snapshots AS metric
+			  ON metric.id = receipt_metric.metric_snapshot_id
+			JOIN journal_subject_metrics AS link
+			  ON link.id = $2
+			 AND link.venue_metric_snapshot_id = metric.id
+			JOIN biomedical_subject_rules AS rule
+			  ON rule.id = link.subject_rule_id
+			JOIN subjects AS subject
+			  ON subject.id = rule.subject_id
+			 AND subject.subject_version_id = rule.subject_version_id
+			WHERE receipt_metric.import_receipt_id = $1
+			  AND metric.id = $3
+			  AND metric.venue_id = $4
+			  AND metric.metric_year = $5
+			  AND metric.category = $6
+			  AND link.subject_rule_id = $7
+			  AND link.jcr_category = metric.category
+			  AND rule.subject_version_id = $8
+			  AND rule.jcr_category = metric.category
+			  AND subject.id = $9
+		`,
+			jcrImportReceipt,
+			linkID,
+			metricID,
+			venueID,
+			match.MetricYear,
+			match.JCRCategory,
+			subjectRuleID,
+			subjectVersionID,
+			subjectID,
+		).Scan(
+			&subject.ID,
+			&subject.Slug,
+			&subject.Name,
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, fmt.Errorf(
+					"%w: accepted biomedical eligibility Subject evidence does not belong to JCR receipt %s",
+					ErrCatalogNotReady,
+					jcrImportReceipt,
+				)
+			}
+			return nil, fmt.Errorf(
+				"query exact biomedical Subject %s: %w",
+				subjectID,
+				err,
+			)
+		}
+		if subject.Slug != match.SubjectSlug ||
+			subject.Name == "" ||
+			subject.Name != strings.TrimSpace(subject.Name) {
+			return nil, fmt.Errorf(
+				"%w: persisted biomedical Subject evidence changed",
+				ErrCatalogNotReady,
+			)
+		}
+		subjects = append(subjects, subject)
+	}
+	sort.Slice(subjects, func(i, j int) bool {
+		if subjects[i].Slug != subjects[j].Slug {
+			return subjects[i].Slug < subjects[j].Slug
+		}
+		return subjects[i].ID.String() < subjects[j].ID.String()
+	})
+	return subjects, nil
+}
+
+func loadCurrentBiomedicalSemantics(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+) (catalogValue, []string, catalogValue, error) {
+	var projectionAssertionID uuid.UUID
+	var logicalSource string
+	err := tx.QueryRow(ctx, `
+		SELECT assertion.id, source_record.source
+		FROM work_projection_states AS state
+		JOIN ingestion_projection_assertions AS assertion
+		  ON assertion.work_id = state.work_id
+		 AND assertion.raw_event_id = state.raw_event_id
+		 AND assertion.normalized_assertion_id = state.normalized_assertion_id
+		 AND assertion.source_record_uuid = state.source_record_uuid
+		 AND assertion.scope_policy_version = state.scope_policy_version
+		 AND assertion.projection_policy_version = state.projection_policy_version
+		JOIN source_records AS source_record
+		  ON source_record.id = state.source_record_uuid
+		WHERE state.work_id = $1
+	`, workID).Scan(&projectionAssertionID, &logicalSource)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return catalogValue{State: "missing"},
+			[]string{},
+			catalogValue{State: "missing"},
+			nil
+	}
+	if err != nil {
+		return catalogValue{}, nil, catalogValue{}, fmt.Errorf(
+			"query work %s current biomedical projection: %w",
+			workID,
+			err,
+		)
+	}
+	if logicalSource != "pubmed" {
+		return catalogValue{State: "missing"},
+			[]string{},
+			catalogValue{State: "missing"},
+			nil
+	}
+
+	headings, err := loadMeSHHeadings(ctx, tx, workID, projectionAssertionID)
+	if err != nil {
+		return catalogValue{}, nil, catalogValue{}, err
+	}
+	publicationTypes, err := loadPublicationTypes(
+		ctx,
+		tx,
+		workID,
+		projectionAssertionID,
+	)
+	if err != nil {
+		return catalogValue{}, nil, catalogValue{}, err
+	}
+	return catalogValue{State: "known", Value: headings},
+		publicationTypes,
+		catalogValue{State: "known", Value: publicationTypes},
+		nil
+}
+
+func loadMeSHHeadings(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+	projectionAssertionID uuid.UUID,
+) ([]meshHeadingPayload, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT
+			heading.id,
+			descriptor.descriptor_ui,
+			heading.descriptor_label,
+			heading.is_major_topic,
+			heading.source_path,
+			qualifier.qualifier_ui,
+			assertion.qualifier_label,
+			assertion.is_major_topic,
+			assertion.source_path
+		FROM work_mesh_headings AS heading
+		JOIN mesh_descriptors AS descriptor
+		  ON descriptor.id = heading.descriptor_id
+		LEFT JOIN work_mesh_qualifiers AS assertion
+		  ON assertion.work_mesh_heading_id = heading.id
+		 AND assertion.projection_assertion_id = heading.projection_assertion_id
+		 AND assertion.source_record_id = heading.source_record_id
+		 AND assertion.work_id = heading.work_id
+		LEFT JOIN mesh_qualifiers AS qualifier
+		  ON qualifier.id = assertion.qualifier_id
+		WHERE heading.work_id = $1
+		  AND heading.projection_assertion_id = $2
+		ORDER BY descriptor.descriptor_ui, qualifier.qualifier_ui NULLS LAST
+	`, workID, projectionAssertionID)
+	if err != nil {
+		return nil, fmt.Errorf("query work %s current MeSH headings: %w", workID, err)
+	}
+	defer rows.Close()
+
+	headings := make([]meshHeadingPayload, 0)
+	headingIndex := make(map[uuid.UUID]int)
+	for rows.Next() {
+		var (
+			headingID                       uuid.UUID
+			descriptorUI, label, sourcePath string
+			majorTopic                      bool
+			qualifierUI, qualifierLabel     *string
+			qualifierSourcePath             *string
+			qualifierMajorTopic             *bool
+		)
+		if err := rows.Scan(
+			&headingID,
+			&descriptorUI,
+			&label,
+			&majorTopic,
+			&sourcePath,
+			&qualifierUI,
+			&qualifierLabel,
+			&qualifierMajorTopic,
+			&qualifierSourcePath,
+		); err != nil {
+			return nil, fmt.Errorf("scan work %s current MeSH heading: %w", workID, err)
+		}
+		index, exists := headingIndex[headingID]
+		if !exists {
+			if descriptorUI == "" || label == "" || sourcePath == "" {
+				return nil, fmt.Errorf(
+					"%w: work %s has incomplete MeSH heading evidence",
+					ErrCatalogNotReady,
+					workID,
+				)
+			}
+			index = len(headings)
+			headingIndex[headingID] = index
+			headings = append(headings, meshHeadingPayload{
+				DescriptorUI: descriptorUI,
+				Label:        label,
+				MajorTopic:   majorTopic,
+				SourcePath:   sourcePath,
+				Qualifiers:   []meshQualifierPayload{},
+			})
+		}
+		if qualifierUI == nil {
+			continue
+		}
+		if qualifierLabel == nil ||
+			qualifierMajorTopic == nil ||
+			qualifierSourcePath == nil ||
+			*qualifierUI == "" ||
+			*qualifierLabel == "" ||
+			*qualifierSourcePath == "" {
+			return nil, fmt.Errorf(
+				"%w: work %s has incomplete MeSH qualifier evidence",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		headings[index].Qualifiers = append(
+			headings[index].Qualifiers,
+			meshQualifierPayload{
+				QualifierUI: *qualifierUI,
+				Label:       *qualifierLabel,
+				MajorTopic:  *qualifierMajorTopic,
+				SourcePath:  *qualifierSourcePath,
+			},
+		)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate work %s current MeSH headings: %w", workID, err)
+	}
+	return headings, nil
+}
+
+func loadPublicationTypes(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+	projectionAssertionID uuid.UUID,
+) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT
+			publication_type.publication_type_ui,
+			assertion.publication_type_label
+		FROM work_publication_types AS assertion
+		JOIN publication_types AS publication_type
+		  ON publication_type.id = assertion.publication_type_id
+		WHERE assertion.work_id = $1
+		  AND assertion.projection_assertion_id = $2
+		ORDER BY publication_type.publication_type_ui
+	`, workID, projectionAssertionID)
+	if err != nil {
+		return nil, fmt.Errorf("query work %s current Publication Types: %w", workID, err)
+	}
+	defer rows.Close()
+
+	values := make([]string, 0)
+	for rows.Next() {
+		var ui, label string
+		if err := rows.Scan(&ui, &label); err != nil {
+			return nil, fmt.Errorf("scan work %s current Publication Type: %w", workID, err)
+		}
+		if ui == "" || label == "" || label != strings.TrimSpace(label) {
+			return nil, fmt.Errorf(
+				"%w: work %s has incomplete Publication Type evidence",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		values = append(values, label)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate work %s current Publication Types: %w", workID, err)
+	}
+	return values, nil
 }
 
 func loadAssertions(
@@ -985,37 +1970,732 @@ func boolColumns(value catalogValue) (string, *bool) {
 	return value.State, &typed
 }
 
-func loadCitationCount(
+func loadCitationAnalysisEvidence(
 	ctx context.Context,
 	tx pgx.Tx,
 	workID uuid.UUID,
-) (catalogValue, *int64, error) {
-	var value string
+	run citationAnalysisRun,
+) (
+	catalogValue,
+	*int64,
+	catalogValue,
+	catalogValue,
+	catalogValue,
+	catalogValue,
+	error,
+) {
+	var (
+		asOf, generatedAt                     time.Time
+		windowDays                            int
+		countState, velocityState             string
+		currentSnapshotID, baselineSnapshotID pgtype.UUID
+		countValue                            pgtype.Int8
+		velocityValue                         pgtype.Text
+		sourceRevision, formulaVersion        string
+		rawWorkEvidence                       []byte
+	)
 	err := tx.QueryRow(ctx, `
-		SELECT metric_value::text
-		FROM metric_snapshots
-		WHERE work_id = $1
-		  AND metric_name = 'citation_count'
-		ORDER BY observed_at DESC, id
-		LIMIT 1
-	`, workID).Scan(&value)
+		SELECT
+			as_of,
+			velocity_window_days,
+			citation_count_state,
+			current_snapshot_id,
+			citation_count,
+			citation_velocity_state,
+			baseline_snapshot_id,
+			citation_velocity::text,
+			source_revision,
+			formula_version,
+			evidence,
+			generated_at
+		FROM citation_analysis_work_snapshots
+		WHERE analysis_run_id = $1
+		  AND work_id = $2
+		  AND source = $3
+	`, run.ID, workID, run.Source).Scan(
+		&asOf,
+		&windowDays,
+		&countState,
+		&currentSnapshotID,
+		&countValue,
+		&velocityState,
+		&baselineSnapshotID,
+		&velocityValue,
+		&sourceRevision,
+		&formulaVersion,
+		&rawWorkEvidence,
+		&generatedAt,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return catalogValue{State: "missing"}, nil, nil
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			fmt.Errorf(
+				"%w: citation analysis run %s has no materialized Work %s",
+				ErrCatalogNotReady,
+				run.ID,
+				workID,
+			)
 	}
 	if err != nil {
-		return catalogValue{}, nil, fmt.Errorf("query work %s citation count: %w", workID, err)
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			fmt.Errorf(
+				"query Work %s citation analysis run %s: %w",
+				workID,
+				run.ID,
+				err,
+			)
 	}
-	var parsed int64
-	if _, err := fmt.Sscan(value, &parsed); err != nil ||
-		fmt.Sprintf("%d", parsed) != value ||
-		parsed < 0 {
-		return catalogValue{}, nil, fmt.Errorf(
-			"%w: work %s citation count is not a non-negative integer",
+	if !asOf.Equal(run.AsOf) ||
+		windowDays < 1 ||
+		formulaVersion != run.FormulaVersion ||
+		generatedAt.IsZero() ||
+		sourceRevision == "" ||
+		!regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(sourceRevision) {
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			fmt.Errorf(
+				"%w: Work %s citation analysis metadata conflicts with run %s",
+				ErrCatalogNotReady,
+				workID,
+				run.ID,
+			)
+	}
+
+	var workEvidence struct {
+		Source                string          `json:"source"`
+		AsOf                  string          `json:"as_of"`
+		VelocityWindowDays    int             `json:"velocity_window_days"`
+		CurrentSnapshotID     *uuid.UUID      `json:"current_snapshot_id"`
+		BaselineSnapshotID    *uuid.UUID      `json:"baseline_snapshot_id"`
+		ElapsedHours          *json.Number    `json:"elapsed_hours"`
+		MissingSignals        []string        `json:"missing_signals"`
+		SupportingSnapshotIDs []uuid.UUID     `json:"supporting_snapshot_ids"`
+		Scope                 json.RawMessage `json:"scope"`
+	}
+	if err := decodeStrictJSONObject(rawWorkEvidence, &workEvidence); err != nil {
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			fmt.Errorf(
+				"%w: decode Work %s citation analysis evidence: %v",
+				ErrCatalogNotReady,
+				workID,
+				err,
+			)
+	}
+	if workEvidence.Source != run.Source ||
+		workEvidence.AsOf != run.AsOf.Format(time.RFC3339Nano) ||
+		workEvidence.VelocityWindowDays != windowDays ||
+		len(workEvidence.Scope) == 0 {
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			fmt.Errorf(
+				"%w: Work %s citation analysis evidence conflicts with run %s",
+				ErrCatalogNotReady,
+				workID,
+				run.ID,
+			)
+	}
+
+	snapshots, err := loadCitationSnapshotsByID(
+		ctx,
+		tx,
+		workID,
+		run.Source,
+		workEvidence.SupportingSnapshotIDs,
+	)
+	if err != nil {
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			err
+	}
+	snapshotsValue := catalogValue{State: "missing"}
+	if len(snapshots) != 0 {
+		snapshotsValue = catalogValue{
+			State: "known",
+			Value: snapshots,
+		}
+	}
+
+	var count *int64
+	countCatalogValue := catalogValue{State: countState}
+	switch countState {
+	case "known":
+		if !countValue.Valid ||
+			countValue.Int64 < 0 ||
+			!currentSnapshotID.Valid {
+			return catalogValue{},
+				nil,
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				fmt.Errorf(
+					"%w: Work %s has invalid materialized citation count",
+					ErrCatalogNotReady,
+					workID,
+				)
+		}
+		value := countValue.Int64
+		count = &value
+		countCatalogValue.Value = value
+	case "missing":
+		if countValue.Valid || currentSnapshotID.Valid {
+			return catalogValue{},
+				nil,
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				fmt.Errorf(
+					"%w: Work %s missing citation count has stored value",
+					ErrCatalogNotReady,
+					workID,
+				)
+		}
+	default:
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			fmt.Errorf(
+				"%w: Work %s has invalid citation count state %q",
+				ErrCatalogNotReady,
+				workID,
+				countState,
+			)
+	}
+
+	var velocityCatalogValue catalogValue
+	var velocityEvidence any
+	switch velocityState {
+	case "known":
+		if !velocityValue.Valid ||
+			!currentSnapshotID.Valid ||
+			!baselineSnapshotID.Valid ||
+			workEvidence.ElapsedHours == nil {
+			return catalogValue{},
+				nil,
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				fmt.Errorf(
+					"%w: Work %s has incomplete known citation velocity",
+					ErrCatalogNotReady,
+					workID,
+				)
+		}
+		velocityNumber, err := strictJSONNumber(velocityValue.String)
+		if err != nil {
+			return catalogValue{},
+				nil,
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				fmt.Errorf(
+					"%w: Work %s has invalid citation velocity: %v",
+					ErrCatalogNotReady,
+					workID,
+					err,
+				)
+		}
+		elapsedHours, err := decimal.NewFromString(
+			workEvidence.ElapsedHours.String(),
+		)
+		if err != nil || !elapsedHours.IsPositive() {
+			return catalogValue{},
+				nil,
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				fmt.Errorf(
+					"%w: Work %s has invalid citation velocity elapsed time",
+					ErrCatalogNotReady,
+					workID,
+				)
+		}
+		elapsedDays := elapsedHours.Div(decimal.NewFromInt(24))
+		velocityCatalogValue = catalogValue{
+			State: "known",
+			Value: velocityNumber,
+		}
+		velocityEvidence = citationVelocityKnownEvidence{
+			State:              "known",
+			WindowDays:         windowDays,
+			CurrentSnapshotID:  uuid.UUID(currentSnapshotID.Bytes),
+			BaselineSnapshotID: uuid.UUID(baselineSnapshotID.Bytes),
+			ElapsedDays:        decimalFloat64(elapsedDays),
+		}
+	case "insufficient_evidence":
+		if velocityValue.Valid {
+			return catalogValue{},
+				nil,
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				catalogValue{},
+				fmt.Errorf(
+					"%w: Work %s insufficient velocity has a numeric value",
+					ErrCatalogNotReady,
+					workID,
+				)
+		}
+		missing := append([]string(nil), workEvidence.MissingSignals...)
+		if len(missing) == 0 {
+			missing = []string{"citation_velocity_boundary"}
+		}
+		reason := "citation velocity requires exact same-source boundary snapshots"
+		velocityCatalogValue = catalogValue{
+			State:  "insufficient_evidence",
+			Reason: reason,
+		}
+		velocityEvidence = citationVelocityInsufficientEvidence{
+			State:      "insufficient_evidence",
+			WindowDays: windowDays,
+			Reason:     reason,
+			Missing:    missing,
+		}
+	default:
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			fmt.Errorf(
+				"%w: Work %s has invalid citation velocity state %q",
+				ErrCatalogNotReady,
+				workID,
+				velocityState,
+			)
+	}
+
+	percentileCatalogValue,
+		percentileEvidence,
+		hasUniquePercentile,
+		err := loadCitationPercentile(
+		ctx,
+		tx,
+		run,
+		workID,
+	)
+	if err != nil {
+		return catalogValue{},
+			nil,
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			catalogValue{},
+			err
+	}
+	analysisEvidence := catalogValue{State: "missing"}
+	if hasUniquePercentile {
+		analysisEvidence = catalogValue{
+			State: "known",
+			Value: citationAnalysisEvidencePayload{
+				AnalysisRunID:  run.ID,
+				Source:         run.Source,
+				AsOf:           run.AsOf.Format(time.RFC3339Nano),
+				GeneratedAt:    generatedAt.UTC().Format(time.RFC3339Nano),
+				FormulaVersion: formulaVersion,
+				SourceRevision: sourceRevision,
+				Velocity:       velocityEvidence,
+				Percentile:     percentileEvidence,
+			},
+		}
+	}
+	return countCatalogValue,
+		count,
+		snapshotsValue,
+		velocityCatalogValue,
+		percentileCatalogValue,
+		analysisEvidence,
+		nil
+}
+
+func loadCitationSnapshotsByID(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+	source string,
+	snapshotIDs []uuid.UUID,
+) ([]citationSnapshotPayload, error) {
+	if len(snapshotIDs) == 0 {
+		return []citationSnapshotPayload{}, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT
+			id,
+			source,
+			observed_at,
+			count,
+			source_record_id,
+			ingestion_job_id,
+			retrieved_at,
+			coverage::double precision,
+			definition_version,
+			dataset_version
+		FROM citation_snapshots
+		WHERE work_id = $1
+		  AND source = $2
+		  AND id = ANY($3::uuid[])
+		ORDER BY observed_at, id
+	`, workID, source, snapshotIDs)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query Work %s materialized citation snapshots: %w",
+			workID,
+			err,
+		)
+	}
+	defer rows.Close()
+	snapshots := make([]citationSnapshotPayload, 0, len(snapshotIDs))
+	seen := make(map[uuid.UUID]struct{}, len(snapshotIDs))
+	for rows.Next() {
+		var (
+			id                      uuid.UUID
+			snapshot                citationSnapshotPayload
+			observedAt, retrievedAt time.Time
+		)
+		if err := rows.Scan(
+			&id,
+			&snapshot.Source,
+			&observedAt,
+			&snapshot.Count,
+			&snapshot.SourceRecordID,
+			&snapshot.IngestionJobID,
+			&retrievedAt,
+			&snapshot.Coverage,
+			&snapshot.DefinitionVersion,
+			&snapshot.DatasetVersion,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan Work %s materialized citation snapshot: %w",
+				workID,
+				err,
+			)
+		}
+		if snapshot.Count < 0 ||
+			snapshot.Coverage < 0 ||
+			snapshot.Coverage > 1 ||
+			snapshot.Source != source {
+			return nil, fmt.Errorf(
+				"%w: Work %s has invalid materialized citation snapshot",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		seen[id] = struct{}{}
+		snapshot.ObservedAt = observedAt.UTC().Format(time.RFC3339Nano)
+		snapshot.RetrievedAt = retrievedAt.UTC().Format(time.RFC3339Nano)
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate Work %s materialized citation snapshots: %w",
+			workID,
+			err,
+		)
+	}
+	if len(seen) != len(snapshotIDs) {
+		return nil, fmt.Errorf(
+			"%w: Work %s materialized citation evidence references missing snapshots",
 			ErrCatalogNotReady,
 			workID,
 		)
 	}
-	return catalogValue{State: "known", Value: parsed}, &parsed, nil
+	return snapshots, nil
+}
+
+func loadCitationPercentile(
+	ctx context.Context,
+	tx pgx.Tx,
+	run citationAnalysisRun,
+	workID uuid.UUID,
+) (catalogValue, any, bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT
+			subject_version_id,
+			subject_id,
+			publication_year,
+			publication_type_id,
+			citation_snapshot_id,
+			citation_count,
+			cohort_key,
+			cohort_size,
+			minimum_cohort_size,
+			percentile_state,
+			midrank::text,
+			citation_percentile::text,
+			source_revision,
+			formula_version,
+			evidence
+		FROM citation_analysis_percentiles
+		WHERE analysis_run_id = $1
+		  AND work_id = $2
+		  AND source = $3
+		ORDER BY subject_id, publication_type_id
+	`, run.ID, workID, run.Source)
+	if err != nil {
+		return catalogValue{}, nil, false, fmt.Errorf(
+			"query Work %s citation percentiles from run %s: %w",
+			workID,
+			run.ID,
+			err,
+		)
+	}
+	defer rows.Close()
+
+	type percentileRow struct {
+		subjectVersionID  uuid.UUID
+		subjectID         uuid.UUID
+		publicationYear   int
+		publicationTypeID uuid.UUID
+		snapshotID        uuid.UUID
+		citationCount     int64
+		cohortKey         string
+		cohortSize        int
+		minimumSize       int
+		state             string
+		midrank           pgtype.Text
+		percentile        pgtype.Text
+		sourceRevision    string
+		formulaVersion    string
+		supportingWorkIDs []uuid.UUID
+	}
+	values := make([]percentileRow, 0, 2)
+	for rows.Next() {
+		var (
+			value       percentileRow
+			rawEvidence []byte
+		)
+		if err := rows.Scan(
+			&value.subjectVersionID,
+			&value.subjectID,
+			&value.publicationYear,
+			&value.publicationTypeID,
+			&value.snapshotID,
+			&value.citationCount,
+			&value.cohortKey,
+			&value.cohortSize,
+			&value.minimumSize,
+			&value.state,
+			&value.midrank,
+			&value.percentile,
+			&value.sourceRevision,
+			&value.formulaVersion,
+			&rawEvidence,
+		); err != nil {
+			return catalogValue{}, nil, false, fmt.Errorf(
+				"scan Work %s citation percentile: %w",
+				workID,
+				err,
+			)
+		}
+		var evidence struct {
+			Cohort             json.RawMessage `json:"cohort"`
+			CohortKey          string          `json:"cohort_key"`
+			MinimumCohortSize  int             `json:"minimum_cohort_size"`
+			SupportingWorkIDs  []uuid.UUID     `json:"supporting_work_ids"`
+			CitationSnapshotID uuid.UUID       `json:"citation_snapshot_id"`
+			Scope              json.RawMessage `json:"scope"`
+		}
+		if err := decodeStrictJSONObject(rawEvidence, &evidence); err != nil {
+			return catalogValue{}, nil, false, fmt.Errorf(
+				"%w: decode Work %s citation percentile evidence: %v",
+				ErrCatalogNotReady,
+				workID,
+				err,
+			)
+		}
+		if value.subjectVersionID == uuid.Nil ||
+			value.subjectID == uuid.Nil ||
+			value.publicationTypeID == uuid.Nil ||
+			value.snapshotID == uuid.Nil ||
+			value.publicationYear < 1900 ||
+			value.publicationYear > 3000 ||
+			value.citationCount < 0 ||
+			value.cohortKey == "" ||
+			value.cohortSize < 1 ||
+			value.minimumSize != run.MinimumCohortSize ||
+			value.formulaVersion != run.FormulaVersion ||
+			!regexp.MustCompile(`^[0-9a-f]{64}$`).
+				MatchString(value.sourceRevision) ||
+			evidence.CohortKey != value.cohortKey ||
+			evidence.MinimumCohortSize != value.minimumSize ||
+			evidence.CitationSnapshotID != value.snapshotID ||
+			len(evidence.SupportingWorkIDs) != value.cohortSize ||
+			len(evidence.Cohort) == 0 ||
+			len(evidence.Scope) == 0 {
+			return catalogValue{}, nil, false, fmt.Errorf(
+				"%w: Work %s has invalid materialized citation percentile evidence",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		value.supportingWorkIDs = evidence.SupportingWorkIDs
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		return catalogValue{}, nil, false, fmt.Errorf(
+			"iterate Work %s citation percentiles: %w",
+			workID,
+			err,
+		)
+	}
+	if len(values) == 0 {
+		return catalogValue{State: "missing"}, nil, false, nil
+	}
+	if len(values) > 1 {
+		return catalogValue{State: "unknown"}, nil, false, nil
+	}
+
+	value := values[0]
+	switch value.state {
+	case "known":
+		if !value.midrank.Valid || !value.percentile.Valid {
+			return catalogValue{}, nil, false, fmt.Errorf(
+				"%w: Work %s known citation percentile is incomplete",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		midrank, err := strictJSONNumber(value.midrank.String)
+		if err != nil {
+			return catalogValue{}, nil, false, fmt.Errorf(
+				"%w: Work %s has invalid percentile midrank",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		percentile, err := strictJSONNumber(value.percentile.String)
+		if err != nil {
+			return catalogValue{}, nil, false, fmt.Errorf(
+				"%w: Work %s has invalid citation percentile",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		return catalogValue{
+				State: "known",
+				Value: percentile,
+			},
+			citationPercentileKnownEvidence{
+				State:              "known",
+				CitationSnapshotID: value.snapshotID,
+				SubjectVersionID:   value.subjectVersionID,
+				SubjectID:          value.subjectID,
+				PublicationYear:    value.publicationYear,
+				PublicationTypeID:  value.publicationTypeID,
+				CohortKey:          value.cohortKey,
+				CohortSize:         value.cohortSize,
+				MinimumCohortSize:  value.minimumSize,
+				Midrank:            midrank,
+				SupportingWorkIDs:  value.supportingWorkIDs,
+			},
+			true,
+			nil
+	case "insufficient_evidence":
+		if value.midrank.Valid || value.percentile.Valid {
+			return catalogValue{}, nil, false, fmt.Errorf(
+				"%w: Work %s insufficient percentile has numeric values",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		reason := fmt.Sprintf(
+			"citation percentile cohort size %d is below minimum %d",
+			value.cohortSize,
+			value.minimumSize,
+		)
+		return catalogValue{
+				State:  "insufficient_evidence",
+				Reason: reason,
+			},
+			citationPercentileInsufficientEvidence{
+				State:              "insufficient_evidence",
+				CitationSnapshotID: value.snapshotID,
+				SubjectVersionID:   value.subjectVersionID,
+				SubjectID:          value.subjectID,
+				PublicationYear:    value.publicationYear,
+				PublicationTypeID:  value.publicationTypeID,
+				CohortKey:          value.cohortKey,
+				CohortSize:         value.cohortSize,
+				MinimumCohortSize:  value.minimumSize,
+				Reason:             reason,
+				SupportingWorkIDs:  value.supportingWorkIDs,
+			},
+			true,
+			nil
+	default:
+		return catalogValue{}, nil, false, fmt.Errorf(
+			"%w: Work %s has invalid citation percentile state %q",
+			ErrCatalogNotReady,
+			workID,
+			value.state,
+		)
+	}
+}
+
+func decodeStrictJSONObject(raw []byte, target any) error {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.UseNumber()
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("JSON value has trailing content")
+		}
+		return err
+	}
+	return nil
+}
+
+func strictJSONNumber(value string) (json.Number, error) {
+	if value == "" || value != strings.TrimSpace(value) {
+		return "", errors.New("number must be non-empty and trimmed")
+	}
+	parsed, err := decimal.NewFromString(value)
+	if err != nil {
+		return "", err
+	}
+	return json.Number(parsed.String()), nil
+}
+
+func decimalFloat64(value decimal.Decimal) float64 {
+	return value.InexactFloat64()
 }
 
 func loadTaxonomyFacts(
@@ -1367,14 +3047,21 @@ func loadAcceptedCuration(
 	input PublishInput,
 ) (curationRevisionFact, bool, error) {
 	var (
-		fact          curationRevisionFact
-		decision      string
-		matchedRules  []byte
-		evidence      []byte
-		metricYear    int
-		policyName    string
-		policyVersion int
-		assessedAt    time.Time
+		fact                        curationRevisionFact
+		decision                    string
+		matchedRules                []byte
+		evidence                    []byte
+		metricYear                  int
+		policyName                  string
+		policyVersion               int
+		assessedAt                  time.Time
+		eligibilityID               uuid.UUID
+		eligibilityPolicyVersion    string
+		eligibilityDecision         string
+		eligibilityEvidence         []byte
+		eligibilityAssessedAt       time.Time
+		eligibilitySubjectVersionID uuid.UUID
+		subjectVersionKey           string
 	)
 	err := tx.QueryRow(ctx, `
 		SELECT
@@ -1386,7 +3073,14 @@ func loadAcceptedCuration(
 			assessment.metric_year,
 			policy.policy_name,
 			policy.version_number,
-			assessment.assessed_at
+			assessment.assessed_at,
+			eligibility.id,
+			eligibility.policy_version,
+			eligibility.decision,
+			eligibility.evidence,
+			eligibility.assessed_at,
+			subject_version.id,
+			subject_version.version_key
 		FROM works AS work
 		JOIN venues AS venue
 		  ON venue.id = work.venue_id
@@ -1397,6 +3091,15 @@ func loadAcceptedCuration(
 		  ON assessment.venue_id = venue.id
 		 AND assessment.policy_version_id = policy.id
 		 AND assessment.metric_year = $4
+		JOIN subject_versions AS subject_version
+		  ON subject_version.version_key = $6
+		JOIN biomedical_publication_eligibility_decisions AS eligibility
+		  ON eligibility.work_id = work.id
+		 AND eligibility.policy_version = $7
+		 AND eligibility.metric_year = $4
+		 AND eligibility.subject_version_id = subject_version.id
+		 AND eligibility.decision = 'accepted'
+		 AND eligibility.venue_id = venue.id
 		WHERE work.id = $1
 		  AND work.status = 'active'
 		  AND venue.venue_type = 'journal'
@@ -1412,12 +3115,13 @@ func loadAcceptedCuration(
 				  ON journal_subject.venue_metric_snapshot_id = metric.id
 				JOIN biomedical_subject_rules AS subject_rule
 				  ON subject_rule.id = journal_subject.subject_rule_id
-				JOIN subject_versions AS subject_version
-				  ON subject_version.id = subject_rule.subject_version_id
 				WHERE receipt_metric.import_receipt_id = $5::uuid
+				  AND journal_subject.id =
+				      eligibility.journal_subject_metric_id
 				  AND metric.venue_id = venue.id
 				  AND metric.metric_year = $4
-				  AND subject_version.version_key = $6
+				  AND subject_rule.subject_version_id =
+				      subject_version.id
 				  AND journal_subject.jcr_category = metric.category
 				  AND subject_rule.jcr_category = metric.category
 		  )
@@ -1428,6 +3132,7 @@ func loadAcceptedCuration(
 		input.JCRMetricYear,
 		input.JCRImportReceipt,
 		input.SubjectVersion,
+		input.EligibilityPolicyVersion,
 	).Scan(
 		&fact.WorkID,
 		&fact.VenueID,
@@ -1438,6 +3143,13 @@ func loadAcceptedCuration(
 		&policyName,
 		&policyVersion,
 		&assessedAt,
+		&eligibilityID,
+		&eligibilityPolicyVersion,
+		&eligibilityDecision,
+		&eligibilityEvidence,
+		&eligibilityAssessedAt,
+		&eligibilitySubjectVersionID,
+		&subjectVersionKey,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return curationRevisionFact{}, false, nil
@@ -1458,7 +3170,232 @@ func loadAcceptedCuration(
 		PolicyVersion: policyVersion,
 		AssessedAt:    assessedAt.UTC().Format(time.RFC3339Nano),
 	}
+	fact.Eligibility = biomedicalEligibilityRevision{
+		ID:                eligibilityID,
+		PolicyVersion:     eligibilityPolicyVersion,
+		MetricYear:        input.JCRMetricYear,
+		SubjectVersionID:  eligibilitySubjectVersionID,
+		SubjectVersionKey: subjectVersionKey,
+		Decision:          eligibilityDecision,
+		Evidence:          json.RawMessage(eligibilityEvidence),
+		AssessedAt:        eligibilityAssessedAt.UTC().Format(time.RFC3339Nano),
+	}
+	if err := validateExactJCRAdmission(
+		ctx,
+		tx,
+		input,
+		fact.VenueID,
+	); err != nil {
+		return curationRevisionFact{}, false, err
+	}
+	if err := validateExactJCRAssessmentEvidence(
+		ctx,
+		tx,
+		input,
+		fact.VenueID,
+		fact.Curation,
+	); err != nil {
+		return curationRevisionFact{}, false, err
+	}
 	return fact, true, nil
+}
+
+func validateExactJCRAdmission(
+	ctx context.Context,
+	tx pgx.Tx,
+	input PublishInput,
+	venueID uuid.UUID,
+) error {
+	var matchedQ1, matchedJIF bool
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			COALESCE(bool_or(
+				metric.metric_status = 'known'
+				AND metric.quartile = 'Q1'
+			), false),
+			COALESCE(bool_or(
+				metric.metric_status = 'known'
+				AND metric.jif >= 10
+			), false)
+		FROM jcr_import_receipt_metrics AS receipt_metric
+		JOIN venue_metric_snapshots AS metric
+		  ON metric.id = receipt_metric.metric_snapshot_id
+		WHERE receipt_metric.import_receipt_id = $1
+		  AND metric.venue_id = $2
+		  AND metric.metric_year = $3
+	`,
+		input.JCRImportReceipt,
+		venueID,
+		input.JCRMetricYear,
+	).Scan(&matchedQ1, &matchedJIF); err != nil {
+		return fmt.Errorf(
+			"validate Journal %s exact JCR admission evidence: %w",
+			venueID,
+			err,
+		)
+	}
+	if !matchedQ1 && !matchedJIF {
+		return fmt.Errorf(
+			"%w: Journal %s does not satisfy JCR Q1 OR JIF >= 10 in receipt %s for metric year %d",
+			ErrCatalogNotReady,
+			venueID,
+			input.JCRImportReceipt,
+			input.JCRMetricYear,
+		)
+	}
+	return nil
+}
+
+func validateExactJCRAssessmentEvidence(
+	ctx context.Context,
+	tx pgx.Tx,
+	input PublishInput,
+	venueID uuid.UUID,
+	curation curationPayload,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT
+			metric.category,
+			metric.jif::text,
+			COALESCE(metric.quartile, ''),
+			metric.metric_status,
+			metric.source_name,
+			metric.metric_status = 'known' AND metric.jif >= 10,
+			metric.metric_status = 'known' AND metric.quartile = 'Q1'
+		FROM jcr_import_receipt_metrics AS receipt_metric
+		JOIN venue_metric_snapshots AS metric
+		  ON metric.id = receipt_metric.metric_snapshot_id
+		WHERE receipt_metric.import_receipt_id = $1
+		  AND metric.venue_id = $2
+		  AND metric.metric_year = $3
+		ORDER BY metric.category
+	`, input.JCRImportReceipt, venueID, input.JCRMetricYear)
+	if err != nil {
+		return fmt.Errorf(
+			"query Journal %s exact JCR assessment evidence: %w",
+			venueID,
+			err,
+		)
+	}
+	defer rows.Close()
+
+	expectedCategories := make([]jcrAssessmentCategoryEvidence, 0)
+	matchedJIF := false
+	matchedQ1 := false
+	for rows.Next() {
+		var (
+			category      jcrAssessmentCategoryEvidence
+			rowMatchedJIF bool
+			rowMatchedQ1  bool
+		)
+		if err := rows.Scan(
+			&category.Category,
+			&category.JIF,
+			&category.Quartile,
+			&category.Status,
+			&category.SourceName,
+			&rowMatchedJIF,
+			&rowMatchedQ1,
+		); err != nil {
+			return fmt.Errorf(
+				"scan Journal %s exact JCR assessment evidence: %w",
+				venueID,
+				err,
+			)
+		}
+		expectedCategories = append(expectedCategories, category)
+		matchedJIF = matchedJIF || rowMatchedJIF
+		matchedQ1 = matchedQ1 || rowMatchedQ1
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf(
+			"iterate Journal %s exact JCR assessment evidence: %w",
+			venueID,
+			err,
+		)
+	}
+
+	expectedRules := make([]string, 0, 2)
+	if matchedJIF {
+		expectedRules = append(expectedRules, "jif_gte_10")
+	}
+	if matchedQ1 {
+		expectedRules = append(expectedRules, "jcr_q1")
+	}
+	var actualRules []string
+	if err := json.Unmarshal(curation.MatchedRules, &actualRules); err != nil {
+		return fmt.Errorf(
+			"%w: Journal %s has invalid accepted assessment matched rules: %v",
+			ErrCatalogNotReady,
+			venueID,
+			err,
+		)
+	}
+	if !equalStrings(actualRules, expectedRules) {
+		return fmt.Errorf(
+			"%w: Journal %s assessment matched rules do not match exact JCR receipt",
+			ErrCatalogNotReady,
+			venueID,
+		)
+	}
+
+	var actual jcrAssessmentEvidence
+	if err := json.Unmarshal(curation.Evidence, &actual); err != nil {
+		return fmt.Errorf(
+			"%w: Journal %s has invalid accepted assessment evidence: %v",
+			ErrCatalogNotReady,
+			venueID,
+			err,
+		)
+	}
+	expectedPolicyVersion := fmt.Sprintf(
+		"%s/v%d",
+		input.VenuePolicyName,
+		input.VenuePolicyVersion,
+	)
+	if actual.JCRImportReceiptID != input.JCRImportReceipt.String() ||
+		actual.PolicyVersion != expectedPolicyVersion ||
+		actual.MetricYear != input.JCRMetricYear ||
+		actual.VenueType != "journal" ||
+		actual.Reason != "" ||
+		!equalJCRAssessmentCategories(actual.Categories, expectedCategories) {
+		return fmt.Errorf(
+			"%w: Journal %s assessment evidence does not match exact JCR receipt",
+			ErrCatalogNotReady,
+			venueID,
+		)
+	}
+	return nil
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalJCRAssessmentCategories(
+	left, right []jcrAssessmentCategoryEvidence,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].Category != right[index].Category ||
+			left[index].Quartile != right[index].Quartile ||
+			left[index].Status != right[index].Status ||
+			left[index].SourceName != right[index].SourceName ||
+			!equalOptionalString(left[index].JIF, right[index].JIF) {
+			return false
+		}
+	}
+	return true
 }
 
 func sourceNames(states []sourceState) []string {
@@ -1601,29 +3538,55 @@ func boolRatio(
 
 func snapshotRevision(input PublishInput, snapshot catalogSnapshot) (string, error) {
 	material := struct {
-		FormulaVersion     string                 `json:"formula_version"`
-		JCRMetricYear      int                    `json:"jcr_metric_year"`
-		VenuePolicyName    string                 `json:"venue_policy_name"`
-		VenuePolicyVersion int                    `json:"venue_policy_version"`
-		SubjectVersion     string                 `json:"subject_version"`
-		JCRImportReceipt   uuid.UUID              `json:"jcr_import_receipt"`
-		Sources            []sourceRevisionFact   `json:"sources"`
-		Curations          []curationRevisionFact `json:"curations"`
-		Papers             []publishedPaper       `json:"papers"`
-		Topics             []publishedTaxonomy    `json:"topics"`
-		Methods            []publishedTaxonomy    `json:"methods"`
+		FormulaVersion           string                         `json:"formula_version"`
+		JCRMetricYear            int                            `json:"jcr_metric_year"`
+		VenuePolicyName          string                         `json:"venue_policy_name"`
+		VenuePolicyVersion       int                            `json:"venue_policy_version"`
+		EligibilityPolicyVersion string                         `json:"eligibility_policy_version"`
+		SubjectVersion           string                         `json:"subject_version"`
+		JCRImportReceipt         uuid.UUID                      `json:"jcr_import_receipt"`
+		CitationSource           string                         `json:"citation_source"`
+		CitationAnalysisRunID    uuid.UUID                      `json:"citation_analysis_run_id"`
+		TrendAnalysisRunID       uuid.UUID                      `json:"trend_analysis_run_id"`
+		JournalAnalysisRunID     uuid.UUID                      `json:"journal_analysis_run_id"`
+		OpportunityAnalysisRunID uuid.UUID                      `json:"opportunity_analysis_run_id"`
+		Sources                  []sourceRevisionFact           `json:"sources"`
+		Curations                []curationRevisionFact         `json:"curations"`
+		Papers                   []publishedPaper               `json:"papers"`
+		Topics                   []publishedTaxonomy            `json:"topics"`
+		Methods                  []publishedTaxonomy            `json:"methods"`
+		Home                     json.RawMessage                `json:"home"`
+		SubjectListMetadata      json.RawMessage                `json:"subject_list_metadata"`
+		JournalListMetadata      json.RawMessage                `json:"journal_list_metadata"`
+		Subjects                 []publishedBiomedicalResource  `json:"subjects"`
+		Journals                 []publishedBiomedicalResource  `json:"journals"`
+		Trends                   []publishedTrend               `json:"trends"`
+		Opportunities            []publishedResearchOpportunity `json:"opportunities"`
 	}{
-		FormulaVersion:     input.FormulaVersion,
-		JCRMetricYear:      input.JCRMetricYear,
-		VenuePolicyName:    input.VenuePolicyName,
-		VenuePolicyVersion: input.VenuePolicyVersion,
-		SubjectVersion:     input.SubjectVersion,
-		JCRImportReceipt:   input.JCRImportReceipt,
-		Sources:            snapshot.sources,
-		Curations:          snapshot.curations,
-		Papers:             snapshot.papers,
-		Topics:             snapshot.topics,
-		Methods:            snapshot.methods,
+		FormulaVersion:           input.FormulaVersion,
+		JCRMetricYear:            input.JCRMetricYear,
+		VenuePolicyName:          input.VenuePolicyName,
+		VenuePolicyVersion:       input.VenuePolicyVersion,
+		EligibilityPolicyVersion: input.EligibilityPolicyVersion,
+		SubjectVersion:           input.SubjectVersion,
+		JCRImportReceipt:         input.JCRImportReceipt,
+		CitationSource:           input.CitationSource,
+		CitationAnalysisRunID:    input.CitationAnalysisRunID,
+		TrendAnalysisRunID:       input.TrendAnalysisRunID,
+		JournalAnalysisRunID:     input.JournalAnalysisRunID,
+		OpportunityAnalysisRunID: input.OpportunityAnalysisRunID,
+		Sources:                  snapshot.sources,
+		Curations:                snapshot.curations,
+		Papers:                   snapshot.papers,
+		Topics:                   snapshot.topics,
+		Methods:                  snapshot.methods,
+		Home:                     snapshot.home,
+		SubjectListMetadata:      snapshot.subjectListMetadata,
+		JournalListMetadata:      snapshot.journalListMetadata,
+		Subjects:                 snapshot.subjects,
+		Journals:                 snapshot.journals,
+		Trends:                   snapshot.trends,
+		Opportunities:            snapshot.opportunities,
 	}
 	encoded, err := json.Marshal(material)
 	if err != nil {
@@ -1686,14 +3649,24 @@ func persistSnapshot(
 	snapshot catalogSnapshot,
 ) (Generation, error) {
 	metadata, err := json.Marshal(map[string]any{
-		"papers":               len(snapshot.papers),
-		"topics":               len(snapshot.topics),
-		"methods":              len(snapshot.methods),
-		"jcr_metric_year":      input.JCRMetricYear,
-		"venue_policy_name":    input.VenuePolicyName,
-		"venue_policy_version": input.VenuePolicyVersion,
-		"subject_version":      input.SubjectVersion,
-		"jcr_import_receipt":   input.JCRImportReceipt,
+		"papers":                      len(snapshot.papers),
+		"topics":                      len(snapshot.topics),
+		"methods":                     len(snapshot.methods),
+		"subjects":                    len(snapshot.subjects),
+		"journals":                    len(snapshot.journals),
+		"trends":                      len(snapshot.trends),
+		"opportunities":               len(snapshot.opportunities),
+		"jcr_metric_year":             input.JCRMetricYear,
+		"venue_policy_name":           input.VenuePolicyName,
+		"venue_policy_version":        input.VenuePolicyVersion,
+		"eligibility_policy_version":  input.EligibilityPolicyVersion,
+		"subject_version":             input.SubjectVersion,
+		"jcr_import_receipt":          input.JCRImportReceipt,
+		"citation_source":             input.CitationSource,
+		"citation_analysis_run_id":    input.CitationAnalysisRunID,
+		"trend_analysis_run_id":       input.TrendAnalysisRunID,
+		"journal_analysis_run_id":     input.JournalAnalysisRunID,
+		"opportunity_analysis_run_id": input.OpportunityAnalysisRunID,
 	})
 	if err != nil {
 		return Generation{}, fmt.Errorf("encode public catalog generation metadata: %w", err)
@@ -1722,6 +3695,69 @@ func persistSnapshot(
 		VALUES ($1, $2)
 	`, generation.ID, snapshot.stats); err != nil {
 		return Generation{}, fmt.Errorf("insert public catalog stats: %w", err)
+	}
+	home, err := bindCatalogGeneration(snapshot.home, generation.ID)
+	if err != nil {
+		return Generation{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO public_catalog_home (generation_id, payload)
+		VALUES ($1, $2)
+	`, generation.ID, home); err != nil {
+		return Generation{}, fmt.Errorf("insert public catalog Home snapshot: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO public_catalog_biomedical_manifest (
+			generation_id,
+			subject_count,
+			subject_list_payload,
+			journal_count,
+			journal_list_payload
+		) VALUES ($1, $2, $3, $4, $5)
+	`,
+		generation.ID,
+		len(snapshot.subjects),
+		snapshot.subjectListMetadata,
+		len(snapshot.journals),
+		snapshot.journalListMetadata,
+	); err != nil {
+		return Generation{}, fmt.Errorf(
+			"insert public catalog biomedical manifest: %w",
+			err,
+		)
+	}
+	for _, subject := range snapshot.subjects {
+		if err := insertBiomedicalResource(
+			ctx,
+			tx,
+			"public_catalog_subjects",
+			"subject_id",
+			generation.ID,
+			subject,
+		); err != nil {
+			return Generation{}, err
+		}
+	}
+	for _, journal := range snapshot.journals {
+		if err := insertBiomedicalResource(
+			ctx,
+			tx,
+			"public_catalog_journals",
+			"journal_id",
+			generation.ID,
+			journal,
+		); err != nil {
+			return Generation{}, err
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO public_catalog_biomedical_coverage (generation_id)
+		VALUES ($1)
+	`, generation.ID); err != nil {
+		return Generation{}, fmt.Errorf(
+			"insert public catalog biomedical coverage marker: %w",
+			err,
+		)
 	}
 
 	for _, taxonomy := range snapshot.topics {
@@ -1796,6 +3832,57 @@ func persistSnapshot(
 			return Generation{}, fmt.Errorf("insert public catalog paper %s: %w", paper.ID, err)
 		}
 	}
+	for _, trend := range snapshot.trends {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO public_catalog_trends (
+				generation_id,
+				trend_kind,
+				window_days,
+				rank,
+				subject_id,
+				score,
+				payload
+			) VALUES ($1, $2, $3, $4, $5, $6::numeric, $7)
+		`,
+			generation.ID,
+			trend.Kind,
+			trend.WindowDays,
+			trend.Rank,
+			trend.SubjectID,
+			trend.Score,
+			trend.Payload,
+		); err != nil {
+			return Generation{}, fmt.Errorf(
+				"insert public catalog %s trend rank %d: %w",
+				trend.Kind,
+				trend.Rank,
+				err,
+			)
+		}
+	}
+	for _, opportunity := range snapshot.opportunities {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO public_catalog_research_opportunities (
+				generation_id,
+				opportunity_id,
+				status,
+				ordinal,
+				payload
+			) VALUES ($1, $2, $3, $4, $5)
+		`,
+			generation.ID,
+			opportunity.ID,
+			opportunity.Status,
+			opportunity.Ordinal,
+			opportunity.Payload,
+		); err != nil {
+			return Generation{}, fmt.Errorf(
+				"insert public catalog research opportunity %s: %w",
+				opportunity.ID,
+				err,
+			)
+		}
+	}
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO public_catalog_publications (generation_id, published_at)
@@ -1843,6 +3930,44 @@ func insertTaxonomy(
 		taxonomy.DetailPayload,
 	); err != nil {
 		return fmt.Errorf("insert %s taxonomy %s: %w", table, taxonomy.ID, err)
+	}
+	return nil
+}
+
+func insertBiomedicalResource(
+	ctx context.Context,
+	tx pgx.Tx,
+	table string,
+	idColumn string,
+	generationID uuid.UUID,
+	resource publishedBiomedicalResource,
+) error {
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
+			generation_id,
+			%s,
+			slug,
+			paper_count,
+			summary_payload,
+			detail_payload
+		) VALUES ($1, $2, $3, $4, $5, $6)
+	`, table, idColumn)
+	if _, err := tx.Exec(
+		ctx,
+		query,
+		generationID,
+		resource.ID,
+		resource.Slug,
+		resource.PaperCount,
+		resource.SummaryPayload,
+		resource.DetailPayload,
+	); err != nil {
+		return fmt.Errorf(
+			"insert %s biomedical resource %s: %w",
+			table,
+			resource.ID,
+			err,
+		)
 	}
 	return nil
 }

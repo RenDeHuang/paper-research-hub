@@ -39,6 +39,11 @@ type facetsResponse struct {
 
 func registerCatalogRoutes(mux *http.ServeMux, repository *catalog.Repository) {
 	handlers := catalogHandlers{repository: repository}
+	mux.HandleFunc("/api/v1/home", getOnly(handlers.home))
+	mux.HandleFunc("/api/v1/subjects", getOnly(handlers.subjects))
+	mux.HandleFunc("/api/v1/subjects/{slug}", getOnly(handlers.subject))
+	mux.HandleFunc("/api/v1/journals", getOnly(handlers.journals))
+	mux.HandleFunc("/api/v1/journals/{slug}", getOnly(handlers.journal))
 	mux.HandleFunc("/api/v1/stats", getOnly(handlers.stats))
 	mux.HandleFunc("/api/v1/papers", getOnly(handlers.papers))
 	mux.HandleFunc("/api/v1/papers/{id}", getOnly(handlers.paper))
@@ -62,6 +67,105 @@ func registerCatalogRoutes(mux *http.ServeMux, repository *catalog.Repository) {
 		"/api/v1/research-opportunities",
 		getOnly(handlers.researchOpportunities),
 	)
+}
+
+func (handlers catalogHandlers) home(writer http.ResponseWriter, request *http.Request) {
+	if !requireNoQuery(writer, request) {
+		return
+	}
+	if handlers.repository == nil {
+		writeCatalogError(writer, request, catalog.ErrCatalogNotPublished)
+		return
+	}
+
+	document, err := handlers.repository.Home(request.Context())
+	if err != nil {
+		writeCatalogError(writer, request, err)
+		return
+	}
+	writeDocument(writer, document)
+}
+
+func (handlers catalogHandlers) subjects(writer http.ResponseWriter, request *http.Request) {
+	handlers.biomedicalList(writer, request, true)
+}
+
+func (handlers catalogHandlers) subject(writer http.ResponseWriter, request *http.Request) {
+	handlers.biomedicalDetail(writer, request, true)
+}
+
+func (handlers catalogHandlers) journals(writer http.ResponseWriter, request *http.Request) {
+	handlers.biomedicalList(writer, request, false)
+}
+
+func (handlers catalogHandlers) journal(writer http.ResponseWriter, request *http.Request) {
+	handlers.biomedicalDetail(writer, request, false)
+}
+
+func (handlers catalogHandlers) biomedicalList(
+	writer http.ResponseWriter,
+	request *http.Request,
+	subject bool,
+) {
+	query, err := parsePageQuery(request)
+	if err != nil {
+		writeCatalogError(writer, request, err)
+		return
+	}
+	if handlers.repository == nil {
+		writeCatalogError(writer, request, catalog.ErrCatalogNotPublished)
+		return
+	}
+
+	var page catalog.BiomedicalPage
+	if subject {
+		page, err = handlers.repository.Subjects(request.Context(), query)
+	} else {
+		page, err = handlers.repository.Journals(request.Context(), query)
+	}
+	if err != nil {
+		writeCatalogError(writer, request, err)
+		return
+	}
+	if err := writeBiomedicalPage(writer, page); err != nil {
+		writeCatalogError(writer, request, err)
+	}
+}
+
+func (handlers catalogHandlers) biomedicalDetail(
+	writer http.ResponseWriter,
+	request *http.Request,
+	subject bool,
+) {
+	query, err := parsePageQuery(request)
+	if err != nil {
+		writeCatalogError(writer, request, err)
+		return
+	}
+	if handlers.repository == nil {
+		writeCatalogError(writer, request, catalog.ErrCatalogNotPublished)
+		return
+	}
+
+	var document catalog.Document
+	if subject {
+		document, err = handlers.repository.Subject(
+			request.Context(),
+			request.PathValue("slug"),
+			query,
+		)
+	} else {
+		document, err = handlers.repository.Journal(
+			request.Context(),
+			request.PathValue("slug"),
+			query,
+		)
+	}
+	if err != nil {
+		writeCatalogError(writer, request, err)
+		return
+	}
+	writeDocument(writer, document)
 }
 
 func (handlers catalogHandlers) stats(writer http.ResponseWriter, request *http.Request) {
@@ -259,15 +363,13 @@ func (handlers catalogHandlers) researchOpportunities(
 	}
 	setGenerationHeader(writer, page.Generation)
 	writeJSON(writer, struct {
-		GeneratedAt    string             `json:"generated_at"`
-		FormulaVersion string             `json:"formula_version"`
-		Items          []json.RawMessage  `json:"items"`
-		Pagination     paginationResponse `json:"pagination"`
+		Analysis   json.RawMessage    `json:"analysis"`
+		Items      []json.RawMessage  `json:"items"`
+		Pagination paginationResponse `json:"pagination"`
 	}{
-		GeneratedAt:    page.Generation.GeneratedAt.Format(timeFormat),
-		FormulaVersion: page.Generation.FormulaVersion,
-		Items:          page.Items,
-		Pagination:     responsePagination(page.Pagination),
+		Analysis:   page.Analysis,
+		Items:      page.Items,
+		Pagination: responsePagination(page.Pagination),
 	})
 }
 
@@ -280,6 +382,38 @@ func writeTaxonomyPage(writer http.ResponseWriter, page catalog.TaxonomyPage) {
 		Items:      page.Items,
 		Pagination: responsePagination(page.Pagination),
 	})
+}
+
+func writeBiomedicalPage(writer http.ResponseWriter, page catalog.BiomedicalPage) error {
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(page.Metadata, &response); err != nil {
+		return err
+	}
+	generation, err := json.Marshal(page.Generation.ID.String())
+	if err != nil {
+		return err
+	}
+	items, err := json.Marshal(page.Items)
+	if err != nil {
+		return err
+	}
+	pagination, err := json.Marshal(responsePagination(page.Pagination))
+	if err != nil {
+		return err
+	}
+	response["catalog_generation"] = generation
+	response["items"] = items
+	response["pagination"] = pagination
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+
+	setGenerationHeader(writer, page.Generation)
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(encoded)
+	return nil
 }
 
 func writeDocument(writer http.ResponseWriter, document catalog.Document) {

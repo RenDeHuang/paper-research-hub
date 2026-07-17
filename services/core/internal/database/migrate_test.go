@@ -71,6 +71,23 @@ var expectedSchemaTables = []string{
 	"subjects",
 	"biomedical_subject_rules",
 	"journal_subject_metrics",
+	"biomedical_publication_eligibility_decisions",
+	"citation_snapshots",
+	"citation_edges",
+	"reference_edges",
+	"citation_analysis_work_snapshots",
+	"citation_analysis_percentiles",
+	"publication_trend_snapshots",
+	"journal_pattern_snapshots",
+	"research_opportunity_snapshots",
+	"research_opportunity_supporting_works",
+}
+
+var expectedSchemaTablesWithoutGeneratedID = []string{
+	"public_catalog_home",
+	"public_catalog_biomedical_manifest",
+	"public_catalog_subjects",
+	"public_catalog_journals",
 }
 
 func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
@@ -97,7 +114,10 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate schema tables: %v", err)
 	}
-	for _, table := range append(expectedSchemaTables, "schema_migrations") {
+	for _, table := range append(
+		append(slices.Clone(expectedSchemaTables), expectedSchemaTablesWithoutGeneratedID...),
+		"schema_migrations",
+	) {
 		if !actual[table] {
 			t.Errorf("expected table %q was not created", table)
 		}
@@ -128,6 +148,11 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 10, name: "repeatable_ingestion_jobs"},
 		{version: 11, name: "biomedical_semantics"},
 		{version: 12, name: "normalized_assertion_versions"},
+		{version: 13, name: "biomedical_publication_eligibility"},
+		{version: 14, name: "biomedical_catalog_snapshots"},
+		{version: 15, name: "citation_evidence"},
+		{version: 16, name: "citation_analysis_snapshots"},
+		{version: 17, name: "biomedical_analysis_snapshots"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -171,8 +196,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 12 {
-		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
+	if len(migrations) != 17 {
+		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -219,6 +244,1524 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 			"twelfth migration = %#v, want 000012_normalized_assertion_versions",
 			migrations[11],
 		)
+	}
+	if migrations[12].Version != 13 ||
+		migrations[12].Name != "biomedical_publication_eligibility" {
+		t.Fatalf(
+			"thirteenth migration = %#v, want 000013_biomedical_publication_eligibility",
+			migrations[12],
+		)
+	}
+	if migrations[13].Version != 14 ||
+		migrations[13].Name != "biomedical_catalog_snapshots" {
+		t.Fatalf(
+			"fourteenth migration = %#v, want 000014_biomedical_catalog_snapshots",
+			migrations[13],
+		)
+	}
+	if migrations[14].Version != 15 ||
+		migrations[14].Name != "citation_evidence" {
+		t.Fatalf(
+			"fifteenth migration = %#v, want 000015_citation_evidence",
+			migrations[14],
+		)
+	}
+	if migrations[15].Version != 16 ||
+		migrations[15].Name != "citation_analysis_snapshots" {
+		t.Fatalf(
+			"sixteenth migration = %#v, want 000016_citation_analysis_snapshots",
+			migrations[15],
+		)
+	}
+	if migrations[16].Version != 17 ||
+		migrations[16].Name != "biomedical_analysis_snapshots" {
+		t.Fatalf(
+			"seventeenth migration = %#v, want 000017_biomedical_analysis_snapshots",
+			migrations[16],
+		)
+	}
+}
+
+func TestCitationEvidenceSchemaIsSourceSpecificAppendOnlyAndProvenanceBound(
+	t *testing.T,
+) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	requiredColumns := map[string][]string{
+		"citation_snapshots": {
+			"id",
+			"work_id",
+			"source",
+			"observed_at",
+			"count",
+			"source_record_id",
+			"ingestion_job_id",
+			"retrieved_at",
+			"coverage",
+			"definition_version",
+			"dataset_version",
+			"created_at",
+		},
+		"citation_edges": {
+			"id",
+			"citing_work_id",
+			"cited_work_id",
+			"citing_identifier",
+			"cited_identifier",
+			"source",
+			"source_record_id",
+			"ingestion_job_id",
+			"retrieved_at",
+			"definition_version",
+			"dataset_version",
+			"created_at",
+		},
+		"reference_edges": {
+			"id",
+			"citing_work_id",
+			"cited_work_id",
+			"citing_identifier",
+			"cited_identifier",
+			"source",
+			"source_record_id",
+			"ingestion_job_id",
+			"retrieved_at",
+			"definition_version",
+			"dataset_version",
+			"created_at",
+		},
+	}
+	for table, columns := range requiredColumns {
+		for _, column := range columns {
+			var nullable string
+			if err := pool.QueryRow(ctx, `
+				SELECT is_nullable
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = $1
+				  AND column_name = $2
+			`, table, column).Scan(&nullable); err != nil {
+				t.Fatalf("%s.%s metadata: %v", table, column, err)
+			}
+			if table == "citation_snapshots" ||
+				(column != "citing_work_id" && column != "cited_work_id") {
+				if nullable != "NO" {
+					t.Fatalf("%s.%s nullable = %q, want NO", table, column, nullable)
+				}
+			}
+		}
+	}
+
+	workID := insertWork(t, pool, "openalex:W1001")
+	sourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		workID,
+		"pubmed",
+		"citations-1001",
+		"citation-evidence-hash",
+	)
+	projectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
+		workID,
+		sourceRecordID,
+		"citation-evidence",
+	)
+	var jobID string
+	if err := pool.QueryRow(ctx, `
+		SELECT job_id::text
+		FROM ingestion_projection_assertions
+		WHERE id = $1
+	`, projectionAssertionID).Scan(&jobID); err != nil {
+		t.Fatalf("query citation evidence ingestion job: %v", err)
+	}
+
+	var observedAt, retrievedAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT source_time, retrieved_at
+		FROM source_records
+		WHERE id = $1
+	`, sourceRecordID).Scan(&observedAt, &retrievedAt); err != nil {
+		t.Fatalf("query citation source evidence times: %v", err)
+	}
+	var snapshotID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO citation_snapshots (
+			work_id,
+			source,
+			observed_at,
+			count,
+			source_record_id,
+			ingestion_job_id,
+			retrieved_at,
+			coverage,
+			definition_version,
+			dataset_version
+		) VALUES (
+			$1,
+			'pubmed',
+			$2,
+			42,
+			$3,
+			$4,
+			$5,
+			1,
+			'pubmed-citation-count/v1',
+			'pubmed/2026-07-17'
+		)
+		RETURNING id
+	`, workID, observedAt, sourceRecordID, jobID, retrievedAt), &snapshotID)
+
+	_, duplicateErr := pool.Exec(ctx, `
+		INSERT INTO citation_snapshots (
+			work_id, source, observed_at, count, source_record_id,
+			ingestion_job_id, retrieved_at, coverage,
+			definition_version, dataset_version
+		) VALUES (
+			$1, 'pubmed', $2, 43, $3, $4, $5, 1,
+			'pubmed-citation-count/v1', 'pubmed/2026-07-17'
+		)
+	`, workID, observedAt, sourceRecordID, jobID, retrievedAt)
+	assertPostgresError(
+		t,
+		duplicateErr,
+		"23505",
+		"citation_snapshots_work_source_observed_key",
+	)
+
+	for _, query := range []string{
+		`UPDATE citation_snapshots SET count = count + 1 WHERE id = $1`,
+		`DELETE FROM citation_snapshots WHERE id = $1`,
+	} {
+		_, err := pool.Exec(ctx, query, snapshotID)
+		assertPostgresError(t, err, "55000", "")
+	}
+
+	_, mismatchedSourceErr := pool.Exec(ctx, `
+		INSERT INTO citation_snapshots (
+			work_id, source, observed_at, count, source_record_id,
+			ingestion_job_id, retrieved_at, coverage,
+			definition_version, dataset_version
+		) VALUES (
+			$1, 'openalex', $2, 1, $3, $4, $5, 1,
+			'openalex-cited-by-count/v1', 'openalex/2026-07-17'
+		)
+	`, workID, observedAt, sourceRecordID, jobID, retrievedAt)
+	assertPostgresError(
+		t,
+		mismatchedSourceErr,
+		"23514",
+		"citation_evidence_provenance",
+	)
+
+	citedWorkID := insertWork(t, pool, "doi:10.1000/cited")
+	var citationEdgeID, referenceEdgeID string
+	for table, destination := range map[string]*string{
+		"citation_edges":  &citationEdgeID,
+		"reference_edges": &referenceEdgeID,
+	} {
+		mustScanID(t, pool.QueryRow(ctx, fmt.Sprintf(`
+			INSERT INTO %s (
+				citing_work_id,
+				cited_work_id,
+				citing_identifier,
+				cited_identifier,
+				source,
+				source_record_id,
+				ingestion_job_id,
+				retrieved_at,
+				definition_version,
+				dataset_version
+			) VALUES (
+				$1,
+				$2,
+				'pmid:1001',
+				'doi:10.1000/cited',
+				'pubmed',
+				$3,
+				$4,
+				$5,
+				'citation-edge/v1',
+				'pubmed/2026-07-17'
+			)
+			RETURNING id
+		`, table), workID, citedWorkID, sourceRecordID, jobID, retrievedAt), destination)
+	}
+
+	for table, id := range map[string]string{
+		"citation_edges":  citationEdgeID,
+		"reference_edges": referenceEdgeID,
+	} {
+		_, err := pool.Exec(
+			ctx,
+			fmt.Sprintf("UPDATE %s SET retrieved_at = retrieved_at + interval '1 second' WHERE id = $1", table),
+			id,
+		)
+		assertPostgresError(t, err, "55000", "")
+	}
+
+	_, selfEdgeErr := pool.Exec(ctx, `
+		INSERT INTO citation_edges (
+			citing_work_id, cited_work_id, citing_identifier, cited_identifier,
+			source, source_record_id, ingestion_job_id, retrieved_at,
+			definition_version, dataset_version
+		) VALUES (
+			$1, $1, 'pmid:1001', 'pmid:1001',
+			'pubmed', $2, $3, $4, 'citation-edge/v1', 'pubmed/2026-07-17'
+		)
+	`, workID, sourceRecordID, jobID, retrievedAt)
+	assertPostgresError(
+		t,
+		selfEdgeErr,
+		"23514",
+		"citation_edges_not_self_check",
+	)
+}
+
+func TestCitationAnalysisSchemaBindsRunsSnapshotsAndExactBiomedicalCohorts(
+	t *testing.T,
+) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	requiredColumns := map[string][]string{
+		"citation_analysis_work_snapshots": {
+			"id",
+			"analysis_run_id",
+			"work_id",
+			"source",
+			"as_of",
+			"velocity_window_days",
+			"citation_count_state",
+			"current_snapshot_id",
+			"citation_count",
+			"citation_velocity_state",
+			"baseline_snapshot_id",
+			"citation_velocity",
+			"source_revision",
+			"formula_version",
+			"evidence",
+			"generated_at",
+			"created_at",
+		},
+		"citation_analysis_percentiles": {
+			"id",
+			"analysis_run_id",
+			"work_id",
+			"subject_version_id",
+			"subject_id",
+			"publication_year",
+			"publication_type_id",
+			"source",
+			"citation_snapshot_id",
+			"citation_count",
+			"cohort_key",
+			"cohort_size",
+			"minimum_cohort_size",
+			"percentile_state",
+			"midrank",
+			"citation_percentile",
+			"source_revision",
+			"formula_version",
+			"evidence",
+			"generated_at",
+			"created_at",
+		},
+	}
+	for table, columns := range requiredColumns {
+		for _, column := range columns {
+			var exists bool
+			if err := pool.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM information_schema.columns
+					WHERE table_schema = 'public'
+					  AND table_name = $1
+					  AND column_name = $2
+				)
+			`, table, column).Scan(&exists); err != nil {
+				t.Fatalf("%s.%s metadata: %v", table, column, err)
+			}
+			if !exists {
+				t.Fatalf("%s.%s was not created", table, column)
+			}
+		}
+	}
+
+	workID := insertWork(t, pool, "openalex:W3001")
+	sourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		workID,
+		"pubmed",
+		"citation-analysis-3001",
+		"citation-analysis-source-hash",
+	)
+	projectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
+		workID,
+		sourceRecordID,
+		"citation-analysis",
+	)
+	var jobID string
+	if err := pool.QueryRow(ctx, `
+		SELECT job_id::text
+		FROM ingestion_projection_assertions
+		WHERE id = $1
+	`, projectionAssertionID).Scan(&jobID); err != nil {
+		t.Fatalf("query citation analysis ingestion job: %v", err)
+	}
+	var observedAt, retrievedAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT source_time, retrieved_at
+		FROM source_records
+		WHERE id = $1
+	`, sourceRecordID).Scan(&observedAt, &retrievedAt); err != nil {
+		t.Fatalf("query citation analysis source times: %v", err)
+	}
+	asOf := observedAt.Add(time.Hour)
+	var citationSnapshotID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO citation_snapshots (
+			work_id,
+			source,
+			observed_at,
+			count,
+			source_record_id,
+			ingestion_job_id,
+			retrieved_at,
+			coverage,
+			definition_version,
+			dataset_version
+		) VALUES (
+			$1,
+			'pubmed',
+			$2,
+			7,
+			$3,
+			$4,
+			$5,
+			1,
+			'pubmed-citation-count/v1',
+			'pubmed/2026-07-17'
+		)
+		RETURNING id
+	`, workID, observedAt, sourceRecordID, jobID, retrievedAt), &citationSnapshotID)
+
+	subjectFixture := insertBiomedicalSubjectRegistryFixture(
+		t,
+		pool,
+		"citation-analysis",
+		[]string{"ONCOLOGY"},
+	)
+	var publicationTypeID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO publication_types (publication_type_ui)
+		VALUES ('D016428')
+		RETURNING id
+	`), &publicationTypeID)
+
+	var analysisRunID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO analysis_runs (
+			analysis_type,
+			model_provider,
+			model_name,
+			prompt_version,
+			status,
+			input_payload,
+			started_at
+		) VALUES (
+			'citation_intelligence',
+			'internal',
+			'deterministic',
+			'citation-intelligence/v1',
+			'running',
+			'{"source":"pubmed"}',
+			$1
+		)
+		RETURNING id
+	`, asOf), &analysisRunID)
+
+	sourceRevision := strings.Repeat("c", 64)
+	var workSnapshotID, percentileID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO citation_analysis_work_snapshots (
+			analysis_run_id,
+			work_id,
+			source,
+			as_of,
+			velocity_window_days,
+			citation_count_state,
+			current_snapshot_id,
+			citation_count,
+			citation_velocity_state,
+			source_revision,
+			formula_version,
+			evidence,
+			generated_at
+		) VALUES (
+			$1,
+			$2,
+			'pubmed',
+			$5,
+			30,
+			'known',
+			$3,
+			7,
+			'insufficient_evidence',
+			$4,
+			'citation-intelligence/v1',
+			'{"missing_signals":["baseline_snapshot"]}',
+			$5
+		)
+		RETURNING id
+	`,
+		analysisRunID,
+		workID,
+		citationSnapshotID,
+		sourceRevision,
+		asOf,
+	), &workSnapshotID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO citation_analysis_percentiles (
+			analysis_run_id,
+			work_id,
+			subject_version_id,
+			subject_id,
+			publication_year,
+			publication_type_id,
+			source,
+			citation_snapshot_id,
+			citation_count,
+			cohort_key,
+			cohort_size,
+			minimum_cohort_size,
+			percentile_state,
+			source_revision,
+			formula_version,
+			evidence,
+			generated_at
+		) VALUES (
+			$1,
+			$2,
+			$3,
+			$4,
+			2026,
+			$5,
+			'pubmed',
+			$6,
+			7,
+			'subject-version:subject:2026:publication-type',
+			1,
+			5,
+			'insufficient_evidence',
+			$7,
+			'citation-intelligence/v1',
+			'{"supporting_work_ids":["openalex:W3001"]}',
+			$8
+		)
+		RETURNING id
+	`,
+		analysisRunID,
+		workID,
+		subjectFixture.VersionID,
+		subjectFixture.SubjectIDs[0],
+		publicationTypeID,
+		citationSnapshotID,
+		sourceRevision,
+		asOf,
+	), &percentileID)
+
+	for table, id := range map[string]string{
+		"citation_analysis_work_snapshots": workSnapshotID,
+		"citation_analysis_percentiles":    percentileID,
+	} {
+		for _, operation := range []string{"UPDATE", "DELETE"} {
+			var query string
+			if operation == "UPDATE" {
+				query = fmt.Sprintf(
+					"UPDATE %s SET generated_at = generated_at + interval '1 second' WHERE id = $1",
+					table,
+				)
+			} else {
+				query = fmt.Sprintf("DELETE FROM %s WHERE id = $1", table)
+			}
+			_, err := pool.Exec(ctx, query, id)
+			assertPostgresError(t, err, "55000", "")
+		}
+	}
+
+	var mismatchedRunID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO analysis_runs (
+			analysis_type,
+			model_provider,
+			model_name,
+			prompt_version,
+			status,
+			input_payload,
+			started_at
+		) VALUES (
+			'citation_intelligence',
+			'internal',
+			'deterministic',
+			'citation-intelligence/v1',
+			'running',
+			'{"source":"openalex"}',
+			$1
+		)
+		RETURNING id
+	`, asOf), &mismatchedRunID)
+	_, mismatchedSourceErr := pool.Exec(ctx, `
+		INSERT INTO citation_analysis_work_snapshots (
+			analysis_run_id,
+			work_id,
+			source,
+			as_of,
+			velocity_window_days,
+			citation_count_state,
+			current_snapshot_id,
+			citation_count,
+			citation_velocity_state,
+			source_revision,
+			formula_version,
+			evidence,
+			generated_at
+		) VALUES (
+			$1,
+			$2,
+			'openalex',
+			$5,
+			30,
+			'known',
+			$3,
+			7,
+			'insufficient_evidence',
+			$4,
+			'citation-intelligence/v1',
+			'{"missing_signals":["baseline_snapshot"]}',
+			$5
+		)
+	`, mismatchedRunID, workID, citationSnapshotID, sourceRevision, asOf)
+	assertPostgresError(
+		t,
+		mismatchedSourceErr,
+		"23503",
+		"citation_analysis_work_current_snapshot_fkey",
+	)
+}
+
+func TestBiomedicalAnalysisSnapshotSchemaIsStructuredImmutableAndIndexed(
+	t *testing.T,
+) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	requiredColumns := map[string][]string{
+		"publication_trend_snapshots": {
+			"id",
+			"analysis_run_id",
+			"entity_type",
+			"entity_id",
+			"state",
+			"model",
+			"model_selection_rule",
+			"dispersion_threshold",
+			"predeclared_dispersion_alpha",
+			"recent_window_start",
+			"recent_window_end",
+			"recent_paper_count",
+			"recent_rate_per_day",
+			"baseline_window_start",
+			"baseline_window_end",
+			"baseline_paper_count",
+			"baseline_rate_per_day",
+			"independent_journal_count",
+			"independent_team_count",
+			"rate_ratio",
+			"confidence_level",
+			"confidence_interval_lower",
+			"confidence_interval_upper",
+			"p_value",
+			"adjusted_p_value",
+			"cohort_revision",
+			"formula_version",
+			"payload",
+			"evidence",
+			"generated_at",
+			"created_at",
+		},
+		"journal_pattern_snapshots": {
+			"id",
+			"analysis_run_id",
+			"pattern_key",
+			"journal_id",
+			"subject_version_id",
+			"subject_id",
+			"pattern_kind",
+			"feature_type",
+			"feature_value",
+			"state",
+			"measure",
+			"journal_feature_paper_count",
+			"journal_paper_count",
+			"field_feature_paper_count",
+			"field_baseline_paper_count",
+			"journal_exposure",
+			"field_baseline_exposure",
+			"covered_paper_count",
+			"eligible_paper_count",
+			"coverage",
+			"effect_value",
+			"confidence_level",
+			"confidence_interval_lower",
+			"confidence_interval_upper",
+			"p_value",
+			"adjusted_p_value",
+			"cohort_revision",
+			"formula_version",
+			"payload",
+			"evidence",
+			"generated_at",
+			"created_at",
+		},
+		"research_opportunity_snapshots": {
+			"id",
+			"analysis_run_id",
+			"rule",
+			"rule_version",
+			"entity_type",
+			"entity_id",
+			"state",
+			"supporting_work_count",
+			"covered_paper_count",
+			"eligible_paper_count",
+			"coverage",
+			"confidence_level",
+			"primary_metric",
+			"primary_estimate",
+			"primary_confidence_interval_lower",
+			"primary_confidence_interval_upper",
+			"secondary_metric",
+			"secondary_estimate",
+			"secondary_confidence_interval_lower",
+			"secondary_confidence_interval_upper",
+			"limitations",
+			"cohort_revision",
+			"payload",
+			"evidence",
+			"generated_at",
+			"created_at",
+		},
+		"research_opportunity_supporting_works": {
+			"id",
+			"analysis_run_id",
+			"research_opportunity_snapshot_id",
+			"work_id",
+			"ordinal",
+			"created_at",
+		},
+	}
+	for table, columns := range requiredColumns {
+		for _, column := range columns {
+			var nullable string
+			if err := pool.QueryRow(ctx, `
+				SELECT is_nullable
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = $1
+				  AND column_name = $2
+			`, table, column).Scan(&nullable); err != nil {
+				t.Fatalf("%s.%s metadata: %v", table, column, err)
+			}
+			if nullable != "NO" &&
+				column != "rate_ratio" &&
+				column != "confidence_level" &&
+				column != "confidence_interval_lower" &&
+				column != "confidence_interval_upper" &&
+				column != "p_value" &&
+				column != "adjusted_p_value" &&
+				column != "journal_exposure" &&
+				column != "field_baseline_exposure" &&
+				column != "effect_value" &&
+				column != "secondary_metric" &&
+				column != "secondary_estimate" &&
+				column != "secondary_confidence_interval_lower" &&
+				column != "secondary_confidence_interval_upper" {
+				t.Fatalf("%s.%s nullable = %q, want NO", table, column, nullable)
+			}
+		}
+	}
+
+	assertNamesExist(t, pool, `
+		SELECT conname
+		FROM pg_constraint
+		WHERE connamespace = 'public'::regnamespace
+	`, []string{
+		"publication_trend_snapshots_run_fkey",
+		"publication_trend_snapshots_identity_key",
+		"publication_trend_snapshots_model_selection_shape_check",
+		"publication_trend_snapshots_window_check",
+		"publication_trend_snapshots_estimate_shape_check",
+		"publication_trend_snapshots_payload_check",
+		"publication_trend_snapshots_evidence_check",
+		"journal_pattern_snapshots_run_fkey",
+		"journal_pattern_snapshots_journal_fkey",
+		"journal_pattern_snapshots_subject_fkey",
+		"journal_pattern_snapshots_identity_key",
+		"journal_pattern_snapshots_count_shape_check",
+		"journal_pattern_snapshots_exposure_shape_check",
+		"journal_pattern_snapshots_estimate_shape_check",
+		"journal_pattern_snapshots_payload_check",
+		"journal_pattern_snapshots_evidence_check",
+		"research_opportunity_snapshots_run_fkey",
+		"research_opportunity_snapshots_identity_key",
+		"research_opportunity_snapshots_supporting_work_shape_check",
+		"research_opportunity_snapshots_rule_metric_shape_check",
+		"research_opportunity_snapshots_estimate_shape_check",
+		"research_opportunity_snapshots_state_shape_check",
+		"research_opportunity_snapshots_payload_check",
+		"research_opportunity_snapshots_evidence_check",
+		"research_opportunity_supporting_works_run_fkey",
+		"research_opportunity_supporting_works_snapshot_fkey",
+		"research_opportunity_supporting_works_work_fkey",
+		"research_opportunity_supporting_works_snapshot_work_key",
+		"research_opportunity_supporting_works_snapshot_ordinal_key",
+	})
+	assertNamesExist(t, pool, `
+		SELECT tgname
+		FROM pg_trigger
+		WHERE NOT tgisinternal
+	`, []string{
+		"publication_trend_snapshots_run_guard",
+		"publication_trend_snapshots_immutable",
+		"journal_pattern_snapshots_run_guard",
+		"journal_pattern_snapshots_immutable",
+		"research_opportunity_snapshots_run_guard",
+		"research_opportunity_snapshots_immutable",
+		"research_opportunity_supporting_works_run_guard",
+		"research_opportunity_supporting_works_immutable",
+		"analysis_runs_biomedical_snapshot_completion",
+	})
+	assertNamesExist(t, pool, `
+		SELECT indexname
+		FROM pg_indexes
+		WHERE schemaname = 'public'
+	`, []string{
+		"idx_publication_trend_snapshots_lookup",
+		"idx_journal_pattern_snapshots_lookup",
+		"idx_research_opportunity_snapshots_lookup",
+		"idx_research_opportunity_supporting_works_lookup",
+	})
+
+	var journalIndexDefinition string
+	if err := pool.QueryRow(ctx, `
+		SELECT indexdef
+		FROM pg_indexes
+		WHERE schemaname = 'public'
+		  AND indexname = 'idx_journal_pattern_snapshots_lookup'
+	`).Scan(&journalIndexDefinition); err != nil {
+		t.Fatalf("query journal pattern lookup index: %v", err)
+	}
+	if strings.Count(journalIndexDefinition, "state") != 1 {
+		t.Fatalf(
+			"journal pattern lookup index state occurrences = %d, want 1: %s",
+			strings.Count(journalIndexDefinition, "state"),
+			journalIndexDefinition,
+		)
+	}
+}
+
+func TestBiomedicalAnalysisSnapshotsRequireMatchingRunningRunsAndCompleteImmutably(
+	t *testing.T,
+) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+	generatedAt := time.Date(2026, 7, 1, 0, 10, 0, 0, time.UTC)
+	runStartedAt := generatedAt.Add(time.Hour)
+	runCompletedAt := runStartedAt.Add(time.Minute)
+
+	insertRun := func(analysisType, status string) string {
+		t.Helper()
+		var runID string
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO analysis_runs (
+				analysis_type,
+				model_provider,
+				model_name,
+				prompt_version,
+				status,
+				input_payload,
+				started_at
+			) VALUES (
+				$1,
+				'internal',
+				'deterministic',
+				$1 || '/v1',
+				$2,
+				'{"cohort_revision":"fixture"}',
+				$3
+			)
+			RETURNING id
+		`, analysisType, status, runStartedAt), &runID)
+		return runID
+	}
+
+	trendRunID := insertRun("publication_trends", "running")
+	journalRunID := insertRun("journal_editorial_patterns", "running")
+	opportunityRunID := insertRun("research_opportunities", "running")
+
+	var journalID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (
+			venue_type,
+			display_title,
+			issn_l
+		) VALUES (
+			'journal',
+			'Biomedical Analysis Snapshot Journal',
+			'1234-5679'
+		)
+		RETURNING id
+	`), &journalID)
+	subjectFixture := insertBiomedicalSubjectRegistryFixture(
+		t,
+		pool,
+		"biomedical-analysis-snapshots",
+		[]string{"ONCOLOGY"},
+	)
+	workIDs := make([]string, 0, 5)
+	for index := 0; index < 5; index++ {
+		workIDs = append(
+			workIDs,
+			insertWork(t, pool, fmt.Sprintf("openalex:W91%02d", index)),
+		)
+	}
+
+	insertTrend := func(runID, entityID, state string, includeEstimate bool) (string, error) {
+		t.Helper()
+		var snapshotID string
+		var rateRatio, confidenceLevel, lower, upper, pValue, adjustedPValue any
+		if includeEstimate {
+			rateRatio = 2.5
+			confidenceLevel = 0.95
+			lower = 1.49
+			upper = 4.19
+			pValue = 0.0005
+			adjustedPValue = 0.001
+		}
+		err := pool.QueryRow(ctx, `
+			INSERT INTO publication_trend_snapshots (
+				analysis_run_id,
+				entity_type,
+				entity_id,
+				state,
+				model,
+				model_selection_rule,
+				dispersion_threshold,
+				predeclared_dispersion_alpha,
+				recent_window_start,
+				recent_window_end,
+				recent_paper_count,
+				recent_rate_per_day,
+				baseline_window_start,
+				baseline_window_end,
+				baseline_paper_count,
+				baseline_rate_per_day,
+				independent_journal_count,
+				independent_team_count,
+				rate_ratio,
+				confidence_level,
+				confidence_interval_lower,
+				confidence_interval_upper,
+				p_value,
+				adjusted_p_value,
+				cohort_revision,
+				formula_version,
+				payload,
+				evidence,
+				generated_at
+			) VALUES (
+				$1,
+				'subject',
+				$2,
+				$3,
+				'poisson',
+				'fixed_poisson',
+				0,
+				0,
+				'2026-05-06T00:00:00Z',
+				'2026-07-01T00:00:00Z',
+				20,
+				0.3571428571,
+				'2025-05-07T00:00:00Z',
+				'2026-05-06T00:00:00Z',
+				52,
+				0.1428571429,
+				4,
+				8,
+				$4,
+				$5,
+				$6,
+				$7,
+				$8,
+				$9,
+				$10,
+				'biomedical-trends/v1',
+				'{"entity_label":"Oncology"}',
+				'{"window_policy":"56d-vs-364d"}',
+				$11
+			)
+			RETURNING id
+		`,
+			runID,
+			entityID,
+			state,
+			rateRatio,
+			confidenceLevel,
+			lower,
+			upper,
+			pValue,
+			adjustedPValue,
+			strings.Repeat("a", 64),
+			generatedAt,
+		).Scan(&snapshotID)
+		return snapshotID, err
+	}
+
+	insertJournalPattern := func(
+		runID, patternKey, patternKind, state string,
+		includeEstimate bool,
+	) (string, error) {
+		t.Helper()
+		var snapshotID string
+		var effectValue, confidenceLevel, lower, upper, pValue, adjustedPValue any
+		if includeEstimate {
+			effectValue = 1.71
+			confidenceLevel = 0.95
+			lower = 0.99
+			upper = 2.98
+			pValue = 0.055
+			adjustedPValue = 0.08
+		}
+		err := pool.QueryRow(ctx, `
+			INSERT INTO journal_pattern_snapshots (
+				analysis_run_id,
+				pattern_key,
+				journal_id,
+				subject_version_id,
+				subject_id,
+				pattern_kind,
+				feature_type,
+				feature_value,
+				state,
+				measure,
+				journal_feature_paper_count,
+				journal_paper_count,
+				field_feature_paper_count,
+				field_baseline_paper_count,
+				covered_paper_count,
+				eligible_paper_count,
+				coverage,
+				effect_value,
+				confidence_level,
+				confidence_interval_lower,
+				confidence_interval_upper,
+				p_value,
+				adjusted_p_value,
+				cohort_revision,
+				formula_version,
+				payload,
+				evidence,
+				generated_at
+			) VALUES (
+				$1,
+				$2,
+				$3,
+				$4,
+				$5,
+				$6,
+				'mesh',
+				'Neoplasms',
+				$7,
+				'odds_ratio',
+				30,
+				100,
+				40,
+				200,
+				270,
+				300,
+				0.9,
+				$8,
+				$9,
+				$10,
+				$11,
+				$12,
+				$13,
+				$14,
+				'journal-editorial-patterns/v1',
+				'{"feature_label":"Neoplasms"}',
+				'{"cohort":"oncology"}',
+				$15
+			)
+			RETURNING id
+		`,
+			runID,
+			patternKey,
+			journalID,
+			subjectFixture.VersionID,
+			subjectFixture.SubjectIDs[0],
+			patternKind,
+			state,
+			effectValue,
+			confidenceLevel,
+			lower,
+			upper,
+			pValue,
+			adjustedPValue,
+			strings.Repeat("b", 64),
+			generatedAt,
+		).Scan(&snapshotID)
+		return snapshotID, err
+	}
+
+	insertOpportunity := func(
+		runID, entityID, state string,
+		coveredPaperCount, eligiblePaperCount int,
+	) (string, string, error) {
+		t.Helper()
+		var snapshotID string
+		err := pool.QueryRow(ctx, `
+			INSERT INTO research_opportunity_snapshots (
+				analysis_run_id,
+				rule,
+				rule_version,
+				entity_type,
+				entity_id,
+				state,
+				supporting_work_count,
+				covered_paper_count,
+				eligible_paper_count,
+				coverage,
+				confidence_level,
+				primary_metric,
+				primary_estimate,
+				primary_confidence_interval_lower,
+				primary_confidence_interval_upper,
+				secondary_metric,
+				secondary_estimate,
+				secondary_confidence_interval_lower,
+				secondary_confidence_interval_upper,
+				limitations,
+				cohort_revision,
+				payload,
+				evidence,
+				generated_at
+			) VALUES (
+				$1,
+				'rapid_growth_low_rct_share',
+				'biomedical-opportunity-rules/v1',
+				'subject',
+				$2,
+				$3,
+				5,
+				$4::bigint,
+				$5::bigint,
+				$4::numeric / $5::numeric,
+				0.95,
+				'trend_rate_ratio',
+				2.5,
+				1.4,
+				4.2,
+				'rct_share',
+				0.1,
+				0.05,
+				0.2,
+				ARRAY['observational source coverage'],
+				$6,
+				'{"title":"Rapid growth with low RCT share"}',
+				'{"supporting_sources":["pubmed"]}',
+				$7
+			)
+			RETURNING id
+		`,
+			runID,
+			entityID,
+			state,
+			coveredPaperCount,
+			eligiblePaperCount,
+			strings.Repeat("c", 64),
+			generatedAt,
+		).Scan(&snapshotID)
+		if err != nil {
+			return "", "", err
+		}
+
+		var firstSupportingWorkID string
+		for index, workID := range workIDs {
+			var supportingWorkID string
+			if err := pool.QueryRow(ctx, `
+				INSERT INTO research_opportunity_supporting_works (
+					analysis_run_id,
+					research_opportunity_snapshot_id,
+					work_id,
+					ordinal
+				) VALUES ($1, $2, $3, $4)
+				RETURNING id
+			`, runID, snapshotID, workID, index+1).Scan(&supportingWorkID); err != nil {
+				return "", "", err
+			}
+			if index == 0 {
+				firstSupportingWorkID = supportingWorkID
+			}
+		}
+		return snapshotID, firstSupportingWorkID, nil
+	}
+
+	trendSnapshotID, err := insertTrend(
+		trendRunID,
+		subjectFixture.SubjectIDs[0],
+		"sufficient_evidence",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("insert biomedical trend snapshot: %v", err)
+	}
+	journalSnapshotID, err := insertJournalPattern(
+		journalRunID,
+		"journal|oncology|mesh|neoplasms",
+		"editorial_pattern",
+		"sufficient_evidence",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("insert journal editorial pattern snapshot: %v", err)
+	}
+	opportunitySnapshotID, opportunitySupportingWorkID, err := insertOpportunity(
+		opportunityRunID,
+		subjectFixture.SubjectIDs[0],
+		"triggered",
+		5,
+		5,
+	)
+	if err != nil {
+		t.Fatalf("insert research opportunity snapshot: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, "DELETE FROM works WHERE id = $1", workIDs[0])
+	assertPostgresError(
+		t,
+		err,
+		"23001",
+		"research_opportunity_supporting_works_work_fkey",
+	)
+
+	wrongTypeCases := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "trend",
+			call: func() error {
+				_, callErr := insertTrend(
+					journalRunID,
+					"wrong-type-trend",
+					"sufficient_evidence",
+					true,
+				)
+				return callErr
+			},
+		},
+		{
+			name: "journal pattern",
+			call: func() error {
+				_, callErr := insertJournalPattern(
+					opportunityRunID,
+					"wrong-type-journal-pattern",
+					"editorial_pattern",
+					"sufficient_evidence",
+					true,
+				)
+				return callErr
+			},
+		},
+		{
+			name: "research opportunity",
+			call: func() error {
+				_, _, callErr := insertOpportunity(
+					trendRunID,
+					"wrong-type-opportunity",
+					"triggered",
+					5,
+					5,
+				)
+				return callErr
+			},
+		},
+	}
+	for _, test := range wrongTypeCases {
+		t.Run(test.name+" rejects a different analysis type", func(t *testing.T) {
+			assertPostgresError(
+				t,
+				test.call(),
+				"23514",
+				"biomedical_analysis_running_run",
+			)
+		})
+	}
+
+	pendingCases := []struct {
+		name         string
+		analysisType string
+		call         func(string) error
+	}{
+		{
+			name:         "trend",
+			analysisType: "publication_trends",
+			call: func(runID string) error {
+				_, callErr := insertTrend(
+					runID,
+					"pending-trend",
+					"sufficient_evidence",
+					true,
+				)
+				return callErr
+			},
+		},
+		{
+			name:         "journal pattern",
+			analysisType: "journal_editorial_patterns",
+			call: func(runID string) error {
+				_, callErr := insertJournalPattern(
+					runID,
+					"pending-journal-pattern",
+					"editorial_pattern",
+					"sufficient_evidence",
+					true,
+				)
+				return callErr
+			},
+		},
+		{
+			name:         "research opportunity",
+			analysisType: "research_opportunities",
+			call: func(runID string) error {
+				_, _, callErr := insertOpportunity(
+					runID,
+					"pending-opportunity",
+					"triggered",
+					5,
+					5,
+				)
+				return callErr
+			},
+		},
+	}
+	for _, test := range pendingCases {
+		t.Run(test.name+" rejects a non-running analysis run", func(t *testing.T) {
+			assertPostgresError(
+				t,
+				test.call(insertRun(test.analysisType, "pending")),
+				"23514",
+				"biomedical_analysis_running_run",
+			)
+		})
+	}
+
+	_, err = insertTrend(
+		trendRunID,
+		"invalid-insufficient-trend-shape",
+		"insufficient_evidence",
+		true,
+	)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"publication_trend_snapshots_estimate_shape_check",
+	)
+	_, err = insertJournalPattern(
+		journalRunID,
+		"invalid-pattern-kind",
+		"preference",
+		"sufficient_evidence",
+		true,
+	)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"journal_pattern_snapshots_kind_check",
+	)
+	_, _, err = insertOpportunity(
+		opportunityRunID,
+		"invalid-triggered-opportunity",
+		"triggered",
+		1,
+		5,
+	)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"research_opportunity_snapshots_state_shape_check",
+	)
+
+	_, err = pool.Exec(ctx, `
+		UPDATE analysis_runs
+		SET analysis_type = 'research_opportunities'
+		WHERE id = $1
+	`, trendRunID)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"biomedical_analysis_run_binding",
+	)
+
+	emptyTrendRunID := insertRun("publication_trends", "running")
+	_, err = pool.Exec(ctx, `
+		UPDATE analysis_runs
+		SET status = 'succeeded',
+		    output_payload = '{"snapshot_count":0}',
+		    completed_at = $2
+		WHERE id = $1
+	`, emptyTrendRunID, runCompletedAt)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"biomedical_analysis_run_completion",
+	)
+
+	_, err = pool.Exec(ctx, `
+		UPDATE analysis_runs
+		SET status = 'succeeded',
+		    output_payload = '{"snapshot_count":1}',
+		    completed_at = $2
+		WHERE id = $1
+	`, trendRunID, generatedAt.Add(-time.Second))
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"biomedical_analysis_run_completion",
+	)
+
+	for _, runID := range []string{
+		trendRunID,
+		journalRunID,
+		opportunityRunID,
+	} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE analysis_runs
+			SET status = 'succeeded',
+			    output_payload = '{"snapshot_count":1}',
+			    completed_at = $2
+			WHERE id = $1
+		`, runID, runCompletedAt); err != nil {
+			t.Fatalf("complete biomedical analysis run %s: %v", runID, err)
+		}
+	}
+
+	completedInsertCases := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "trend",
+			call: func() error {
+				_, callErr := insertTrend(
+					trendRunID,
+					"completed-trend",
+					"sufficient_evidence",
+					true,
+				)
+				return callErr
+			},
+		},
+		{
+			name: "journal pattern",
+			call: func() error {
+				_, callErr := insertJournalPattern(
+					journalRunID,
+					"completed-journal-pattern",
+					"editorial_pattern",
+					"sufficient_evidence",
+					true,
+				)
+				return callErr
+			},
+		},
+		{
+			name: "research opportunity",
+			call: func() error {
+				_, _, callErr := insertOpportunity(
+					opportunityRunID,
+					"completed-opportunity",
+					"triggered",
+					5,
+					5,
+				)
+				return callErr
+			},
+		},
+	}
+	for _, test := range completedInsertCases {
+		t.Run(test.name+" rejects inserts after completion", func(t *testing.T) {
+			assertPostgresError(
+				t,
+				test.call(),
+				"23514",
+				"biomedical_analysis_running_run",
+			)
+		})
+	}
+
+	extraWorkID := insertWork(t, pool, "openalex:W9199")
+	_, err = pool.Exec(ctx, `
+		INSERT INTO research_opportunity_supporting_works (
+			analysis_run_id,
+			research_opportunity_snapshot_id,
+			work_id,
+			ordinal
+		) VALUES ($1, $2, $3, 6)
+	`, opportunityRunID, opportunitySnapshotID, extraWorkID)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"biomedical_analysis_running_run",
+	)
+
+	for table, snapshotID := range map[string]string{
+		"publication_trend_snapshots":    trendSnapshotID,
+		"journal_pattern_snapshots":      journalSnapshotID,
+		"research_opportunity_snapshots": opportunitySnapshotID,
+	} {
+		for _, query := range []string{
+			fmt.Sprintf(
+				"UPDATE %s SET generated_at = generated_at + interval '1 second' WHERE id = $1",
+				table,
+			),
+			fmt.Sprintf("DELETE FROM %s WHERE id = $1", table),
+		} {
+			_, mutationErr := pool.Exec(ctx, query, snapshotID)
+			assertPostgresError(t, mutationErr, "55000", "")
+		}
+	}
+	for _, query := range []string{
+		`UPDATE research_opportunity_supporting_works
+		 SET ordinal = ordinal
+		 WHERE id = $1`,
+		`DELETE FROM research_opportunity_supporting_works WHERE id = $1`,
+	} {
+		_, mutationErr := pool.Exec(ctx, query, opportunitySupportingWorkID)
+		assertPostgresError(t, mutationErr, "55000", "")
 	}
 }
 
@@ -329,8 +1872,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 12 {
-		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
+	if len(migrations) != 17 {
+		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -1751,8 +3294,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 12 {
-		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
+	if len(migrations) != 17 {
+		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -3571,8 +5114,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 12 {
-		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
+	if len(migrations) != 17 {
+		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
 	}
 
 	pool := openTestPool(t)

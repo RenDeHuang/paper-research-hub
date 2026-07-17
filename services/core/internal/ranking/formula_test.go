@@ -160,6 +160,65 @@ func TestCitationVelocityUsesElapsedDaysBetweenBoundaries(t *testing.T) {
 	}
 }
 
+func TestSourceSpecificCitationVelocityRejectsMixedOrUncontrolledSources(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	at := time.Date(2026, time.July, 16, 0, 0, 0, 0, time.UTC)
+	valid := SourceSpecificCitationVelocityInput{
+		Source: "openalex",
+		Start: &SourceMetricSnapshot{
+			Source:     "openalex",
+			ObservedAt: at.Add(-48 * time.Hour),
+			Value:      decimal.NewFromInt(6),
+		},
+		End: &SourceMetricSnapshot{
+			Source:     "openalex",
+			ObservedAt: at,
+			Value:      decimal.NewFromInt(12),
+		},
+	}
+	got, err := SourceSpecificCitationVelocity(valid)
+	if err != nil {
+		t.Fatalf("SourceSpecificCitationVelocity(valid) error = %v", err)
+	}
+	if !got.Equal(decimal.NewFromInt(3)) {
+		t.Fatalf(
+			"SourceSpecificCitationVelocity(valid) = %s, want 3",
+			got,
+		)
+	}
+
+	mixed := valid
+	mixed.End = &SourceMetricSnapshot{
+		Source:     "crossref",
+		ObservedAt: at,
+		Value:      decimal.NewFromInt(12),
+	}
+	if _, err := SourceSpecificCitationVelocity(mixed); !errors.Is(
+		err,
+		ErrMixedMetricSource,
+	) {
+		t.Fatalf(
+			"SourceSpecificCitationVelocity(mixed) error = %v, want ErrMixedMetricSource",
+			err,
+		)
+	}
+
+	uncontrolled := valid
+	uncontrolled.Source = " openalex"
+	if _, err := SourceSpecificCitationVelocity(uncontrolled); !errors.Is(
+		err,
+		ErrInvalidMetricSource,
+	) {
+		t.Fatalf(
+			"SourceSpecificCitationVelocity(uncontrolled) error = %v, want ErrInvalidMetricSource",
+			err,
+		)
+	}
+}
+
 func TestCitationVelocityRejectsReversedOrZeroDurationBoundaries(t *testing.T) {
 	t.Parallel()
 

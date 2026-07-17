@@ -2788,7 +2788,9 @@ func TestPostgresRepositoryConcurrentBiomedicalCanonicalUpsertsUseFixedOrder(
 	}
 }
 
-func TestPostgresRepositoryPersistsCitationMetricsAndNeverRevivesRetractedWork(t *testing.T) {
+func TestPostgresRepositoryPersistsSourceSpecificCitationEvidenceAndNeverRevivesRetractedWork(
+	t *testing.T,
+) {
 	pool := openIngestionTestPool(t)
 	repository := mustPostgresRepository(t, pool)
 	ctx := context.Background()
@@ -2837,28 +2839,94 @@ func TestPostgresRepositoryPersistsCitationMetricsAndNeverRevivesRetractedWork(t
 		}
 	}
 
-	var status string
-	var metricValue int
+	var (
+		status, citationSource, definitionVersion, datasetVersion string
+		sourceRecordID, ingestionJobID                            string
+		metricValue                                               int
+		observedAt, retrievedAt                                   time.Time
+		coverage                                                  float64
+	)
 	if err := pool.QueryRow(ctx, `
 		SELECT
 			work.status,
-			metric.metric_value::integer
+			citation.count,
+			citation.source,
+			citation.observed_at,
+			citation.source_record_id::text,
+			citation.ingestion_job_id::text,
+			citation.retrieved_at,
+			citation.coverage::double precision,
+			citation.definition_version,
+			citation.dataset_version
 		FROM works AS work
-		JOIN metric_snapshots AS metric
-		  ON metric.work_id = work.id
-		 AND metric.metric_name = 'citation_count'
+		JOIN citation_snapshots AS citation
+		  ON citation.work_id = work.id
 		WHERE work.canonical_key = 'doi:10.1000/terminal-status'
-		ORDER BY metric.observed_at
+		ORDER BY citation.observed_at
 		LIMIT 1
-	`).Scan(&status, &metricValue); err != nil {
-		t.Fatalf("query terminal work metric: %v", err)
+	`).Scan(
+		&status,
+		&metricValue,
+		&citationSource,
+		&observedAt,
+		&sourceRecordID,
+		&ingestionJobID,
+		&retrievedAt,
+		&coverage,
+		&definitionVersion,
+		&datasetVersion,
+	); err != nil {
+		t.Fatalf("query terminal Work citation evidence: %v", err)
 	}
-	if status != "retracted" || metricValue != citations {
+	if status != "retracted" ||
+		metricValue != citations ||
+		citationSource != source.OpenAlex ||
+		!observedAt.Equal(baseTime) ||
+		sourceRecordID == "" ||
+		ingestionJobID == "" ||
+		retrievedAt.IsZero() ||
+		coverage != 1 ||
+		definitionVersion != "openalex-cited-by-count/v1" ||
+		datasetVersion != "openalex-source-record/"+sourceRecordID {
 		t.Fatalf(
-			"terminal work = status %q metric %d, want retracted/%d",
+			"terminal Work citation evidence = status %q count %d source %q observed %s source_record %q job %q retrieved %s coverage %v definition %q dataset %q",
 			status,
 			metricValue,
-			citations,
+			citationSource,
+			observedAt,
+			sourceRecordID,
+			ingestionJobID,
+			retrievedAt,
+			coverage,
+			definitionVersion,
+			datasetVersion,
+		)
+	}
+
+	var legacyCitationRows int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM metric_snapshots
+		WHERE metric_name = 'citation_count'
+	`).Scan(&legacyCitationRows); err != nil {
+		t.Fatalf("count legacy citation metric rows: %v", err)
+	}
+	if legacyCitationRows != 0 {
+		t.Fatalf(
+			"legacy source-ambiguous citation metrics = %d, want zero",
+			legacyCitationRows,
+		)
+	}
+}
+
+func TestCitationDefinitionRejectsUnregisteredSource(t *testing.T) {
+	t.Parallel()
+
+	if _, err := citationDefinitionVersion(source.Crossref); err == nil ||
+		!strings.Contains(err.Error(), source.Crossref) {
+		t.Fatalf(
+			"citationDefinitionVersion(Crossref) error = %v",
+			err,
 		)
 	}
 }

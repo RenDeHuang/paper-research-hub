@@ -13,7 +13,7 @@ type OpportunityStatus =
 interface OpportunityPoint {
   id: string
   label: string
-  missingSignals: string[]
+  missingSignals?: string[]
   status: OpportunityStatus
   x: DataValue<number>
   y: DataValue<number>
@@ -39,7 +39,7 @@ const normalizedPoints = computed(() =>
   props.points.map((point) => ({
     ...point,
     // 缺失信号按调用方来源顺序复制，组件不排序也不改写原数组。
-    missingSignals: [...point.missingSignals],
+    missingSignals: point.missingSignals?.slice(),
   })),
 )
 
@@ -89,7 +89,7 @@ const plottablePoints = computed(() =>
       {
         id: point.id,
         label: point.label,
-        missingSignals: [...point.missingSignals],
+        missingSignals: point.missingSignals?.slice(),
         status: point.status,
         x: point.x.value,
         y: point.y.value,
@@ -145,7 +145,14 @@ function coordinateText(value: DataValue<number>) {
   return presentDataValue(value).text
 }
 
-function missingSignalsText(signals: string[]) {
+function missingSignalsState(signals: string[] | undefined) {
+  return signals === undefined ? "unknown" : "known"
+}
+
+function missingSignalsText(signals: string[] | undefined) {
+  if (signals === undefined) {
+    return "未覆盖"
+  }
   return signals.length > 0 ? signals.join("；") : "无"
 }
 </script>
@@ -227,7 +234,10 @@ function missingSignalsText(signals: string[]) {
                 </div>
                 <div>
                   <dt>缺失信号</dt>
-                  <dd data-missing-signals>
+                  <dd
+                    data-missing-signals
+                    :data-value-state="missingSignalsState(point.missingSignals)"
+                  >
                     {{ missingSignalsText(point.missingSignals) }}
                   </dd>
                 </div>
@@ -282,7 +292,10 @@ function missingSignalsText(signals: string[]) {
               </div>
               <div>
                 <dt>缺失信号</dt>
-                <dd data-missing-signals>
+                <dd
+                  data-missing-signals
+                  :data-value-state="missingSignalsState(point.missingSignals)"
+                >
                   {{ missingSignalsText(point.missingSignals) }}
                 </dd>
               </div>
@@ -332,7 +345,10 @@ function missingSignalsText(signals: string[]) {
             </div>
             <div>
               <dt>缺失信号</dt>
-              <dd data-missing-signals>
+              <dd
+                data-missing-signals
+                :data-value-state="missingSignalsState(point.missingSignals)"
+              >
                 {{ missingSignalsText(point.missingSignals) }}
               </dd>
             </div>
@@ -380,7 +396,10 @@ function missingSignalsText(signals: string[]) {
               >
                 {{ coordinateText(point.y) }}
               </td>
-              <td data-missing-signals>
+              <td
+                data-missing-signals
+                :data-value-state="missingSignalsState(point.missingSignals)"
+              >
                 {{ missingSignalsText(point.missingSignals) }}
               </td>
             </tr>

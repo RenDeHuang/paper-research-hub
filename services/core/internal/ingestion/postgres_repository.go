@@ -2172,6 +2172,7 @@ func applyWinningProjection(
 		normalizedAssertionID string
 		rawEventID            string
 		sourceRecordID        string
+		ingestionJobID        string
 		sourceTime            time.Time
 		tieBreakKey           string
 		position              int64
@@ -2184,6 +2185,7 @@ func applyWinningProjection(
 			state.normalized_assertion_id::text,
 			state.raw_event_id::text,
 			state.source_record_uuid::text,
+			assertion.job_id::text,
 			state.source_time,
 			state.tie_break_key,
 			state.position,
@@ -2210,6 +2212,7 @@ func applyWinningProjection(
 		&normalizedAssertionID,
 		&rawEventID,
 		&sourceRecordID,
+		&ingestionJobID,
 		&sourceTime,
 		&tieBreakKey,
 		&position,
@@ -2268,7 +2271,14 @@ func applyWinningProjection(
 	if err := json.Unmarshal(payload, &record); err != nil {
 		return false, fmt.Errorf("decode winning work projection: %w", err)
 	}
-	if err := applyRecordProjection(ctx, tx, workID, sourceRecordID, record); err != nil {
+	if err := applyRecordProjection(
+		ctx,
+		tx,
+		workID,
+		sourceRecordID,
+		ingestionJobID,
+		record,
+	); err != nil {
 		return false, err
 	}
 	if _, err := tx.Exec(ctx, `
@@ -2315,6 +2325,7 @@ func applyRecordProjection(
 	tx pgx.Tx,
 	workID string,
 	sourceRecordID string,
+	ingestionJobID string,
 	record persistedRecordPayload,
 ) error {
 	status := paper.WorkStatusActive
@@ -2347,11 +2358,12 @@ func applyRecordProjection(
 	if err := replaceTopics(ctx, tx, workID, sourceRecordID, record.Topics); err != nil {
 		return err
 	}
-	if err := persistCitationMetric(
+	if err := persistCitationSnapshot(
 		ctx,
 		tx,
 		workID,
 		sourceRecordID,
+		ingestionJobID,
 		record.Source,
 		record.CitedByCount,
 	); err != nil {
@@ -2590,11 +2602,12 @@ func replaceTopics(
 	return nil
 }
 
-func persistCitationMetric(
+func persistCitationSnapshot(
 	ctx context.Context,
 	tx pgx.Tx,
 	workID string,
 	sourceRecordID string,
+	ingestionJobID string,
 	metricSource string,
 	value *int,
 ) error {
@@ -2604,23 +2617,116 @@ func persistCitationMetric(
 	if *value < 0 {
 		return errors.New("citation metric must not be negative")
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO metric_snapshots (
-			work_id, metric_name, metric_value, observed_at, source
+	definitionVersion, err := citationDefinitionVersion(metricSource)
+	if err != nil {
+		return err
+	}
+	datasetVersion := metricSource + "-source-record/" + sourceRecordID
+
+	var insertedID string
+	err = tx.QueryRow(ctx, `
+		INSERT INTO citation_snapshots (
+			work_id,
+			source,
+			observed_at,
+			count,
+			source_record_id,
+			ingestion_job_id,
+			retrieved_at,
+			coverage,
+			definition_version,
+			dataset_version
 		)
 		SELECT
 			$1,
-			'citation_count',
+			source_record.source,
+			source_record.source_time,
 			$2,
-			source_time,
-			$3
-		FROM source_records
-		WHERE id = $4
-		ON CONFLICT DO NOTHING
-	`, workID, *value, metricSource, sourceRecordID); err != nil {
-		return fmt.Errorf("persist citation metric: %w", err)
+			source_record.id,
+			$3,
+			source_record.retrieved_at,
+			1,
+			$4,
+			$5
+		FROM source_records AS source_record
+		JOIN ingestion_projection_assertions AS projection
+		  ON projection.source_record_uuid = source_record.id
+		 AND projection.work_id = $1
+		 AND projection.job_id = $3
+		WHERE source_record.id = $6
+		  AND source_record.source = $7
+		ON CONFLICT (work_id, source, observed_at)
+		DO NOTHING
+		RETURNING id::text
+	`,
+		workID,
+		*value,
+		ingestionJobID,
+		definitionVersion,
+		datasetVersion,
+		sourceRecordID,
+		metricSource,
+	).Scan(&insertedID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("persist citation snapshot: %w", err)
+	}
+
+	var replayMatches bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM citation_snapshots
+			WHERE work_id = $1
+			  AND source = $2
+			  AND observed_at = (
+				  SELECT source_time
+				  FROM source_records
+				  WHERE id = $3
+			  )
+			  AND count = $4
+			  AND source_record_id = $3
+			  AND ingestion_job_id = $5
+			  AND retrieved_at = (
+				  SELECT retrieved_at
+				  FROM source_records
+				  WHERE id = $3
+			  )
+			  AND coverage = 1
+			  AND definition_version = $6
+			  AND dataset_version = $7
+		)
+	`,
+		workID,
+		metricSource,
+		sourceRecordID,
+		*value,
+		ingestionJobID,
+		definitionVersion,
+		datasetVersion,
+	).Scan(&replayMatches); err != nil {
+		return fmt.Errorf("verify citation snapshot replay: %w", err)
+	}
+	if !replayMatches {
+		return errors.New(
+			"citation snapshot replay conflicts with immutable evidence",
+		)
 	}
 	return nil
+}
+
+func citationDefinitionVersion(metricSource string) (string, error) {
+	switch metricSource {
+	case source.OpenAlex:
+		return "openalex-cited-by-count/v1", nil
+	default:
+		return "", fmt.Errorf(
+			"citation count source %q has no registered evidence definition",
+			metricSource,
+		)
+	}
 }
 
 func replaceCodeRepositories(

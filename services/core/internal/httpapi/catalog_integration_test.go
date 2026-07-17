@@ -24,6 +24,11 @@ func TestPublicCatalogGETRoutesReadPublishedGeneration(t *testing.T) {
 	handler := newCatalogTestHandler(t, pool)
 
 	for _, target := range []string{
+		"/api/v1/home",
+		"/api/v1/subjects?limit=1",
+		"/api/v1/subjects/oncology?limit=1",
+		"/api/v1/journals?limit=1",
+		"/api/v1/journals/journal-of-clinical-oncology?limit=1",
 		"/api/v1/stats",
 		"/api/v1/papers?limit=1",
 		"/api/v1/papers/" + fixture.paperID.String(),
@@ -61,11 +66,56 @@ func TestPublicCatalogGETRoutesReadPublishedGeneration(t *testing.T) {
 	}
 }
 
+func TestResearchOpportunityResponseUsesAnalysisMetadataFromCatalog(
+	t *testing.T,
+) {
+	pool := openHTTPAPITestPool(t)
+	insertHTTPAPICatalogFixture(t, pool)
+	handler := newCatalogTestHandler(t, pool)
+
+	response := serveWithHandler(
+		handler,
+		http.MethodGet,
+		"/api/v1/research-opportunities?limit=1",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"status = %d, want 200; body=%s",
+			response.Code,
+			response.Body,
+		)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode research opportunity response: %v", err)
+	}
+	if _, exists := body["analysis"]; !exists {
+		t.Fatalf("response is missing analysis metadata: %s", response.Body)
+	}
+	if _, exists := body["generated_at"]; exists {
+		t.Fatalf(
+			"response leaked Catalog generation time as analysis time: %s",
+			response.Body,
+		)
+	}
+	if _, exists := body["formula_version"]; exists {
+		t.Fatalf(
+			"response leaked Catalog formula as opportunity formula: %s",
+			response.Body,
+		)
+	}
+}
+
 func TestPublicCatalogRoutesReturn503BeforePublication(t *testing.T) {
 	pool := openHTTPAPITestPool(t)
 	handler := newCatalogTestHandler(t, pool)
 
 	for _, target := range []string{
+		"/api/v1/home",
+		"/api/v1/subjects",
+		"/api/v1/subjects/oncology",
+		"/api/v1/journals",
+		"/api/v1/journals/journal-of-clinical-oncology",
 		"/api/v1/stats",
 		"/api/v1/papers",
 		"/api/v1/papers/" + uuid.NewString(),
@@ -90,6 +140,11 @@ func TestKnownPublicCatalogPathsRejectNonGETWithProblemDetails(t *testing.T) {
 	handler := newCatalogTestHandler(t, pool)
 
 	for _, target := range []string{
+		"/api/v1/home",
+		"/api/v1/subjects",
+		"/api/v1/subjects/oncology",
+		"/api/v1/journals",
+		"/api/v1/journals/journal-of-clinical-oncology",
 		"/api/v1/stats",
 		"/api/v1/papers",
 		"/api/v1/papers/" + uuid.NewString(),
@@ -141,6 +196,55 @@ func TestPaperDetailUsesIdentical404ForInvisibleMissingAndMalformedIDs(t *testin
 	}
 }
 
+func TestBiomedicalCatalogHidesRejectedAndUnknownSnapshotSlugsBehind404(t *testing.T) {
+	pool := openHTTPAPITestPool(t)
+	insertHTTPAPICatalogFixture(t, pool)
+	handler := newCatalogTestHandler(t, pool)
+
+	for _, target := range []string{
+		"/api/v1/subjects/rejected-oncology",
+		"/api/v1/subjects/does-not-exist",
+		"/api/v1/journals/rejected-journal",
+		"/api/v1/journals/does-not-exist",
+	} {
+		response := serveWithHandler(handler, http.MethodGet, target)
+		assertProblem(t, response, http.StatusNotFound, "resource_not_found")
+	}
+}
+
+func TestBiomedicalCatalogListAndDetailCursorsAreContextBound(t *testing.T) {
+	pool := openHTTPAPITestPool(t)
+	insertHTTPAPICatalogFixture(t, pool)
+	handler := newCatalogTestHandler(t, pool)
+
+	subjectList := serveWithHandler(
+		handler,
+		http.MethodGet,
+		"/api/v1/subjects?limit=1",
+	)
+	subjectListCursor := responseCursor(t, subjectList)
+	mismatch := serveWithHandler(
+		handler,
+		http.MethodGet,
+		"/api/v1/journals?limit=1&cursor="+urlQueryEscape(subjectListCursor),
+	)
+	assertProblem(t, mismatch, http.StatusConflict, "cursor_context_mismatch")
+
+	subjectDetail := serveWithHandler(
+		handler,
+		http.MethodGet,
+		"/api/v1/subjects/oncology?limit=1",
+	)
+	subjectDetailCursor := responseRecentPaperCursor(t, subjectDetail)
+	detailMismatch := serveWithHandler(
+		handler,
+		http.MethodGet,
+		"/api/v1/journals/journal-of-clinical-oncology?limit=1&cursor="+
+			urlQueryEscape(subjectDetailCursor),
+	)
+	assertProblem(t, detailMismatch, http.StatusConflict, "cursor_context_mismatch")
+}
+
 func TestPaperListMapsCursorValidationAndContextConflicts(t *testing.T) {
 	pool := openHTTPAPITestPool(t)
 	insertHTTPAPICatalogFixture(t, pool)
@@ -190,6 +294,12 @@ func TestPublicCatalogQueryValidationIsStrict(t *testing.T) {
 	handler := newCatalogTestHandler(t, pool)
 
 	for _, target := range []string{
+		"/api/v1/home?limit=1",
+		"/api/v1/subjects?limit=0",
+		"/api/v1/subjects?limit=1&limit=2",
+		"/api/v1/subjects/oncology?unknown=value",
+		"/api/v1/journals?cursor=",
+		"/api/v1/journals/journal-of-clinical-oncology?limit=101",
 		"/api/v1/papers?q=%20%20",
 		"/api/v1/papers?limit=0",
 		"/api/v1/papers?has_code=1",
@@ -272,6 +382,191 @@ func insertHTTPAPICatalogFixture(
 		)
 	`, fixture.generationID); err != nil {
 		t.Fatalf("insert HTTP API stats: %v", err)
+	}
+
+	analysisPayload := `{
+		"coverage_ratio":{"state":"known","value":1},
+		"generated_at":{"state":"known","value":"2026-07-16T05:00:00Z"},
+		"missing_signals":[],
+		"sample_size":{"state":"known","value":2},
+		"sources":{"state":"known","value":["test-fixture"]},
+		"window_days":{"state":"known","value":30}
+	}`
+	homePayload := fmt.Sprintf(`{
+		"active_journals":{"analysis":%s,"items":[]},
+		"catalog_generation":%q,
+		"citation_momentum":{"analysis":%s,"items":[]},
+		"coverage":{"analysis":%s,"citation_coverage_ratio":{"state":"known","value":1},"jcr_metric_year":2025,"mesh_coverage_ratio":{"state":"known","value":1},"publication_type_coverage_ratio":{"state":"known","value":1},"taxonomy_version":"biomedical-jcr-subjects/v1"},
+		"entity_momentum":{"analysis":%s,"items":[]},
+		"evidence_gaps":[],
+		"generated_at":"2026-07-16T05:00:00Z",
+		"latest_papers":{"analysis":%s,"items":[]},
+		"research_opportunities":{"analysis":%s,"items":[]},
+		"scope":{"jcr_metric_year":2025,"taxonomy_version":"biomedical-jcr-subjects/v1"},
+		"subject_momentum":{"analysis":%s,"items":[]}
+	}`,
+		analysisPayload,
+		fixture.generationID,
+		analysisPayload,
+		analysisPayload,
+		analysisPayload,
+		analysisPayload,
+		analysisPayload,
+		analysisPayload,
+	)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO public_catalog_home (generation_id, payload)
+		VALUES ($1, $2::jsonb)
+	`, fixture.generationID, homePayload); err != nil {
+		t.Fatalf("insert HTTP API Home snapshot: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO public_catalog_biomedical_manifest (
+			generation_id,
+			subject_count,
+			subject_list_payload,
+			journal_count,
+			journal_list_payload
+		) VALUES (
+			$1,
+			2,
+			$2::jsonb,
+			2,
+			$3::jsonb
+		)
+	`,
+		fixture.generationID,
+		fmt.Sprintf(
+			`{"analysis":%s,"jcr_metric_year":2025,"taxonomy_version":"biomedical-jcr-subjects/v1"}`,
+			analysisPayload,
+		),
+		fmt.Sprintf(
+			`{"analysis":%s,"jcr_metric_year":2025,"taxonomy_version":"biomedical-jcr-subjects/v1"}`,
+			analysisPayload,
+		),
+	); err != nil {
+		t.Fatalf("insert HTTP API biomedical manifest: %v", err)
+	}
+
+	subjectDetailPayload := fmt.Sprintf(`{
+		"active_journals":{"analysis":%s,"items":[]},
+		"description":{"state":"known","value":"Oncology"},
+		"evidence_gaps":[],
+		"id":"00000000-0000-0000-0000-000000000301",
+		"jcr_metric_year":2025,
+		"journal_count":{"state":"known","value":1},
+		"mesh_distribution":{"analysis":%s,"items":[]},
+		"name":"Oncology",
+		"paper_count":{"state":"known","value":2},
+		"publication_type_distribution":{"analysis":%s,"items":[]},
+		"recent_papers":{"analysis":%s,"items":[{"has_benchmark":{"state":"known","value":false},"has_code":{"state":"known","value":false},"has_data":{"state":"known","value":true},"id":"00000000-0000-0000-0000-000000000311","published_at":{"state":"known","value":"2026-07-16T04:00:00Z"},"status":"active","title":"Accepted oncology paper A","type":{"state":"known","value":"research_article"}},{"has_benchmark":{"state":"known","value":false},"has_code":{"state":"known","value":false},"has_data":{"state":"known","value":true},"id":"00000000-0000-0000-0000-000000000312","published_at":{"state":"known","value":"2026-07-16T03:00:00Z"},"status":"active","title":"Accepted oncology paper B","type":{"state":"known","value":"research_article"}}],"pagination":{"has_more":false,"limit":2,"next_cursor":null,"total":2}},
+		"slug":"oncology",
+		"taxonomy_version":"biomedical-jcr-subjects/v1",
+		"trend_estimates":{"analysis":%s,"items":[]}
+	}`,
+		analysisPayload,
+		analysisPayload,
+		analysisPayload,
+		analysisPayload,
+		analysisPayload,
+	)
+	for _, subject := range []struct {
+		id     string
+		slug   string
+		name   string
+		count  int
+		detail string
+	}{
+		{
+			id:     "00000000-0000-0000-0000-000000000301",
+			slug:   "oncology",
+			name:   "Oncology",
+			count:  2,
+			detail: subjectDetailPayload,
+		},
+		{
+			id:     "00000000-0000-0000-0000-000000000302",
+			slug:   "cardiology",
+			name:   "Cardiology",
+			count:  2,
+			detail: `{"id":"00000000-0000-0000-0000-000000000302","slug":"cardiology","name":"Cardiology"}`,
+		},
+	} {
+		summary := fmt.Sprintf(
+			`{"description":{"state":"known","value":%q},"id":%q,"jcr_metric_year":2025,"journal_count":{"state":"known","value":1},"name":%q,"paper_count":{"state":"known","value":%d},"slug":%q,"taxonomy_version":"biomedical-jcr-subjects/v1"}`,
+			subject.name,
+			subject.id,
+			subject.name,
+			subject.count,
+			subject.slug,
+		)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO public_catalog_subjects (
+				generation_id,
+				subject_id,
+				slug,
+				paper_count,
+				summary_payload,
+				detail_payload
+			) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+		`, fixture.generationID, subject.id, subject.slug, subject.count, summary, subject.detail); err != nil {
+			t.Fatalf("insert HTTP API Subject %q: %v", subject.slug, err)
+		}
+	}
+
+	journalDetailPayload := fmt.Sprintf(`{
+		"curation":{"assessed_at":"2026-07-16T04:00:00Z","decision":"accepted","evidence":[],"matched_rules":["jcr_q1"],"metric_year":2025,"policy_name":"biomedical-journal-admission","policy_version":1},
+		"editorial_patterns":{"analysis":%s,"items":[]},
+		"evidence_gaps":[],
+		"id":"00000000-0000-0000-0000-000000000401",
+		"jcr_metric_year":2025,
+		"jif":{"state":"known","value":45.3},
+		"recent_papers":{"analysis":%s,"items":[{"has_benchmark":{"state":"known","value":false},"has_code":{"state":"known","value":false},"has_data":{"state":"known","value":true},"id":"00000000-0000-0000-0000-000000000411","published_at":{"state":"known","value":"2026-07-16T04:00:00Z"},"status":"active","title":"Accepted journal paper A","type":{"state":"known","value":"research_article"}},{"has_benchmark":{"state":"known","value":false},"has_code":{"state":"known","value":false},"has_data":{"state":"known","value":true},"id":"00000000-0000-0000-0000-000000000412","published_at":{"state":"known","value":"2026-07-16T03:00:00Z"},"status":"active","title":"Accepted journal paper B","type":{"state":"known","value":"research_article"}}],"pagination":{"has_more":false,"limit":2,"next_cursor":null,"total":2}},
+		"slug":"journal-of-clinical-oncology",
+		"taxonomy_version":"biomedical-jcr-subjects/v1",
+		"title":"Journal of Clinical Oncology"
+	}`, analysisPayload, analysisPayload)
+	for _, journal := range []struct {
+		id     string
+		slug   string
+		title  string
+		count  int
+		detail string
+	}{
+		{
+			id:     "00000000-0000-0000-0000-000000000401",
+			slug:   "journal-of-clinical-oncology",
+			title:  "Journal of Clinical Oncology",
+			count:  2,
+			detail: journalDetailPayload,
+		},
+		{
+			id:     "00000000-0000-0000-0000-000000000402",
+			slug:   "annals-of-biomedicine",
+			title:  "Annals of Biomedicine",
+			count:  2,
+			detail: `{"id":"00000000-0000-0000-0000-000000000402","slug":"annals-of-biomedicine","title":"Annals of Biomedicine"}`,
+		},
+	} {
+		summary := fmt.Sprintf(
+			`{"id":%q,"jcr_metric_year":2025,"jif":{"state":"known","value":12.5},"paper_count":{"state":"known","value":%d},"slug":%q,"taxonomy_version":"biomedical-jcr-subjects/v1","title":%q}`,
+			journal.id,
+			journal.count,
+			journal.slug,
+			journal.title,
+		)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO public_catalog_journals (
+				generation_id,
+				journal_id,
+				slug,
+				paper_count,
+				summary_payload,
+				detail_payload
+			) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)
+		`, fixture.generationID, journal.id, journal.slug, journal.count, summary, journal.detail); err != nil {
+			t.Fatalf("insert HTTP API Journal %q: %v", journal.slug, err)
+		}
 	}
 
 	topicPayload := fmt.Sprintf(
@@ -491,4 +786,45 @@ func urlQueryEscape(value string) string {
 		"=", "%3D",
 	)
 	return replacer.Replace(value)
+}
+
+func responseCursor(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want 200; body=%s", response.Code, response.Body)
+	}
+	var page struct {
+		Pagination struct {
+			NextCursor *string `json:"next_cursor"`
+		} `json:"pagination"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode list response cursor: %v", err)
+	}
+	if page.Pagination.NextCursor == nil || *page.Pagination.NextCursor == "" {
+		t.Fatalf("response did not contain a continuation cursor: %s", response.Body)
+	}
+	return *page.Pagination.NextCursor
+}
+
+func responseRecentPaperCursor(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want 200; body=%s", response.Code, response.Body)
+	}
+	var page struct {
+		RecentPapers struct {
+			Pagination struct {
+				NextCursor *string `json:"next_cursor"`
+			} `json:"pagination"`
+		} `json:"recent_papers"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode detail response cursor: %v", err)
+	}
+	if page.RecentPapers.Pagination.NextCursor == nil ||
+		*page.RecentPapers.Pagination.NextCursor == "" {
+		t.Fatalf("response did not contain a recent-paper cursor: %s", response.Body)
+	}
+	return *page.RecentPapers.Pagination.NextCursor
 }

@@ -5,14 +5,15 @@ COMPOSE_FILES := -f docker-compose.yml
 COMPOSE_TEST_FILES := -f docker-compose.yml -f docker-compose.test.yml
 SMOKE_PROJECT := paper-research-hub-smoke
 
-.PHONY: help install generate dev-web build build-core build-web typecheck lint-web \
-	test test-core test-web test-race compose-config compose-build compose-up \
+.PHONY: help install generate generate-api-types dev-web build build-core build-web typecheck lint-web \
+	test test-core test-web test-race compose-config compose-build compose-up verify-local \
 	compose-down compose-logs smoke
 
 help:
 	@printf '%s\n' \
 		'install         Install locked pnpm dependencies' \
 		'generate        Generate Nuxt type metadata' \
+		'generate-api-types Generate TypeScript types from contracts/openapi.yaml' \
 		'dev-web         Start the Nuxt development server' \
 		'build           Build Go binaries and the Nuxt production bundle' \
 		'typecheck       Run the Nuxt TypeScript checker' \
@@ -21,7 +22,8 @@ help:
 		'test-race       Run the Go race detector suite' \
 		'compose-config  Validate local and smoke Compose models' \
 		'compose-build   Build the Core and Web images' \
-		'compose-up      Build and start the complete local stack' \
+		'compose-up      Build, start, and verify the complete local stack' \
+		'verify-local    Verify the running API/Web deployment boundary' \
 		'compose-down    Stop the local stack' \
 		'compose-logs    Follow local stack logs' \
 		'smoke           Build and verify an isolated empty-database stack'
@@ -31,6 +33,9 @@ install:
 
 generate:
 	pnpm --dir apps/web exec nuxt prepare
+
+generate-api-types:
+	pnpm --dir apps/web generate:api-types
 
 dev-web:
 	pnpm dev:web
@@ -69,6 +74,10 @@ compose-build: compose-config
 
 compose-up: compose-config
 	$(COMPOSE) $(COMPOSE_FILES) up --build --detach --wait --wait-timeout 240
+	@$(MAKE) --no-print-directory verify-local
+
+verify-local:
+	@sh docs/deployment/verify-local.sh
 
 compose-down:
 	$(COMPOSE) $(COMPOSE_FILES) down --remove-orphans

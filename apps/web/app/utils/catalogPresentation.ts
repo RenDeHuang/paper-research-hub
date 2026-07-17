@@ -3,10 +3,10 @@ import type {
   CatalogValue,
   PaperLifecycleStatus,
   ResearchOpportunityStatus,
-  SourceProvenance,
   TaxonomyReference,
   TrendItem,
 } from "~/types/catalog"
+import type { components } from "~/types/openapi.generated"
 import type {
   DataValue,
   KnownDataValue,
@@ -91,7 +91,9 @@ export function paperTaxonomyLabels(
 }
 
 export function paperSources(
-  provenance: Array<SourceProvenance | string> | undefined,
+  provenance:
+    | components["schemas"]["SourceProvenanceCatalogValue"]
+    | undefined,
 ): DataValue<string[]> {
   if (provenance === undefined) {
     return {
@@ -99,9 +101,10 @@ export function paperSources(
       state: "unknown",
     }
   }
-  const values = provenance.map((source) =>
-    typeof source === "string" ? source : source.source,
-  )
+  if (provenance.state !== "known") {
+    return { state: provenance.state }
+  }
+  const values = provenance.value.map((source) => source.source)
   return {
     state: "known",
     value: [...new Set(values)],

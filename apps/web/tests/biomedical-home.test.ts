@@ -15,11 +15,17 @@ const catalogApi = vi.hoisted(() => ({
 mockNuxtImport("useCatalogApi", () => () => catalogApi)
 
 const generatedAt = "2026-07-17T08:30:00Z"
+const analysisRunID = "11111111-1111-4111-8111-111111111111"
 const known = <T>(value: T) => ({ state: "known" as const, value })
 const analysis = {
+  analysis_run_id: analysisRunID,
+  analysis_type: "subject_trend",
+  baseline_window_days: 30,
   coverage_ratio: known(0.82),
+  cohort_revision: "a".repeat(64),
   generated_at: generatedAt,
   missing_signals: [],
+  recent_window_days: 7,
   sample_size: known(128),
   sources: ["PubMed", "Europe PMC"],
   window_days: 7,
@@ -101,19 +107,36 @@ const homeResponse = {
     },
     items: [
       {
-        entity_type: "disease",
-        estimate: known(1.42),
-        label: "Non-small-cell lung cancer",
-      },
-      {
-        entity_type: "target",
-        estimate: { state: "missing" as const },
-        label: "EGFR",
-      },
-      {
-        entity_type: "method",
+        adjusted_p_value: known(0.022),
+        baseline_count: known(118),
+        confidence_interval: {
+          lower: 1.05,
+          upper: 1.31,
+        },
         estimate: known(1.18),
-        label: "Spatial transcriptomics",
+        entity_type: "disease",
+        independent_journal_count: known(7),
+        independent_team_count: known(19),
+        label: "Non-small-cell lung cancer",
+        model_family: "poisson",
+        p_value: known(0.014),
+        recent_count: known(29),
+      },
+      {
+        adjusted_p_value: known(0.031),
+        baseline_count: known(102),
+        confidence_interval: {
+          lower: 0.98,
+          upper: 1.21,
+        },
+        entity_type: "target",
+        estimate: known(1.08),
+        independent_journal_count: known(8),
+        independent_team_count: { state: "missing" as const },
+        label: "EGFR",
+        model_family: "negative_binomial",
+        p_value: known(0.019),
+        recent_count: known(26),
       },
     ],
   },
@@ -135,13 +158,45 @@ const homeResponse = {
     },
     items: [
       {
-        evidence_ids: ["paper-1"],
+        analysis_run_id: analysisRunID,
+        coverage_ratio: known(0.74),
+        estimates: [
+          {
+            confidence_interval: {
+              lower: 1.12,
+              upper: 1.64,
+            },
+            metric: "trend_rate_ratio",
+            value: 1.36,
+          },
+          {
+            confidence_interval: {
+              lower: 0.12,
+              upper: 0.24,
+            },
+            metric: "external_validation_share",
+            value: 0.18,
+          },
+        ],
         formula_version: "opportunity-v2",
+        generated_at: generatedAt,
         id: "opportunity-1",
+        limitations: ["外部验证仍不足"],
         missing_signals: ["external_validation"],
+        recommended_next_steps: [
+          "补充多中心验证",
+          "扩大独立队列",
+        ],
         status: "proceed_with_caution",
+        supporting_work_ids: [paper.id],
         summary: "增长信号明确，但外部验证仍不足。",
+        target_id: "subject-1",
+        target_kind: "subject",
         title: "多中心外部验证",
+        trigger_rule: {
+          code: "single_center_external_validation_gap",
+          version: "biomedical-opportunities/v1",
+        },
       },
     ],
   },
@@ -153,11 +208,16 @@ const homeResponse = {
     analysis,
     items: [
       {
+        adjusted_p_value: known(0.015),
+        baseline_count: known(132),
         confidence_interval: {
           lower: 1.12,
           upper: 1.64,
         },
         estimate: known(1.36),
+        model_family: "negative_binomial",
+        p_value: known(0.009),
+        recent_count: known(41),
         independent_journal_count: known(9),
         independent_team_count: known(31),
         subject: {
@@ -206,6 +266,9 @@ describe("biomedical intelligence home", () => {
     expect(wrapper.text()).toContain("JCR 指标年份")
     expect(wrapper.text()).toContain("2025")
     expect(wrapper.text()).toContain("jcr-biomedical-2025-v1")
+    expect(wrapper.text()).toContain("多中心外部验证")
+    expect(wrapper.text()).toContain("single_center_external_validation_gap")
+    expect(wrapper.text()).toContain(paper.id)
   })
 
   it("shows window, generation time, sample, coverage and explicit missing state for every intelligence module", async () => {
