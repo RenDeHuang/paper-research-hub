@@ -107,6 +107,27 @@ describe("Nuxt visual foundation contract", () => {
     expect(globalUtilities).not.toMatch(rawPaletteToken)
   })
 
+  it("keeps discovery rail visibility under the shell breakpoint contract", () => {
+    const componentSource = readFileSync(
+      `${webRoot}/app/components/DiscoveryRail.vue`,
+      "utf8",
+    )
+    const stylesheet = readFileSync(
+      `${webRoot}/app/assets/css/main.css`,
+      "utf8",
+    )
+
+    expect(componentSource).not.toMatch(
+      /\.discovery-rail\s*\{[^}]*display:\s*grid/s,
+    )
+    expect(stylesheet).toContain(
+      ".app-shell__content > .discovery-rail {\n  display: none;",
+    )
+    expect(stylesheet).toMatch(
+      /@media \(min-width: 1024px\)[\s\S]*\.app-shell__content > \.discovery-rail\s*\{[\s\S]*display:\s*grid;/,
+    )
+  })
+
   it("uses NuxtLink for every primary navigation destination", () => {
     const source = readFileSync(
       `${webRoot}/app/components/AppHeader.vue`,

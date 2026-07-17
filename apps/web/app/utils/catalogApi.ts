@@ -13,6 +13,13 @@ import type {
   TrendListResponse,
   TrendQuery,
 } from "~/types/catalog"
+import type {
+  HomeResponse,
+  JournalDetailResponse,
+  JournalListResponse,
+  SubjectDetailResponse,
+  SubjectListResponse,
+} from "~/types/biomedical"
 
 interface FetchOptions {
   baseURL: string
@@ -35,9 +42,20 @@ export class CatalogApiError extends Error {
 
 export interface CatalogApiClient {
   readonly baseURL: string
+  getHome(): Promise<HomeResponse>
+  getJournal(
+    slug: string,
+    query?: PageQuery,
+  ): Promise<JournalDetailResponse>
   getStats(): Promise<StatsResponse>
+  getSubject(
+    slug: string,
+    query?: PageQuery,
+  ): Promise<SubjectDetailResponse>
   listPapers(query?: PaperListQuery): Promise<PaperListResponse>
   getPaper(id: string): Promise<PaperDetail>
+  listJournals(query?: PageQuery): Promise<JournalListResponse>
+  listSubjects(query?: PageQuery): Promise<SubjectListResponse>
   listTopics(query?: PageQuery): Promise<TaxonomyListResponse>
   getTopic(slug: string): Promise<TaxonomyItem>
   listMethods(query?: PageQuery): Promise<TaxonomyListResponse>
@@ -94,6 +112,12 @@ export function createCatalogApiClient(
 
   return {
     baseURL,
+    getHome: () => request<HomeResponse>("/api/v1/home"),
+    getJournal: (slug, query = {}) =>
+      request<JournalDetailResponse>(
+        `/api/v1/journals/${encodeURIComponent(slug)}`,
+        query as CatalogQuery,
+      ),
     getMethod: (slug) =>
       request<TaxonomyItem>(
         `/api/v1/methods/${encodeURIComponent(slug)}`,
@@ -101,6 +125,11 @@ export function createCatalogApiClient(
     getPaper: (id) =>
       request<PaperDetail>(`/api/v1/papers/${encodeURIComponent(id)}`),
     getStats: () => request<StatsResponse>("/api/v1/stats"),
+    getSubject: (slug, query = {}) =>
+      request<SubjectDetailResponse>(
+        `/api/v1/subjects/${encodeURIComponent(slug)}`,
+        query as CatalogQuery,
+      ),
     getTopic: (slug) =>
       request<TaxonomyItem>(
         `/api/v1/topics/${encodeURIComponent(slug)}`,
@@ -113,6 +142,11 @@ export function createCatalogApiClient(
     listMethods: (query = {}) =>
       request<TaxonomyListResponse>(
         "/api/v1/methods",
+        query as CatalogQuery,
+      ),
+    listJournals: (query = {}) =>
+      request<JournalListResponse>(
+        "/api/v1/journals",
         query as CatalogQuery,
       ),
     listPaperTrends: (query = {}) =>
@@ -128,6 +162,11 @@ export function createCatalogApiClient(
     listResearchOpportunities: (query = {}) =>
       request<ResearchOpportunityListResponse>(
         "/api/v1/research-opportunities",
+        query as CatalogQuery,
+      ),
+    listSubjects: (query = {}) =>
+      request<SubjectListResponse>(
+        "/api/v1/subjects",
         query as CatalogQuery,
       ),
     listTopicTrends: (query = {}) =>

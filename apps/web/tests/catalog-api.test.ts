@@ -138,17 +138,83 @@ describe("catalog API client contract", () => {
     expect(client.baseURL).toBe("http://api.internal:8080")
     expect(Object.keys(client).sort()).toEqual([
       "baseURL",
+      "getHome",
+      "getJournal",
       "getMethod",
       "getPaper",
       "getStats",
+      "getSubject",
       "getTopic",
+      "listJournals",
       "listMethodTrends",
       "listMethods",
       "listPaperTrends",
       "listPapers",
       "listResearchOpportunities",
+      "listSubjects",
       "listTopicTrends",
       "listTopics",
+    ])
+  })
+
+  it("uses only the generation-bound biomedical discovery endpoints", async () => {
+    const calls: Array<{
+      options: {
+        baseURL: string
+        query?: Record<string, boolean | number | string>
+      }
+      path: string
+    }> = []
+    const client = createCatalogApiClient(
+      "http://api.internal:8080",
+      async (path, options) => {
+        calls.push({ options, path })
+        return {} as never
+      },
+    )
+
+    await client.getHome()
+    await client.listSubjects({ cursor: "subject-page-2" })
+    await client.getSubject("oncology", { cursor: "subject-paper-page-2" })
+    await client.listJournals({ cursor: "journal-page-2" })
+    await client.getJournal(
+      "journal-of-clinical-oncology",
+      { cursor: "journal-paper-page-2" },
+    )
+
+    expect(calls).toEqual([
+      {
+        options: { baseURL: "http://api.internal:8080" },
+        path: "/api/v1/home",
+      },
+      {
+        options: {
+          baseURL: "http://api.internal:8080",
+          query: { cursor: "subject-page-2" },
+        },
+        path: "/api/v1/subjects",
+      },
+      {
+        options: {
+          baseURL: "http://api.internal:8080",
+          query: { cursor: "subject-paper-page-2" },
+        },
+        path: "/api/v1/subjects/oncology",
+      },
+      {
+        options: {
+          baseURL: "http://api.internal:8080",
+          query: { cursor: "journal-page-2" },
+        },
+        path: "/api/v1/journals",
+      },
+      {
+        options: {
+          baseURL: "http://api.internal:8080",
+          query: { cursor: "journal-paper-page-2" },
+        },
+        path: "/api/v1/journals/journal-of-clinical-oncology",
+      },
     ])
   })
 

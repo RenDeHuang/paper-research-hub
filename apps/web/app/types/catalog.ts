@@ -88,6 +88,12 @@ export interface TaxonomyReference {
   name: string
 }
 
+export interface JournalReference {
+  id: UUID
+  slug: string
+  title: string
+}
+
 export interface TaxonomyItem extends TaxonomyReference {
   description: CatalogValue<string>
   paper_count: number
@@ -177,6 +183,9 @@ export interface PaperSummary {
   trend_score?: CatalogValue<number>
   curation?: CatalogValue<CurationPayload>
   ranking?: RankingMetadata
+  journal?: JournalReference
+  publication_types?: string[]
+  subjects?: TaxonomyReference[]
 }
 
 export interface PaperDetail extends PaperSummary {

@@ -107,7 +107,6 @@ const groups = computed(() => [
 
 <style scoped>
 .discovery-rail {
-  display: grid;
   gap: var(--space-6);
   align-content: start;
   min-width: 0;

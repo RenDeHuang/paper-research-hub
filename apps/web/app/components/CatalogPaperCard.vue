@@ -46,6 +46,10 @@ const summary = computed(() =>
   ),
 )
 const tags = computed(() => [
+  ...paperTaxonomyLabels(props.paper.subjects).map((label) => ({
+    category: "Subject",
+    label,
+  })),
   ...paperTaxonomyLabels(props.paper.topics).map((label) => ({
     category: "Topic",
     label,
@@ -54,7 +58,19 @@ const tags = computed(() => [
     category: "Method",
     label,
   })),
+  ...(props.paper.publication_types ?? []).map((label) => ({
+    category: "Publication Type",
+    label,
+  })),
 ])
+const venue = computed<DataValue<string> | undefined>(() =>
+  props.paper.journal === undefined
+    ? undefined
+    : {
+        state: "known",
+        value: props.paper.journal.title,
+      },
+)
 const evidence = computed(() => [
   {
     label: "代码",
@@ -97,6 +113,7 @@ const metrics = computed(() => {
     :status="paperStatusPresentation(paper.status)"
     :summary="summary"
     :tags="tags"
+    :venue="venue"
     :evidence="evidence"
     :metrics="metrics"
   />
