@@ -130,16 +130,15 @@ Require these immutable or controlled tables:
 ```text
 mesh_descriptors
 mesh_qualifiers
-mesh_descriptor_tree_numbers
 publication_types
 work_mesh_headings
 work_mesh_qualifiers
 work_publication_types
+subject_import_receipts
 subject_versions
 subjects
 biomedical_subject_rules
 journal_subject_metrics
-work_subjects
 ```
 
 Required identity rules:
@@ -147,9 +146,17 @@ Required identity rules:
 - MeSH descriptor primary identity: `descriptor_ui`;
 - qualifier primary identity: `qualifier_ui`;
 - Publication Type primary identity: `publication_type_ui`;
-- Tree Number stored separately and unique per descriptor/version;
-- work relations include `source_record_id`;
+- canonical MeSH and Publication Type identity rows do not use a mutable display name as identity;
+- source-backed work assertions include `source_record_id` and preserve the source label;
+- `work_mesh_qualifiers` references the exact `work_mesh_headings` assertion to which the qualifier belongs;
+- the same UI and a different label in a later source record creates a separate immutable assertion instead of overwriting prior evidence;
+- PubMed article XML does not populate or synthesize MeSH Tree Numbers;
+- `subject_import_receipts` records exact source, registry version, SHA-256, row counts, and import time;
+- `subject_import_receipts` is unique by `(source, registry_version)` and by `file_sha256`;
+- `subject_versions.subject_import_receipt_id` is a required unique foreign key to the receipt that created it;
 - Subject rules include a version and an exact authorized JCR Category;
+- `journal_subject_metrics` references an existing `venue_metric_snapshots` row and an exact Subject rule instead of copying or approximating JIF/Quartile;
+- `journal_subject_metrics` uses composite foreign keys with one stored `jcr_category` value so the database proves that the Venue metric Category and Subject rule Category are exactly equal;
 - no name-only uniqueness is used as the canonical identifier.
 
 **Step 2: Run migration test and confirm RED**
@@ -175,19 +182,59 @@ source_record_works
 Add database constraints that prevent:
 
 - blank UI values;
-- blank names;
+- blank source labels;
 - a source record linking semantics to a different Work;
 - duplicate descriptor, qualifier, Publication Type, or Subject assertions.
 
-Add immutable triggers for versioned taxonomy rows and source-backed work assertions.
+Use the existing source-backed ownership pattern:
+
+```text
+source_record_id -> source_records(id) ON DELETE RESTRICT
+(source_record_id, work_id) -> source_record_works(source_record_id, work_id)
+    DEFERRABLE INITIALLY DEFERRED
+```
+
+Extend `ingestion_projection_assertions` with a composite unique key over `(id, source_record_uuid, work_id)`. Every source-backed semantic assertion must retain:
+
+```text
+projection_assertion_id
+source_record_id
+work_id
+source_path
+source label and semantic flags
+```
+
+Use a composite foreign key from `(projection_assertion_id, source_record_id, work_id)` to the matching ingestion projection assertion. This binds source path, source snapshot, scope policy, and projection policy without copying mutable provenance text into each row.
+
+Require this receipt chain:
+
+```text
+subject_import_receipts
+  -> subject_versions
+  -> subjects
+  -> biomedical_subject_rules
+```
+
+Add immutable triggers only to append-only import receipts, versioned taxonomy rows, and source-backed semantic assertions. Do not add an immutable trigger to a replaceable current-state table. Task 2 does not create a second mutable projection cache.
+
+Current semantics must first use the complete winner tuple stored in `work_projection_states`:
+
+```text
+raw_event_id
+source_record_uuid
+work_id
+scope_policy_version
+projection_policy_version
+```
+
+Join that tuple to one `ingestion_projection_assertions.id`, then select semantic rows only by the matching `projection_assertion_id`. Selecting by `source_record_uuid` alone is forbidden because one raw/source record may be projected under multiple policy versions.
 
 **Step 4: Verify empty and upgraded databases**
 
 Run:
 
 ```bash
-go -C services/core test ./internal/database -run 'TestBiomedicalSemanticSchema|TestMigrate' -count=1
-go -C services/core test ./migrations -count=1
+go -C services/core test ./internal/database -run 'TestBiomedicalSemanticSchema|TestMigrationFromEmptyDatabaseCreatesExpectedSchema|TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrations|TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch' -count=1
 ```
 
 Expected: PASS.
@@ -215,7 +262,6 @@ Build a PubMed record with:
 - structured abstract sections;
 - MeSH Descriptor and Qualifier UIs;
 - Major Topic flags;
-- multiple Tree Numbers;
 - Publication Types such as `Journal Article`, `Randomized Controlled Trial`, and `Meta-Analysis`;
 - comments/corrections relation;
 - PMID, PMCID, DOI.
@@ -225,7 +271,10 @@ Assert that after `Normalize` and `Project`:
 - `ingestion_normalized_records.normalized_payload` contains all fields;
 - the semantic tables contain source-backed rows;
 - rerunning the same raw event is idempotent;
-- a conflicting UI/name assertion fails instead of overwriting.
+- the same UI with a different source label in a later source record preserves both immutable assertions;
+- an older source event that does not win still preserves its semantic assertions, while a current-semantics query returns only the `work_projection_states` winner;
+- the same raw/source record projected under two policy-version tuples preserves both assertion sets, while the current query returns only the tuple referenced by `work_projection_states`;
+- no MeSH Tree Number is synthesized from PubMed article XML.
 
 **Step 2: Run focused tests and confirm RED**
 
@@ -256,11 +305,16 @@ Deep-copy all nested collections.
 Add projection functions that:
 
 - upsert controlled MeSH and Publication Type identities;
-- insert immutable source-backed Work relations;
-- replace only the winning source projection for the same source field;
-- materialize `work_subjects` from the Work's verified Venue and its versioned JCR Category rows.
+- insert immutable source-backed Work assertions immediately after the matching `ingestion_projection_assertions` insert/replay and before `upsertSourceState`;
+- persist deterministic PubMed XML `source_path` values and the matching `projection_assertion_id`;
+- write assertions for every successfully projected source record, including records that do not become the Work winner;
+- never insert or delete semantic assertions from `applyWinningProjection` or `applyRecordProjection`;
+- select current paper semantics by joining the complete `work_projection_states` winner tuple to one `ingestion_projection_assertions.id`, then matching semantic assertions on `projection_assertion_id`;
+- leave Subject membership to the exact Venue metric Category-to-Subject relation imported in Task 4.
 
 Do not infer a Subject from title, abstract, journal title, or Category-name similarity. MeSH remains paper-level semantic evidence and does not replace the JCR Subject relation.
+
+Do not parse, infer, or fabricate MeSH Tree Numbers from PubMed article XML. A future Tree Number feature requires a separate authorized NLM MeSH vocabulary import with an explicit vocabulary version and receipt.
 
 Do not compress Publication Type strings into the existing generic `paper_type` field with ad-hoc mappings. If a normalized high-level study type is required, add a separate explicit, versioned mapping table and tests.
 
@@ -292,6 +346,8 @@ git commit -m "feat(pubmed): persist biomedical semantics"
 - Create: `services/core/internal/biomed/taxonomy_test.go`
 - Modify: `services/core/cmd/worker/main.go`
 - Modify: `services/core/cmd/worker/main_test.go`
+- Modify: `services/core/internal/venue/postgres_store.go`
+- Modify: `services/core/internal/venue/postgres_store_test.go`
 
 **Step 1: Write failing parser and command tests**
 
@@ -308,7 +364,9 @@ Require:
 - unique slug;
 - exact authorized JCR Category name;
 - no duplicate category rule within one Subject version;
-- atomic import receipt;
+- atomic `subject_import_receipts` row with source, version, file SHA-256, row counts, and import time;
+- an auditable foreign-key path from receipt to Subject version, Subject rows, and Category rules;
+- the same source/version with a different SHA-256 fails atomically;
 - idempotent repeat import.
 
 **Step 2: Run and confirm RED**
@@ -316,7 +374,7 @@ Require:
 Run:
 
 ```bash
-go -C services/core test ./internal/biomed ./cmd/worker -run 'Subject' -count=1
+go -C services/core test ./internal/biomed ./internal/venue ./cmd/worker -run 'Subject|Reconcile' -count=1
 ```
 
 Expected: FAIL because package and command do not exist.
@@ -327,12 +385,34 @@ The CSV is an explicit biomedical allowlist over exact JCR Category values from 
 
 Do not create a custom parent/child hierarchy in v1. Record the source, version, display label, stable slug, and exact Category match for every Subject.
 
+Implement one idempotent exact-link reconciliation operation. Call it from both the Subject importer and the authorized JCR importer so import order is interchangeable:
+
+```sql
+INSERT INTO journal_subject_metrics (...)
+SELECT ...
+FROM venue_metric_snapshots AS metric
+JOIN biomedical_subject_rules AS rule
+  ON metric.category = rule.jcr_category
+ON CONFLICT DO NOTHING
+```
+
+`journal_subject_metrics` must retain the metric snapshot ID, Subject rule ID, and one exact `jcr_category`. Composite foreign keys must prove that this Category equals both referenced rows. Do not use title matching, case-folded similarity, aliases, or partial Category matching.
+
+Test both import orders:
+
+```text
+Subject -> JCR
+JCR -> Subject
+```
+
+Both must create the same links. Category values that differ only by case, spacing, prefix, or substring must create no link.
+
 **Step 4: Verify**
 
 Run:
 
 ```bash
-go -C services/core test ./internal/biomed ./cmd/worker -count=1
+go -C services/core test ./internal/biomed ./internal/venue ./cmd/worker -count=1
 git diff --check
 ```
 
@@ -341,7 +421,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add data/subjects services/core/internal/biomed services/core/cmd/worker
+git add data/subjects services/core/internal/biomed services/core/internal/venue services/core/cmd/worker
 git commit -m "feat(core): add versioned biomedical JCR subjects"
 ```
 

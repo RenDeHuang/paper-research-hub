@@ -99,7 +99,9 @@ JCR Q1 OR JIF >= 10
 - 生物信息学；
 - 转化医学。
 
-页面 URL 使用稳定的 Subject identity，不直接依赖临时 slug 化的 Category 文本。MeSH Descriptor、Qualifier、Major Topic 和 Tree Number 保留为论文级疾病、靶点和主题语义，不冒充期刊学科。论文通过其已验证 Venue 的 JCR Category 进入一个或多个 Subject，关系必须保留 JCR 指标年份、来源和 taxonomy 版本。
+页面 URL 使用稳定的 Subject identity，不直接依赖临时 slug 化的 Category 文本。MeSH Descriptor、Qualifier 和 Major Topic 保留为论文级疾病、靶点和主题语义，不冒充期刊学科。论文通过其已验证 Venue 的 JCR Category 进入一个或多个 Subject，关系必须保留 JCR 指标年份、来源和 taxonomy 版本。
+
+PubMed 文章 XML 不提供权威 MeSH Tree Number。当前产品只持久化文章实际携带的 Descriptor UI、Qualifier UI、显示名称和 Major Topic；Tree Number 只有在以后单独导入带版本和回执的 NLM MeSH vocabulary 后才允许进入规范层，不能由名称、UI 前缀或其他文章字段推导。
 
 ### 3.3 期刊页面
 
@@ -210,20 +212,21 @@ JCR 数据只从用户明确授权的 CSV 导入：
 - `mesh_descriptors`
 - `mesh_qualifiers`
 - `work_mesh_headings`
+- `work_mesh_qualifiers`
 - `publication_types`
 - `work_publication_types`
+- `subject_import_receipts`
 - `subject_versions`
 - `subjects`
 - `biomedical_subject_rules`
 - `journal_subject_metrics`
-- `work_subjects`
 - `citation_snapshots`
 - `citation_edges`
 - `reference_edges`
 - `analysis_cohorts`
 - `journal_pattern_snapshots`
 
-所有来源断言保留 source record、source path、快照时间和 policy version。MeSH UI、Tree Number 和版本化 Subject identity 是稳定标识，显示名称不是唯一键。
+所有来源断言保留 source record、source path、快照时间和 policy version。MeSH Descriptor UI、Qualifier UI、Publication Type UI 和版本化 Subject identity 是稳定标识，显示名称不是唯一键。不同 source record 中同一 UI 的不同显示名称作为独立、不可变的来源断言保留，不能覆盖 canonical identity。
 
 引用数据采用 source-specific snapshot：
 
