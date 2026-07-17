@@ -1,0 +1,9 @@
+source,registry_version,slug,display_label,jcr_category
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,oncology,Oncology,Oncology
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,immunology,Immunology,Immunology
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,neurosciences,Neurosciences,Neurosciences
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,genetics-heredity,Genetics & Heredity,Genetics & Heredity
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,cell-biology,Cell Biology,Cell Biology
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,biochemistry-molecular-biology,Biochemistry & Molecular Biology,Biochemistry & Molecular Biology
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,pharmacology-pharmacy,Pharmacology & Pharmacy,Pharmacology & Pharmacy
+medpaperhub-reviewed-jcr-category-allowlist,biomedical-jcr-subjects/v1,medical-informatics,Medical Informatics,Medical Informatics

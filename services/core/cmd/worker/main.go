@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/catalog"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/config"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
@@ -40,6 +41,7 @@ const (
 	commandSyncPubMed     commandKind = "sync_pubmed"
 	commandSyncCrossref   commandKind = "sync_crossref"
 	commandImportJCR      commandKind = "import_jcr"
+	commandImportSubjects commandKind = "import_subjects"
 	commandPublishCatalog commandKind = "publish_catalog"
 	maxSyncResults                    = 1000
 )
@@ -129,14 +131,19 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 		return command, config.RoleCatalogPublish, err
 	}
 	if args[0] == "import" {
-		if args[1] != "jcr" {
+		switch args[1] {
+		case "jcr":
+			command, err := parseJCRImportCommand(args[2:])
+			return command, config.RoleJCRImport, err
+		case "subjects":
+			command, err := parseSubjectImportCommand(args[2:])
+			return command, config.RoleMigrate, err
+		default:
 			return workerCommand{}, "", fmt.Errorf(
-				"unsupported import source %q; expected jcr",
+				"unsupported import source %q; expected jcr or subjects",
 				args[1],
 			)
 		}
-		command, err := parseJCRImportCommand(args[2:])
-		return command, config.RoleJCRImport, err
 	}
 	if args[0] != "sync" {
 		return workerCommand{}, "", errors.New(
@@ -241,6 +248,36 @@ func parseJCRImportCommand(args []string) (workerCommand, error) {
 	if strings.ContainsAny(command.File, "?#") ||
 		!strings.EqualFold(filepath.Ext(command.File), ".csv") {
 		return workerCommand{}, errors.New("JCR import file must be an explicit .csv file")
+	}
+	return command, nil
+}
+
+func parseSubjectImportCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("import subjects", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	set.StringVar(&command.File, "file", "", "versioned biomedical Subject CSV")
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf("parse Subject import flags: %w", err)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected Subject import arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+	command.Kind = commandImportSubjects
+	command.File = strings.TrimSpace(command.File)
+	if command.File == "" {
+		return workerCommand{}, errors.New(
+			"Subject import requires an explicit --file",
+		)
+	}
+	if strings.ContainsAny(command.File, "?#") ||
+		!strings.EqualFold(filepath.Ext(command.File), ".csv") {
+		return workerCommand{}, errors.New(
+			"Subject import file must be an explicit .csv file",
+		)
 	}
 	return command, nil
 }
@@ -413,6 +450,8 @@ func runCommand(
 		return runCatalogPublish(ctx, pool, command)
 	case commandImportJCR:
 		return runJCRImport(ctx, pool, cfg, command)
+	case commandImportSubjects:
+		return runSubjectImport(ctx, pool, command)
 	default:
 		return runSync(ctx, pool, cfg, command)
 	}
@@ -445,6 +484,35 @@ func catalogGenerationResult(generation catalog.Generation) map[string]any {
 		"generated_at":    generation.GeneratedAt.UTC().Format(time.RFC3339Nano),
 		"published_at":    generation.PublishedAt.UTC().Format(time.RFC3339Nano),
 	}
+}
+
+func runSubjectImport(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	command workerCommand,
+) (map[string]any, error) {
+	file, err := os.Open(command.File)
+	if err != nil {
+		return nil, fmt.Errorf("open Subject import file: %w", err)
+	}
+	defer file.Close()
+
+	importer, err := biomed.NewPostgresSubjectImporter(pool, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	receipt, err := importer.Import(ctx, file)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"file_sha256":      receipt.FileSHA256(),
+		"source":           receipt.Source(),
+		"registry_version": receipt.RegistryVersion(),
+		"imported_at":      receipt.ImportedAt(),
+		"subject_count":    receipt.SubjectCount(),
+		"rule_count":       receipt.RuleCount(),
+	}, nil
 }
 
 func runSync(

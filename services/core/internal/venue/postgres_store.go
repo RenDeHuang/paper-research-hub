@@ -16,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 )
 
 const postgresJCRAliasAdvisoryNamespace int32 = 0x4a435241
@@ -238,6 +240,9 @@ func (store *PostgresJCRStore) PersistJCRImport(
 		); err != nil {
 			return ImportReceipt{}, err
 		}
+		if _, err := biomed.ReconcileJournalSubjectMetrics(ctx, tx); err != nil {
+			return ImportReceipt{}, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return ImportReceipt{}, fmt.Errorf("commit idempotent JCR import lookup: %w", err)
 		}
@@ -380,6 +385,9 @@ func (store *PostgresJCRStore) PersistJCRImport(
 		}
 	}
 
+	if _, err := biomed.ReconcileJournalSubjectMetrics(ctx, tx); err != nil {
+		return ImportReceipt{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		if mapped := mapPostgresMetricConflict(err, MetricKey{}); mapped != nil {
 			return ImportReceipt{}, mapped

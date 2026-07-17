@@ -3,6 +3,7 @@ package venue
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
 )
 
@@ -223,6 +225,475 @@ func TestPostgresJCRStoreImportsFixtureWithReceiptTraceability(t *testing.T) {
 	}
 	if len(matches) != 1 || matches[0].ID() != fixtureVenueSubthreshold {
 		t.Fatalf("FindVenuesByISSNs() = %#v, want exact subthreshold venue", matches)
+	}
+}
+
+func TestPostgresSubjectImporterPersistsVersionedReceiptAndIsIdempotent(t *testing.T) {
+	pool := openMigratedVenueTestPool(t)
+	importedAt := time.Date(2026, time.July, 17, 3, 4, 5, 0, time.UTC)
+	importer, err := biomed.NewPostgresSubjectImporter(
+		pool,
+		func() time.Time { return importedAt },
+	)
+	if err != nil {
+		t.Fatalf("NewPostgresSubjectImporter() error = %v", err)
+	}
+	contents := subjectRegistryCSV(
+		"biomedical-jcr-subjects/v1",
+		[]subjectRegistryTestRow{
+			{slug: "oncology", label: "Oncology", category: "Oncology"},
+			{
+				slug:     "genetics-heredity",
+				label:    "Genetics & Heredity",
+				category: "Genetics & Heredity",
+			},
+		},
+	)
+	receipt, err := importer.Import(context.Background(), strings.NewReader(contents))
+	if err != nil {
+		t.Fatalf("Import(Subject registry) error = %v", err)
+	}
+	digest := sha256.Sum256([]byte(contents))
+	if receipt.Source() != "medpaperhub-reviewed-jcr-category-allowlist" ||
+		receipt.RegistryVersion() != "biomedical-jcr-subjects/v1" ||
+		receipt.FileSHA256() != fmt.Sprintf("%x", digest[:]) ||
+		receipt.SubjectCount() != 2 ||
+		receipt.RuleCount() != 2 ||
+		!receipt.ImportedAt().Equal(importedAt) {
+		t.Fatalf("Subject receipt = %#v", receipt)
+	}
+
+	ctx := venueTestContext(t)
+	var (
+		receiptID                                              string
+		versionID                                              string
+		source, registryVersion, fileSHA, versionKey           string
+		storedImportedAt                                       time.Time
+		subjectCount, ruleCount, joinedSubjects, joinedRules   int
+		categoryProofs, subjectVersionProofs, receiptPathCount int
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			id::text,
+			source,
+			registry_version,
+			file_sha256,
+			subject_count,
+			rule_count,
+			imported_at
+		FROM subject_import_receipts
+	`).Scan(
+		&receiptID,
+		&source,
+		&registryVersion,
+		&fileSHA,
+		&subjectCount,
+		&ruleCount,
+		&storedImportedAt,
+	); err != nil {
+		t.Fatalf("query Subject receipt: %v", err)
+	}
+	if source != receipt.Source() ||
+		registryVersion != receipt.RegistryVersion() ||
+		fileSHA != receipt.FileSHA256() ||
+		subjectCount != 2 ||
+		ruleCount != 2 ||
+		!storedImportedAt.Equal(importedAt) {
+		t.Fatalf(
+			"stored Subject receipt = %q/%q/%q counts %d/%d at %v",
+			source,
+			registryVersion,
+			fileSHA,
+			subjectCount,
+			ruleCount,
+			storedImportedAt,
+		)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text, version_key
+		FROM subject_versions
+		WHERE subject_import_receipt_id = $1
+	`, receiptID).Scan(&versionID, &versionKey); err != nil {
+		t.Fatalf("query Subject version: %v", err)
+	}
+	if versionKey != receipt.RegistryVersion() {
+		t.Fatalf("Subject version_key = %q, want %q", versionKey, receipt.RegistryVersion())
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(DISTINCT subject.id),
+			count(rule.id),
+			count(*) FILTER (
+				WHERE subject.subject_version_id = version.id
+				  AND rule.subject_version_id = version.id
+			),
+			count(*) FILTER (
+				WHERE rule.subject_id = subject.id
+				  AND rule.subject_version_id = subject.subject_version_id
+			),
+			count(*) FILTER (
+				WHERE receipt.id = version.subject_import_receipt_id
+			)
+		FROM subject_import_receipts AS receipt
+		JOIN subject_versions AS version
+		  ON version.subject_import_receipt_id = receipt.id
+		JOIN subjects AS subject
+		  ON subject.subject_version_id = version.id
+		JOIN biomedical_subject_rules AS rule
+		  ON rule.subject_id = subject.id
+		 AND rule.subject_version_id = version.id
+		WHERE receipt.id = $1
+	`, receiptID).Scan(
+		&joinedSubjects,
+		&joinedRules,
+		&subjectVersionProofs,
+		&categoryProofs,
+		&receiptPathCount,
+	); err != nil {
+		t.Fatalf("query Subject receipt/version/rule path: %v", err)
+	}
+	if joinedSubjects != 2 ||
+		joinedRules != 2 ||
+		subjectVersionProofs != 2 ||
+		categoryProofs != 2 ||
+		receiptPathCount != 2 {
+		t.Fatalf(
+			"Subject receipt path counts = subjects %d rules %d version %d subject %d receipt %d",
+			joinedSubjects,
+			joinedRules,
+			subjectVersionProofs,
+			categoryProofs,
+			receiptPathCount,
+		)
+	}
+
+	replayed, err := importer.Import(context.Background(), strings.NewReader(contents))
+	if err != nil {
+		t.Fatalf("Import(idempotent Subject registry) error = %v", err)
+	}
+	if replayed.FileSHA256() != receipt.FileSHA256() ||
+		!replayed.ImportedAt().Equal(receipt.ImportedAt()) {
+		t.Fatalf("idempotent Subject receipt = %#v, want original %#v", replayed, receipt)
+	}
+	var receipts, versions, subjects, rules int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM subject_import_receipts),
+			(SELECT count(*) FROM subject_versions),
+			(SELECT count(*) FROM subjects),
+			(SELECT count(*) FROM biomedical_subject_rules)
+	`).Scan(&receipts, &versions, &subjects, &rules); err != nil {
+		t.Fatalf("count idempotent Subject rows: %v", err)
+	}
+	if receipts != 1 || versions != 1 || subjects != 2 || rules != 2 {
+		t.Fatalf(
+			"idempotent Subject rows = receipts %d versions %d subjects %d rules %d",
+			receipts,
+			versions,
+			subjects,
+			rules,
+		)
+	}
+}
+
+func TestPostgresSubjectImporterRejectsSameSourceVersionDifferentHashAtomically(t *testing.T) {
+	pool := openMigratedVenueTestPool(t)
+	importer, err := biomed.NewPostgresSubjectImporter(
+		pool,
+		func() time.Time {
+			return time.Date(2026, time.July, 17, 4, 0, 0, 0, time.UTC)
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewPostgresSubjectImporter() error = %v", err)
+	}
+	first := subjectRegistryCSV(
+		"biomedical-jcr-subjects/v1",
+		[]subjectRegistryTestRow{
+			{slug: "oncology", label: "Oncology", category: "Oncology"},
+		},
+	)
+	if _, err := importer.Import(context.Background(), strings.NewReader(first)); err != nil {
+		t.Fatalf("Import(first Subject registry) error = %v", err)
+	}
+	conflicting := subjectRegistryCSV(
+		"biomedical-jcr-subjects/v1",
+		[]subjectRegistryTestRow{
+			{slug: "oncology", label: "Cancer Biology", category: "Oncology"},
+		},
+	)
+	_, err = importer.Import(context.Background(), strings.NewReader(conflicting))
+	if !errors.Is(err, biomed.ErrConflictingSubjectRegistry) {
+		t.Fatalf(
+			"Import(conflicting Subject registry) error = %v, want ErrConflictingSubjectRegistry",
+			err,
+		)
+	}
+
+	ctx := venueTestContext(t)
+	var receipts, versions, subjects, rules, conflictingLabels int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM subject_import_receipts),
+			(SELECT count(*) FROM subject_versions),
+			(SELECT count(*) FROM subjects),
+			(SELECT count(*) FROM biomedical_subject_rules),
+			(SELECT count(*) FROM subjects WHERE display_label = 'Cancer Biology')
+	`).Scan(&receipts, &versions, &subjects, &rules, &conflictingLabels); err != nil {
+		t.Fatalf("count conflicting Subject import rows: %v", err)
+	}
+	if receipts != 1 ||
+		versions != 1 ||
+		subjects != 1 ||
+		rules != 1 ||
+		conflictingLabels != 0 {
+		t.Fatalf(
+			"conflicting Subject rows = receipts %d versions %d subjects %d rules %d conflicting labels %d",
+			receipts,
+			versions,
+			subjects,
+			rules,
+			conflictingLabels,
+		)
+	}
+}
+
+func TestPostgresJCRStoreReconcilesSubjectsInEitherImportOrder(t *testing.T) {
+	importOrders := []struct {
+		name         string
+		subjectFirst bool
+	}{
+		{name: "Subject then JCR", subjectFirst: true},
+		{name: "JCR then Subject", subjectFirst: false},
+	}
+	var normalizedResults [][]string
+	for _, importOrder := range importOrders {
+		t.Run(importOrder.name, func(t *testing.T) {
+			pool := openMigratedVenueTestPool(t)
+			venueID := insertSingleStoreVenue(t, pool)
+			subjectImporter, err := biomed.NewPostgresSubjectImporter(
+				pool,
+				func() time.Time {
+					return time.Date(2026, time.July, 17, 5, 0, 0, 0, time.UTC)
+				},
+			)
+			if err != nil {
+				t.Fatalf("NewPostgresSubjectImporter() error = %v", err)
+			}
+			subjects := subjectRegistryCSV(
+				"biomedical-jcr-subjects/v1",
+				[]subjectRegistryTestRow{
+					{slug: "oncology", label: "Oncology", category: "Oncology"},
+				},
+			)
+			store := mustNewPostgresJCRStore(t, pool)
+			metric := mustMetricSnapshot(
+				t,
+				venueID,
+				2025,
+				"Oncology",
+				"12.5",
+				QuartileQ1,
+				MetricStatusKnown,
+				"synthetic-jcr-fixture",
+			)
+			importSubjects := func() {
+				t.Helper()
+				if _, err := subjectImporter.Import(
+					context.Background(),
+					strings.NewReader(subjects),
+				); err != nil {
+					t.Fatalf("Import(Subjects) error = %v", err)
+				}
+			}
+			importJCR := func() {
+				t.Helper()
+				if _, err := store.PersistJCRImport(
+					context.Background(),
+					mustJCRImport(
+						t,
+						strings.Repeat("7", 64),
+						2026,
+						[]MetricSnapshot{metric},
+						nil,
+					),
+				); err != nil {
+					t.Fatalf("PersistJCRImport() error = %v", err)
+				}
+			}
+			if importOrder.subjectFirst {
+				importSubjects()
+				importJCR()
+			} else {
+				importJCR()
+				importSubjects()
+			}
+
+			rows, err := pool.Query(venueTestContext(t), `
+				SELECT
+					metric.category,
+					subject.slug,
+					rule.jcr_category,
+					link.jcr_category
+				FROM journal_subject_metrics AS link
+				JOIN venue_metric_snapshots AS metric
+				  ON metric.id = link.venue_metric_snapshot_id
+				JOIN biomedical_subject_rules AS rule
+				  ON rule.id = link.subject_rule_id
+				JOIN subjects AS subject
+				  ON subject.id = rule.subject_id
+				ORDER BY metric.category, subject.slug
+			`)
+			if err != nil {
+				t.Fatalf("query reconciled Subject links: %v", err)
+			}
+			defer rows.Close()
+			var result []string
+			for rows.Next() {
+				var metricCategory, slug, ruleCategory, linkCategory string
+				if err := rows.Scan(
+					&metricCategory,
+					&slug,
+					&ruleCategory,
+					&linkCategory,
+				); err != nil {
+					t.Fatalf("scan reconciled Subject link: %v", err)
+				}
+				if metricCategory != ruleCategory || metricCategory != linkCategory {
+					t.Fatalf(
+						"reconciled categories = metric %q rule %q link %q",
+						metricCategory,
+						ruleCategory,
+						linkCategory,
+					)
+				}
+				result = append(result, metricCategory+"|"+slug)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("iterate reconciled Subject links: %v", err)
+			}
+			if len(result) != 1 || result[0] != "Oncology|oncology" {
+				t.Fatalf("reconciled Subject links = %#v", result)
+			}
+			normalizedResults = append(normalizedResults, result)
+		})
+	}
+	if len(normalizedResults) != 2 ||
+		fmt.Sprint(normalizedResults[0]) != fmt.Sprint(normalizedResults[1]) {
+		t.Fatalf("import orders produced different Subject links: %#v", normalizedResults)
+	}
+}
+
+func TestReconcileJournalSubjectMetricsRejectsCaseSpacePrefixAndSubstringMatches(t *testing.T) {
+	pool := openMigratedVenueTestPool(t)
+	subjectImporter, err := biomed.NewPostgresSubjectImporter(
+		pool,
+		func() time.Time {
+			return time.Date(2026, time.July, 17, 6, 0, 0, 0, time.UTC)
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewPostgresSubjectImporter() error = %v", err)
+	}
+	if _, err := subjectImporter.Import(
+		context.Background(),
+		strings.NewReader(subjectRegistryCSV(
+			"biomedical-jcr-subjects/v1",
+			[]subjectRegistryTestRow{
+				{slug: "oncology", label: "Oncology", category: "Oncology"},
+			},
+		)),
+	); err != nil {
+		t.Fatalf("Import(Subjects) error = %v", err)
+	}
+
+	ctx := venueTestContext(t)
+	categories := []string{
+		"Oncology",
+		"oncology",
+		" Oncology",
+		"Oncology ",
+		"Onco",
+		"Oncology Research",
+		"Clinical Oncology",
+	}
+	for index, category := range categories {
+		var venueID string
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO venues (venue_type, display_title)
+			VALUES ('journal', $1)
+			RETURNING id::text
+		`, fmt.Sprintf("Exact Category Venue %d", index)).Scan(&venueID); err != nil {
+			t.Fatalf("insert exact-category Venue %d: %v", index, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO venue_metric_snapshots (
+				venue_id,
+				metric_year,
+				category,
+				jif,
+				quartile,
+				metric_status,
+				source_name,
+				source_license,
+				captured_at
+			) VALUES (
+				$1,
+				2025,
+				$2,
+				10,
+				'Q1',
+				'known',
+				'synthetic-exact-match-test',
+				'synthetic-only',
+				$3
+			)
+		`, venueID, category, time.Date(2026, time.July, 17, 6, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatalf("insert metric category %q: %v", category, err)
+		}
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin exact Subject reconciliation: %v", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+	if _, err := biomed.ReconcileJournalSubjectMetrics(ctx, tx); err != nil {
+		t.Fatalf("ReconcileJournalSubjectMetrics() error = %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit exact Subject reconciliation: %v", err)
+	}
+
+	var linkedCategories []string
+	rows, err := pool.Query(ctx, `
+		SELECT metric.category
+		FROM journal_subject_metrics AS link
+		JOIN venue_metric_snapshots AS metric
+		  ON metric.id = link.venue_metric_snapshot_id
+		ORDER BY metric.category
+	`)
+	if err != nil {
+		t.Fatalf("query exact Subject categories: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var category string
+		if err := rows.Scan(&category); err != nil {
+			t.Fatalf("scan exact Subject category: %v", err)
+		}
+		linkedCategories = append(linkedCategories, category)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate exact Subject categories: %v", err)
+	}
+	if len(linkedCategories) != 1 || linkedCategories[0] != "Oncology" {
+		t.Fatalf(
+			"reconciled categories = %#v, want only exact %q",
+			linkedCategories,
+			"Oncology",
+		)
 	}
 }
 
@@ -1355,4 +1826,29 @@ func mustVenueAliasEvidence(
 		t.Fatalf("NewVenueAliasEvidence() error = %v", err)
 	}
 	return evidence
+}
+
+type subjectRegistryTestRow struct {
+	slug     string
+	label    string
+	category string
+}
+
+func subjectRegistryCSV(
+	version string,
+	rows []subjectRegistryTestRow,
+) string {
+	var builder strings.Builder
+	builder.WriteString("source,registry_version,slug,display_label,jcr_category\n")
+	for _, row := range rows {
+		fmt.Fprintf(
+			&builder,
+			"medpaperhub-reviewed-jcr-category-allowlist,%s,%s,%s,%s\n",
+			version,
+			row.slug,
+			row.label,
+			row.category,
+		)
+	}
+	return builder.String()
 }

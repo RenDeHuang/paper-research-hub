@@ -221,6 +221,16 @@ func TestRealMainRejectsInvalidOrUnboundedCommandsBeforeMutation(t *testing.T) {
 			},
 			want: "RFC3339Nano",
 		},
+		{
+			name: "subject import missing file",
+			args: []string{"import", "subjects"},
+			want: "explicit --file",
+		},
+		{
+			name: "subject import file is not CSV",
+			args: []string{"import", "subjects", "--file", "/imports/subjects.json"},
+			want: "explicit .csv",
+		},
 	}
 
 	for _, test := range tests {
@@ -300,6 +310,53 @@ func TestRealMainParsesJCRImportWithExplicitLicensedFile(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), `"input_rows":10`) {
 		t.Fatalf("stdout = %q, want JCR receipt", stdout.String())
+	}
+}
+
+func TestRealMainParsesSubjectRegistryImportWithExplicitVersionedFile(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	var received workerCommand
+	code := realMain(
+		context.Background(),
+		[]string{
+			"import",
+			"subjects",
+			"--file",
+			"/imports/biomedical-jcr-subjects.v1.csv",
+		},
+		&stdout,
+		&stderr,
+		func(key string) (string, bool) {
+			if key == "DATABASE_URL" {
+				return "postgres://paper:secret@localhost/papers", true
+			}
+			return "", false
+		},
+		func(_ context.Context, cfg config.Config, command workerCommand) (map[string]any, error) {
+			received = command
+			if cfg.Venues.JCRImportPath != "" || cfg.Venues.JCRSourceLicense != "" {
+				t.Fatal("Subject import unexpectedly required JCR import configuration")
+			}
+			return map[string]any{
+				"file_sha256":      strings.Repeat("a", 64),
+				"source":           "medpaperhub-reviewed-jcr-category-allowlist",
+				"registry_version": "biomedical-jcr-subjects/v1",
+				"subject_count":    8,
+				"rule_count":       8,
+			}, nil
+		},
+	)
+	if code != 0 {
+		t.Fatalf("realMain() code = %d, stderr = %s", code, stderr.String())
+	}
+	if received.Kind != commandImportSubjects ||
+		received.File != "/imports/biomedical-jcr-subjects.v1.csv" {
+		t.Fatalf("received Subject command = %#v", received)
+	}
+	if !strings.Contains(stdout.String(), `"registry_version":"biomedical-jcr-subjects/v1"`) ||
+		!strings.Contains(stdout.String(), `"subject_count":8`) ||
+		!strings.Contains(stdout.String(), `"rule_count":8`) {
+		t.Fatalf("stdout = %q, want Subject receipt", stdout.String())
 	}
 }
 
