@@ -22,7 +22,10 @@ type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
 
-const postgresJobIdempotencyAdvisorySeed int64 = 0x49444D50
+const (
+	postgresJobIdempotencyAdvisorySeed int64 = 0x49444D50
+	normalizedPayloadSchemaVersion           = "normalized-record/v2"
+)
 
 func NewPostgresRepository(pool *pgxpool.Pool) (*PostgresRepository, error) {
 	if pool == nil {
@@ -527,22 +530,22 @@ func recordPayload(record source.Record) persistedRecordPayload {
 		Source:           record.Source,
 		SourceRecordID:   record.SourceRecordID,
 		CanonicalKey:     canonicalKey,
-		Identifiers:      append([]source.Identifier(nil), record.Identifiers...),
+		Identifiers:      slices.Clone(record.Identifiers),
 		Title:            record.Title,
 		Abstract:         record.Abstract,
 		AbstractSections: slices.Clone(record.AbstractSections),
 		PublishedAt:      cloneRepositoryTime(record.PublishedAt),
-		Authors:          append([]source.Author(nil), record.Authors...),
+		Authors:          cloneAuthors(record.Authors),
 		MeSHHeadings:     cloneMeSHHeadings(record.MeSHHeadings),
 		PublicationTypes: slices.Clone(record.PublicationTypes),
 		Relations:        slices.Clone(record.Relations),
-		Topics:           append([]source.Topic(nil), record.Topics...),
+		Topics:           cloneTopics(record.Topics),
 		Keywords:         cloneKeywords(record.Keywords),
 		CitedByCount:     cloneRepositoryInt(record.CitedByCount),
 		Venue:            cloneRepositoryVenue(record.Venue),
 		Retracted:        cloneRepositoryBool(record.Retracted),
-		CodeURLs:         append([]string(nil), record.CodeURLs...),
-		Evidence:         append([]source.FieldEvidence(nil), record.Evidence...),
+		CodeURLs:         slices.Clone(record.CodeURLs),
+		Evidence:         slices.Clone(record.Evidence),
 		AuthorsTruncated: cloneRepositoryBool(record.AuthorsTruncated),
 	}
 }
@@ -626,29 +629,51 @@ func (repository *PostgresRepository) Normalize(
 		return NormalizedRecord{}, fmt.Errorf("persist normalized source record: %w", err)
 	}
 
-	command, err := tx.Exec(ctx, `
+	var normalizedAssertionID string
+	err = tx.QueryRow(ctx, `
 		INSERT INTO ingestion_normalized_records (
 			raw_event_id,
 			source_record_uuid,
 			normalization_policy_version,
+			payload_schema_version,
 			normalized_payload
-		) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (raw_event_id) DO NOTHING
-	`, raw.ID, sourceRecordUUID, normalizedPolicy, normalizedJSON)
-	if err != nil {
+		) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (
+			raw_event_id,
+			normalization_policy_version,
+			payload_schema_version
+		) DO NOTHING
+		RETURNING id::text
+	`,
+		raw.ID,
+		sourceRecordUUID,
+		normalizedPolicy,
+		normalizedPayloadSchemaVersion,
+		normalizedJSON,
+	).Scan(&normalizedAssertionID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return NormalizedRecord{}, fmt.Errorf("link normalized ingestion record: %w", err)
 	}
-	if command.RowsAffected() == 0 {
+	if errors.Is(err, pgx.ErrNoRows) {
 		var existingSourceRecord, existingPolicy string
 		var payloadMatches bool
 		if err := tx.QueryRow(ctx, `
 			SELECT
+				id::text,
 				source_record_uuid::text,
 				normalization_policy_version,
-				normalized_payload = $2::jsonb
+				normalized_payload = $4::jsonb
 			FROM ingestion_normalized_records
 			WHERE raw_event_id = $1
-		`, raw.ID, normalizedJSON).Scan(
+			  AND normalization_policy_version = $2
+			  AND payload_schema_version = $3
+		`,
+			raw.ID,
+			normalizedPolicy,
+			normalizedPayloadSchemaVersion,
+			normalizedJSON,
+		).Scan(
+			&normalizedAssertionID,
 			&existingSourceRecord,
 			&existingPolicy,
 			&payloadMatches,
@@ -666,7 +691,12 @@ func (repository *PostgresRepository) Normalize(
 	if err := tx.Commit(ctx); err != nil {
 		return NormalizedRecord{}, fmt.Errorf("commit normalization transaction: %w", err)
 	}
-	return NewNormalizedRecord(raw, raw.Envelope.Record)
+	return NewNormalizedRecord(
+		raw,
+		raw.Envelope.Record,
+		normalizedAssertionID,
+		normalizedPayloadSchemaVersion,
+	)
 }
 
 func (repository *PostgresRepository) Exclude(
@@ -692,7 +722,12 @@ func (repository *PostgresRepository) Exclude(
 	defer func() {
 		_ = tx.Rollback(context.Background())
 	}()
-	sourceRecordUUID, err := normalizedSourceRecordID(ctx, tx, record.RawID)
+	sourceRecordUUID, err := normalizedSourceRecordID(
+		ctx,
+		tx,
+		record.AssertionID,
+		record.RawID,
+	)
 	if err != nil {
 		return ProjectionResult{}, err
 	}
@@ -712,6 +747,7 @@ func (repository *PostgresRepository) Exclude(
 		sourceState{
 			LogicalSource:           record.LogicalSource,
 			EventKey:                record.EventKey,
+			NormalizedAssertionID:   record.AssertionID,
 			RawEventID:              record.RawID,
 			SourceRecordUUID:        sourceRecordUUID,
 			SourceTime:              record.SourceTime,
@@ -767,12 +803,15 @@ func (repository *PostgresRepository) Project(
 	); err != nil {
 		return ProjectionResult{}, err
 	}
-	sourceRecordUUID, payload, normalizedRecord, err := immutableNormalizedProjectionPayload(
-		ctx,
-		tx,
-		candidate.RawID,
-		candidate.Record,
-	)
+	sourceRecordUUID, normalizedRecord, candidatePayload, err :=
+		immutableNormalizedProjectionPayload(
+			ctx,
+			tx,
+			candidate.NormalizedAssertionID,
+			candidate.RawID,
+			candidate.PayloadSchemaVersion,
+			candidate.Record,
+		)
 	if err != nil {
 		return ProjectionResult{}, err
 	}
@@ -825,6 +864,7 @@ func (repository *PostgresRepository) Project(
 	var projectionAssertionID string
 	err = tx.QueryRow(ctx, `
 			INSERT INTO ingestion_projection_assertions (
+				normalized_assertion_id,
 				raw_event_id,
 				source_record_uuid,
 				work_id,
@@ -832,45 +872,48 @@ func (repository *PostgresRepository) Project(
 				scope_policy_version,
 				projection_policy_version,
 				record_payload
-			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (
-				raw_event_id,
+				normalized_assertion_id,
 				scope_policy_version,
 				projection_policy_version
 			) DO NOTHING
 			RETURNING id::text
 	`,
+		candidate.NormalizedAssertionID,
 		candidate.RawID,
 		sourceRecordUUID,
 		workID,
 		jobID,
 		scopePolicyVersion,
 		projectionPolicyVersion,
-		payload,
+		candidatePayload,
 	).Scan(&projectionAssertionID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return ProjectionResult{}, fmt.Errorf("persist projection assertion: %w", err)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		var existingSourceRecordUUID, existingWorkID string
+		var existingRawEventID, existingSourceRecordUUID, existingWorkID string
 		var payloadMatches bool
 		if err := tx.QueryRow(ctx, `
 			SELECT
 				id::text,
+				raw_event_id::text,
 				source_record_uuid::text,
 				work_id::text,
 				record_payload = $4::jsonb
 			FROM ingestion_projection_assertions
-			WHERE raw_event_id = $1
+			WHERE normalized_assertion_id = $1
 			  AND scope_policy_version = $2
 			  AND projection_policy_version = $3
 		`,
-			candidate.RawID,
+			candidate.NormalizedAssertionID,
 			scopePolicyVersion,
 			projectionPolicyVersion,
-			payload,
+			candidatePayload,
 		).Scan(
 			&projectionAssertionID,
+			&existingRawEventID,
 			&existingSourceRecordUUID,
 			&existingWorkID,
 			&payloadMatches,
@@ -880,7 +923,8 @@ func (repository *PostgresRepository) Project(
 				err,
 			)
 		}
-		if existingSourceRecordUUID != sourceRecordUUID ||
+		if existingRawEventID != candidate.RawID ||
+			existingSourceRecordUUID != sourceRecordUUID ||
 			existingWorkID != workID ||
 			!payloadMatches {
 			return ProjectionResult{}, errors.New(
@@ -904,6 +948,7 @@ func (repository *PostgresRepository) Project(
 		sourceState{
 			LogicalSource:           candidate.LogicalSource,
 			EventKey:                candidate.EventKey,
+			NormalizedAssertionID:   candidate.NormalizedAssertionID,
 			RawEventID:              candidate.RawID,
 			SourceRecordUUID:        sourceRecordUUID,
 			WorkID:                  workID,
@@ -1177,14 +1222,16 @@ func identityPriority(canonicalKey string) int {
 func normalizedSourceRecordID(
 	ctx context.Context,
 	tx pgx.Tx,
+	normalizedAssertionID string,
 	rawEventID string,
 ) (string, error) {
 	var id string
 	if err := tx.QueryRow(ctx, `
 		SELECT source_record_uuid::text
 		FROM ingestion_normalized_records
-		WHERE raw_event_id = $1
-	`, rawEventID).Scan(&id); err != nil {
+		WHERE id = $1
+		  AND raw_event_id = $2
+	`, normalizedAssertionID, rawEventID).Scan(&id); err != nil {
 		return "", fmt.Errorf("read normalized source record ID: %w", err)
 	}
 	return id, nil
@@ -1193,12 +1240,14 @@ func normalizedSourceRecordID(
 func immutableNormalizedProjectionPayload(
 	ctx context.Context,
 	tx pgx.Tx,
+	normalizedAssertionID string,
 	rawEventID string,
+	payloadSchemaVersion string,
 	candidate source.Record,
-) (string, []byte, persistedRecordPayload, error) {
+) (string, persistedRecordPayload, []byte, error) {
 	candidatePayload, err := json.Marshal(recordPayload(candidate))
 	if err != nil {
-		return "", nil, persistedRecordPayload{}, fmt.Errorf(
+		return "", persistedRecordPayload{}, nil, fmt.Errorf(
 			"encode projection candidate normalized payload: %w",
 			err,
 		)
@@ -1206,38 +1255,58 @@ func immutableNormalizedProjectionPayload(
 
 	var sourceRecordID string
 	var persistedPayload []byte
-	var payloadMatches bool
 	if err := tx.QueryRow(ctx, `
 		SELECT
 			source_record_uuid::text,
-			normalized_payload,
-			normalized_payload = $2::jsonb
+			normalized_payload
 		FROM ingestion_normalized_records
-		WHERE raw_event_id = $1
-	`, rawEventID, candidatePayload).Scan(
+		WHERE id = $1
+		  AND raw_event_id = $2
+		  AND payload_schema_version = $3
+	`,
+		normalizedAssertionID,
+		rawEventID,
+		payloadSchemaVersion,
+	).Scan(
 		&sourceRecordID,
 		&persistedPayload,
-		&payloadMatches,
 	); err != nil {
-		return "", nil, persistedRecordPayload{}, fmt.Errorf(
+		return "", persistedRecordPayload{}, nil, fmt.Errorf(
 			"read immutable normalized projection payload: %w",
 			err,
-		)
-	}
-	if !payloadMatches {
-		return "", nil, persistedRecordPayload{}, errors.New(
-			"projection candidate differs from immutable normalized payload",
 		)
 	}
 
 	var persisted persistedRecordPayload
 	if err := json.Unmarshal(persistedPayload, &persisted); err != nil {
-		return "", nil, persistedRecordPayload{}, fmt.Errorf(
+		return "", persistedRecordPayload{}, nil, fmt.Errorf(
 			"decode immutable normalized projection payload: %w",
 			err,
 		)
 	}
-	return sourceRecordID, persistedPayload, persisted, nil
+	if err := validateImmutableProjectionIdentity(candidate, persisted); err != nil {
+		return "", persistedRecordPayload{}, nil, err
+	}
+	return sourceRecordID, persisted, candidatePayload, nil
+}
+
+func validateImmutableProjectionIdentity(
+	candidate source.Record,
+	normalized persistedRecordPayload,
+) error {
+	candidateCanonicalKey := ""
+	if candidate.Identity.Valid() {
+		candidateCanonicalKey = candidate.Identity.CanonicalKey()
+	}
+	if candidate.Source != normalized.Source ||
+		candidate.SourceRecordID != normalized.SourceRecordID ||
+		candidateCanonicalKey != normalized.CanonicalKey ||
+		!slices.Equal(candidate.Identifiers, normalized.Identifiers) {
+		return errors.New(
+			"projection candidate changed immutable normalized identity",
+		)
+	}
+	return nil
 }
 
 func associateSourceRecord(
@@ -1398,6 +1467,11 @@ type biomedicalPublicationTypeAssertion struct {
 	SourcePath string
 }
 
+type biomedicalCanonicalIdentity struct {
+	Kind string
+	UI   string
+}
+
 func persistBiomedicalSemanticAssertions(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -1410,16 +1484,20 @@ func persistBiomedicalSemanticAssertions(
 	if err != nil {
 		return err
 	}
+	canonicalIDs, err := resolveBiomedicalCanonicalIDs(
+		ctx,
+		tx,
+		headings,
+		publicationTypes,
+	)
+	if err != nil {
+		return err
+	}
 	for _, heading := range headings {
-		descriptorID, err := resolveBiomedicalCanonicalID(
-			ctx,
-			tx,
-			"mesh descriptor",
-			heading.UI,
-		)
-		if err != nil {
-			return err
-		}
+		descriptorID := canonicalIDs[biomedicalCanonicalIdentity{
+			Kind: "mesh descriptor",
+			UI:   heading.UI,
+		}]
 		headingID, err := persistMeSHHeadingAssertion(
 			ctx,
 			tx,
@@ -1433,15 +1511,10 @@ func persistBiomedicalSemanticAssertions(
 			return err
 		}
 		for _, qualifier := range heading.Qualifiers {
-			qualifierID, err := resolveBiomedicalCanonicalID(
-				ctx,
-				tx,
-				"mesh qualifier",
-				qualifier.UI,
-			)
-			if err != nil {
-				return err
-			}
+			qualifierID := canonicalIDs[biomedicalCanonicalIdentity{
+				Kind: "mesh qualifier",
+				UI:   qualifier.UI,
+			}]
 			if err := persistMeSHQualifierAssertion(
 				ctx,
 				tx,
@@ -1457,15 +1530,10 @@ func persistBiomedicalSemanticAssertions(
 		}
 	}
 	for _, publicationType := range publicationTypes {
-		publicationTypeID, err := resolveBiomedicalCanonicalID(
-			ctx,
-			tx,
-			"publication type",
-			publicationType.UI,
-		)
-		if err != nil {
-			return err
-		}
+		publicationTypeID := canonicalIDs[biomedicalCanonicalIdentity{
+			Kind: "publication type",
+			UI:   publicationType.UI,
+		}]
 		if err := persistPublicationTypeAssertion(
 			ctx,
 			tx,
@@ -1488,6 +1556,7 @@ func normalizedBiomedicalSemanticAssertions(
 		return nil, nil, nil
 	}
 	headings := make([]biomedicalMeSHHeadingAssertion, len(record.MeSHHeadings))
+	descriptorUIs := make(map[string]struct{}, len(record.MeSHHeadings))
 	for headingIndex, heading := range record.MeSHHeadings {
 		descriptorUI, descriptorLabel, err := normalizedBiomedicalIdentity(
 			heading.Descriptor.UI,
@@ -1497,10 +1566,18 @@ func normalizedBiomedicalSemanticAssertions(
 		if err != nil {
 			return nil, nil, err
 		}
+		if _, duplicate := descriptorUIs[descriptorUI]; duplicate {
+			return nil, nil, fmt.Errorf(
+				"duplicate PubMed MeSH descriptor UI %q",
+				descriptorUI,
+			)
+		}
+		descriptorUIs[descriptorUI] = struct{}{}
 		qualifiers := make(
 			[]biomedicalMeSHQualifierAssertion,
 			len(heading.Qualifiers),
 		)
+		qualifierUIs := make(map[string]struct{}, len(heading.Qualifiers))
 		for qualifierIndex, qualifier := range heading.Qualifiers {
 			qualifierUI, qualifierLabel, err := normalizedBiomedicalIdentity(
 				qualifier.UI,
@@ -1514,6 +1591,14 @@ func normalizedBiomedicalSemanticAssertions(
 			if err != nil {
 				return nil, nil, err
 			}
+			if _, duplicate := qualifierUIs[qualifierUI]; duplicate {
+				return nil, nil, fmt.Errorf(
+					"duplicate PubMed MeSH qualifier UI %q in heading %d",
+					qualifierUI,
+					headingIndex+1,
+				)
+			}
+			qualifierUIs[qualifierUI] = struct{}{}
 			qualifiers[qualifierIndex] = biomedicalMeSHQualifierAssertion{
 				UI:    qualifierUI,
 				Label: qualifierLabel,
@@ -1543,6 +1628,10 @@ func normalizedBiomedicalSemanticAssertions(
 		[]biomedicalPublicationTypeAssertion,
 		len(record.PublicationTypes),
 	)
+	publicationTypeUIs := make(
+		map[string]struct{},
+		len(record.PublicationTypes),
+	)
 	for typeIndex, publicationType := range record.PublicationTypes {
 		publicationTypeUI, publicationTypeLabel, err := normalizedBiomedicalIdentity(
 			publicationType.UI,
@@ -1552,6 +1641,13 @@ func normalizedBiomedicalSemanticAssertions(
 		if err != nil {
 			return nil, nil, err
 		}
+		if _, duplicate := publicationTypeUIs[publicationTypeUI]; duplicate {
+			return nil, nil, fmt.Errorf(
+				"duplicate PubMed Publication Type UI %q",
+				publicationTypeUI,
+			)
+		}
+		publicationTypeUIs[publicationTypeUI] = struct{}{}
 		publicationTypes[typeIndex] = biomedicalPublicationTypeAssertion{
 			UI:    publicationTypeUI,
 			Label: publicationTypeLabel,
@@ -1563,6 +1659,59 @@ func normalizedBiomedicalSemanticAssertions(
 		}
 	}
 	return headings, publicationTypes, nil
+}
+
+func resolveBiomedicalCanonicalIDs(
+	ctx context.Context,
+	tx pgx.Tx,
+	headings []biomedicalMeSHHeadingAssertion,
+	publicationTypes []biomedicalPublicationTypeAssertion,
+) (map[biomedicalCanonicalIdentity]string, error) {
+	unique := make(map[biomedicalCanonicalIdentity]struct{})
+	for _, heading := range headings {
+		unique[biomedicalCanonicalIdentity{
+			Kind: "mesh descriptor",
+			UI:   heading.UI,
+		}] = struct{}{}
+		for _, qualifier := range heading.Qualifiers {
+			unique[biomedicalCanonicalIdentity{
+				Kind: "mesh qualifier",
+				UI:   qualifier.UI,
+			}] = struct{}{}
+		}
+	}
+	for _, publicationType := range publicationTypes {
+		unique[biomedicalCanonicalIdentity{
+			Kind: "publication type",
+			UI:   publicationType.UI,
+		}] = struct{}{}
+	}
+
+	ordered := make([]biomedicalCanonicalIdentity, 0, len(unique))
+	for identity := range unique {
+		ordered = append(ordered, identity)
+	}
+	slices.SortFunc(ordered, func(left, right biomedicalCanonicalIdentity) int {
+		if compared := strings.Compare(left.Kind, right.Kind); compared != 0 {
+			return compared
+		}
+		return strings.Compare(left.UI, right.UI)
+	})
+
+	resolved := make(map[biomedicalCanonicalIdentity]string, len(ordered))
+	for _, identity := range ordered {
+		id, err := resolveBiomedicalCanonicalID(
+			ctx,
+			tx,
+			identity.Kind,
+			identity.UI,
+		)
+		if err != nil {
+			return nil, err
+		}
+		resolved[identity] = id
+	}
+	return resolved, nil
 }
 
 func normalizedBiomedicalIdentity(
@@ -1911,6 +2060,7 @@ func lockSourceState(
 type sourceState struct {
 	LogicalSource           string
 	EventKey                string
+	NormalizedAssertionID   string
 	RawEventID              string
 	SourceRecordUUID        string
 	WorkID                  string
@@ -1941,10 +2091,11 @@ func upsertSourceState(
 			scope_status,
 			scope_policy_version,
 			projection_policy_version,
+			normalized_assertion_id,
 			is_deleted
 		) VALUES (
 			$1, $2, $3, NULLIF($4, '')::uuid, NULLIF($5, '')::uuid,
-			$6, $7, $8, $9, $10, $11, $12
+			$6, $7, $8, $9, $10, $11, NULLIF($12, '')::uuid, $13
 		)
 		ON CONFLICT (logical_source, event_key)
 		DO UPDATE SET
@@ -1957,6 +2108,7 @@ func upsertSourceState(
 			scope_status = EXCLUDED.scope_status,
 			scope_policy_version = EXCLUDED.scope_policy_version,
 			projection_policy_version = EXCLUDED.projection_policy_version,
+			normalized_assertion_id = EXCLUDED.normalized_assertion_id,
 			is_deleted = EXCLUDED.is_deleted,
 			updated_at = now()
 		WHERE (
@@ -1978,6 +2130,7 @@ func upsertSourceState(
 				EXCLUDED.scope_status,
 				EXCLUDED.scope_policy_version,
 				EXCLUDED.projection_policy_version,
+				EXCLUDED.normalized_assertion_id,
 				EXCLUDED.is_deleted
 			) IS DISTINCT FROM (
 				ingestion_source_states.source_record_uuid,
@@ -1985,6 +2138,7 @@ func upsertSourceState(
 				ingestion_source_states.scope_status,
 				ingestion_source_states.scope_policy_version,
 				ingestion_source_states.projection_policy_version,
+				ingestion_source_states.normalized_assertion_id,
 				ingestion_source_states.is_deleted
 			)
 		)
@@ -2000,6 +2154,7 @@ func upsertSourceState(
 		state.ScopeStatus,
 		state.ScopePolicyVersion,
 		state.ProjectionPolicyVersion,
+		state.NormalizedAssertionID,
 		state.IsDeleted,
 	)
 	if err != nil {
@@ -2014,17 +2169,19 @@ func applyWinningProjection(
 	workID string,
 ) (bool, error) {
 	var (
-		rawEventID       string
-		sourceRecordID   string
-		sourceTime       time.Time
-		tieBreakKey      string
-		position         int64
-		scopePolicy      string
-		projectionPolicy string
-		payload          []byte
+		normalizedAssertionID string
+		rawEventID            string
+		sourceRecordID        string
+		sourceTime            time.Time
+		tieBreakKey           string
+		position              int64
+		scopePolicy           string
+		projectionPolicy      string
+		payload               []byte
 	)
 	err := tx.QueryRow(ctx, `
 		SELECT
+			state.normalized_assertion_id::text,
 			state.raw_event_id::text,
 			state.source_record_uuid::text,
 			state.source_time,
@@ -2035,7 +2192,8 @@ func applyWinningProjection(
 			assertion.record_payload
 		FROM ingestion_source_states AS state
 		JOIN ingestion_projection_assertions AS assertion
-		  ON assertion.raw_event_id = state.raw_event_id
+		  ON assertion.normalized_assertion_id = state.normalized_assertion_id
+		 AND assertion.raw_event_id = state.raw_event_id
 		 AND assertion.work_id = state.work_id
 		 AND assertion.scope_policy_version = state.scope_policy_version
 		 AND assertion.projection_policy_version = state.projection_policy_version
@@ -2049,6 +2207,7 @@ func applyWinningProjection(
 			state.raw_event_id DESC
 		LIMIT 1
 	`, workID).Scan(
+		&normalizedAssertionID,
 		&rawEventID,
 		&sourceRecordID,
 		&sourceTime,
@@ -2071,13 +2230,15 @@ func applyWinningProjection(
 	}
 
 	var (
-		currentRawEventID       string
-		currentSourceRecordID   string
-		currentScopePolicy      string
-		currentProjectionPolicy string
+		currentNormalizedAssertionID string
+		currentRawEventID            string
+		currentSourceRecordID        string
+		currentScopePolicy           string
+		currentProjectionPolicy      string
 	)
 	err = tx.QueryRow(ctx, `
 		SELECT
+			normalized_assertion_id::text,
 			raw_event_id::text,
 			source_record_uuid::text,
 			scope_policy_version,
@@ -2085,12 +2246,14 @@ func applyWinningProjection(
 		FROM work_projection_states
 		WHERE work_id = $1
 	`, workID).Scan(
+		&currentNormalizedAssertionID,
 		&currentRawEventID,
 		&currentSourceRecordID,
 		&currentScopePolicy,
 		&currentProjectionPolicy,
 	)
 	if err == nil &&
+		currentNormalizedAssertionID == normalizedAssertionID &&
 		currentRawEventID == rawEventID &&
 		currentSourceRecordID == sourceRecordID &&
 		currentScopePolicy == scopePolicy &&
@@ -2111,6 +2274,7 @@ func applyWinningProjection(
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO work_projection_states (
 			work_id,
+			normalized_assertion_id,
 			raw_event_id,
 			source_record_uuid,
 			source_time,
@@ -2118,9 +2282,10 @@ func applyWinningProjection(
 			position,
 			scope_policy_version,
 			projection_policy_version
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (work_id)
 		DO UPDATE SET
+			normalized_assertion_id = EXCLUDED.normalized_assertion_id,
 			raw_event_id = EXCLUDED.raw_event_id,
 			source_record_uuid = EXCLUDED.source_record_uuid,
 			source_time = EXCLUDED.source_time,
@@ -2131,6 +2296,7 @@ func applyWinningProjection(
 			updated_at = now()
 	`,
 		workID,
+		normalizedAssertionID,
 		rawEventID,
 		sourceRecordID,
 		sourceTime,

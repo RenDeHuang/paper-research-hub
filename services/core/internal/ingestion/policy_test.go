@@ -15,7 +15,12 @@ func TestControlledIdentityPoliciesIncludeOnlyCanonicalizableRecords(t *testing.
 		Disposition: RawDispositionInserted,
 		Envelope:    testEnvelope(t, source.ScopePending),
 	}
-	normalized, err := NewNormalizedRecord(raw, raw.Envelope.Record)
+	normalized, err := NewNormalizedRecord(
+		raw,
+		raw.Envelope.Record,
+		"normalized-assertion-1",
+		normalizedPayloadSchemaVersion,
+	)
 	if err != nil {
 		t.Fatalf("NewNormalizedRecord() error = %v", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -350,137 +351,337 @@ func TestPostgresRepositoryPersistsPubMedBiomedicalSemantics(t *testing.T) {
 	}
 }
 
-func TestPostgresRepositoryRejectsProjectionCandidateBiomedicalMutations(t *testing.T) {
-	testCases := []struct {
-		name   string
-		mutate func(*source.Record)
-	}{
-		{
-			name: "descriptor UI",
-			mutate: func(record *source.Record) {
-				record.MeSHHeadings[0].Descriptor.UI = "D999999"
-			},
-		},
-		{
-			name: "descriptor label",
-			mutate: func(record *source.Record) {
-				record.MeSHHeadings[0].Descriptor.Name = "Mutated Neoplasms"
-			},
-		},
-		{
-			name: "major topic",
-			mutate: func(record *source.Record) {
-				record.MeSHHeadings[0].Descriptor.MajorTopic =
-					!record.MeSHHeadings[0].Descriptor.MajorTopic
-			},
-		},
-		{
-			name: "heading order",
-			mutate: func(record *source.Record) {
-				record.MeSHHeadings[0], record.MeSHHeadings[1] =
-					record.MeSHHeadings[1], record.MeSHHeadings[0]
-			},
-		},
-		{
-			name: "publication type",
-			mutate: func(record *source.Record) {
-				record.PublicationTypes[0].Name = "Mutated Publication Type"
-			},
-		},
+func TestRecordPayloadPreservesKnownEmptyAndDeepCopiesNestedCollections(t *testing.T) {
+	score := 0.87
+	record := source.Record{
+		Source:         source.PubMed,
+		SourceRecordID: "76543240",
+		Identifiers: []source.Identifier{{
+			Scheme: source.IdentifierDOI,
+			Value:  "10.1000/pubmed.clone-contract",
+		}},
+		Authors: []source.Author{{
+			DisplayName:  "Ada Lovelace",
+			Affiliations: []string{"Analytical Engine Institute"},
+			Institutions: []source.Institution{{
+				DisplayName: "Analytical Engine Institute",
+			}},
+		}},
+		MeSHHeadings:     make([]source.MeSHHeading, 0),
+		PublicationTypes: make([]source.PublicationType, 0),
+		Relations:        make([]source.Relation, 0),
+		Topics: []source.Topic{{
+			OpenAlexID:  "T1",
+			DisplayName: "Biomedical informatics",
+			Score:       &score,
+		}},
+		Keywords: make([]source.Keyword, 0),
+		CodeURLs: make([]string, 0),
+		Evidence: make([]source.FieldEvidence, 0),
 	}
 
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			pool := openIngestionTestPool(t)
-			repository := mustPostgresRepository(t, pool)
-			ctx := context.Background()
-			suffix := strings.ToLower(strings.ReplaceAll(testCase.name, " ", "-"))
-			envelope := pubMedBiomedicalRepositoryEnvelope(
-				t,
-				"76543250",
-				"10.1000/pubmed.candidate-mutation."+suffix,
-				time.Date(2026, time.July, 17, 8, 30, 0, 0, time.UTC),
-			)
-			job := startPubMedRepositoryJob(t, repository, "candidate-mutation-"+suffix)
-			raw, err := repository.PersistRaw(ctx, job.ID, envelope)
-			if err != nil {
-				t.Fatalf("PersistRaw() error = %v", err)
-			}
-			normalized, err := repository.Normalize(
-				ctx,
-				job.ID,
-				raw,
-				"normalization/pubmed-v1",
-			)
-			if err != nil {
-				t.Fatalf("Normalize() error = %v", err)
-			}
-			candidate, err := NewProjectionCandidate(
-				normalized,
-				source.ScopeDecision{
-					Status: source.ScopeIncluded,
-					Reason: "controlled_identity_present",
-				},
-			)
-			if err != nil {
-				t.Fatalf("NewProjectionCandidate() error = %v", err)
-			}
-			testCase.mutate(&candidate.Record)
+	payload := recordPayload(record)
+	record.Authors[0].Affiliations[0] = "mutated"
+	record.Authors[0].Institutions[0].DisplayName = "mutated"
+	*record.Topics[0].Score = 0
 
-			_, err = repository.Project(
-				ctx,
-				job.ID,
-				candidate,
-				"scope/pubmed-v1",
-				"projection/pubmed-v1",
-			)
-			if err == nil ||
-				!strings.Contains(
-					err.Error(),
-					"projection candidate differs from immutable normalized payload",
-				) {
-				t.Fatalf(
-					"Project(mutated candidate) error = %v, want immutable normalized payload rejection",
-					err,
-				)
-			}
+	if payload.Authors[0].Affiliations[0] != "Analytical Engine Institute" ||
+		payload.Authors[0].Institutions[0].DisplayName != "Analytical Engine Institute" ||
+		payload.Topics[0].Score == nil ||
+		*payload.Topics[0].Score != 0.87 {
+		t.Fatalf("recordPayload() retained nested mutable aliases: %#v", payload)
+	}
 
-			var projectionRows, semanticRows, canonicalRows, workRows int
-			if err := pool.QueryRow(ctx, `
-				SELECT
-					(SELECT count(*) FROM ingestion_projection_assertions),
-					(
-						(SELECT count(*) FROM work_mesh_headings) +
-						(SELECT count(*) FROM work_mesh_qualifiers) +
-						(SELECT count(*) FROM work_publication_types)
-					),
-					(
-						(SELECT count(*) FROM mesh_descriptors) +
-						(SELECT count(*) FROM mesh_qualifiers) +
-						(SELECT count(*) FROM publication_types)
-					),
-					(SELECT count(*) FROM works)
-			`).Scan(
-				&projectionRows,
-				&semanticRows,
-				&canonicalRows,
-				&workRows,
-			); err != nil {
-				t.Fatalf("query mutated candidate rollback state: %v", err)
-			}
-			if projectionRows != 0 ||
-				semanticRows != 0 ||
-				canonicalRows != 0 ||
-				workRows != 0 {
-				t.Fatalf(
-					"mutated candidate rollback = projection %d semantic %d canonical %d work %d, want all zero",
-					projectionRows,
-					semanticRows,
-					canonicalRows,
-					workRows,
-				)
-			}
-		})
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal known-empty payload: %v", err)
+	}
+	var shape map[string]any
+	if err := json.Unmarshal(encoded, &shape); err != nil {
+		t.Fatalf("decode known-empty payload: %v", err)
+	}
+	for _, field := range []string{
+		"mesh_headings",
+		"publication_types",
+		"relations",
+		"keywords",
+		"code_urls",
+		"evidence",
+	} {
+		values, ok := shape[field].([]any)
+		if !ok || len(values) != 0 {
+			t.Errorf("%s = %#v, want a known-empty JSON array", field, shape[field])
+		}
+	}
+}
+
+func TestPostgresRepositoryProjectionPolicyTransformsPreserveNormalizedSemanticProvenance(
+	t *testing.T,
+) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543250",
+		"10.1000/pubmed.candidate-transform",
+		time.Date(2026, time.July, 17, 8, 30, 0, 0, time.UTC),
+	)
+	job := startPubMedRepositoryJob(t, repository, "candidate-transform")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+	normalized, err := repository.Normalize(
+		ctx,
+		job.ID,
+		raw,
+		"normalization/pubmed-v1",
+	)
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	candidate, err := NewProjectionCandidate(
+		normalized,
+		source.ScopeDecision{
+			Status: source.ScopeIncluded,
+			Reason: "controlled_identity_present",
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	candidate.Record.Title = "Projection-policy transformed title"
+	candidate.Record.Abstract = "Projection-policy transformed abstract"
+	candidate.Record.MeSHHeadings[0].Descriptor.Name = "Candidate-only MeSH label"
+	candidate.Record.MeSHHeadings[0].Descriptor.MajorTopic = false
+	candidate.Record.PublicationTypes[0].Name = "Candidate-only Publication Type"
+
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-transform-v1",
+	); err != nil {
+		t.Fatalf("Project(transformed candidate) error = %v", err)
+	}
+
+	var (
+		workTitle                   string
+		workAbstract                string
+		projectionTitle             string
+		projectionDescriptorLabel   string
+		normalizedDescriptorLabel   string
+		semanticDescriptorLabel     string
+		semanticDescriptorIsMajor   bool
+		projectionMatchesNormalized bool
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			work.title,
+			work.abstract,
+			assertion.record_payload ->> 'title',
+			assertion.record_payload #>> '{mesh_headings,0,Descriptor,Name}',
+			normalized.normalized_payload #>> '{mesh_headings,0,Descriptor,Name}',
+			heading.descriptor_label,
+			heading.is_major_topic,
+			assertion.record_payload = normalized.normalized_payload
+		FROM ingestion_projection_assertions AS assertion
+		JOIN ingestion_normalized_records AS normalized
+		  ON normalized.raw_event_id = assertion.raw_event_id
+		JOIN works AS work
+		  ON work.id = assertion.work_id
+		JOIN work_mesh_headings AS heading
+		  ON heading.projection_assertion_id = assertion.id
+		JOIN mesh_descriptors AS descriptor
+		  ON descriptor.id = heading.descriptor_id
+		WHERE assertion.raw_event_id = $1
+		  AND descriptor.descriptor_ui = 'D009369'
+	`, raw.ID).Scan(
+		&workTitle,
+		&workAbstract,
+		&projectionTitle,
+		&projectionDescriptorLabel,
+		&normalizedDescriptorLabel,
+		&semanticDescriptorLabel,
+		&semanticDescriptorIsMajor,
+		&projectionMatchesNormalized,
+	); err != nil {
+		t.Fatalf("query transformed projection provenance: %v", err)
+	}
+	if workTitle != "Projection-policy transformed title" ||
+		workAbstract != "Projection-policy transformed abstract" ||
+		projectionTitle != "Projection-policy transformed title" ||
+		projectionDescriptorLabel != "Candidate-only MeSH label" {
+		t.Fatalf(
+			"candidate projection = work %q/%q payload %q/%q",
+			workTitle,
+			workAbstract,
+			projectionTitle,
+			projectionDescriptorLabel,
+		)
+	}
+	if normalizedDescriptorLabel != "Neoplasms" ||
+		semanticDescriptorLabel != "Neoplasms" ||
+		!semanticDescriptorIsMajor ||
+		projectionMatchesNormalized {
+		t.Fatalf(
+			"semantic provenance = normalized %q assertion %q major %v payload_equal %v",
+			normalizedDescriptorLabel,
+			semanticDescriptorLabel,
+			semanticDescriptorIsMajor,
+			projectionMatchesNormalized,
+		)
+	}
+}
+
+func TestPostgresRepositoryReplaysRawEventWithNewNormalizedPayloadSchema(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543260",
+		"10.1000/pubmed.normalized-schema-replay",
+		time.Date(2026, time.July, 17, 8, 45, 0, 0, time.UTC),
+	)
+	job := startPubMedRepositoryJob(t, repository, "normalized-schema-replay")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+
+	payload := recordPayload(envelope.Record)
+	identityJSON, err := json.Marshal(map[string]any{
+		"canonical_key": payload.CanonicalKey,
+		"identifiers":   payload.Identifiers,
+	})
+	if err != nil {
+		t.Fatalf("encode legacy source identity: %v", err)
+	}
+	rawJSON, err := sourceRecordJSON(envelope.Raw)
+	if err != nil {
+		t.Fatalf("encode legacy source raw payload: %v", err)
+	}
+	var sourceRecordID, legacyNormalizedID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO source_records (
+			source, source_record_id, source_identity, source_time,
+			content_hash, raw_payload
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id::text
+	`,
+		envelope.LogicalSource,
+		envelope.Record.SourceRecordID,
+		identityJSON,
+		envelope.SourceTime,
+		envelope.Raw.SHA256,
+		rawJSON,
+	).Scan(&sourceRecordID); err != nil {
+		t.Fatalf("insert legacy source record: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO ingestion_normalized_records (
+			raw_event_id, source_record_uuid, normalization_policy_version,
+			payload_schema_version, normalized_payload
+		) VALUES (
+			$1, $2, 'normalization/pubmed-v1', 'normalized-record/v1',
+			jsonb_build_object(
+				'source', 'pubmed',
+				'source_record_id', $3::text,
+				'title', 'legacy normalized payload'
+			)
+		)
+		RETURNING id::text
+	`, raw.ID, sourceRecordID, envelope.Record.SourceRecordID).Scan(
+		&legacyNormalizedID,
+	); err != nil {
+		t.Fatalf("insert legacy normalized assertion: %v", err)
+	}
+
+	normalized, err := repository.Normalize(
+		ctx,
+		job.ID,
+		raw,
+		"normalization/pubmed-v1",
+	)
+	if err != nil {
+		t.Fatalf("Normalize(v2 replay) error = %v", err)
+	}
+	if normalized.AssertionID == legacyNormalizedID ||
+		normalized.PayloadSchemaVersion != normalizedPayloadSchemaVersion {
+		t.Fatalf(
+			"replayed normalized assertion = %q/%q, legacy %q",
+			normalized.AssertionID,
+			normalized.PayloadSchemaVersion,
+			legacyNormalizedID,
+		)
+	}
+	candidate, err := NewProjectionCandidate(
+		normalized,
+		source.ScopeDecision{
+			Status: source.ScopeIncluded,
+			Reason: "controlled_identity_present",
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("Project(v2 replay) error = %v", err)
+	}
+
+	var (
+		normalizedCount        int
+		projectionNormalizedID string
+		sourceStateNormalized  string
+		workStateNormalized    string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM ingestion_normalized_records WHERE raw_event_id = $1),
+			(
+				SELECT normalized_assertion_id::text
+				FROM ingestion_projection_assertions
+				WHERE raw_event_id = $1
+			),
+			(
+				SELECT normalized_assertion_id::text
+				FROM ingestion_source_states
+				WHERE logical_source = $2 AND event_key = $3
+			),
+			(
+				SELECT normalized_assertion_id::text
+				FROM work_projection_states
+				LIMIT 1
+			)
+	`, raw.ID, envelope.LogicalSource, envelope.EventKey).Scan(
+		&normalizedCount,
+		&projectionNormalizedID,
+		&sourceStateNormalized,
+		&workStateNormalized,
+	); err != nil {
+		t.Fatalf("query replayed normalized bindings: %v", err)
+	}
+	if normalizedCount != 2 ||
+		projectionNormalizedID != normalized.AssertionID ||
+		sourceStateNormalized != normalized.AssertionID ||
+		workStateNormalized != normalized.AssertionID {
+		t.Fatalf(
+			"replayed bindings = count %d projection %q source %q work %q, want %q",
+			normalizedCount,
+			projectionNormalizedID,
+			sourceStateNormalized,
+			workStateNormalized,
+			normalized.AssertionID,
+		)
 	}
 }
 
@@ -619,6 +820,62 @@ func TestPostgresRepositoryRejectsInvalidPubMedBiomedicalSemanticsAtomically(t *
 					canonicalRows,
 					semanticRows,
 					workRows,
+				)
+			}
+		})
+	}
+}
+
+func TestNormalizedBiomedicalSemanticAssertionsRejectDuplicateUIs(t *testing.T) {
+	base := recordPayload(pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543350",
+		"10.1000/pubmed.duplicate-ui",
+		time.Date(2026, time.July, 17, 9, 30, 0, 0, time.UTC),
+	).Record)
+	testCases := []struct {
+		name      string
+		mutate    func(*persistedRecordPayload)
+		wantError string
+	}{
+		{
+			name: "descriptor UI",
+			mutate: func(record *persistedRecordPayload) {
+				record.MeSHHeadings[1].Descriptor.UI =
+					record.MeSHHeadings[0].Descriptor.UI
+			},
+			wantError: `duplicate PubMed MeSH descriptor UI "D009369"`,
+		},
+		{
+			name: "qualifier UI within one heading",
+			mutate: func(record *persistedRecordPayload) {
+				record.MeSHHeadings[0].Qualifiers[1].UI =
+					record.MeSHHeadings[0].Qualifiers[0].UI
+			},
+			wantError: `duplicate PubMed MeSH qualifier UI "Q000628" in heading 1`,
+		},
+		{
+			name: "publication type UI",
+			mutate: func(record *persistedRecordPayload) {
+				record.PublicationTypes[1].UI = record.PublicationTypes[0].UI
+			},
+			wantError: `duplicate PubMed Publication Type UI "D016428"`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			record := base
+			record.MeSHHeadings = cloneMeSHHeadings(base.MeSHHeadings)
+			record.PublicationTypes = slices.Clone(base.PublicationTypes)
+			testCase.mutate(&record)
+
+			_, _, err := normalizedBiomedicalSemanticAssertions(record)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Fatalf(
+					"normalizedBiomedicalSemanticAssertions() error = %v, want %q",
+					err,
+					testCase.wantError,
 				)
 			}
 		})
@@ -1708,10 +1965,10 @@ func TestPostgresRepositoryRejectsConflictingProjectionAssertionReplay(t *testin
 	); err == nil ||
 		!strings.Contains(
 			err.Error(),
-			"projection candidate differs from immutable normalized payload",
+			"projection assertion replay conflicts with immutable assertion",
 		) {
 		t.Fatalf(
-			"Project(conflicting replay) error = %v, want immutable normalized payload conflict",
+			"Project(conflicting replay) error = %v, want immutable projection assertion conflict",
 			err,
 		)
 	}
@@ -2350,6 +2607,183 @@ func TestPostgresRepositoryProjectAndDeletionUseConsistentLockOrder(t *testing.T
 			"concurrent Project/ApplyDeletion errors = project %v deletion %v",
 			projectErr,
 			deletionErr,
+		)
+	}
+}
+
+func TestPostgresRepositoryConcurrentBiomedicalCanonicalUpsertsUseFixedOrder(
+	t *testing.T,
+) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	baseTime := time.Date(2026, time.July, 17, 14, 0, 0, 0, time.UTC)
+
+	firstEnvelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543601",
+		"10.1000/pubmed.biomedical-lock-order-a",
+		baseTime,
+	)
+	secondEnvelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543602",
+		"10.1000/pubmed.biomedical-lock-order-b",
+		baseTime,
+	)
+	secondEnvelope.Record.MeSHHeadings[0], secondEnvelope.Record.MeSHHeadings[1] =
+		secondEnvelope.Record.MeSHHeadings[1], secondEnvelope.Record.MeSHHeadings[0]
+
+	type preparedProjection struct {
+		job       Job
+		candidate ProjectionCandidate
+	}
+	prepared := make([]preparedProjection, 0, 2)
+	for index, envelope := range []Envelope{firstEnvelope, secondEnvelope} {
+		job := startPubMedRepositoryJob(
+			t,
+			repository,
+			fmt.Sprintf("biomedical-lock-order-%d", index),
+		)
+		raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+		if err != nil {
+			t.Fatalf("PersistRaw(%d) error = %v", index, err)
+		}
+		normalized, err := repository.Normalize(
+			ctx,
+			job.ID,
+			raw,
+			"normalization/pubmed-v1",
+		)
+		if err != nil {
+			t.Fatalf("Normalize(%d) error = %v", index, err)
+		}
+		candidate, err := NewProjectionCandidate(
+			normalized,
+			source.ScopeDecision{
+				Status: source.ScopeIncluded,
+				Reason: "controlled_identity_present",
+			},
+		)
+		if err != nil {
+			t.Fatalf("NewProjectionCandidate(%d) error = %v", index, err)
+		}
+		prepared = append(prepared, preparedProjection{
+			job:       job,
+			candidate: candidate,
+		})
+	}
+
+	const (
+		firstGateKey  int64 = 70176543601
+		secondGateKey int64 = 70176543602
+	)
+	if _, err := pool.Exec(ctx, `
+		CREATE FUNCTION pause_biomedical_canonical_insert() RETURNS trigger
+		LANGUAGE plpgsql AS $$
+		BEGIN
+			IF current_setting('application_name') = 'biomedical-lock-order-a'
+			   AND NEW.descriptor_ui = 'D009369' THEN
+				PERFORM pg_advisory_xact_lock(70176543601);
+			ELSIF current_setting('application_name') = 'biomedical-lock-order-b'
+			      AND NEW.descriptor_ui = 'D001943' THEN
+				PERFORM pg_advisory_xact_lock(70176543602);
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+
+		CREATE TRIGGER pause_biomedical_canonical_insert
+		AFTER INSERT ON mesh_descriptors
+		FOR EACH ROW
+		EXECUTE FUNCTION pause_biomedical_canonical_insert();
+	`); err != nil {
+		t.Fatalf("install biomedical lock-order trigger: %v", err)
+	}
+
+	gateConnection, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire biomedical lock-order gate connection: %v", err)
+	}
+	var unlockGatesOnce sync.Once
+	unlockGates := func() {
+		unlockGatesOnce.Do(func() {
+			for _, key := range []int64{firstGateKey, secondGateKey} {
+				if _, unlockErr := gateConnection.Exec(
+					context.Background(),
+					"SELECT pg_advisory_unlock($1)",
+					key,
+				); unlockErr != nil {
+					t.Errorf("release biomedical lock-order gate %d: %v", key, unlockErr)
+				}
+			}
+		})
+	}
+	defer func() {
+		unlockGates()
+		gateConnection.Release()
+	}()
+	for _, key := range []int64{firstGateKey, secondGateKey} {
+		if _, err := gateConnection.Exec(
+			ctx,
+			"SELECT pg_advisory_lock($1)",
+			key,
+		); err != nil {
+			t.Fatalf("acquire biomedical lock-order gate %d: %v", key, err)
+		}
+	}
+
+	firstPool := openNamedIngestionTestPool(t, pool, "biomedical-lock-order-a")
+	secondPool := openNamedIngestionTestPool(t, pool, "biomedical-lock-order-b")
+	firstRepository := mustPostgresRepository(t, firstPool)
+	secondRepository := mustPostgresRepository(t, secondPool)
+	operationContext, cancelOperations := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelOperations()
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+
+	go func() {
+		_, projectErr := firstRepository.Project(
+			operationContext,
+			prepared[0].job.ID,
+			prepared[0].candidate,
+			"scope/pubmed-v1",
+			"projection/pubmed-v1",
+		)
+		firstDone <- projectErr
+	}()
+	waitForPostgresApplicationLock(
+		t,
+		pool,
+		"biomedical-lock-order-a",
+		5*time.Second,
+	)
+
+	go func() {
+		_, projectErr := secondRepository.Project(
+			operationContext,
+			prepared[1].job.ID,
+			prepared[1].candidate,
+			"scope/pubmed-v1",
+			"projection/pubmed-v1",
+		)
+		secondDone <- projectErr
+	}()
+	waitForPostgresApplicationLock(
+		t,
+		pool,
+		"biomedical-lock-order-b",
+		5*time.Second,
+	)
+
+	unlockGates()
+	firstErr := <-firstDone
+	secondErr := <-secondDone
+	if firstErr != nil || secondErr != nil {
+		t.Fatalf(
+			"concurrent biomedical Project errors = first %v second %v",
+			firstErr,
+			secondErr,
 		)
 	}
 }

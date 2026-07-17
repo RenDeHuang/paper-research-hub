@@ -213,29 +213,35 @@ type RawRepository interface {
 }
 
 type NormalizedRecord struct {
-	RawID         string
-	JobID         string
-	LogicalSource string
-	EventKey      string
-	SourceTime    time.Time
-	TieBreakKey   string
-	Position      int64
-	Record        source.Record
+	AssertionID          string
+	PayloadSchemaVersion string
+	RawID                string
+	JobID                string
+	LogicalSource        string
+	EventKey             string
+	SourceTime           time.Time
+	TieBreakKey          string
+	Position             int64
+	Record               source.Record
 }
 
 func NewNormalizedRecord(
 	raw PersistedRaw,
 	record source.Record,
+	assertionID string,
+	payloadSchemaVersion string,
 ) (NormalizedRecord, error) {
 	normalized := NormalizedRecord{
-		RawID:         raw.ID,
-		JobID:         raw.JobID,
-		LogicalSource: raw.Envelope.LogicalSource,
-		EventKey:      raw.Envelope.EventKey,
-		SourceTime:    raw.Envelope.SourceTime,
-		TieBreakKey:   raw.Envelope.TieBreakKey,
-		Position:      raw.Envelope.Position,
-		Record:        cloneSourceRecord(record),
+		AssertionID:          strings.TrimSpace(assertionID),
+		PayloadSchemaVersion: strings.TrimSpace(payloadSchemaVersion),
+		RawID:                raw.ID,
+		JobID:                raw.JobID,
+		LogicalSource:        raw.Envelope.LogicalSource,
+		EventKey:             raw.Envelope.EventKey,
+		SourceTime:           raw.Envelope.SourceTime,
+		TieBreakKey:          raw.Envelope.TieBreakKey,
+		Position:             raw.Envelope.Position,
+		Record:               cloneSourceRecord(record),
 	}
 	if err := raw.Validate(); err != nil {
 		return NormalizedRecord{}, err
@@ -247,6 +253,12 @@ func NewNormalizedRecord(
 }
 
 func (record NormalizedRecord) Validate() error {
+	if strings.TrimSpace(record.AssertionID) == "" {
+		return errors.New("normalized record requires an assertion ID")
+	}
+	if strings.TrimSpace(record.PayloadSchemaVersion) == "" {
+		return errors.New("normalized record requires a payload schema version")
+	}
 	if strings.TrimSpace(record.RawID) == "" {
 		return errors.New("normalized record requires a raw ID")
 	}
@@ -286,15 +298,17 @@ type ScopePolicy interface {
 }
 
 type ProjectionCandidate struct {
-	RawID         string
-	JobID         string
-	LogicalSource string
-	EventKey      string
-	SourceTime    time.Time
-	TieBreakKey   string
-	Position      int64
-	Record        source.Record
-	Scope         source.ScopeDecision
+	NormalizedAssertionID string
+	PayloadSchemaVersion  string
+	RawID                 string
+	JobID                 string
+	LogicalSource         string
+	EventKey              string
+	SourceTime            time.Time
+	TieBreakKey           string
+	Position              int64
+	Record                source.Record
+	Scope                 source.ScopeDecision
 }
 
 func NewProjectionCandidate(
@@ -302,14 +316,16 @@ func NewProjectionCandidate(
 	decision source.ScopeDecision,
 ) (ProjectionCandidate, error) {
 	candidate := ProjectionCandidate{
-		RawID:         record.RawID,
-		JobID:         record.JobID,
-		LogicalSource: record.LogicalSource,
-		EventKey:      record.EventKey,
-		SourceTime:    record.SourceTime,
-		TieBreakKey:   record.TieBreakKey,
-		Position:      record.Position,
-		Record:        cloneSourceRecord(record.Record),
+		NormalizedAssertionID: record.AssertionID,
+		PayloadSchemaVersion:  record.PayloadSchemaVersion,
+		RawID:                 record.RawID,
+		JobID:                 record.JobID,
+		LogicalSource:         record.LogicalSource,
+		EventKey:              record.EventKey,
+		SourceTime:            record.SourceTime,
+		TieBreakKey:           record.TieBreakKey,
+		Position:              record.Position,
+		Record:                cloneSourceRecord(record.Record),
 		Scope: source.ScopeDecision{
 			Status:   decision.Status,
 			Reason:   decision.Reason,
@@ -326,6 +342,12 @@ func NewProjectionCandidate(
 }
 
 func (candidate ProjectionCandidate) Validate() error {
+	if strings.TrimSpace(candidate.NormalizedAssertionID) == "" {
+		return errors.New("projection candidate requires a normalized assertion ID")
+	}
+	if strings.TrimSpace(candidate.PayloadSchemaVersion) == "" {
+		return errors.New("projection candidate requires a payload schema version")
+	}
 	if strings.TrimSpace(candidate.RawID) == "" {
 		return errors.New("projection candidate requires a raw ID")
 	}
@@ -387,6 +409,10 @@ func (candidate ProjectionCandidate) Clone() ProjectionCandidate {
 
 type ProjectionPolicy interface {
 	Version() string
+	// Prepare may transform projection-owned record fields, but it must preserve
+	// the normalized assertion identity and immutable source identity. Project
+	// persists the candidate payload as the projection assertion while retaining
+	// semantic provenance from the referenced immutable normalized payload.
 	Prepare(
 		context.Context,
 		NormalizedRecord,

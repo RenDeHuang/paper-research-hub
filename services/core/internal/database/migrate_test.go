@@ -127,6 +127,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 9, name: "analysis_runs"},
 		{version: 10, name: "repeatable_ingestion_jobs"},
 		{version: 11, name: "biomedical_semantics"},
+		{version: 12, name: "normalized_assertion_versions"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -170,8 +171,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 11 {
-		t.Fatalf("embedded migration count = %d, want 11", len(migrations))
+	if len(migrations) != 12 {
+		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -210,6 +211,331 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 		t.Fatalf(
 			"eleventh migration = %#v, want 000011_biomedical_semantics",
 			migrations[10],
+		)
+	}
+	if migrations[11].Version != 12 ||
+		migrations[11].Name != "normalized_assertion_versions" {
+		t.Fatalf(
+			"twelfth migration = %#v, want 000012_normalized_assertion_versions",
+			migrations[11],
+		)
+	}
+}
+
+func TestNormalizedAssertionSchemaVersionsAndBindsDownstreamState(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	expectedColumns := []struct {
+		table  string
+		column string
+	}{
+		{table: "ingestion_normalized_records", column: "id"},
+		{table: "ingestion_normalized_records", column: "payload_schema_version"},
+		{table: "ingestion_projection_assertions", column: "normalized_assertion_id"},
+		{table: "ingestion_source_states", column: "normalized_assertion_id"},
+		{table: "work_projection_states", column: "normalized_assertion_id"},
+	}
+	for _, expected := range expectedColumns {
+		var nullable string
+		if err := pool.QueryRow(ctx, `
+			SELECT is_nullable
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = $1
+			  AND column_name = $2
+		`, expected.table, expected.column).Scan(&nullable); err != nil {
+			t.Fatalf("%s.%s metadata: %v", expected.table, expected.column, err)
+		}
+		if expected.table != "ingestion_source_states" && nullable != "NO" {
+			t.Fatalf(
+				"%s.%s nullable = %q, want NO",
+				expected.table,
+				expected.column,
+				nullable,
+			)
+		}
+	}
+
+	var normalizedPrimaryKey string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid)
+		FROM pg_constraint
+		WHERE conrelid = 'ingestion_normalized_records'::regclass
+		  AND contype = 'p'
+	`).Scan(&normalizedPrimaryKey); err != nil {
+		t.Fatalf("query normalized assertion primary key: %v", err)
+	}
+	if normalizedPrimaryKey != "PRIMARY KEY (id)" {
+		t.Fatalf(
+			"normalized assertion primary key = %q, want explicit assertion ID",
+			normalizedPrimaryKey,
+		)
+	}
+
+	expectedConstraints := map[string][]string{
+		"ingestion_normalized_records_raw_policy_schema_key": {
+			"raw_event_id",
+			"normalization_policy_version",
+			"payload_schema_version",
+		},
+		"ingestion_projection_assertions_normalized_policy_key": {
+			"normalized_assertion_id",
+			"scope_policy_version",
+			"projection_policy_version",
+		},
+		"ingestion_projection_assertions_normalized_assertion_fkey": {
+			"normalized_assertion_id",
+			"raw_event_id",
+			"source_record_uuid",
+		},
+		"ingestion_source_states_normalized_assertion_fkey": {
+			"normalized_assertion_id",
+			"raw_event_id",
+			"source_record_uuid",
+		},
+		"work_projection_states_normalized_assertion_fkey": {
+			"normalized_assertion_id",
+			"raw_event_id",
+			"source_record_uuid",
+		},
+	}
+	for constraint, columns := range expectedConstraints {
+		var definition string
+		if err := pool.QueryRow(ctx, `
+			SELECT pg_get_constraintdef(oid)
+			FROM pg_constraint
+			WHERE conname = $1
+		`, constraint).Scan(&definition); err != nil {
+			t.Fatalf("query constraint %s: %v", constraint, err)
+		}
+		for _, column := range columns {
+			if !strings.Contains(definition, column) {
+				t.Errorf(
+					"constraint %s = %q, want column %s",
+					constraint,
+					definition,
+					column,
+				)
+			}
+		}
+	}
+}
+
+func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
+	t *testing.T,
+) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	if len(migrations) != 12 {
+		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
+	}
+
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:11]); err != nil {
+		t.Fatalf("apply migrations through v11: %v", err)
+	}
+
+	workID := insertWork(t, pool, "doi:10.1000/normalized-upgrade")
+	sourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		workID,
+		"pubmed",
+		"normalized-upgrade-source",
+		"normalized-upgrade-source-hash",
+	)
+	var jobID, rawEventID, legacyProjectionID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_jobs (
+			source, job_type, idempotency_key, status, payload, max_attempts,
+			batch_key, stage
+		) VALUES (
+			'pubmed', 'normalized-upgrade', 'normalized-upgrade-job',
+			'succeeded', '{}', 1, 'normalized-upgrade', 'project'
+		)
+		RETURNING id
+	`), &jobID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_raw_events (
+			job_id, logical_source, event_key, event_kind, source_record_id,
+			source_time, tie_break_key, position, content_hash, raw_format, raw_payload
+		) VALUES (
+			$1, 'pubmed', 'pubmed:normalized-upgrade', 'upsert',
+			'normalized-upgrade-source', now(), 'legacy', 1,
+			'1212121212121212121212121212121212121212121212121212121212121212',
+			'xml', convert_to('<PubmedArticle/>', 'UTF8')
+		)
+		RETURNING id
+	`, jobID), &rawEventID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO ingestion_normalized_records (
+			raw_event_id, source_record_uuid, normalization_policy_version,
+			normalized_payload
+		) VALUES (
+			$1, $2, 'normalization/pubmed-v1',
+			'{"source":"pubmed","source_record_id":"normalized-upgrade-source","title":"legacy"}'
+		)
+	`, rawEventID, sourceRecordID); err != nil {
+		t.Fatalf("insert v11 normalized record: %v", err)
+	}
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_projection_assertions (
+			raw_event_id, source_record_uuid, work_id, job_id,
+			scope_policy_version, projection_policy_version, record_payload
+		) VALUES (
+			$1, $2, $3, $4, 'scope/pubmed-v1', 'projection/pubmed-v1',
+			'{"source":"pubmed","source_record_id":"normalized-upgrade-source","title":"legacy"}'
+		)
+		RETURNING id
+	`, rawEventID, sourceRecordID, workID, jobID), &legacyProjectionID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO ingestion_source_states (
+			logical_source, event_key, raw_event_id, source_record_uuid, work_id,
+			source_time, tie_break_key, position, scope_status,
+			scope_policy_version, projection_policy_version, is_deleted
+		) VALUES (
+			'pubmed', 'pubmed:normalized-upgrade', $1, $2, $3,
+			now(), 'legacy', 1, 'included',
+			'scope/pubmed-v1', 'projection/pubmed-v1', false
+		)
+	`, rawEventID, sourceRecordID, workID); err != nil {
+		t.Fatalf("insert v11 source state: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_projection_states (
+			work_id, raw_event_id, source_record_uuid, source_time, tie_break_key,
+			position, scope_policy_version, projection_policy_version
+		) VALUES (
+			$1, $2, $3, now(), 'legacy', 1,
+			'scope/pubmed-v1', 'projection/pubmed-v1'
+		)
+	`, workID, rawEventID, sourceRecordID); err != nil {
+		t.Fatalf("insert v11 work projection state: %v", err)
+	}
+
+	if err := UpMigrations(ctx, pool, migrations[11:]); err != nil {
+		t.Fatalf("apply v12 normalized assertion migration: %v", err)
+	}
+
+	var (
+		legacyNormalizedID          string
+		legacyPayloadSchema         string
+		projectionNormalizedID      string
+		sourceStateNormalizedID     string
+		workStateNormalizedID       string
+		preservedLegacyProjectionID string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text, payload_schema_version
+		FROM ingestion_normalized_records
+		WHERE raw_event_id = $1
+	`, rawEventID).Scan(
+		&legacyNormalizedID,
+		&legacyPayloadSchema,
+	); err != nil {
+		t.Fatalf("query upgraded legacy normalized assertion: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text, normalized_assertion_id::text
+		FROM ingestion_projection_assertions
+		WHERE id = $1
+	`, legacyProjectionID).Scan(
+		&preservedLegacyProjectionID,
+		&projectionNormalizedID,
+	); err != nil {
+		t.Fatalf("query upgraded legacy projection assertion: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT normalized_assertion_id::text
+		FROM ingestion_source_states
+		WHERE logical_source = 'pubmed'
+		  AND event_key = 'pubmed:normalized-upgrade'
+	`).Scan(&sourceStateNormalizedID); err != nil {
+		t.Fatalf("query upgraded source-state normalized binding: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT normalized_assertion_id::text
+		FROM work_projection_states
+		WHERE work_id = $1
+	`, workID).Scan(&workStateNormalizedID); err != nil {
+		t.Fatalf("query upgraded work-state normalized binding: %v", err)
+	}
+	if legacyPayloadSchema != "normalized-record/v1" ||
+		preservedLegacyProjectionID != legacyProjectionID ||
+		projectionNormalizedID != legacyNormalizedID ||
+		sourceStateNormalizedID != legacyNormalizedID ||
+		workStateNormalizedID != legacyNormalizedID {
+		t.Fatalf(
+			"legacy bindings = schema %q normalized %q projection %q source %q work %q",
+			legacyPayloadSchema,
+			legacyNormalizedID,
+			projectionNormalizedID,
+			sourceStateNormalizedID,
+			workStateNormalizedID,
+		)
+	}
+
+	var currentNormalizedID, currentProjectionID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_normalized_records (
+			raw_event_id, source_record_uuid, normalization_policy_version,
+			payload_schema_version, normalized_payload
+		) VALUES (
+			$1, $2, 'normalization/pubmed-v1', 'normalized-record/v2',
+			'{
+				"source":"pubmed",
+				"source_record_id":"normalized-upgrade-source",
+				"title":"current",
+				"mesh_headings":[]
+			}'
+		)
+		RETURNING id
+	`, rawEventID, sourceRecordID), &currentNormalizedID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_projection_assertions (
+			normalized_assertion_id, raw_event_id, source_record_uuid, work_id, job_id,
+			scope_policy_version, projection_policy_version, record_payload
+		) VALUES (
+			$1, $2, $3, $4, $5, 'scope/pubmed-v1', 'projection/pubmed-v1',
+			'{
+				"source":"pubmed",
+				"source_record_id":"normalized-upgrade-source",
+				"title":"current projection"
+			}'
+		)
+		RETURNING id
+	`,
+		currentNormalizedID,
+		rawEventID,
+		sourceRecordID,
+		workID,
+		jobID,
+	), &currentProjectionID)
+
+	var normalizedCount, projectionCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM ingestion_normalized_records WHERE raw_event_id = $1),
+			(SELECT count(*) FROM ingestion_projection_assertions WHERE raw_event_id = $1)
+	`, rawEventID).Scan(&normalizedCount, &projectionCount); err != nil {
+		t.Fatalf("count versioned normalized/projection assertions: %v", err)
+	}
+	if currentNormalizedID == legacyNormalizedID ||
+		currentProjectionID == legacyProjectionID ||
+		normalizedCount != 2 ||
+		projectionCount != 2 {
+		t.Fatalf(
+			"versioned assertions = normalized %q/%q projection %q/%q counts %d/%d",
+			legacyNormalizedID,
+			currentNormalizedID,
+			legacyProjectionID,
+			currentProjectionID,
+			normalizedCount,
+			projectionCount,
 		)
 	}
 }
@@ -880,57 +1206,26 @@ func TestBiomedicalSemanticSchemaProjectionProvenance(t *testing.T) {
 		"biomedical-source-hash-b",
 	)
 
-	insertProjectionAssertion := func(workID, sourceRecordID, suffix, contentHash string) string {
-		t.Helper()
-		var jobID, rawEventID, projectionAssertionID string
-		mustScanID(t, pool.QueryRow(ctx, `
-			INSERT INTO ingestion_jobs (
-				source, job_type, idempotency_key, status, payload, max_attempts, batch_key, stage
-			) VALUES (
-				'pubmed', 'projection', $1, 'succeeded', '{}', 1, $1, 'project'
-			)
-			RETURNING id
-		`, "biomedical-projection-"+suffix), &jobID)
-		mustScanID(t, pool.QueryRow(ctx, `
-			INSERT INTO ingestion_raw_events (
-				job_id, logical_source, event_key, event_kind, source_record_id,
-				source_time, tie_break_key, position, content_hash, raw_format, raw_payload
-			) VALUES (
-				$1, 'pubmed', $2, 'upsert', $2,
-				now(), $2, 0, $3, 'xml', convert_to('<PubmedArticle/>', 'UTF8')
-			)
-			RETURNING id
-		`, jobID, "biomedical-event-"+suffix, contentHash), &rawEventID)
-		mustScanID(t, pool.QueryRow(ctx, `
-			INSERT INTO ingestion_projection_assertions (
-				raw_event_id, source_record_uuid, work_id, job_id,
-				scope_policy_version, projection_policy_version, record_payload
-			) VALUES (
-				$1, $2, $3, $4, 'biomedical-scope-v1', 'biomedical-projection-v1',
-				jsonb_build_object('fixture', $5::text)
-			)
-			RETURNING id
-		`, rawEventID, sourceRecordID, workID, jobID, suffix), &projectionAssertionID)
-		return projectionAssertionID
-	}
-
-	projectionAssertionID := insertProjectionAssertion(
+	projectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
 		workID,
 		sourceRecordID,
 		"a",
-		"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 	)
-	secondProjectionAssertionID := insertProjectionAssertion(
+	secondProjectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
 		secondWorkID,
 		secondSourceRecordID,
 		"b",
-		"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 	)
-	mismatchedProjectionAssertionID := insertProjectionAssertion(
+	mismatchedProjectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
 		secondWorkID,
 		sourceRecordID,
 		"c",
-		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	)
 
 	assertDeferredConstraintViolation := func(
@@ -1456,8 +1751,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 11 {
-		t.Fatalf("embedded migration count = %d, want 11", len(migrations))
+	if len(migrations) != 12 {
+		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -1510,15 +1805,22 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	}
 
 	if err := UpMigrations(ctx, pool, migrations[10:]); err != nil {
-		t.Fatalf("apply v11 biomedical semantics migration: %v", err)
+		t.Fatalf("apply v11 biomedical semantics and v12 normalized assertion migrations: %v", err)
 	}
 
-	var preservedProjectionID, preservedMetricID, preservedCategory string
+	var preservedProjectionID, normalizedAssertionID, preservedMetricID, preservedCategory string
 	if err := pool.QueryRow(ctx, `
-		SELECT id::text
-		FROM ingestion_projection_assertions
-		WHERE id = $1
-	`, projectionAssertionID).Scan(&preservedProjectionID); err != nil {
+		SELECT assertion.id::text, assertion.normalized_assertion_id::text
+		FROM ingestion_projection_assertions AS assertion
+		JOIN ingestion_normalized_records AS normalized
+		  ON normalized.id = assertion.normalized_assertion_id
+		 AND normalized.raw_event_id = assertion.raw_event_id
+		 AND normalized.source_record_uuid = assertion.source_record_uuid
+		WHERE assertion.id = $1
+	`, projectionAssertionID).Scan(
+		&preservedProjectionID,
+		&normalizedAssertionID,
+	); err != nil {
 		t.Fatalf("query preserved projection assertion: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
@@ -1538,14 +1840,16 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 		t.Fatalf("count upgraded Venue metric snapshots: %v", err)
 	}
 	if preservedProjectionID != projectionAssertionID ||
+		normalizedAssertionID == "" ||
 		preservedMetricID != metricSnapshotID ||
 		preservedCategory != "UPGRADE CATEGORY" ||
 		projectionCountAfter != projectionCountBefore ||
 		metricCountAfter != metricCountBefore {
 		t.Fatalf(
-			"v10->v11 preservation = projection %q/%q count %d/%d, metric %q/%q category %q count %d/%d",
+			"v10->v12 preservation = projection %q/%q normalized %q count %d/%d, metric %q/%q category %q count %d/%d",
 			preservedProjectionID,
 			projectionAssertionID,
+			normalizedAssertionID,
 			projectionCountAfter,
 			projectionCountBefore,
 			preservedMetricID,
@@ -1570,7 +1874,7 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 			$1, $2, $3, $4, '/upgrade/DescriptorName', 'Upgrade Descriptor', false
 		)
 	`, projectionAssertionID, sourceRecordID, workID, descriptorID); err != nil {
-		t.Fatalf("reference preserved v10 projection assertion from v11 semantic row: %v", err)
+		t.Fatalf("reference preserved v10 projection assertion from v12 semantic row: %v", err)
 	}
 
 	subjectFixture := insertBiomedicalSubjectRegistryFixture(
@@ -3267,8 +3571,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 11 {
-		t.Fatalf("embedded migration count = %d, want 11", len(migrations))
+	if len(migrations) != 12 {
+		t.Fatalf("embedded migration count = %d, want 12", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -5155,6 +5459,62 @@ func insertBiomedicalProjectionAssertion(
 		)
 		RETURNING id
 	`, jobID, "biomedical-event-"+suffix, contentHash), &rawEventID)
+	var hasNormalizedAssertionID bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'ingestion_projection_assertions'
+			  AND column_name = 'normalized_assertion_id'
+		)
+	`).Scan(&hasNormalizedAssertionID); err != nil {
+		t.Fatalf("query normalized assertion schema: %v", err)
+	}
+	if hasNormalizedAssertionID {
+		var normalizedAssertionID string
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO ingestion_normalized_records (
+				raw_event_id, source_record_uuid, normalization_policy_version,
+				payload_schema_version, normalized_payload
+			) VALUES (
+				$1, $2, 'biomedical-normalization-v1', 'normalized-record/v2',
+				jsonb_build_object('fixture', $3::text)
+			)
+			RETURNING id
+		`, rawEventID, sourceRecordID, suffix), &normalizedAssertionID)
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO ingestion_projection_assertions (
+				normalized_assertion_id, raw_event_id, source_record_uuid, work_id, job_id,
+				scope_policy_version, projection_policy_version, record_payload
+			) VALUES (
+				$1, $2, $3, $4, $5,
+				'biomedical-scope-v1', 'biomedical-projection-v1',
+				jsonb_build_object('fixture', $6::text)
+			)
+			RETURNING id
+		`,
+			normalizedAssertionID,
+			rawEventID,
+			sourceRecordID,
+			workID,
+			jobID,
+			suffix,
+		), &projectionAssertionID)
+		return projectionAssertionID
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO ingestion_normalized_records (
+			raw_event_id, source_record_uuid, normalization_policy_version,
+			normalized_payload
+		) VALUES (
+			$1, $2, 'biomedical-normalization-v1',
+			jsonb_build_object('fixture', $3::text)
+		)
+	`, rawEventID, sourceRecordID, suffix); err != nil {
+		t.Fatalf("insert legacy normalized assertion: %v", err)
+	}
 	mustScanID(t, pool.QueryRow(ctx, `
 		INSERT INTO ingestion_projection_assertions (
 			raw_event_id, source_record_uuid, work_id, job_id,

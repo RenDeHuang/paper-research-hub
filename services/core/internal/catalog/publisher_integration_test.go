@@ -112,6 +112,56 @@ func TestPublisherBuildsAndAtomicallyPublishesNormalizedCurrentState(t *testing.
 	assertNestedJSONValue(t, stats.Payload, []string{"with_code_ratio", "value"}, float64(1))
 }
 
+func TestPublisherLoadsNormalizedPayloadByBoundAssertionID(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "openalex:publisher-normalized-binding",
+		canonicalKey:      "doi:10.1000/publisher-normalized-binding",
+		title:             "Bound normalized payload",
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		sourceTime:        time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC),
+	})
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO ingestion_normalized_records (
+			raw_event_id, source_record_uuid, normalization_policy_version,
+			payload_schema_version, normalized_payload
+		) VALUES (
+			$1, $2, 'normalize/v1', 'normalized-record/v3',
+			'{
+				"source":"openalex",
+				"source_record_id":"openalex:publisher-normalized-binding",
+				"canonical_key":"doi:10.1000/publisher-normalized-binding",
+				"title":"Unbound decoy payload"
+			}'
+		)
+	`, fixture.rawEventID, fixture.sourceRecord); err != nil {
+		t.Fatalf("insert unbound normalized assertion: %v", err)
+	}
+
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin normalized binding read: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+	states, err := loadCurrentSourceStates(context.Background(), tx)
+	if err != nil {
+		t.Fatalf("loadCurrentSourceStates() error = %v", err)
+	}
+	if len(states) != 1 {
+		t.Fatalf("current source states = %d, want one bound assertion", len(states))
+	}
+	payload, ok := states[0].normalizedPayload.(map[string]any)
+	if !ok || payload["title"] != "Bound normalized payload" {
+		t.Fatalf(
+			"bound normalized payload = %#v, want the source-state assertion",
+			states[0].normalizedPayload,
+		)
+	}
+}
+
 func TestPublisherPreservesKnownUnknownAndMissingWithoutInventingValues(t *testing.T) {
 	pool := openCatalogTestPool(t)
 	known := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
@@ -259,19 +309,6 @@ func TestPublisherReturnsNotReadyForPendingOrBrokenIncludedStateWithoutWrites(t 
 				sourceTime:        time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC),
 			},
 		},
-		{
-			name: "included state without normalized record",
-			options: publisherWorkOptions{
-				eventKey:          "openalex:publisher-not-normalized",
-				canonicalKey:      "doi:10.1000/publisher-not-normalized",
-				title:             "Not Normalized",
-				scopeStatus:       "included",
-				includeWorkLink:   true,
-				includeWorkID:     true,
-				includeNormalized: false,
-				sourceTime:        time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC),
-			},
-		},
 	}
 
 	for _, test := range tests {
@@ -391,9 +428,10 @@ type publisherWorkOptions struct {
 }
 
 type publisherWorkFixture struct {
-	workID       uuid.UUID
-	sourceRecord uuid.UUID
-	rawEventID   uuid.UUID
+	workID                uuid.UUID
+	sourceRecord          uuid.UUID
+	rawEventID            uuid.UUID
+	normalizedAssertionID uuid.UUID
 }
 
 func insertPublisherVisibleWork(
@@ -488,12 +526,15 @@ func insertPublisherVisibleWork(
 			options.canonicalKey,
 			options.title,
 		)
-		if _, err := tx.Exec(ctx, `
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO ingestion_normalized_records (
 				raw_event_id, source_record_uuid, normalization_policy_version,
-				normalized_payload
-			) VALUES ($1, $2, 'normalize/v1', $3::jsonb)
-		`, fixture.rawEventID, fixture.sourceRecord, normalizedPayload); err != nil {
+				payload_schema_version, normalized_payload
+			) VALUES ($1, $2, 'normalize/v1', 'normalized-record/v2', $3::jsonb)
+			RETURNING id
+		`, fixture.rawEventID, fixture.sourceRecord, normalizedPayload).Scan(
+			&fixture.normalizedAssertionID,
+		); err != nil {
 			t.Fatalf("insert publisher normalized record: %v", err)
 		}
 	}
@@ -537,10 +578,12 @@ func insertPublisherVisibleWork(
 		INSERT INTO ingestion_source_states (
 			logical_source, event_key, raw_event_id, source_record_uuid, work_id,
 			source_time, tie_break_key, position, scope_status,
-			scope_policy_version, projection_policy_version, is_deleted
+			scope_policy_version, projection_policy_version,
+			normalized_assertion_id, is_deleted
 		) VALUES (
 			'openalex', $1, $2, $3, NULLIF($4, '')::uuid, $5,
-			'publisher-fixture', 1, $6, 'scope/v1', 'projection/v1', false
+			'publisher-fixture', 1, $6, 'scope/v1', 'projection/v1',
+			NULLIF($7, '')::uuid, false
 		)
 	`,
 		options.eventKey,
@@ -549,6 +592,7 @@ func insertPublisherVisibleWork(
 		optionalUUID(options.includeWorkID, fixture.workID),
 		options.sourceTime,
 		options.scopeStatus,
+		optionalUUID(options.includeNormalized, fixture.normalizedAssertionID),
 	); err != nil {
 		t.Fatalf("insert publisher source state: %v", err)
 	}

@@ -867,7 +867,12 @@ func (repository *fakeProjectionRepository) Normalize(
 	if repository.normalizeErr != nil {
 		return NormalizedRecord{}, repository.normalizeErr
 	}
-	return NewNormalizedRecord(raw, raw.Envelope.Record)
+	return NewNormalizedRecord(
+		raw,
+		raw.Envelope.Record,
+		"normalized-assertion-"+raw.ID,
+		normalizedPayloadSchemaVersion,
+	)
 }
 
 func (repository *fakeProjectionRepository) Exclude(

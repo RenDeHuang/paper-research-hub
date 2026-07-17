@@ -635,6 +635,8 @@ func validateProjectionCandidate(
 		return fmt.Errorf("projection policy returned invalid candidate: %w", err)
 	}
 	if candidate.RawID != normalized.RawID ||
+		candidate.NormalizedAssertionID != normalized.AssertionID ||
+		candidate.PayloadSchemaVersion != normalized.PayloadSchemaVersion ||
 		candidate.JobID != normalized.JobID ||
 		candidate.LogicalSource != normalized.LogicalSource ||
 		candidate.EventKey != normalized.EventKey ||

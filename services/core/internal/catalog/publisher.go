@@ -35,6 +35,7 @@ type catalogSnapshot struct {
 type sourceRevisionFact struct {
 	LogicalSource              string `json:"logical_source"`
 	EventKey                   string `json:"event_key"`
+	NormalizedAssertionID      string `json:"normalized_assertion_id"`
 	RawEventID                 string `json:"raw_event_id"`
 	SourceRecordID             string `json:"source_record_id"`
 	WorkID                     string `json:"work_id"`
@@ -44,12 +45,14 @@ type sourceRevisionFact struct {
 	ScopePolicyVersion         string `json:"scope_policy_version"`
 	ProjectionPolicyVersion    string `json:"projection_policy_version"`
 	NormalizationPolicyVersion string `json:"normalization_policy_version"`
+	NormalizedPayloadSchema    string `json:"normalized_payload_schema"`
 	NormalizedPayload          any    `json:"normalized_payload"`
 }
 
 type sourceState struct {
 	logicalSource              string
 	eventKey                   string
+	normalizedAssertionID      uuid.UUID
 	rawEventID                 uuid.UUID
 	sourceRecordID             uuid.UUID
 	workID                     uuid.UUID
@@ -62,6 +65,7 @@ type sourceState struct {
 	isDeleted                  bool
 	hasNormalized              bool
 	normalizationPolicyVersion string
+	normalizedPayloadSchema    string
 	normalizedPayload          any
 	hasWorkLink                bool
 }
@@ -317,6 +321,7 @@ func buildCurrentSnapshot(
 		revisionSources = append(revisionSources, sourceRevisionFact{
 			LogicalSource:              state.logicalSource,
 			EventKey:                   state.eventKey,
+			NormalizedAssertionID:      state.normalizedAssertionID.String(),
 			RawEventID:                 state.rawEventID.String(),
 			SourceRecordID:             state.sourceRecordID.String(),
 			WorkID:                     state.workID.String(),
@@ -326,6 +331,7 @@ func buildCurrentSnapshot(
 			ScopePolicyVersion:         state.scopePolicyVersion,
 			ProjectionPolicyVersion:    state.projectionPolicyVersion,
 			NormalizationPolicyVersion: state.normalizationPolicyVersion,
+			NormalizedPayloadSchema:    state.normalizedPayloadSchema,
 			NormalizedPayload:          state.normalizedPayload,
 		})
 	}
@@ -405,6 +411,7 @@ func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, err
 		SELECT
 			state.logical_source,
 			state.event_key,
+			COALESCE(state.normalized_assertion_id::text, ''),
 			state.raw_event_id,
 			COALESCE(state.source_record_uuid::text, ''),
 			COALESCE(state.work_id::text, ''),
@@ -415,13 +422,15 @@ func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, err
 			state.scope_policy_version,
 			state.projection_policy_version,
 			state.is_deleted,
-			normalized.raw_event_id IS NOT NULL,
+			normalized.id IS NOT NULL,
 			COALESCE(normalized.normalization_policy_version, ''),
+			COALESCE(normalized.payload_schema_version, ''),
 			COALESCE(normalized.normalized_payload::text, ''),
 			association.source_record_id IS NOT NULL
 		FROM ingestion_source_states AS state
 		LEFT JOIN ingestion_normalized_records AS normalized
-		  ON normalized.raw_event_id = state.raw_event_id
+		  ON normalized.id = state.normalized_assertion_id
+		 AND normalized.raw_event_id = state.raw_event_id
 		 AND normalized.source_record_uuid = state.source_record_uuid
 		LEFT JOIN source_record_works AS association
 		  ON association.source_record_id = state.source_record_uuid
@@ -437,6 +446,7 @@ func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, err
 	for rows.Next() {
 		var (
 			state             sourceState
+			normalizedID      string
 			rawEventID        string
 			sourceRecordID    string
 			workID            string
@@ -445,6 +455,7 @@ func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, err
 		if err := rows.Scan(
 			&state.logicalSource,
 			&state.eventKey,
+			&normalizedID,
 			&rawEventID,
 			&sourceRecordID,
 			&workID,
@@ -457,12 +468,22 @@ func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, err
 			&state.isDeleted,
 			&state.hasNormalized,
 			&state.normalizationPolicyVersion,
+			&state.normalizedPayloadSchema,
 			&normalizedPayload,
 			&state.hasWorkLink,
 		); err != nil {
 			return nil, fmt.Errorf("scan current ingestion source state: %w", err)
 		}
 		var err error
+		if normalizedID != "" {
+			state.normalizedAssertionID, err = uuid.Parse(normalizedID)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"%w: invalid normalized assertion ID",
+					ErrCatalogNotReady,
+				)
+			}
+		}
 		state.rawEventID, err = uuid.Parse(rawEventID)
 		if err != nil {
 			return nil, fmt.Errorf("%w: invalid raw event ID", ErrCatalogNotReady)
@@ -480,7 +501,10 @@ func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, err
 			}
 		}
 		if state.hasNormalized {
-			if state.normalizationPolicyVersion == "" || normalizedPayload == "" {
+			if state.normalizedAssertionID == uuid.Nil ||
+				state.normalizationPolicyVersion == "" ||
+				state.normalizedPayloadSchema == "" ||
+				normalizedPayload == "" {
 				return nil, fmt.Errorf(
 					"%w: normalized source state is structurally incomplete",
 					ErrCatalogNotReady,
