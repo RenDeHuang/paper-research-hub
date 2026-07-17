@@ -78,9 +78,13 @@ JCR Q1 OR JIF >= 10
 
 每个榜单都必须显示统计窗口、样本量、数据来源和缺失状态。
 
+首页通过单一 generation-bound `HomeResponse` 获取全部模块，不能由浏览器拼接多个可能跨越不同 Catalog generation 的响应。
+
 ### 3.2 学科页面
 
-第一层学科采用稳定、版本化的医学生物学 taxonomy。论文归类以 MeSH Tree Number 为核心证据，并允许使用 JCR Category 作为期刊层级的补充分类。首批导航领域包括：
+第一版学科采用授权 JCR Category 作为受控、扁平、版本化的 Subject taxonomy。系统只接纳版本化医学生物学 JCR Category registry 中明确列出的分类，不从标题、摘要或 Category 名称做启发式归并。一个期刊可以属于多个 Subject，Quartile 必须保留在“期刊 × Subject × 指标年份”关系上。
+
+典型导航领域包括：
 
 - 肿瘤学；
 - 免疫学；
@@ -95,7 +99,7 @@ JCR Q1 OR JIF >= 10
 - 生物信息学；
 - 转化医学。
 
-这些是导航聚合，不替换原始 MeSH Descriptor、Qualifier 和 Tree Number。一个论文可以属于多个领域，归类关系必须保留来源和 taxonomy 版本。
+页面 URL 使用稳定的 Subject identity，不直接依赖临时 slug 化的 Category 文本。MeSH Descriptor、Qualifier、Major Topic 和 Tree Number 保留为论文级疾病、靶点和主题语义，不冒充期刊学科。论文通过其已验证 Venue 的 JCR Category 进入一个或多个 Subject，关系必须保留 JCR 指标年份、来源和 taxonomy 版本。
 
 ### 3.3 期刊页面
 
@@ -208,15 +212,18 @@ JCR 数据只从用户明确授权的 CSV 导入：
 - `work_mesh_headings`
 - `publication_types`
 - `work_publication_types`
-- `journal_categories`
-- `work_journal_context`
+- `subject_versions`
+- `subjects`
+- `biomedical_subject_rules`
+- `journal_subject_metrics`
+- `work_subjects`
 - `citation_snapshots`
 - `citation_edges`
 - `reference_edges`
 - `analysis_cohorts`
 - `journal_pattern_snapshots`
 
-所有来源断言保留 source record、source path、快照时间和 policy version。MeSH UI 和 Tree Number 是稳定标识，显示名称不是唯一键。
+所有来源断言保留 source record、source path、快照时间和 policy version。MeSH UI、Tree Number 和版本化 Subject identity 是稳定标识，显示名称不是唯一键。
 
 引用数据采用 source-specific snapshot：
 
@@ -242,7 +249,7 @@ Catalog 发布只允许满足以下条件的 Work：
 4. 最新适用 policy assessment 为 `accepted`；
 5. assessment 的指标年份属于本次 Catalog generation 声明的 JCR 数据版本；
 6. Work 生命周期不是 rejected、retracted 或 withdrawn；
-7. 论文属于医学或生物学范围。
+7. Venue 至少命中一个版本化 biomedical Subject registry 中的 JCR Category。
 
 `missing`、`unknown`、`rejected` 和 `not_applicable` 一律不进入公开 generation。发布器必须在数据库事务内验证，不允许只在前端过滤。
 
@@ -304,15 +311,16 @@ Catalog 发布只允许满足以下条件的 Work：
 
 ```text
 GET /
+GET /api/v1/home
 GET /api/v1/stats
 GET /api/v1/papers
 GET /api/v1/papers/{id}
-GET /api/v1/disciplines
-GET /api/v1/disciplines/{slug}
+GET /api/v1/subjects
+GET /api/v1/subjects/{slug}
 GET /api/v1/journals
 GET /api/v1/journals/{slug}
 GET /api/v1/trends/papers
-GET /api/v1/trends/disciplines
+GET /api/v1/trends/subjects
 GET /api/v1/trends/journals
 GET /api/v1/trends/mesh
 GET /api/v1/research-opportunities
@@ -417,4 +425,3 @@ GET /api/v1/research-opportunities
 - 语言模型自由生成的研究机会；
 - 自动投稿成功率预测；
 - 将统计发表模式表述为编辑部因果偏好。
-
