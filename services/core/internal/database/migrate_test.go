@@ -2,12 +2,14 @@ package database
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/csv"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +60,17 @@ var expectedSchemaTables = []string{
 	"jcr_import_receipt_aliases",
 	"jcr_import_receipt_metrics",
 	"fulltext_assets",
+	"mesh_descriptors",
+	"mesh_qualifiers",
+	"publication_types",
+	"work_mesh_headings",
+	"work_mesh_qualifiers",
+	"work_publication_types",
+	"subject_import_receipts",
+	"subject_versions",
+	"subjects",
+	"biomedical_subject_rules",
+	"journal_subject_metrics",
 }
 
 func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
@@ -113,6 +126,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 8, name: "public_search"},
 		{version: 9, name: "analysis_runs"},
 		{version: 10, name: "repeatable_ingestion_jobs"},
+		{version: 11, name: "biomedical_semantics"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -156,8 +170,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 10 {
-		t.Fatalf("embedded migration count = %d, want 10", len(migrations))
+	if len(migrations) != 11 {
+		t.Fatalf("embedded migration count = %d, want 11", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -192,6 +206,12 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 			migrations[9],
 		)
 	}
+	if migrations[10].Version != 11 || migrations[10].Name != "biomedical_semantics" {
+		t.Fatalf(
+			"eleventh migration = %#v, want 000011_biomedical_semantics",
+			migrations[10],
+		)
+	}
 }
 
 func TestMigrationUsesDatabaseGeneratedUUIDsAndTimestamptz(t *testing.T) {
@@ -223,6 +243,1348 @@ func TestMigrationUsesDatabaseGeneratedUUIDsAndTimestamptz(t *testing.T) {
 	}
 	if timestampWithoutZoneCount != 0 {
 		t.Fatalf("schema contains %d timestamp columns without time zone", timestampWithoutZoneCount)
+	}
+}
+
+func TestBiomedicalSemanticSchemaMetadata(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	semanticTables := []string{
+		"mesh_descriptors",
+		"mesh_qualifiers",
+		"publication_types",
+		"work_mesh_headings",
+		"work_mesh_qualifiers",
+		"work_publication_types",
+		"subject_import_receipts",
+		"subject_versions",
+		"subjects",
+		"biomedical_subject_rules",
+		"journal_subject_metrics",
+	}
+	for _, table := range semanticTables {
+		var registered *string
+		if err := pool.QueryRow(ctx, "SELECT to_regclass('public.' || $1)::text", table).Scan(&registered); err != nil {
+			t.Fatalf("query %s registration: %v", table, err)
+		}
+		if registered == nil {
+			t.Fatalf("biomedical semantic table %q was not created", table)
+		}
+
+		var dataType, defaultValue string
+		if err := pool.QueryRow(ctx, `
+			SELECT data_type, column_default
+			FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'id'
+		`, table).Scan(&dataType, &defaultValue); err != nil {
+			t.Fatalf("%s.id metadata: %v", table, err)
+		}
+		if dataType != "uuid" || !strings.Contains(defaultValue, "gen_random_uuid()") {
+			t.Fatalf("%s.id = (%q, %q), want database-generated UUID", table, dataType, defaultValue)
+		}
+	}
+
+	var treeNumberTable *string
+	if err := pool.QueryRow(ctx, `
+		SELECT to_regclass('public.mesh_descriptor_tree_numbers')::text
+	`).Scan(&treeNumberTable); err != nil {
+		t.Fatalf("query MeSH Tree Number table: %v", err)
+	}
+	if treeNumberTable != nil {
+		t.Fatal("mesh_descriptor_tree_numbers must not exist because PubMed article XML has no Tree Number")
+	}
+
+	var canonicalDisplayColumns int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND table_name = ANY($1::text[])
+		  AND column_name IN ('name', 'display_name', 'display_label', 'label')
+	`, []string{"mesh_descriptors", "mesh_qualifiers", "publication_types"}).Scan(&canonicalDisplayColumns); err != nil {
+		t.Fatalf("query canonical identity display columns: %v", err)
+	}
+	if canonicalDisplayColumns != 0 {
+		t.Fatalf("canonical identity tables contain %d mutable display-label columns, want 0", canonicalDisplayColumns)
+	}
+
+	assertNamesExist(t, pool, `
+		SELECT conname
+		FROM pg_constraint
+		WHERE connamespace = 'public'::regnamespace
+	`, []string{
+		"ingestion_projection_assertions_id_source_record_work_key",
+		"mesh_descriptors_descriptor_ui_key",
+		"mesh_descriptors_descriptor_ui_check",
+		"mesh_qualifiers_qualifier_ui_key",
+		"mesh_qualifiers_qualifier_ui_check",
+		"publication_types_publication_type_ui_key",
+		"publication_types_publication_type_ui_check",
+		"work_mesh_headings_projection_descriptor_key",
+		"work_mesh_headings_source_record_work_fkey",
+		"work_mesh_headings_projection_assertion_fkey",
+		"work_mesh_qualifiers_heading_qualifier_key",
+		"work_mesh_qualifiers_source_record_work_fkey",
+		"work_mesh_qualifiers_projection_assertion_fkey",
+		"work_mesh_qualifiers_heading_assertion_fkey",
+		"work_publication_types_projection_type_key",
+		"work_publication_types_source_record_work_fkey",
+		"work_publication_types_projection_assertion_fkey",
+		"subject_import_receipts_source_registry_key",
+		"subject_import_receipts_file_sha256_key",
+		"subject_versions_subject_import_receipt_id_fkey",
+		"subject_versions_subject_import_receipt_id_key",
+		"subject_versions_version_key_key",
+		"subjects_subject_version_id_fkey",
+		"subjects_version_slug_key",
+		"subjects_id_subject_version_key",
+		"biomedical_subject_rules_version_category_key",
+		"biomedical_subject_rules_subject_version_fkey",
+		"biomedical_subject_rules_id_category_key",
+		"venue_metric_snapshots_id_category_key",
+		"journal_subject_metrics_metric_category_fkey",
+		"journal_subject_metrics_rule_category_fkey",
+	})
+	assertNamesExist(t, pool, `
+		SELECT proname
+		FROM pg_proc
+		WHERE pronamespace = 'public'::regnamespace
+	`, []string{
+		"enforce_subject_import_receipt_integrity",
+		"enforce_subject_import_receipt_child_transaction",
+	})
+	assertNamesExist(t, pool, `
+		SELECT tgname
+		FROM pg_trigger
+		WHERE NOT tgisinternal
+	`, []string{
+		"subject_import_receipts_content_integrity",
+		"subject_versions_receipt_transaction",
+		"subjects_receipt_transaction",
+		"biomedical_subject_rules_receipt_transaction",
+	})
+
+	var receiptTriggerDeferrable, receiptTriggerInitiallyDeferred bool
+	if err := pool.QueryRow(ctx, `
+		SELECT tgdeferrable, tginitdeferred
+		FROM pg_trigger
+		WHERE tgrelid = 'subject_import_receipts'::regclass
+		  AND tgname = 'subject_import_receipts_content_integrity'
+	`).Scan(&receiptTriggerDeferrable, &receiptTriggerInitiallyDeferred); err != nil {
+		t.Fatalf("query Subject receipt integrity trigger semantics: %v", err)
+	}
+	if !receiptTriggerDeferrable || !receiptTriggerInitiallyDeferred {
+		t.Fatalf(
+			"Subject receipt integrity trigger = deferrable %t, initially deferred %t; want true, true",
+			receiptTriggerDeferrable,
+			receiptTriggerInitiallyDeferred,
+		)
+	}
+
+	for _, constraint := range []string{
+		"work_mesh_headings_source_record_work_fkey",
+		"work_mesh_qualifiers_source_record_work_fkey",
+		"work_publication_types_source_record_work_fkey",
+	} {
+		var deleteAction string
+		var deferrable, initiallyDeferred bool
+		if err := pool.QueryRow(ctx, `
+			SELECT confdeltype::text, condeferrable, condeferred
+			FROM pg_constraint
+			WHERE connamespace = 'public'::regnamespace AND conname = $1
+		`, constraint).Scan(&deleteAction, &deferrable, &initiallyDeferred); err != nil {
+			t.Fatalf("query %s delete action and deferrability: %v", constraint, err)
+		}
+		if deleteAction != "a" || !deferrable || !initiallyDeferred {
+			t.Fatalf(
+				"%s = delete action %q, deferrable %t, initially deferred %t; want %q, true, true",
+				constraint,
+				deleteAction,
+				deferrable,
+				initiallyDeferred,
+				"a",
+			)
+		}
+	}
+
+	for _, index := range []struct {
+		name    string
+		columns []string
+	}{
+		{
+			name:    "idx_work_mesh_headings_work",
+			columns: []string{"work_id", "projection_assertion_id", "id"},
+		},
+		{
+			name:    "idx_work_mesh_headings_source_record",
+			columns: []string{"source_record_id", "projection_assertion_id", "id"},
+		},
+		{
+			name:    "idx_work_mesh_headings_descriptor",
+			columns: []string{"descriptor_id", "work_id", "id"},
+		},
+		{
+			name:    "idx_work_mesh_qualifiers_work",
+			columns: []string{"work_id", "projection_assertion_id", "id"},
+		},
+		{
+			name:    "idx_work_mesh_qualifiers_source_record",
+			columns: []string{"source_record_id", "projection_assertion_id", "id"},
+		},
+		{
+			name:    "idx_work_mesh_qualifiers_qualifier",
+			columns: []string{"qualifier_id", "work_mesh_heading_id", "id"},
+		},
+		{
+			name:    "idx_work_publication_types_work",
+			columns: []string{"work_id", "projection_assertion_id", "id"},
+		},
+		{
+			name:    "idx_work_publication_types_source_record",
+			columns: []string{"source_record_id", "projection_assertion_id", "id"},
+		},
+		{
+			name:    "idx_work_publication_types_type",
+			columns: []string{"publication_type_id", "work_id", "id"},
+		},
+		{
+			name:    "idx_subjects_version_display_label",
+			columns: []string{"subject_version_id", "display_label", "id"},
+		},
+		{
+			name:    "idx_biomedical_subject_rules_subject",
+			columns: []string{"subject_id", "subject_version_id", "id"},
+		},
+		{
+			name:    "idx_journal_subject_metrics_rule",
+			columns: []string{"subject_rule_id", "venue_metric_snapshot_id", "id"},
+		},
+	} {
+		var accessMethod string
+		var unique, hasPredicate bool
+		var columns []string
+		if err := pool.QueryRow(ctx, `
+			SELECT
+				access_method.amname,
+				index_metadata.indisunique,
+				index_metadata.indpred IS NOT NULL,
+				array_agg(attribute.attname ORDER BY indexed_column.ordinality)
+			FROM pg_class AS index_relation
+			JOIN pg_namespace AS index_namespace
+			  ON index_namespace.oid = index_relation.relnamespace
+			JOIN pg_index AS index_metadata
+			  ON index_metadata.indexrelid = index_relation.oid
+			JOIN pg_am AS access_method
+			  ON access_method.oid = index_relation.relam
+			JOIN unnest(index_metadata.indkey)
+			     WITH ORDINALITY AS indexed_column(attnum, ordinality)
+			  ON true
+			JOIN pg_attribute AS attribute
+			  ON attribute.attrelid = index_metadata.indrelid
+			 AND attribute.attnum = indexed_column.attnum
+			WHERE index_namespace.nspname = 'public'
+			  AND index_relation.relname = $1
+			GROUP BY access_method.amname, index_metadata.indisunique, index_metadata.indpred
+		`, index.name).Scan(&accessMethod, &unique, &hasPredicate, &columns); err != nil {
+			t.Fatalf("query %s metadata: %v", index.name, err)
+		}
+		if accessMethod != "btree" ||
+			unique ||
+			hasPredicate ||
+			!slices.Equal(columns, index.columns) {
+			t.Fatalf(
+				"%s = method %q, unique %t, predicate %t, columns %v; want btree, false, false, %v",
+				index.name,
+				accessMethod,
+				unique,
+				hasPredicate,
+				columns,
+				index.columns,
+			)
+		}
+	}
+
+	for _, identity := range []struct {
+		table      string
+		uiColumn   string
+		constraint string
+		definition string
+	}{
+		{
+			table:      "mesh_descriptors",
+			uiColumn:   "descriptor_ui",
+			constraint: "mesh_descriptors_descriptor_ui_key",
+			definition: "UNIQUE (descriptor_ui)",
+		},
+		{
+			table:      "mesh_qualifiers",
+			uiColumn:   "qualifier_ui",
+			constraint: "mesh_qualifiers_qualifier_ui_key",
+			definition: "UNIQUE (qualifier_ui)",
+		},
+		{
+			table:      "publication_types",
+			uiColumn:   "publication_type_ui",
+			constraint: "publication_types_publication_type_ui_key",
+			definition: "UNIQUE (publication_type_ui)",
+		},
+	} {
+		rows, err := pool.Query(ctx, `
+			SELECT conname, pg_get_constraintdef(oid)
+			FROM pg_constraint
+			WHERE conrelid = $1::regclass AND contype = 'u'
+			ORDER BY conname
+		`, "public."+identity.table)
+		if err != nil {
+			t.Fatalf("query %s unique constraints: %v", identity.table, err)
+		}
+		var uniqueCount int
+		for rows.Next() {
+			var name, definition string
+			if err := rows.Scan(&name, &definition); err != nil {
+				rows.Close()
+				t.Fatalf("scan %s unique constraint: %v", identity.table, err)
+			}
+			uniqueCount++
+			if name != identity.constraint || definition != identity.definition {
+				rows.Close()
+				t.Fatalf(
+					"%s unique constraint = (%q, %q), want (%q, %q)",
+					identity.table,
+					name,
+					definition,
+					identity.constraint,
+					identity.definition,
+				)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatalf("iterate %s unique constraints: %v", identity.table, err)
+		}
+		rows.Close()
+		if uniqueCount != 1 {
+			t.Fatalf("%s unique constraint count = %d, want exactly 1 UI-only unique", identity.table, uniqueCount)
+		}
+	}
+
+}
+
+func TestBiomedicalSemanticSchemaCanonicalIdentity(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	var descriptorID, qualifierID, publicationTypeID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_descriptors (descriptor_ui)
+		VALUES ('D009369')
+		RETURNING id
+	`), &descriptorID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_qualifiers (qualifier_ui)
+		VALUES ('Q000627')
+		RETURNING id
+	`), &qualifierID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO publication_types (publication_type_ui)
+		VALUES ('D016428')
+		RETURNING id
+	`), &publicationTypeID)
+
+	for _, identity := range []struct {
+		table           string
+		uiColumn        string
+		validUI         string
+		checkConstraint string
+		keyConstraint   string
+	}{
+		{
+			table:           "mesh_descriptors",
+			uiColumn:        "descriptor_ui",
+			validUI:         "D009369",
+			checkConstraint: "mesh_descriptors_descriptor_ui_check",
+			keyConstraint:   "mesh_descriptors_descriptor_ui_key",
+		},
+		{
+			table:           "mesh_qualifiers",
+			uiColumn:        "qualifier_ui",
+			validUI:         "Q000627",
+			checkConstraint: "mesh_qualifiers_qualifier_ui_check",
+			keyConstraint:   "mesh_qualifiers_qualifier_ui_key",
+		},
+		{
+			table:           "publication_types",
+			uiColumn:        "publication_type_ui",
+			validUI:         "D016428",
+			checkConstraint: "publication_types_publication_type_ui_check",
+			keyConstraint:   "publication_types_publication_type_ui_key",
+		},
+	} {
+		for _, invalidUI := range []string{"", " " + identity.validUI, identity.validUI + " "} {
+			_, err := pool.Exec(
+				ctx,
+				fmt.Sprintf("INSERT INTO %s (%s) VALUES ($1)", identity.table, identity.uiColumn),
+				invalidUI,
+			)
+			assertPostgresError(t, err, "23514", identity.checkConstraint)
+		}
+		_, err := pool.Exec(
+			ctx,
+			fmt.Sprintf("INSERT INTO %s (%s) VALUES ($1)", identity.table, identity.uiColumn),
+			identity.validUI,
+		)
+		assertPostgresError(t, err, "23505", identity.keyConstraint)
+	}
+
+}
+
+func TestBiomedicalSemanticSchemaSubjectReceiptIntegrity(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	fixture := insertBiomedicalSubjectRegistryFixture(
+		t,
+		pool,
+		"receipt-primary",
+		[]string{"ONCOLOGY", "CARDIAC & CARDIOVASCULAR SYSTEMS"},
+	)
+	receiptID := fixture.ReceiptID
+	subjectVersionID := fixture.VersionID
+	oncologySubjectID := fixture.SubjectIDs[0]
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO subject_import_receipts (
+			source, registry_version, file_sha256, subject_count, rule_count, imported_at
+		) VALUES (
+			$1, $2,
+			'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+			2, 2, now()
+		)
+	`, fixture.Source, fixture.RegistryVersion)
+	assertPostgresError(t, err, "23505", "subject_import_receipts_source_registry_key")
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO subject_import_receipts (
+			source, registry_version, file_sha256, subject_count, rule_count, imported_at
+		) VALUES (
+			'clarivate-conflict', 'conflicting-hash',
+			$1,
+			2, 2, now()
+		)
+	`, fixture.FileSHA256)
+	assertPostgresError(t, err, "23505", "subject_import_receipts_file_sha256_key")
+
+	for _, invalidReceipt := range []struct {
+		query      string
+		constraint string
+	}{
+		{
+			query: `
+				INSERT INTO subject_import_receipts (
+					source, registry_version, file_sha256, subject_count, rule_count, imported_at
+				) VALUES ('clarivate', 'bad-hash', 'ABC', 0, 0, now())
+			`,
+			constraint: "subject_import_receipts_file_sha256_check",
+		},
+		{
+			query: `
+				INSERT INTO subject_import_receipts (
+					source, registry_version, file_sha256, subject_count, rule_count, imported_at
+				) VALUES (
+					'clarivate', 'bad-count',
+					'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+					-1, 0, now()
+				)
+			`,
+			constraint: "subject_import_receipts_counts_check",
+		},
+	} {
+		_, err := pool.Exec(ctx, invalidReceipt.query)
+		assertPostgresError(t, err, "23514", invalidReceipt.constraint)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO subject_versions (subject_import_receipt_id, version_key)
+		VALUES ('00000000-0000-0000-0000-000000000001', 'missing-receipt-version')
+	`)
+	assertPostgresError(t, err, "23503", "subject_versions_subject_import_receipt_id_fkey")
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO subjects (subject_version_id, slug, display_label)
+		VALUES ('00000000-0000-0000-0000-000000000002', 'missing-version', 'Missing Version')
+	`)
+	assertPostgresError(t, err, "23503", "subjects_subject_version_id_fkey")
+
+	for _, mismatch := range []struct {
+		name             string
+		includeVersion   bool
+		declaredSubjects int
+		declaredRules    int
+		actualSubjects   int
+		actualRules      int
+	}{
+		{
+			name:           "missing version",
+			includeVersion: false,
+		},
+		{
+			name:             "subject count mismatch",
+			includeVersion:   true,
+			declaredSubjects: 1,
+			actualSubjects:   0,
+		},
+		{
+			name:             "rule count mismatch",
+			includeVersion:   true,
+			declaredSubjects: 1,
+			declaredRules:    1,
+			actualSubjects:   1,
+			actualRules:      0,
+		},
+	} {
+		commitErr := commitBiomedicalSubjectRegistryCounts(
+			t,
+			pool,
+			"mismatch-"+strings.ReplaceAll(mismatch.name, " ", "-"),
+			mismatch.includeVersion,
+			mismatch.declaredSubjects,
+			mismatch.declaredRules,
+			mismatch.actualSubjects,
+			mismatch.actualRules,
+		)
+		assertPostgresError(
+			t,
+			commitErr,
+			"23514",
+			"subject_import_receipts_content_integrity",
+		)
+	}
+
+	for _, lateChild := range []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{
+			name: "version",
+			query: `
+				INSERT INTO subject_versions (subject_import_receipt_id, version_key)
+				VALUES ($1, 'late-version')
+			`,
+			args: []any{receiptID},
+		},
+		{
+			name: "subject",
+			query: `
+				INSERT INTO subjects (subject_version_id, slug, display_label)
+				VALUES ($1, 'late-subject', 'Late Subject')
+			`,
+			args: []any{subjectVersionID},
+		},
+		{
+			name: "rule",
+			query: `
+				INSERT INTO biomedical_subject_rules (
+					subject_version_id, subject_id, jcr_category
+				) VALUES ($1, $2, 'LATE CATEGORY')
+			`,
+			args: []any{subjectVersionID, oncologySubjectID},
+		},
+	} {
+		_, lateChildErr := pool.Exec(ctx, lateChild.query, lateChild.args...)
+		assertPostgresError(
+			t,
+			lateChildErr,
+			"23514",
+			"subject_import_receipt_children_current_transaction",
+		)
+	}
+
+	var versionCount, subjectCount, ruleCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(
+				SELECT count(*)
+				FROM subject_versions
+				WHERE subject_import_receipt_id = $1
+			),
+			(
+				SELECT count(*)
+				FROM subjects AS subject
+				JOIN subject_versions AS version
+				  ON version.id = subject.subject_version_id
+				WHERE version.subject_import_receipt_id = $1
+			),
+			(
+				SELECT count(*)
+				FROM biomedical_subject_rules AS rule
+				JOIN subject_versions AS version
+				  ON version.id = rule.subject_version_id
+				WHERE version.subject_import_receipt_id = $1
+			)
+	`, receiptID).Scan(&versionCount, &subjectCount, &ruleCount); err != nil {
+		t.Fatalf("query sealed subject receipt counts: %v", err)
+	}
+	if versionCount != 1 || subjectCount != 2 || ruleCount != 2 {
+		t.Fatalf(
+			"sealed receipt content = versions %d, subjects %d, rules %d; want 1, 2, 2",
+			versionCount,
+			subjectCount,
+			ruleCount,
+		)
+	}
+
+	assertBiomedicalSubjectValidationConstraints(t, pool)
+
+}
+
+func TestBiomedicalSemanticSchemaProjectionProvenance(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+	var err error
+
+	var descriptorID, qualifierID, publicationTypeID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_descriptors (descriptor_ui)
+		VALUES ('D009369')
+		RETURNING id
+	`), &descriptorID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_qualifiers (qualifier_ui)
+		VALUES ('Q000627')
+		RETURNING id
+	`), &qualifierID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO publication_types (publication_type_ui)
+		VALUES ('D016428')
+		RETURNING id
+	`), &publicationTypeID)
+
+	workID := insertWork(t, pool, "openreview:biomedical-a")
+	secondWorkID := insertWork(t, pool, "openreview:biomedical-b")
+	sourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		workID,
+		"pubmed",
+		"biomedical-source-a",
+		"biomedical-source-hash-a",
+	)
+	secondSourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		secondWorkID,
+		"pubmed",
+		"biomedical-source-b",
+		"biomedical-source-hash-b",
+	)
+
+	insertProjectionAssertion := func(workID, sourceRecordID, suffix, contentHash string) string {
+		t.Helper()
+		var jobID, rawEventID, projectionAssertionID string
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO ingestion_jobs (
+				source, job_type, idempotency_key, status, payload, max_attempts, batch_key, stage
+			) VALUES (
+				'pubmed', 'projection', $1, 'succeeded', '{}', 1, $1, 'project'
+			)
+			RETURNING id
+		`, "biomedical-projection-"+suffix), &jobID)
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO ingestion_raw_events (
+				job_id, logical_source, event_key, event_kind, source_record_id,
+				source_time, tie_break_key, position, content_hash, raw_format, raw_payload
+			) VALUES (
+				$1, 'pubmed', $2, 'upsert', $2,
+				now(), $2, 0, $3, 'xml', convert_to('<PubmedArticle/>', 'UTF8')
+			)
+			RETURNING id
+		`, jobID, "biomedical-event-"+suffix, contentHash), &rawEventID)
+		mustScanID(t, pool.QueryRow(ctx, `
+			INSERT INTO ingestion_projection_assertions (
+				raw_event_id, source_record_uuid, work_id, job_id,
+				scope_policy_version, projection_policy_version, record_payload
+			) VALUES (
+				$1, $2, $3, $4, 'biomedical-scope-v1', 'biomedical-projection-v1',
+				jsonb_build_object('fixture', $5::text)
+			)
+			RETURNING id
+		`, rawEventID, sourceRecordID, workID, jobID, suffix), &projectionAssertionID)
+		return projectionAssertionID
+	}
+
+	projectionAssertionID := insertProjectionAssertion(
+		workID,
+		sourceRecordID,
+		"a",
+		"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+	)
+	secondProjectionAssertionID := insertProjectionAssertion(
+		secondWorkID,
+		secondSourceRecordID,
+		"b",
+		"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+	)
+	mismatchedProjectionAssertionID := insertProjectionAssertion(
+		secondWorkID,
+		sourceRecordID,
+		"c",
+		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	)
+
+	assertDeferredConstraintViolation := func(
+		constraint string,
+		query string,
+		args ...any,
+	) {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin %s violation transaction: %v", constraint, err)
+		}
+		if _, err := tx.Exec(ctx, query, args...); err != nil {
+			_ = tx.Rollback(context.Background())
+			t.Fatalf("insert before checking deferred %s: %v", constraint, err)
+		}
+		_, constraintErr := tx.Exec(ctx, "SET CONSTRAINTS "+constraint+" IMMEDIATE")
+		if rollbackErr := tx.Rollback(context.Background()); rollbackErr != nil {
+			t.Fatalf("rollback %s violation transaction: %v", constraint, rollbackErr)
+		}
+		assertPostgresError(t, constraintErr, "23503", constraint)
+	}
+
+	var (
+		projectionDescriptorID      string
+		validationDescriptorID      string
+		projectionQualifierID       string
+		validationQualifierID       string
+		projectionPublicationTypeID string
+		validationPublicationTypeID string
+	)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_descriptors (descriptor_ui) VALUES ('D000101') RETURNING id
+	`), &projectionDescriptorID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_descriptors (descriptor_ui) VALUES ('D000102') RETURNING id
+	`), &validationDescriptorID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_qualifiers (qualifier_ui) VALUES ('Q000101') RETURNING id
+	`), &projectionQualifierID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_qualifiers (qualifier_ui) VALUES ('Q000102') RETURNING id
+	`), &validationQualifierID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO publication_types (publication_type_ui) VALUES ('D000201') RETURNING id
+	`), &projectionPublicationTypeID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO publication_types (publication_type_ui) VALUES ('D000202') RETURNING id
+	`), &validationPublicationTypeID)
+
+	var headingID, secondHeadingID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_mesh_headings (
+			projection_assertion_id, source_record_id, work_id, descriptor_id,
+			source_path, descriptor_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4,
+			'/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[1]/DescriptorName',
+			'Neoplasms', true
+		)
+		RETURNING id
+	`, projectionAssertionID, sourceRecordID, workID, descriptorID), &headingID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_mesh_headings (
+			projection_assertion_id, source_record_id, work_id, descriptor_id,
+			source_path, descriptor_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4,
+			'/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[1]/DescriptorName',
+			'Cancer', false
+		)
+		RETURNING id
+	`, secondProjectionAssertionID, secondSourceRecordID, secondWorkID, descriptorID), &secondHeadingID)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_mesh_headings (
+			projection_assertion_id, source_record_id, work_id, descriptor_id,
+			source_path, descriptor_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4, '/mismatch/DescriptorName', 'Neoplasms', false
+		)
+	`, mismatchedProjectionAssertionID, sourceRecordID, secondWorkID, descriptorID)
+	assertPostgresError(t, err, "23503", "work_mesh_headings_source_record_work_fkey")
+
+	assertDeferredConstraintViolation(
+		"work_mesh_headings_projection_assertion_fkey",
+		`
+			INSERT INTO work_mesh_headings (
+				projection_assertion_id, source_record_id, work_id, descriptor_id,
+				source_path, descriptor_label, is_major_topic
+			) VALUES (
+				$1, $2, $3, $4, '/wrong-projection/DescriptorName',
+				'Wrong projection descriptor', false
+			)
+		`,
+		secondProjectionAssertionID,
+		sourceRecordID,
+		workID,
+		projectionDescriptorID,
+	)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_mesh_headings (
+			projection_assertion_id, source_record_id, work_id, descriptor_id,
+			source_path, descriptor_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4, '/duplicate/DescriptorName', 'Cancer duplicate', false
+		)
+	`, projectionAssertionID, sourceRecordID, workID, descriptorID)
+	assertPostgresError(t, err, "23505", "work_mesh_headings_projection_descriptor_key")
+
+	for _, invalidHeading := range []struct {
+		name       string
+		sourcePath any
+		label      any
+		majorTopic any
+		code       string
+		constraint string
+		column     string
+	}{
+		{
+			name:       "blank source path",
+			sourcePath: "",
+			label:      "Validation descriptor",
+			majorTopic: false,
+			code:       "23514",
+			constraint: "work_mesh_headings_source_path_check",
+		},
+		{
+			name:       "blank label",
+			sourcePath: "/validation/DescriptorName",
+			label:      "",
+			majorTopic: false,
+			code:       "23514",
+			constraint: "work_mesh_headings_descriptor_label_check",
+		},
+		{
+			name:       "null major topic",
+			sourcePath: "/validation/DescriptorName",
+			label:      "Validation descriptor",
+			majorTopic: nil,
+			code:       "23502",
+			column:     "is_major_topic",
+		},
+	} {
+		_, headingErr := pool.Exec(ctx, `
+			INSERT INTO work_mesh_headings (
+				projection_assertion_id, source_record_id, work_id, descriptor_id,
+				source_path, descriptor_label, is_major_topic
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`,
+			projectionAssertionID,
+			sourceRecordID,
+			workID,
+			validationDescriptorID,
+			invalidHeading.sourcePath,
+			invalidHeading.label,
+			invalidHeading.majorTopic,
+		)
+		if invalidHeading.code == "23502" {
+			assertPostgresColumnError(
+				t,
+				headingErr,
+				invalidHeading.code,
+				"work_mesh_headings",
+				invalidHeading.column,
+			)
+		} else {
+			assertPostgresError(t, headingErr, invalidHeading.code, invalidHeading.constraint)
+		}
+	}
+
+	var qualifierAssertionID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_mesh_qualifiers (
+			projection_assertion_id, source_record_id, work_id, work_mesh_heading_id,
+			qualifier_id, source_path, qualifier_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			'/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[1]/QualifierName[1]',
+			'therapy', false
+		)
+		RETURNING id
+	`, projectionAssertionID, sourceRecordID, workID, headingID, qualifierID), &qualifierAssertionID)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_mesh_qualifiers (
+			projection_assertion_id, source_record_id, work_id, work_mesh_heading_id,
+			qualifier_id, source_path, qualifier_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4, $5, '/wrong/QualifierName', 'therapy', false
+		)
+	`, projectionAssertionID, sourceRecordID, workID, secondHeadingID, qualifierID)
+	assertPostgresError(t, err, "23503", "work_mesh_qualifiers_heading_assertion_fkey")
+
+	assertDeferredConstraintViolation(
+		"work_mesh_qualifiers_projection_assertion_fkey",
+		`
+			INSERT INTO work_mesh_qualifiers (
+				projection_assertion_id, source_record_id, work_id, work_mesh_heading_id,
+				qualifier_id, source_path, qualifier_label, is_major_topic
+			) VALUES (
+				$1, $2, $3, $4, $5, '/wrong-projection/QualifierName',
+				'wrong projection qualifier', false
+			)
+		`,
+		secondProjectionAssertionID,
+		sourceRecordID,
+		workID,
+		headingID,
+		projectionQualifierID,
+	)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_mesh_qualifiers (
+			projection_assertion_id, source_record_id, work_id, work_mesh_heading_id,
+			qualifier_id, source_path, qualifier_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4, $5, '/duplicate/QualifierName', 'drug therapy', true
+		)
+	`, projectionAssertionID, sourceRecordID, workID, headingID, qualifierID)
+	assertPostgresError(t, err, "23505", "work_mesh_qualifiers_heading_qualifier_key")
+
+	for _, invalidQualifier := range []struct {
+		name       string
+		sourcePath any
+		label      any
+		majorTopic any
+		code       string
+		constraint string
+		column     string
+	}{
+		{
+			name:       "blank source path",
+			sourcePath: "",
+			label:      "validation qualifier",
+			majorTopic: false,
+			code:       "23514",
+			constraint: "work_mesh_qualifiers_source_path_check",
+		},
+		{
+			name:       "blank label",
+			sourcePath: "/validation/QualifierName",
+			label:      "",
+			majorTopic: false,
+			code:       "23514",
+			constraint: "work_mesh_qualifiers_qualifier_label_check",
+		},
+		{
+			name:       "null major topic",
+			sourcePath: "/validation/QualifierName",
+			label:      "validation qualifier",
+			majorTopic: nil,
+			code:       "23502",
+			column:     "is_major_topic",
+		},
+	} {
+		_, qualifierErr := pool.Exec(ctx, `
+			INSERT INTO work_mesh_qualifiers (
+				projection_assertion_id, source_record_id, work_id, work_mesh_heading_id,
+				qualifier_id, source_path, qualifier_label, is_major_topic
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`,
+			projectionAssertionID,
+			sourceRecordID,
+			workID,
+			headingID,
+			validationQualifierID,
+			invalidQualifier.sourcePath,
+			invalidQualifier.label,
+			invalidQualifier.majorTopic,
+		)
+		if invalidQualifier.code == "23502" {
+			assertPostgresColumnError(
+				t,
+				qualifierErr,
+				invalidQualifier.code,
+				"work_mesh_qualifiers",
+				invalidQualifier.column,
+			)
+		} else {
+			assertPostgresError(t, qualifierErr, invalidQualifier.code, invalidQualifier.constraint)
+		}
+	}
+
+	var publicationTypeAssertionID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_publication_types (
+			projection_assertion_id, source_record_id, work_id, publication_type_id,
+			source_path, publication_type_label
+		) VALUES (
+			$1, $2, $3, $4,
+			'/PubmedArticle/MedlineCitation/Article/PublicationTypeList/PublicationType[1]',
+			'Journal Article'
+		)
+		RETURNING id
+	`, projectionAssertionID, sourceRecordID, workID, publicationTypeID), &publicationTypeAssertionID)
+
+	assertDeferredConstraintViolation(
+		"work_publication_types_projection_assertion_fkey",
+		`
+			INSERT INTO work_publication_types (
+				projection_assertion_id, source_record_id, work_id, publication_type_id,
+				source_path, publication_type_label
+			) VALUES (
+				$1, $2, $3, $4, '/wrong-projection/PublicationType',
+				'Wrong Projection Publication Type'
+			)
+		`,
+		secondProjectionAssertionID,
+		sourceRecordID,
+		workID,
+		projectionPublicationTypeID,
+	)
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_publication_types (
+			projection_assertion_id, source_record_id, work_id, publication_type_id,
+			source_path, publication_type_label
+		) VALUES (
+			$1, $2, $3, $4,
+			'/PubmedArticle/MedlineCitation/Article/PublicationTypeList/PublicationType[1]',
+			'Research Article'
+		)
+	`, secondProjectionAssertionID, secondSourceRecordID, secondWorkID, publicationTypeID); err != nil {
+		t.Fatalf("same Publication Type UI with a different source label was rejected: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_publication_types (
+			projection_assertion_id, source_record_id, work_id, publication_type_id,
+			source_path, publication_type_label
+		) VALUES (
+			$1, $2, $3, $4, '/duplicate/PublicationType', 'Duplicate label'
+		)
+	`, projectionAssertionID, sourceRecordID, workID, publicationTypeID)
+	assertPostgresError(t, err, "23505", "work_publication_types_projection_type_key")
+
+	for _, invalidPublicationType := range []struct {
+		sourcePath string
+		label      string
+		constraint string
+	}{
+		{
+			sourcePath: "",
+			label:      "Validation Publication Type",
+			constraint: "work_publication_types_source_path_check",
+		},
+		{
+			sourcePath: "/validation/PublicationType",
+			label:      "",
+			constraint: "work_publication_types_label_check",
+		},
+	} {
+		_, publicationTypeErr := pool.Exec(ctx, `
+			INSERT INTO work_publication_types (
+				projection_assertion_id, source_record_id, work_id, publication_type_id,
+				source_path, publication_type_label
+			) VALUES ($1, $2, $3, $4, $5, $6)
+		`,
+			projectionAssertionID,
+			sourceRecordID,
+			workID,
+			validationPublicationTypeID,
+			invalidPublicationType.sourcePath,
+			invalidPublicationType.label,
+		)
+		assertPostgresError(
+			t,
+			publicationTypeErr,
+			"23514",
+			invalidPublicationType.constraint,
+		)
+	}
+
+	var descriptorAssertionCount int
+	var descriptorLabels []string
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*), array_agg(descriptor_label ORDER BY descriptor_label)
+		FROM work_mesh_headings
+		WHERE descriptor_id = $1
+	`, descriptorID).Scan(&descriptorAssertionCount, &descriptorLabels); err != nil {
+		t.Fatalf("query source-specific descriptor labels: %v", err)
+	}
+	if descriptorAssertionCount != 2 ||
+		len(descriptorLabels) != 2 ||
+		descriptorLabels[0] != "Cancer" ||
+		descriptorLabels[1] != "Neoplasms" {
+		t.Fatalf(
+			"descriptor source assertions = count %d, labels %v; want 2 and [Cancer Neoplasms]",
+			descriptorAssertionCount,
+			descriptorLabels,
+		)
+	}
+
+}
+
+func TestBiomedicalSemanticSchemaJournalSubjectMetrics(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+	subjectFixture := insertBiomedicalSubjectRegistryFixture(
+		t,
+		pool,
+		"journal-metrics",
+		[]string{"ONCOLOGY", "CARDIAC & CARDIOVASCULAR SYSTEMS"},
+	)
+	oncologyRuleID := subjectFixture.RuleIDs[0]
+	cardiologyRuleID := subjectFixture.RuleIDs[1]
+
+	var venueID, metricSnapshotID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l)
+		VALUES ('journal', 'Biomedical Semantics Journal', '9876-543X')
+		RETURNING id
+	`), &venueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license
+		) VALUES (
+			$1, 2025, 'ONCOLOGY', 12.5, 'Q1', 'known', 'clarivate', 'licensed'
+		)
+		RETURNING id
+	`, venueID), &metricSnapshotID)
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO journal_subject_metrics (
+			venue_metric_snapshot_id, subject_rule_id, jcr_category
+		) VALUES ($1, $2, 'CARDIAC & CARDIOVASCULAR SYSTEMS')
+	`, metricSnapshotID, cardiologyRuleID)
+	assertPostgresError(t, err, "23503", "journal_subject_metrics_metric_category_fkey")
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO journal_subject_metrics (
+			venue_metric_snapshot_id, subject_rule_id, jcr_category
+		) VALUES ($1, $2, 'ONCOLOGY')
+	`, metricSnapshotID, cardiologyRuleID)
+	assertPostgresError(t, err, "23503", "journal_subject_metrics_rule_category_fkey")
+
+	var journalSubjectMetricID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO journal_subject_metrics (
+			venue_metric_snapshot_id, subject_rule_id, jcr_category
+		) VALUES ($1, $2, 'ONCOLOGY')
+		RETURNING id
+	`, metricSnapshotID, oncologyRuleID), &journalSubjectMetricID)
+
+}
+
+func TestBiomedicalSemanticSchemaImmutability(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+	projectionFixture := insertBiomedicalProjectionFixture(t, pool, "immutable")
+	subjectFixture := insertBiomedicalSubjectRegistryFixture(
+		t,
+		pool,
+		"immutable",
+		[]string{"IMMUTABLE CATEGORY"},
+	)
+
+	var venueID, metricSnapshotID, journalSubjectMetricID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l)
+		VALUES ('journal', 'Immutable Biomedical Journal', '1357-246X')
+		RETURNING id
+	`), &venueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license
+		) VALUES (
+			$1, 2025, 'IMMUTABLE CATEGORY', 10, 'Q1', 'known', 'clarivate', 'licensed'
+		)
+		RETURNING id
+	`, venueID), &metricSnapshotID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO journal_subject_metrics (
+			venue_metric_snapshot_id, subject_rule_id, jcr_category
+		) VALUES ($1, $2, 'IMMUTABLE CATEGORY')
+		RETURNING id
+	`, metricSnapshotID, subjectFixture.RuleIDs[0]), &journalSubjectMetricID)
+
+	immutableRows := []struct {
+		table string
+		id    string
+	}{
+		{table: "mesh_descriptors", id: projectionFixture.DescriptorID},
+		{table: "mesh_qualifiers", id: projectionFixture.QualifierID},
+		{table: "publication_types", id: projectionFixture.PublicationTypeID},
+		{table: "work_mesh_headings", id: projectionFixture.HeadingID},
+		{table: "work_mesh_qualifiers", id: projectionFixture.QualifierAssertionID},
+		{table: "work_publication_types", id: projectionFixture.PublicationTypeAssertionID},
+		{table: "subject_import_receipts", id: subjectFixture.ReceiptID},
+		{table: "subject_versions", id: subjectFixture.VersionID},
+		{table: "subjects", id: subjectFixture.SubjectIDs[0]},
+		{table: "biomedical_subject_rules", id: subjectFixture.RuleIDs[0]},
+		{table: "journal_subject_metrics", id: journalSubjectMetricID},
+	}
+	for _, row := range immutableRows {
+		t.Run(row.table+" immutable", func(t *testing.T) {
+			_, updateErr := pool.Exec(
+				ctx,
+				fmt.Sprintf(
+					"UPDATE %s SET created_at = created_at + interval '1 second' WHERE id = $1",
+					row.table,
+				),
+				row.id,
+			)
+			assertPostgresError(t, updateErr, "55000", "")
+
+			_, deleteErr := pool.Exec(
+				ctx,
+				fmt.Sprintf("DELETE FROM %s WHERE id = $1", row.table),
+				row.id,
+			)
+			assertPostgresError(t, deleteErr, "55000", "")
+		})
+	}
+}
+
+func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	if len(migrations) != 11 {
+		t.Fatalf("embedded migration count = %d, want 11", len(migrations))
+	}
+
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:10]); err != nil {
+		t.Fatalf("apply migrations through v10: %v", err)
+	}
+
+	workID := insertWork(t, pool, "openreview:v10-upgrade")
+	sourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		workID,
+		"pubmed",
+		"v10-upgrade-source",
+		"v10-upgrade-source-hash",
+	)
+	projectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
+		workID,
+		sourceRecordID,
+		"v10-upgrade",
+	)
+
+	var venueID, metricSnapshotID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l)
+		VALUES ('journal', 'V10 Upgrade Journal', '2468-135X')
+		RETURNING id
+	`), &venueID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license
+		) VALUES (
+			$1, 2025, 'UPGRADE CATEGORY', 11, 'Q1', 'known', 'clarivate', 'licensed'
+		)
+		RETURNING id
+	`, venueID), &metricSnapshotID)
+
+	var projectionCountBefore, metricCountBefore int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ingestion_projection_assertions").
+		Scan(&projectionCountBefore); err != nil {
+		t.Fatalf("count v10 projection assertions: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_metric_snapshots").
+		Scan(&metricCountBefore); err != nil {
+		t.Fatalf("count v10 Venue metric snapshots: %v", err)
+	}
+
+	if err := UpMigrations(ctx, pool, migrations[10:]); err != nil {
+		t.Fatalf("apply v11 biomedical semantics migration: %v", err)
+	}
+
+	var preservedProjectionID, preservedMetricID, preservedCategory string
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text
+		FROM ingestion_projection_assertions
+		WHERE id = $1
+	`, projectionAssertionID).Scan(&preservedProjectionID); err != nil {
+		t.Fatalf("query preserved projection assertion: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text, category
+		FROM venue_metric_snapshots
+		WHERE id = $1
+	`, metricSnapshotID).Scan(&preservedMetricID, &preservedCategory); err != nil {
+		t.Fatalf("query preserved Venue metric snapshot: %v", err)
+	}
+	var projectionCountAfter, metricCountAfter int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM ingestion_projection_assertions").
+		Scan(&projectionCountAfter); err != nil {
+		t.Fatalf("count upgraded projection assertions: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM venue_metric_snapshots").
+		Scan(&metricCountAfter); err != nil {
+		t.Fatalf("count upgraded Venue metric snapshots: %v", err)
+	}
+	if preservedProjectionID != projectionAssertionID ||
+		preservedMetricID != metricSnapshotID ||
+		preservedCategory != "UPGRADE CATEGORY" ||
+		projectionCountAfter != projectionCountBefore ||
+		metricCountAfter != metricCountBefore {
+		t.Fatalf(
+			"v10->v11 preservation = projection %q/%q count %d/%d, metric %q/%q category %q count %d/%d",
+			preservedProjectionID,
+			projectionAssertionID,
+			projectionCountAfter,
+			projectionCountBefore,
+			preservedMetricID,
+			metricSnapshotID,
+			preservedCategory,
+			metricCountAfter,
+			metricCountBefore,
+		)
+	}
+
+	var descriptorID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_descriptors (descriptor_ui)
+		VALUES ('D800001')
+		RETURNING id
+	`), &descriptorID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_mesh_headings (
+			projection_assertion_id, source_record_id, work_id, descriptor_id,
+			source_path, descriptor_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4, '/upgrade/DescriptorName', 'Upgrade Descriptor', false
+		)
+	`, projectionAssertionID, sourceRecordID, workID, descriptorID); err != nil {
+		t.Fatalf("reference preserved v10 projection assertion from v11 semantic row: %v", err)
+	}
+
+	subjectFixture := insertBiomedicalSubjectRegistryFixture(
+		t,
+		pool,
+		"v10-upgrade",
+		[]string{"UPGRADE CATEGORY"},
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO journal_subject_metrics (
+			venue_metric_snapshot_id, subject_rule_id, jcr_category
+		) VALUES ($1, $2, 'UPGRADE CATEGORY')
+	`, metricSnapshotID, subjectFixture.RuleIDs[0]); err != nil {
+		t.Fatalf("reference preserved v10 metric snapshot from v11 semantic row: %v", err)
 	}
 }
 
@@ -1905,8 +3267,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 10 {
-		t.Fatalf("embedded migration count = %d, want 10", len(migrations))
+	if len(migrations) != 11 {
+		t.Fatalf("embedded migration count = %d, want 11", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -3489,6 +4851,400 @@ func testContext(t *testing.T) context.Context {
 	return ctx
 }
 
+type biomedicalSubjectRegistryFixture struct {
+	ReceiptID       string
+	VersionID       string
+	SubjectIDs      []string
+	RuleIDs         []string
+	Source          string
+	RegistryVersion string
+	FileSHA256      string
+}
+
+func insertBiomedicalSubjectRegistryFixture(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	suffix string,
+	categories []string,
+) biomedicalSubjectRegistryFixture {
+	t.Helper()
+	ctx := testContext(t)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin biomedical Subject registry fixture: %v", err)
+	}
+	fixture := biomedicalSubjectRegistryFixture{
+		Source:          "clarivate-" + suffix,
+		RegistryVersion: "registry-" + suffix,
+		FileSHA256:      fmt.Sprintf("%x", sha256.Sum256([]byte("subject-registry-"+suffix))),
+		SubjectIDs:      make([]string, 0, len(categories)),
+		RuleIDs:         make([]string, 0, len(categories)),
+	}
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_import_receipts (
+			source, registry_version, file_sha256, subject_count, rule_count, imported_at
+		) VALUES ($1, $2, $3, $4, $4, now())
+		RETURNING id
+	`, fixture.Source, fixture.RegistryVersion, fixture.FileSHA256, len(categories)), &fixture.ReceiptID)
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_versions (subject_import_receipt_id, version_key)
+		VALUES ($1, $2)
+		RETURNING id
+	`, fixture.ReceiptID, "version-"+suffix), &fixture.VersionID)
+	for index, category := range categories {
+		var subjectID, ruleID string
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO subjects (subject_version_id, slug, display_label)
+			VALUES ($1, $2, $3)
+			RETURNING id
+		`,
+			fixture.VersionID,
+			fmt.Sprintf("subject-%d", index+1),
+			fmt.Sprintf("Subject %d", index+1),
+		), &subjectID)
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO biomedical_subject_rules (
+				subject_version_id, subject_id, jcr_category
+			) VALUES ($1, $2, $3)
+			RETURNING id
+		`, fixture.VersionID, subjectID, category), &ruleID)
+		fixture.SubjectIDs = append(fixture.SubjectIDs, subjectID)
+		fixture.RuleIDs = append(fixture.RuleIDs, ruleID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit biomedical Subject registry fixture: %v", err)
+	}
+	return fixture
+}
+
+func commitBiomedicalSubjectRegistryCounts(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	suffix string,
+	includeVersion bool,
+	declaredSubjects int,
+	declaredRules int,
+	actualSubjects int,
+	actualRules int,
+) error {
+	t.Helper()
+	ctx := testContext(t)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin mismatched biomedical Subject registry: %v", err)
+	}
+	var receiptID string
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_import_receipts (
+			source, registry_version, file_sha256, subject_count, rule_count, imported_at
+		) VALUES ($1, $2, $3, $4, $5, now())
+		RETURNING id
+	`,
+		"clarivate-"+suffix,
+		"registry-"+suffix,
+		fmt.Sprintf("%x", sha256.Sum256([]byte("subject-registry-"+suffix))),
+		declaredSubjects,
+		declaredRules,
+	), &receiptID)
+	if !includeVersion {
+		return tx.Commit(ctx)
+	}
+
+	var versionID string
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_versions (subject_import_receipt_id, version_key)
+		VALUES ($1, $2)
+		RETURNING id
+	`, receiptID, "version-"+suffix), &versionID)
+	subjectIDs := make([]string, 0, actualSubjects)
+	for index := range actualSubjects {
+		var subjectID string
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO subjects (subject_version_id, slug, display_label)
+			VALUES ($1, $2, $3)
+			RETURNING id
+		`,
+			versionID,
+			fmt.Sprintf("subject-%d", index+1),
+			fmt.Sprintf("Subject %d", index+1),
+		), &subjectID)
+		subjectIDs = append(subjectIDs, subjectID)
+	}
+	for index := range actualRules {
+		if len(subjectIDs) == 0 {
+			_ = tx.Rollback(context.Background())
+			t.Fatal("actual biomedical Subject rules require at least one Subject")
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO biomedical_subject_rules (
+				subject_version_id, subject_id, jcr_category
+			) VALUES ($1, $2, $3)
+		`, versionID, subjectIDs[index%len(subjectIDs)], fmt.Sprintf("CATEGORY %d", index+1)); err != nil {
+			_ = tx.Rollback(context.Background())
+			t.Fatalf("insert mismatched biomedical Subject rule: %v", err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func assertBiomedicalSubjectValidationConstraints(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := testContext(t)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin invalid Subject slug transaction: %v", err)
+	}
+	var receiptID, versionID string
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_import_receipts (
+			source, registry_version, file_sha256, subject_count, rule_count, imported_at
+		) VALUES (
+			'clarivate-invalid-slug', 'invalid-slug',
+			'1010101010101010101010101010101010101010101010101010101010101010',
+			0, 0, now()
+		)
+		RETURNING id
+	`), &receiptID)
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_versions (subject_import_receipt_id, version_key)
+		VALUES ($1, 'invalid-slug-version')
+		RETURNING id
+	`, receiptID), &versionID)
+	_, invalidSlugErr := tx.Exec(ctx, `
+		INSERT INTO subjects (subject_version_id, slug, display_label)
+		VALUES ($1, 'Clinical-Neurology', 'Invalid Slug')
+	`, versionID)
+	_ = tx.Rollback(context.Background())
+	assertPostgresError(t, invalidSlugErr, "23514", "subjects_slug_check")
+
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin mismatched Subject rule transaction: %v", err)
+	}
+	insertVersionAndSubject := func(suffix, hash string) (string, string) {
+		t.Helper()
+		var localReceiptID, localVersionID, subjectID string
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO subject_import_receipts (
+				source, registry_version, file_sha256, subject_count, rule_count, imported_at
+			) VALUES ($1, $1, $2, 1, 0, now())
+			RETURNING id
+		`, suffix, hash), &localReceiptID)
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO subject_versions (subject_import_receipt_id, version_key)
+			VALUES ($1, $2)
+			RETURNING id
+		`, localReceiptID, "version-"+suffix), &localVersionID)
+		mustScanID(t, tx.QueryRow(ctx, `
+			INSERT INTO subjects (subject_version_id, slug, display_label)
+			VALUES ($1, $2, $3)
+			RETURNING id
+		`, localVersionID, "subject-"+suffix, "Subject "+suffix), &subjectID)
+		return localVersionID, subjectID
+	}
+	firstVersionID, _ := insertVersionAndSubject(
+		"mismatched-rule-a",
+		"2020202020202020202020202020202020202020202020202020202020202020",
+	)
+	_, secondSubjectID := insertVersionAndSubject(
+		"mismatched-rule-b",
+		"3030303030303030303030303030303030303030303030303030303030303030",
+	)
+	_, mismatchedRuleErr := tx.Exec(ctx, `
+		INSERT INTO biomedical_subject_rules (
+			subject_version_id, subject_id, jcr_category
+		) VALUES ($1, $2, 'MISMATCHED CATEGORY')
+	`, firstVersionID, secondSubjectID)
+	_ = tx.Rollback(context.Background())
+	assertPostgresError(
+		t,
+		mismatchedRuleErr,
+		"23503",
+		"biomedical_subject_rules_subject_version_fkey",
+	)
+
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin duplicate Subject category transaction: %v", err)
+	}
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_import_receipts (
+			source, registry_version, file_sha256, subject_count, rule_count, imported_at
+		) VALUES (
+			'clarivate-duplicate-category', 'duplicate-category',
+			'4040404040404040404040404040404040404040404040404040404040404040',
+			2, 1, now()
+		)
+		RETURNING id
+	`), &receiptID)
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subject_versions (subject_import_receipt_id, version_key)
+		VALUES ($1, 'duplicate-category-version')
+		RETURNING id
+	`, receiptID), &versionID)
+	var firstSubjectID, secondSubjectIDForDuplicate string
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subjects (subject_version_id, slug, display_label)
+		VALUES ($1, 'first-subject', 'First Subject')
+		RETURNING id
+	`, versionID), &firstSubjectID)
+	mustScanID(t, tx.QueryRow(ctx, `
+		INSERT INTO subjects (subject_version_id, slug, display_label)
+		VALUES ($1, 'second-subject', 'Second Subject')
+		RETURNING id
+	`, versionID), &secondSubjectIDForDuplicate)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO biomedical_subject_rules (
+			subject_version_id, subject_id, jcr_category
+		) VALUES ($1, $2, 'DUPLICATE CATEGORY')
+	`, versionID, firstSubjectID); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("insert first Subject category rule: %v", err)
+	}
+	_, duplicateCategoryErr := tx.Exec(ctx, `
+		INSERT INTO biomedical_subject_rules (
+			subject_version_id, subject_id, jcr_category
+		) VALUES ($1, $2, 'DUPLICATE CATEGORY')
+	`, versionID, secondSubjectIDForDuplicate)
+	_ = tx.Rollback(context.Background())
+	assertPostgresError(
+		t,
+		duplicateCategoryErr,
+		"23505",
+		"biomedical_subject_rules_version_category_key",
+	)
+}
+
+type biomedicalProjectionFixture struct {
+	DescriptorID               string
+	QualifierID                string
+	PublicationTypeID          string
+	HeadingID                  string
+	QualifierAssertionID       string
+	PublicationTypeAssertionID string
+	ProjectionAssertionID      string
+	SourceRecordID             string
+	WorkID                     string
+}
+
+func insertBiomedicalProjectionAssertion(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	workID string,
+	sourceRecordID string,
+	suffix string,
+) string {
+	t.Helper()
+	ctx := testContext(t)
+	contentHash := fmt.Sprintf("%x", sha256.Sum256([]byte("projection-"+suffix)))
+	var jobID, rawEventID, projectionAssertionID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_jobs (
+			source, job_type, idempotency_key, status, payload, max_attempts, batch_key, stage
+		) VALUES ('pubmed', 'projection', $1, 'succeeded', '{}', 1, $1, 'project')
+		RETURNING id
+	`, "biomedical-projection-"+suffix), &jobID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_raw_events (
+			job_id, logical_source, event_key, event_kind, source_record_id,
+			source_time, tie_break_key, position, content_hash, raw_format, raw_payload
+		) VALUES (
+			$1, 'pubmed', $2, 'upsert', $2, now(), $2, 0, $3, 'xml',
+			convert_to('<PubmedArticle/>', 'UTF8')
+		)
+		RETURNING id
+	`, jobID, "biomedical-event-"+suffix, contentHash), &rawEventID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO ingestion_projection_assertions (
+			raw_event_id, source_record_uuid, work_id, job_id,
+			scope_policy_version, projection_policy_version, record_payload
+		) VALUES (
+			$1, $2, $3, $4, 'biomedical-scope-v1', 'biomedical-projection-v1',
+			jsonb_build_object('fixture', $5::text)
+		)
+		RETURNING id
+	`, rawEventID, sourceRecordID, workID, jobID, suffix), &projectionAssertionID)
+	return projectionAssertionID
+}
+
+func insertBiomedicalProjectionFixture(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	suffix string,
+) biomedicalProjectionFixture {
+	t.Helper()
+	ctx := testContext(t)
+	var fixture biomedicalProjectionFixture
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_descriptors (descriptor_ui) VALUES ('D900001') RETURNING id
+	`), &fixture.DescriptorID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO mesh_qualifiers (qualifier_ui) VALUES ('Q900001') RETURNING id
+	`), &fixture.QualifierID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO publication_types (publication_type_ui) VALUES ('D900002') RETURNING id
+	`), &fixture.PublicationTypeID)
+	fixture.WorkID = insertWork(t, pool, "openreview:fixture-"+suffix)
+	fixture.SourceRecordID = insertSourceRecord(
+		t,
+		pool,
+		fixture.WorkID,
+		"pubmed",
+		"source-"+suffix,
+		"source-hash-"+suffix,
+	)
+	fixture.ProjectionAssertionID = insertBiomedicalProjectionAssertion(
+		t,
+		pool,
+		fixture.WorkID,
+		fixture.SourceRecordID,
+		suffix,
+	)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_mesh_headings (
+			projection_assertion_id, source_record_id, work_id, descriptor_id,
+			source_path, descriptor_label, is_major_topic
+		) VALUES ($1, $2, $3, $4, '/fixture/DescriptorName', 'Fixture Descriptor', false)
+		RETURNING id
+	`,
+		fixture.ProjectionAssertionID,
+		fixture.SourceRecordID,
+		fixture.WorkID,
+		fixture.DescriptorID,
+	), &fixture.HeadingID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_mesh_qualifiers (
+			projection_assertion_id, source_record_id, work_id, work_mesh_heading_id,
+			qualifier_id, source_path, qualifier_label, is_major_topic
+		) VALUES (
+			$1, $2, $3, $4, $5, '/fixture/QualifierName', 'fixture qualifier', false
+		)
+		RETURNING id
+	`,
+		fixture.ProjectionAssertionID,
+		fixture.SourceRecordID,
+		fixture.WorkID,
+		fixture.HeadingID,
+		fixture.QualifierID,
+	), &fixture.QualifierAssertionID)
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_publication_types (
+			projection_assertion_id, source_record_id, work_id, publication_type_id,
+			source_path, publication_type_label
+		) VALUES (
+			$1, $2, $3, $4, '/fixture/PublicationType', 'Fixture Publication Type'
+		)
+		RETURNING id
+	`,
+		fixture.ProjectionAssertionID,
+		fixture.SourceRecordID,
+		fixture.WorkID,
+		fixture.PublicationTypeID,
+	), &fixture.PublicationTypeAssertionID)
+	return fixture
+}
+
 func insertWork(t *testing.T, pool *pgxpool.Pool, canonicalKey string) string {
 	t.Helper()
 	var id string
@@ -3615,6 +5371,35 @@ func assertPostgresError(t *testing.T, err error, code string, constraint string
 			"PostgreSQL constraint = %q, want %q: %v",
 			pgError.ConstraintName,
 			constraint,
+			pgError,
+		)
+	}
+}
+
+func assertPostgresColumnError(
+	t *testing.T,
+	err error,
+	code string,
+	table string,
+	column string,
+) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("PostgreSQL operation succeeded, want SQLSTATE %s on %s.%s", code, table, column)
+	}
+	var pgError *pgconn.PgError
+	if !errors.As(err, &pgError) {
+		t.Fatalf("error = %T %v, want *pgconn.PgError with SQLSTATE %s", err, err, code)
+	}
+	if pgError.Code != code || pgError.TableName != table || pgError.ColumnName != column {
+		t.Fatalf(
+			"PostgreSQL error = SQLSTATE %s, table %q, column %q; want %s, %q, %q: %v",
+			pgError.Code,
+			pgError.TableName,
+			pgError.ColumnName,
+			code,
+			table,
+			column,
 			pgError,
 		)
 	}
