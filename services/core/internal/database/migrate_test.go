@@ -81,6 +81,7 @@ var expectedSchemaTables = []string{
 	"journal_pattern_snapshots",
 	"research_opportunity_snapshots",
 	"research_opportunity_supporting_works",
+	"work_publication_event_assertions",
 }
 
 var expectedSchemaTablesWithoutGeneratedID = []string{
@@ -88,6 +89,7 @@ var expectedSchemaTablesWithoutGeneratedID = []string{
 	"public_catalog_biomedical_manifest",
 	"public_catalog_subjects",
 	"public_catalog_journals",
+	"work_publication_states",
 }
 
 func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
@@ -153,6 +155,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 15, name: "citation_evidence"},
 		{version: 16, name: "citation_analysis_snapshots"},
 		{version: 17, name: "biomedical_analysis_snapshots"},
+		{version: 18, name: "publication_event_assertions"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -196,8 +199,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 17 {
-		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
+	if len(migrations) != 18 {
+		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -279,6 +282,530 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 			"seventeenth migration = %#v, want 000017_biomedical_analysis_snapshots",
 			migrations[16],
 		)
+	}
+	if migrations[17].Version != 18 ||
+		migrations[17].Name != "publication_event_assertions" {
+		t.Fatalf(
+			"eighteenth migration = %#v, want 000018_publication_event_assertions",
+			migrations[17],
+		)
+	}
+}
+
+func TestPublicationEventAssertionSchema(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	requiredColumns := map[string]map[string]bool{
+		"work_publication_event_assertions": {
+			"id":                      true,
+			"projection_assertion_id": true,
+			"normalized_assertion_id": true,
+			"source_record_id":        true,
+			"work_id":                 true,
+			"event_kind":              true,
+			"event_date":              false,
+			"date_precision":          true,
+			"source_date":             true,
+			"status_raw":              true,
+			"publication_model_raw":   false,
+			"source_path":             true,
+			"ordinal":                 true,
+			"created_at":              true,
+		},
+		"work_publication_states": {
+			"work_id":                    true,
+			"projection_assertion_id":    true,
+			"normalized_assertion_id":    true,
+			"source_record_id":           true,
+			"print_published_on":         false,
+			"print_published_state":      true,
+			"electronic_published_on":    false,
+			"electronic_published_state": true,
+			"ahead_of_print_on":          false,
+			"ahead_of_print_state":       true,
+			"accepted_on":                false,
+			"accepted_state":             true,
+			"publication_model_raw":      false,
+			"publication_status_raw":     false,
+			"updated_at":                 true,
+		},
+	}
+	for table, columns := range requiredColumns {
+		for column, wantNotNull := range columns {
+			var nullable string
+			if err := pool.QueryRow(ctx, `
+				SELECT is_nullable
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = $1
+				  AND column_name = $2
+			`, table, column).Scan(&nullable); err != nil {
+				t.Fatalf("%s.%s metadata: %v", table, column, err)
+			}
+			if gotNotNull := nullable == "NO"; gotNotNull != wantNotNull {
+				t.Fatalf(
+					"%s.%s NOT NULL = %t, want %t",
+					table,
+					column,
+					gotNotNull,
+					wantNotNull,
+				)
+			}
+		}
+	}
+
+	expectedConstraintColumns := map[string][]string{
+		"work_publication_event_assertions_projection_provenance_fkey": {
+			"projection_assertion_id",
+			"normalized_assertion_id",
+			"source_record_id",
+			"work_id",
+		},
+		"work_publication_event_assertions_normalized_source_fkey": {
+			"normalized_assertion_id",
+			"source_record_id",
+		},
+		"work_publication_event_assertions_source_record_work_fkey": {
+			"source_record_id",
+			"work_id",
+		},
+		"work_publication_states_projection_provenance_fkey": {
+			"projection_assertion_id",
+			"normalized_assertion_id",
+			"source_record_id",
+			"work_id",
+		},
+		"work_publication_states_normalized_source_fkey": {
+			"normalized_assertion_id",
+			"source_record_id",
+		},
+		"work_publication_states_source_record_work_fkey": {
+			"source_record_id",
+			"work_id",
+		},
+	}
+	for constraint, columns := range expectedConstraintColumns {
+		var definition string
+		if err := pool.QueryRow(ctx, `
+			SELECT pg_get_constraintdef(oid)
+			FROM pg_constraint
+			WHERE conname = $1
+		`, constraint).Scan(&definition); err != nil {
+			t.Fatalf("query constraint %s: %v", constraint, err)
+		}
+		for _, column := range columns {
+			if !strings.Contains(definition, column) {
+				t.Errorf(
+					"constraint %s = %q, want column %s",
+					constraint,
+					definition,
+					column,
+				)
+			}
+		}
+	}
+
+	expectedIndexes := map[string][]string{
+		"idx_work_publication_event_assertions_event_date": {
+			"(event_kind, event_date DESC, work_id)",
+		},
+		"idx_work_publication_event_assertions_work_projection": {
+			"(work_id, projection_assertion_id)",
+		},
+		"idx_work_publication_event_assertions_source_ordinal": {
+			"(source_record_id, ordinal)",
+		},
+	}
+	for index, fragments := range expectedIndexes {
+		var definition string
+		if err := pool.QueryRow(ctx, `
+			SELECT indexdef
+			FROM pg_indexes
+			WHERE schemaname = 'public'
+			  AND indexname = $1
+		`, index).Scan(&definition); err != nil {
+			t.Fatalf("query index %s: %v", index, err)
+		}
+		for _, fragment := range fragments {
+			if !strings.Contains(definition, fragment) {
+				t.Errorf("index %s = %q, want %q", index, definition, fragment)
+			}
+		}
+	}
+
+	var immutableAssertionTriggers, immutableStateTriggers int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_trigger
+		WHERE tgrelid = 'work_publication_event_assertions'::regclass
+		  AND tgname = 'work_publication_event_assertions_immutable'
+		  AND NOT tgisinternal
+	`).Scan(&immutableAssertionTriggers); err != nil {
+		t.Fatalf("query publication assertion immutable trigger: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_trigger
+		WHERE tgrelid = 'work_publication_states'::regclass
+		  AND tgname LIKE '%immutable%'
+		  AND NOT tgisinternal
+	`).Scan(&immutableStateTriggers); err != nil {
+		t.Fatalf("query publication state immutable triggers: %v", err)
+	}
+	if immutableAssertionTriggers != 1 || immutableStateTriggers != 0 {
+		t.Fatalf(
+			"publication immutability triggers = assertions %d, states %d; want 1, 0",
+			immutableAssertionTriggers,
+			immutableStateTriggers,
+		)
+	}
+
+	workID := insertWork(t, pool, "doi:10.1000/publication-event-schema")
+	sourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		workID,
+		"pubmed",
+		"publication-event-schema",
+		"publication-event-schema-hash",
+	)
+	projectionAssertionID := insertBiomedicalProjectionAssertion(
+		t,
+		pool,
+		workID,
+		sourceRecordID,
+		"publication-event-schema",
+	)
+	var normalizedAssertionID string
+	if err := pool.QueryRow(ctx, `
+		SELECT normalized_assertion_id::text
+		FROM ingestion_projection_assertions
+		WHERE id = $1
+	`, projectionAssertionID).Scan(&normalizedAssertionID); err != nil {
+		t.Fatalf("query publication normalized assertion: %v", err)
+	}
+
+	var eventAssertionID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_publication_event_assertions (
+			projection_assertion_id,
+			normalized_assertion_id,
+			source_record_id,
+			work_id,
+			event_kind,
+			event_date,
+			date_precision,
+			source_date,
+			status_raw,
+			publication_model_raw,
+			source_path,
+			ordinal
+		) VALUES (
+			$1, $2, $3, $4,
+			'accepted', DATE '2026-07-15', 'day',
+			'{"year":2026,"month":7,"day":15}',
+			'accepted', 'Print-Electronic',
+			'/PubmedArticle/PubmedData/History/PubMedPubDate[1]',
+			1
+		)
+		RETURNING id
+	`,
+		projectionAssertionID,
+		normalizedAssertionID,
+		sourceRecordID,
+		workID,
+	), &eventAssertionID)
+
+	var sourceDatePreserved bool
+	var sourcePath string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			source_date = '{"year":2026,"month":7,"day":15}'::jsonb,
+			source_path
+		FROM work_publication_event_assertions
+		WHERE id = $1
+	`, eventAssertionID).Scan(&sourceDatePreserved, &sourcePath); err != nil {
+		t.Fatalf("query preserved publication event evidence: %v", err)
+	}
+	if !sourceDatePreserved ||
+		sourcePath != "/PubmedArticle/PubmedData/History/PubMedPubDate[1]" {
+		t.Fatalf(
+			"preserved publication evidence = source date %t, path %q",
+			sourceDatePreserved,
+			sourcePath,
+		)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_publication_event_assertions (
+			projection_assertion_id, normalized_assertion_id,
+			source_record_id, work_id, event_kind, event_date,
+			date_precision, source_date, status_raw, source_path, ordinal
+		) VALUES (
+			$1, $2, $3, $4, 'electronic_published', NULL,
+			'month', '{"year":2026,"month":7}', 'epublish',
+			'/PubmedArticle/PubmedData/History/PubMedPubDate[2]', 2
+		)
+	`,
+		projectionAssertionID,
+		normalizedAssertionID,
+		sourceRecordID,
+		workID,
+	); err != nil {
+		t.Fatalf("insert partial publication event evidence: %v", err)
+	}
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO work_publication_event_assertions (
+			projection_assertion_id, normalized_assertion_id,
+			source_record_id, work_id, event_kind, event_date,
+			date_precision, source_date, status_raw, source_path, ordinal
+		) VALUES (
+			$1, $2, $3, $4, 'submitted', DATE '2026-07-15',
+			'day', '{"year":2026,"month":7,"day":15}', 'submitted',
+			'/PubmedArticle/PubmedData/History/PubMedPubDate[3]', 3
+		)
+	`, projectionAssertionID, normalizedAssertionID, sourceRecordID, workID)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"work_publication_event_assertions_event_kind_check",
+	)
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_publication_event_assertions (
+			projection_assertion_id, normalized_assertion_id,
+			source_record_id, work_id, event_kind, event_date,
+			date_precision, source_date, status_raw, source_path, ordinal
+		) VALUES (
+			$1, $2, $3, $4, 'print_published', DATE '2026-07-15',
+			'hour', '{"year":2026,"month":7,"day":15}', 'ppublish',
+			'/PubmedArticle/PubmedData/History/PubMedPubDate[4]', 4
+		)
+	`, projectionAssertionID, normalizedAssertionID, sourceRecordID, workID)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"work_publication_event_assertions_date_precision_check",
+	)
+
+	for _, test := range []struct {
+		name      string
+		eventDate string
+		precision string
+		ordinal   int
+	}{
+		{
+			name:      "day precision without exact date",
+			eventDate: "NULL",
+			precision: "day",
+			ordinal:   5,
+		},
+		{
+			name:      "partial precision with invented exact date",
+			eventDate: "DATE '2026-07-01'",
+			precision: "month",
+			ordinal:   6,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			query := fmt.Sprintf(`
+				INSERT INTO work_publication_event_assertions (
+					projection_assertion_id, normalized_assertion_id,
+					source_record_id, work_id, event_kind, event_date,
+					date_precision, source_date, status_raw, source_path, ordinal
+				) VALUES (
+					$1, $2, $3, $4, 'ahead_of_print', %s,
+					$5, '{"year":2026,"month":7}', 'aheadofprint',
+					'/PubmedArticle/PubmedData/History/PubMedPubDate[%d]', %d
+				)
+			`, test.eventDate, test.ordinal, test.ordinal)
+			_, shapeErr := pool.Exec(
+				ctx,
+				query,
+				projectionAssertionID,
+				normalizedAssertionID,
+				sourceRecordID,
+				workID,
+				test.precision,
+			)
+			assertPostgresError(
+				t,
+				shapeErr,
+				"23514",
+				"work_publication_event_assertions_date_shape_check",
+			)
+		})
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_publication_event_assertions (
+			projection_assertion_id, normalized_assertion_id,
+			source_record_id, work_id, event_kind, event_date,
+			date_precision, source_date, status_raw, source_path, ordinal
+		) VALUES (
+			$1, $2, $3, $4, 'accepted', DATE '2026-07-15',
+			'day', '{"year":2026,"month":7,"day":15}', 'accepted',
+			'/PubmedArticle/PubmedData/History/PubMedPubDate[1]', 1
+		)
+	`, projectionAssertionID, normalizedAssertionID, sourceRecordID, workID)
+	assertPostgresError(
+		t,
+		err,
+		"23505",
+		"work_publication_event_assertions_projection_ordinal_key",
+	)
+
+	otherWorkID := insertWork(t, pool, "doi:10.1000/publication-event-other-work")
+	otherSourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		otherWorkID,
+		"pubmed",
+		"publication-event-other-work",
+		"publication-event-other-work-hash",
+	)
+	crossSourceRecordID := insertSourceRecord(
+		t,
+		pool,
+		workID,
+		"crossref",
+		"publication-event-cross-source",
+		"publication-event-cross-source-hash",
+	)
+	for _, test := range []struct {
+		name           string
+		sourceRecordID string
+		workID         string
+		ordinal        int
+	}{
+		{
+			name:           "cross Work",
+			sourceRecordID: sourceRecordID,
+			workID:         otherWorkID,
+			ordinal:        7,
+		},
+		{
+			name:           "cross source",
+			sourceRecordID: crossSourceRecordID,
+			workID:         workID,
+			ordinal:        8,
+		},
+	} {
+		t.Run(test.name+" assertion provenance", func(t *testing.T) {
+			_, provenanceErr := pool.Exec(ctx, `
+				INSERT INTO work_publication_event_assertions (
+					projection_assertion_id, normalized_assertion_id,
+					source_record_id, work_id, event_kind, event_date,
+					date_precision, source_date, status_raw, source_path, ordinal
+				) VALUES (
+					$1, $2, $3, $4, 'accepted', DATE '2026-07-15',
+					'day', '{"year":2026,"month":7,"day":15}', 'accepted',
+					'/PubmedArticle/PubmedData/History/PubMedPubDate[9]', $5
+				)
+			`,
+				projectionAssertionID,
+				normalizedAssertionID,
+				test.sourceRecordID,
+				test.workID,
+				test.ordinal,
+			)
+			assertPostgresError(t, provenanceErr, "23503", "")
+		})
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_publication_states (
+			work_id,
+			projection_assertion_id,
+			normalized_assertion_id,
+			source_record_id,
+			print_published_on,
+			print_published_state,
+			electronic_published_on,
+			electronic_published_state,
+			ahead_of_print_on,
+			ahead_of_print_state,
+			accepted_on,
+			accepted_state,
+			publication_model_raw,
+			publication_status_raw
+		) VALUES (
+			$1, $2, $3, $4,
+			DATE '2026-07-16', 'known',
+			NULL, 'missing',
+			NULL, 'conflict',
+			DATE '2026-07-15', 'known',
+			'Print-Electronic', 'ppublish'
+		)
+	`, workID, projectionAssertionID, normalizedAssertionID, sourceRecordID); err != nil {
+		t.Fatalf("insert current publication state: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+		UPDATE work_publication_states
+		SET electronic_published_state = 'unknown'
+		WHERE work_id = $1
+	`, workID)
+	assertPostgresError(
+		t,
+		err,
+		"23514",
+		"work_publication_states_electronic_state_check",
+	)
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE work_publication_states
+		SET accepted_on = NULL,
+		    accepted_state = 'conflict',
+		    publication_model_raw = 'Electronic',
+		    updated_at = now()
+		WHERE work_id = $1
+	`, workID); err != nil {
+		t.Fatalf("update replaceable publication state: %v", err)
+	}
+	var acceptedState, publicationModel string
+	var acceptedOn *time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT accepted_on, accepted_state, publication_model_raw
+		FROM work_publication_states
+		WHERE work_id = $1
+	`, workID).Scan(&acceptedOn, &acceptedState, &publicationModel); err != nil {
+		t.Fatalf("query updated publication state: %v", err)
+	}
+	if acceptedOn != nil ||
+		acceptedState != "conflict" ||
+		publicationModel != "Electronic" {
+		t.Fatalf(
+			"updated publication state = date %v, state %q, model %q",
+			acceptedOn,
+			acceptedState,
+			publicationModel,
+		)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO work_publication_states (
+			work_id, projection_assertion_id, normalized_assertion_id,
+			source_record_id, print_published_state,
+			electronic_published_state, ahead_of_print_state, accepted_state
+		) VALUES (
+			$1, $2, $3, $4, 'missing', 'missing', 'missing', 'missing'
+		)
+	`, otherWorkID, projectionAssertionID, normalizedAssertionID, otherSourceRecordID)
+	assertPostgresError(t, err, "23503", "")
+
+	for _, query := range []string{
+		`UPDATE work_publication_event_assertions
+		 SET ordinal = ordinal
+		 WHERE id = $1`,
+		`DELETE FROM work_publication_event_assertions WHERE id = $1`,
+	} {
+		_, mutationErr := pool.Exec(ctx, query, eventAssertionID)
+		assertPostgresError(t, mutationErr, "55000", "")
 	}
 }
 
@@ -1872,8 +2399,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 17 {
-		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
+	if len(migrations) != 18 {
+		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -3294,8 +3821,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 17 {
-		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
+	if len(migrations) != 18 {
+		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -5114,8 +5641,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 17 {
-		t.Fatalf("embedded migration count = %d, want 17", len(migrations))
+	if len(migrations) != 18 {
+		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -5126,8 +5653,13 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 
 	var workID, sourceRecordID, paperVersionID, externalIdentifierID string
 	mustScanID(t, pool.QueryRow(ctx, `
-		INSERT INTO works (canonical_key, status, title)
-		VALUES ('doi:10.1000/Legacy', 'active', 'Legacy Work')
+		INSERT INTO works (canonical_key, status, title, published_at)
+		VALUES (
+			'doi:10.1000/Legacy',
+			'active',
+			'Legacy Work',
+			TIMESTAMPTZ '2020-01-01 00:00:00+00'
+		)
 		RETURNING id
 	`), &workID)
 	mustScanID(t, pool.QueryRow(ctx, `
@@ -5221,7 +5753,7 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 		)
 	}
 
-	var appliedCount int
+	var appliedCount, publicationEventCount, publicationStateCount int
 	var preservedChecksum string
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*), min(checksum) FILTER (WHERE version = 1)
@@ -5236,6 +5768,28 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 			preservedChecksum,
 			len(migrations),
 			initialMigrationChecksum,
+		)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(
+				SELECT count(*)
+				FROM work_publication_event_assertions
+				WHERE work_id = $1
+			),
+			(
+				SELECT count(*)
+				FROM work_publication_states
+				WHERE work_id = $1
+			)
+	`, workID).Scan(&publicationEventCount, &publicationStateCount); err != nil {
+		t.Fatalf("query upgraded publication event rows: %v", err)
+	}
+	if publicationEventCount != 0 || publicationStateCount != 0 {
+		t.Fatalf(
+			"legacy works.published_at backfilled publication meaning: assertions %d, states %d",
+			publicationEventCount,
+			publicationStateCount,
 		)
 	}
 }
