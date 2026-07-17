@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
@@ -22,6 +21,8 @@ import (
 type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
+
+const postgresJobIdempotencyAdvisorySeed int64 = 0x49444D50
 
 func NewPostgresRepository(pool *pgxpool.Pool) (*PostgresRepository, error) {
 	if pool == nil {
@@ -103,8 +104,61 @@ func (repository *PostgresRepository) Start(
 		return Job{}, fmt.Errorf("encode ingestion job payload: %w", err)
 	}
 
+	tx, err := repository.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Job{}, fmt.Errorf("begin ingestion job start transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	if _, err := tx.Exec(
+		ctx,
+		"SELECT pg_advisory_xact_lock(hashtextextended($1, $2))",
+		pending.IdempotencyKey,
+		postgresJobIdempotencyAdvisorySeed,
+	); err != nil {
+		return Job{}, fmt.Errorf("lock ingestion job idempotency key: %w", err)
+	}
+
+	var existingID string
+	var existingSource, existingBatch string
+	var existingPayload []byte
+	err = tx.QueryRow(ctx, `
+		SELECT id::text, source, batch_key, payload
+		FROM ingestion_jobs
+		WHERE idempotency_key = $1
+		  AND status IN ('pending', 'running')
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1
+		FOR UPDATE
+	`, pending.IdempotencyKey).Scan(
+		&existingID,
+		&existingSource,
+		&existingBatch,
+		&existingPayload,
+	)
+	switch {
+	case err == nil:
+		return Job{}, &ErrIdempotencyConflict{
+			IdempotencyKey: pending.IdempotencyKey,
+			ExistingJobID:  existingID,
+			Cause: fmt.Errorf(
+				"persisted job source/batch/payload = %q/%q/%s; incoming = %q/%q/%s",
+				existingSource,
+				existingBatch,
+				string(existingPayload),
+				pending.LogicalSource,
+				pending.BatchKey,
+				string(payload),
+			),
+		}
+	case !errors.Is(err, pgx.ErrNoRows):
+		return Job{}, fmt.Errorf("query active ingestion job: %w", err)
+	}
+
 	var id string
-	err = repository.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO ingestion_jobs (
 			source,
 			job_type,
@@ -129,52 +183,14 @@ func (repository *PostgresRepository) Start(
 		pending.Stage,
 	).Scan(&id)
 	if err != nil {
-		var postgresError *pgconn.PgError
-		if !errors.As(err, &postgresError) ||
-			postgresError.Code != "23505" ||
-			postgresError.ConstraintName != "ingestion_jobs_active_idempotency_key" {
-			return Job{}, fmt.Errorf("insert ingestion job: %w", err)
-		}
-
-		var existingID string
-		var existingSource, existingBatch string
-		var existingPayload []byte
-		existingErr := repository.pool.QueryRow(ctx, `
-			SELECT id::text, source, batch_key, payload
-			FROM ingestion_jobs
-			WHERE idempotency_key = $1
-			  AND status IN ('pending', 'running')
-			ORDER BY created_at DESC, id DESC
-			LIMIT 1
-		`, pending.IdempotencyKey).Scan(
-			&existingID,
-			&existingSource,
-			&existingBatch,
-			&existingPayload,
-		)
-		if existingErr == nil {
-			return Job{}, &ErrIdempotencyConflict{
-				IdempotencyKey: pending.IdempotencyKey,
-				ExistingJobID:  existingID,
-				Cause: fmt.Errorf(
-					"persisted job source/batch/payload = %q/%q/%s; incoming = %q/%q/%s",
-					existingSource,
-					existingBatch,
-					string(existingPayload),
-					pending.LogicalSource,
-					pending.BatchKey,
-					string(payload),
-				),
-			}
-		}
-		return Job{}, fmt.Errorf(
-			"insert ingestion job violated active idempotency key without an active row: %w",
-			err,
-		)
+		return Job{}, fmt.Errorf("insert ingestion job: %w", err)
 	}
 	started, err := pending.Start(id)
 	if err != nil {
 		return Job{}, fmt.Errorf("restore started ingestion job: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Job{}, fmt.Errorf("commit ingestion job start: %w", err)
 	}
 	return started, nil
 }
@@ -1650,17 +1666,29 @@ func resolveVenue(
 	for _, detail := range venue.ISSNDetails {
 		appendISSN(detail.Value)
 	}
-	for _, identifier := range identifiers {
-		var id string
-		err := tx.QueryRow(ctx, `
-			SELECT id::text
+	if len(identifiers) > 0 {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT id::text
 			FROM venues
-			WHERE $1 IN (issn_l, issn, eissn)
-		`, identifier).Scan(&id)
-		if err == nil {
+			WHERE
+				issn_l = ANY($1::text[])
+				OR issn = ANY($1::text[])
+				OR eissn = ANY($1::text[])
+			ORDER BY id
+		`, identifiers)
+		if err != nil {
+			return "", fmt.Errorf("resolve venue ISSNs: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return "", fmt.Errorf("scan venue ISSN match: %w", err)
+			}
 			matches[id] = struct{}{}
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return "", fmt.Errorf("resolve venue ISSN %q: %w", identifier, err)
+		}
+		if err := rows.Err(); err != nil {
+			return "", fmt.Errorf("iterate venue ISSN matches: %w", err)
 		}
 	}
 	if len(matches) > 1 {

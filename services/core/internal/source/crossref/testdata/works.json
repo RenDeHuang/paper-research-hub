@@ -8,6 +8,7 @@
     "items": [
       {
         "DOI": "HTTPS://DOI.ORG/10.1000/ARTICLE",
+        "type": "journal-article",
         "title": [
           "A deterministic Crossref record",
           "A title that must not be selected"

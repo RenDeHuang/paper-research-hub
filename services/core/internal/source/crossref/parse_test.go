@@ -107,6 +107,7 @@ func TestParseMapsCrossrefItemWithoutInventingValues(t *testing.T) {
 	if record.Venue == nil ||
 		record.Venue.DisplayName != "Journal of Reproducible Agents" ||
 		record.Venue.ISOAbbreviation != "J. Reprod. Agents" ||
+		record.Venue.Type != "journal" ||
 		record.Venue.ISSNL != "" ||
 		!slices.Equal(record.Venue.ISSN, []string{"0028-0836", "2049-3630"}) ||
 		!slices.Equal(record.Venue.ISSNDetails, []source.VenueISSN{
@@ -197,6 +198,7 @@ func TestParseMapsCrossrefItemWithoutInventingValues(t *testing.T) {
 		{Field: "authors", SourcePath: "$.author"},
 		{Field: "venue", SourcePath: "$.container-title[0]"},
 		{Field: "venue", SourcePath: "$.short-container-title[0]"},
+		{Field: "venue", SourcePath: "$.type"},
 		{Field: "venue", SourcePath: "$.ISSN"},
 		{Field: "venue", SourcePath: "$.issn-type"},
 		{Field: "published_date", SourcePath: "$.published.date-parts"},
@@ -252,6 +254,79 @@ func TestParseLeavesOptionalFieldsAbsentAndNeverFallsBackToOtherCrossrefDates(t 
 	}}
 	if !slices.Equal(record.Evidence, wantEvidence) {
 		t.Fatalf("Evidence = %#v, want only actual DOI mapping", record.Evidence)
+	}
+}
+
+func TestParseMapsOnlySupportedCrossrefWorkTypesToVenueType(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		workType         string
+		wantVenueType    string
+		wantTypeEvidence bool
+	}{
+		{
+			name:             "journal article",
+			workType:         `"type":"journal-article",`,
+			wantVenueType:    "journal",
+			wantTypeEvidence: true,
+		},
+		{
+			name:             "proceedings article",
+			workType:         `"type":"proceedings-article",`,
+			wantVenueType:    "conference",
+			wantTypeEvidence: true,
+		},
+		{
+			name: "missing type",
+		},
+		{
+			name:     "unsupported type",
+			workType: `"type":"book-chapter",`,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			record, err := crossref.Parse([]byte(
+				`{"DOI":"10.1000/venue-type",` +
+					test.workType +
+					`"container-title":["Deterministic Venue"]}`,
+			))
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if record.Venue == nil {
+				t.Fatal("Venue = nil, want container-title venue")
+			}
+			if record.Venue.Type != test.wantVenueType {
+				t.Fatalf(
+					"Venue.Type = %q, want %q",
+					record.Venue.Type,
+					test.wantVenueType,
+				)
+			}
+
+			gotTypeEvidence := slices.Contains(
+				record.Evidence,
+				source.FieldEvidence{
+					Field:      "venue",
+					SourcePath: "$.type",
+				},
+			)
+			if gotTypeEvidence != test.wantTypeEvidence {
+				t.Fatalf(
+					"Evidence contains venue $.type = %t, want %t; Evidence = %#v",
+					gotTypeEvidence,
+					test.wantTypeEvidence,
+					record.Evidence,
+				)
+			}
+		})
 	}
 }
 

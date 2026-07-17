@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -121,6 +122,224 @@ func TestPostgresRepositoryRejectsConcurrentRunWithSameKey(t *testing.T) {
 	}
 	if conflict.ExistingJobID != first.ID {
 		t.Fatalf("conflict existing job ID = %q, want %q", conflict.ExistingJobID, first.ID)
+	}
+}
+
+func TestPostgresRepositoryStartSucceedsWhenPriorJobFinishesBeforeActiveCheck(t *testing.T) {
+	for _, testCase := range postgresRepositoryTerminalCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIngestionTestPool(t)
+			repository := mustPostgresRepository(t, pool)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			pending, err := NewJob(
+				"sync/openalex/terminal-before-check/"+testCase.name,
+				source.OpenAlex,
+				"test:terminal-before-check:"+testCase.name,
+				map[string]any{"query": "agent"},
+			)
+			if err != nil {
+				t.Fatalf("NewJob() error = %v", err)
+			}
+			first, err := repository.Start(ctx, pending)
+			if err != nil {
+				t.Fatalf("Start(first) error = %v", err)
+			}
+			terminal, err := testCase.terminal(first)
+			if err != nil {
+				t.Fatalf("%s terminal transition error = %v", testCase.name, err)
+			}
+
+			lockConnection, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("acquire idempotency lock connection: %v", err)
+			}
+			defer lockConnection.Release()
+			if _, err := lockConnection.Exec(ctx, `
+				SELECT pg_advisory_lock(hashtextextended($1, $2))
+			`, pending.IdempotencyKey, postgresJobIdempotencyAdvisorySeed); err != nil {
+				t.Fatalf("acquire idempotency advisory barrier: %v", err)
+			}
+			var unlockOnce sync.Once
+			unlock := func() {
+				unlockOnce.Do(func() {
+					if _, unlockErr := lockConnection.Exec(
+						context.Background(),
+						`SELECT pg_advisory_unlock(hashtextextended($1, $2))`,
+						pending.IdempotencyKey,
+						postgresJobIdempotencyAdvisorySeed,
+					); unlockErr != nil {
+						t.Errorf("release idempotency advisory barrier: %v", unlockErr)
+					}
+				})
+			}
+			defer unlock()
+
+			startLockTrace := newPostgresQueryBarrierTracer(func(sql string) bool {
+				return strings.Contains(sql, "pg_advisory_xact_lock") &&
+					strings.Contains(sql, "hashtextextended")
+			}, nil)
+			startPool := openTracedIngestionTestPool(t, pool, startLockTrace)
+			startRepository := mustPostgresRepository(t, startPool)
+			startResult := make(chan postgresRepositoryStartResult, 1)
+			go func() {
+				job, startErr := startRepository.Start(ctx, pending)
+				startResult <- postgresRepositoryStartResult{job: job, err: startErr}
+			}()
+
+			waitForPostgresTraceSignal(
+				t,
+				ctx,
+				startLockTrace.queryStarted,
+				"new Start to reach the idempotency advisory lock",
+			)
+			if err := testCase.persist(ctx, repository, terminal); err != nil {
+				t.Fatalf("%s prior job error = %v", testCase.name, err)
+			}
+
+			var persistedStatus JobStatus
+			if err := pool.QueryRow(ctx, `
+				SELECT status
+				FROM ingestion_jobs
+				WHERE id = $1
+			`, first.ID).Scan(&persistedStatus); err != nil {
+				t.Fatalf("query prior job status: %v", err)
+			}
+			if persistedStatus != testCase.status {
+				t.Fatalf(
+					"prior job status before releasing Start = %q, want %q",
+					persistedStatus,
+					testCase.status,
+				)
+			}
+
+			unlock()
+			result := waitForPostgresStartResult(t, ctx, startResult)
+			if result.err != nil {
+				t.Fatalf("Start(after %s) error = %v", testCase.name, result.err)
+			}
+			if result.job.ID == first.ID {
+				t.Fatalf("new Start job ID = %q, want a new run", result.job.ID)
+			}
+		})
+	}
+}
+
+func TestPostgresRepositoryStartLocksActiveJobBeforeTerminalUpdate(t *testing.T) {
+	for _, testCase := range postgresRepositoryTerminalCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIngestionTestPool(t)
+			repository := mustPostgresRepository(t, pool)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			pending, err := NewJob(
+				"sync/openalex/start-before-terminal/"+testCase.name,
+				source.OpenAlex,
+				"test:start-before-terminal:"+testCase.name,
+				map[string]any{"query": "agent"},
+			)
+			if err != nil {
+				t.Fatalf("NewJob() error = %v", err)
+			}
+			first, err := repository.Start(ctx, pending)
+			if err != nil {
+				t.Fatalf("Start(first) error = %v", err)
+			}
+			terminal, err := testCase.terminal(first)
+			if err != nil {
+				t.Fatalf("%s terminal transition error = %v", testCase.name, err)
+			}
+
+			releaseActiveRow := make(chan struct{})
+			var releaseActiveRowOnce sync.Once
+			releaseStart := func() {
+				releaseActiveRowOnce.Do(func() {
+					close(releaseActiveRow)
+				})
+			}
+			defer releaseStart()
+			startRowTrace := newPostgresQueryBarrierTracer(func(sql string) bool {
+				return strings.Contains(sql, "FROM ingestion_jobs") &&
+					strings.Contains(sql, "status IN ('pending', 'running')") &&
+					strings.Contains(sql, "FOR UPDATE")
+			}, releaseActiveRow)
+			startPool := openTracedIngestionTestPool(t, pool, startRowTrace)
+			startRepository := mustPostgresRepository(t, startPool)
+			startResult := make(chan postgresRepositoryStartResult, 1)
+			go func() {
+				job, startErr := startRepository.Start(ctx, pending)
+				startResult <- postgresRepositoryStartResult{job: job, err: startErr}
+			}()
+
+			waitForPostgresTraceSignal(
+				t,
+				ctx,
+				startRowTrace.queryEnded,
+				"second Start to select and lock the active job row",
+			)
+
+			finishTrace := newPostgresQueryBarrierTracer(func(sql string) bool {
+				return strings.Contains(sql, "UPDATE ingestion_jobs") &&
+					strings.Contains(sql, "finished_at = now()") &&
+					strings.Contains(sql, "status = $2")
+			}, nil)
+			finishPool := openTracedIngestionTestPool(t, pool, finishTrace)
+			finishRepository := mustPostgresRepository(t, finishPool)
+			finishResult := make(chan error, 1)
+			go func() {
+				finishResult <- testCase.persist(ctx, finishRepository, terminal)
+			}()
+			waitForPostgresTraceSignal(
+				t,
+				ctx,
+				finishTrace.queryStarted,
+				testCase.name+" update to enter PostgreSQL while Start holds the row lock",
+			)
+
+			releaseStart()
+			result := waitForPostgresStartResult(t, ctx, startResult)
+			var conflict *ErrIdempotencyConflict
+			if !errors.As(result.err, &conflict) {
+				t.Fatalf(
+					"Start(second) error = %v, want ErrIdempotencyConflict",
+					result.err,
+				)
+			}
+			if conflict.ExistingJobID != first.ID {
+				t.Fatalf(
+					"conflict existing job ID = %q, want %q",
+					conflict.ExistingJobID,
+					first.ID,
+				)
+			}
+
+			select {
+			case finishErr := <-finishResult:
+				if finishErr != nil {
+					t.Fatalf("%s serialized update error = %v", testCase.name, finishErr)
+				}
+			case <-ctx.Done():
+				t.Fatalf("wait for serialized %s update: %v", testCase.name, ctx.Err())
+			}
+
+			var persistedStatus JobStatus
+			if err := pool.QueryRow(ctx, `
+				SELECT status
+				FROM ingestion_jobs
+				WHERE id = $1
+			`, first.ID).Scan(&persistedStatus); err != nil {
+				t.Fatalf("query serialized terminal status: %v", err)
+			}
+			if persistedStatus != testCase.status {
+				t.Fatalf(
+					"serialized terminal status = %q, want %q",
+					persistedStatus,
+					testCase.status,
+				)
+			}
+		})
 	}
 }
 
@@ -323,6 +542,76 @@ func TestPostgresRepositoryResolvesVenueISSNAcrossStoredRoles(t *testing.T) {
 	}
 	if venueCount != 1 {
 		t.Fatalf("exact ISSN Venue count = %d, want 1", venueCount)
+	}
+}
+
+func TestPostgresRepositoryRejectsAmbiguousVenueISSNAcrossStoredRoles(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+
+	for _, statement := range []string{
+		`INSERT INTO venues (
+			venue_type,
+			display_title,
+			issn_l
+		) VALUES (
+			'journal',
+			'Ambiguous Linking Venue',
+			'0028-0836'
+		)`,
+		`INSERT INTO venues (
+			venue_type,
+			display_title,
+			eissn
+		) VALUES (
+			'journal',
+			'Ambiguous Electronic Venue',
+			'0028-0836'
+		)`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatalf("insert ambiguous Venue: %v", err)
+		}
+	}
+
+	job := startRepositoryJob(t, repository, "venue-ambiguous-cross-role")
+	envelope := repositoryEnvelope(
+		t,
+		"W108",
+		"10.1000/venue-ambiguous-cross-role",
+		time.Date(2026, time.July, 16, 14, 0, 0, 0, time.UTC),
+	)
+	envelope.Record.Venue = &source.Venue{
+		DisplayName: "Ambiguous Source Venue",
+		Type:        "journal",
+		ISSN:        []string{"0028-0836"},
+	}
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+	normalized, err := repository.Normalize(ctx, job.ID, raw, "normalization/v1")
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	candidate, err := NewProjectionCandidate(normalized, source.ScopeDecision{
+		Status: source.ScopeIncluded,
+		Reason: "controlled_identity_present",
+	})
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+
+	_, err = repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/v1",
+		"projection/v1",
+	)
+	if err == nil || !strings.Contains(err.Error(), "multiple venues") {
+		t.Fatalf("Project() error = %v, want ambiguous Venue rejection", err)
 	}
 }
 
@@ -1273,6 +1562,154 @@ func envelopeWithTitle(t *testing.T, envelope Envelope, title string) Envelope {
 		t.Fatalf("title envelope validation error = %v", err)
 	}
 	return envelope
+}
+
+type postgresRepositoryTerminalCase struct {
+	name     string
+	status   JobStatus
+	terminal func(Job) (Job, error)
+	persist  func(context.Context, *PostgresRepository, Job) error
+}
+
+func postgresRepositoryTerminalCases() []postgresRepositoryTerminalCase {
+	return []postgresRepositoryTerminalCase{
+		{
+			name:     "complete",
+			status:   JobStatusSucceeded,
+			terminal: Job.Succeed,
+			persist: func(
+				ctx context.Context,
+				repository *PostgresRepository,
+				job Job,
+			) error {
+				return repository.Complete(ctx, job)
+			},
+		},
+		{
+			name:     "fail",
+			status:   JobStatusFailed,
+			terminal: Job.Fail,
+			persist: func(
+				ctx context.Context,
+				repository *PostgresRepository,
+				job Job,
+			) error {
+				return repository.Fail(
+					ctx,
+					job,
+					errors.New("deterministic terminal race fixture"),
+				)
+			},
+		},
+	}
+}
+
+type postgresRepositoryStartResult struct {
+	job Job
+	err error
+}
+
+type postgresQueryBarrierContextKey struct{}
+
+type postgresQueryBarrierTracer struct {
+	match           func(string) bool
+	releaseQueryEnd <-chan struct{}
+	queryStarted    chan struct{}
+	queryEnded      chan struct{}
+	startOnce       sync.Once
+	endOnce         sync.Once
+}
+
+func newPostgresQueryBarrierTracer(
+	match func(string) bool,
+	releaseQueryEnd <-chan struct{},
+) *postgresQueryBarrierTracer {
+	return &postgresQueryBarrierTracer{
+		match:           match,
+		releaseQueryEnd: releaseQueryEnd,
+		queryStarted:    make(chan struct{}),
+		queryEnded:      make(chan struct{}),
+	}
+}
+
+func (tracer *postgresQueryBarrierTracer) TraceQueryStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	data pgx.TraceQueryStartData,
+) context.Context {
+	if tracer == nil || tracer.match == nil || !tracer.match(data.SQL) {
+		return ctx
+	}
+	tracer.startOnce.Do(func() {
+		close(tracer.queryStarted)
+	})
+	return context.WithValue(ctx, postgresQueryBarrierContextKey{}, tracer)
+}
+
+func (tracer *postgresQueryBarrierTracer) TraceQueryEnd(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceQueryEndData,
+) {
+	if ctx.Value(postgresQueryBarrierContextKey{}) != tracer {
+		return
+	}
+	tracer.endOnce.Do(func() {
+		close(tracer.queryEnded)
+	})
+	if tracer.releaseQueryEnd == nil {
+		return
+	}
+	select {
+	case <-tracer.releaseQueryEnd:
+	case <-ctx.Done():
+	}
+}
+
+func openTracedIngestionTestPool(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	tracer pgx.QueryTracer,
+) *pgxpool.Pool {
+	t.Helper()
+	config := pool.Config()
+	config.ConnConfig.Tracer = tracer
+	config.MaxConns = 1
+	tracedPool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("open traced PostgreSQL pool: %v", err)
+	}
+	t.Cleanup(tracedPool.Close)
+	return tracedPool
+}
+
+func waitForPostgresTraceSignal(
+	t *testing.T,
+	ctx context.Context,
+	signal <-chan struct{},
+	description string,
+) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-ctx.Done():
+		t.Fatalf("wait for %s: %v", description, ctx.Err())
+	}
+}
+
+func waitForPostgresStartResult(
+	t *testing.T,
+	ctx context.Context,
+	results <-chan postgresRepositoryStartResult,
+) postgresRepositoryStartResult {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-ctx.Done():
+		t.Fatalf("wait for ingestion Start result: %v", ctx.Err())
+		return postgresRepositoryStartResult{}
+	}
 }
 
 func openNamedIngestionTestPool(

@@ -18,6 +18,7 @@ import (
 
 type workPayload struct {
 	DOI                 string              `json:"DOI"`
+	Type                string              `json:"type"`
 	Title               []string            `json:"title"`
 	Publisher           string              `json:"publisher"`
 	Authors             []authorPayload     `json:"author"`
@@ -242,6 +243,7 @@ func parseAuthors(values []authorPayload) ([]source.Author, error) {
 type venueEvidenceFlags struct {
 	title     bool
 	short     bool
+	workType  bool
 	issns     bool
 	issnTypes bool
 }
@@ -259,22 +261,36 @@ func parseVenue(
 	if err != nil {
 		return nil, venueEvidenceFlags{}, err
 	}
+	venueType := crossrefVenueType(work.Type)
 
 	evidence := venueEvidenceFlags{
 		title:     title != "",
 		short:     shortTitle != "",
+		workType:  venueType != "",
 		issns:     len(issns) > 0,
 		issnTypes: len(issnDetails) > 0,
 	}
 	if !evidence.title && !evidence.short && !evidence.issns && !evidence.issnTypes {
-		return nil, evidence, nil
+		return nil, venueEvidenceFlags{}, nil
 	}
 	return &source.Venue{
 		DisplayName:     title,
 		ISOAbbreviation: shortTitle,
+		Type:            venueType,
 		ISSN:            issns,
 		ISSNDetails:     issnDetails,
 	}, evidence, nil
+}
+
+func crossrefVenueType(workType string) string {
+	switch workType {
+	case "journal-article":
+		return "journal"
+	case "proceedings-article":
+		return "conference"
+	default:
+		return ""
+	}
 }
 
 func normalizeRecordISSNs(values []string) ([]string, error) {
@@ -701,6 +717,7 @@ func buildEvidence(
 	add("authors", "$.author", len(record.Authors) > 0)
 	add("venue", "$.container-title[0]", venue.title)
 	add("venue", "$.short-container-title[0]", venue.short)
+	add("venue", "$.type", venue.workType)
 	add("venue", "$.ISSN", venue.issns)
 	add("venue", "$.issn-type", venue.issnTypes)
 	add("published_date", "$.published.date-parts", record.PublishedDate != nil)
