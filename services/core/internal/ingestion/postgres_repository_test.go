@@ -1,7 +1,9 @@
 package ingestion
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/pubmed"
 )
 
 var (
@@ -27,6 +30,971 @@ var (
 	postgresRepositoryDatabaseURL   string
 	postgresRepositoryContainerErr  error
 )
+
+func TestPostgresRepositoryPersistsPubMedBiomedicalSemantics(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	eventTime := time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC)
+	envelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543210",
+		"10.1000/pubmed.biomedical",
+		eventTime,
+	)
+	if envelope.Record.Source != source.PubMed ||
+		envelope.Record.SourceRecordID != "76543210" ||
+		envelope.Record.Title != "Biomedical repository paper default" ||
+		len(envelope.Record.AbstractSections) != 2 ||
+		len(envelope.Record.MeSHHeadings) != 2 ||
+		len(envelope.Record.PublicationTypes) != 3 ||
+		len(envelope.Record.Relations) != 2 ||
+		envelope.Record.Venue == nil ||
+		envelope.Record.Venue.DisplayName != "Journal of Biomedical Evidence" ||
+		envelope.Record.PublishedAt == nil {
+		t.Fatalf(
+			"PubMed parser-derived fixture = %#v, want complete biomedical record",
+			envelope.Record,
+		)
+	}
+	if len(envelope.Record.Keywords) != 1 ||
+		envelope.Record.Keywords[0].DisplayName != "immune checkpoint blockade" {
+		t.Fatalf(
+			"supplemented generic keyword = %#v, want one non-XML normalized payload keyword",
+			envelope.Record.Keywords,
+		)
+	}
+
+	payloadCopy := recordPayload(envelope.Record)
+	payloadBeforeMutation, err := json.Marshal(payloadCopy)
+	if err != nil {
+		t.Fatalf("marshal persisted payload before source mutation: %v", err)
+	}
+	envelope.Record.MeSHHeadings[0].Qualifiers[0].Name = "mutated qualifier"
+	*envelope.Record.Keywords[0].Score = 0.01
+	payloadAfterMutation, err := json.Marshal(payloadCopy)
+	if err != nil {
+		t.Fatalf("marshal persisted payload after source mutation: %v", err)
+	}
+	if !bytes.Equal(payloadAfterMutation, payloadBeforeMutation) {
+		t.Fatal("persisted record payload shares nested biomedical state with source.Record")
+	}
+	envelope = pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543210",
+		"10.1000/pubmed.biomedical",
+		eventTime,
+	)
+
+	job := startPubMedRepositoryJob(t, repository, "biomedical-semantics")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+	normalized, err := repository.Normalize(ctx, job.ID, raw, "normalization/pubmed-v1")
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	var normalizedJSON []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT normalized_payload
+		FROM ingestion_normalized_records
+		WHERE raw_event_id = $1
+	`, raw.ID).Scan(&normalizedJSON); err != nil {
+		t.Fatalf("query normalized PubMed payload: %v", err)
+	}
+	var normalizedPayload struct {
+		Identifiers      []source.Identifier      `json:"identifiers"`
+		AbstractSections []source.AbstractSection `json:"abstract_sections"`
+		MeSHHeadings     []source.MeSHHeading     `json:"mesh_headings"`
+		PublicationTypes []source.PublicationType `json:"publication_types"`
+		Relations        []source.Relation        `json:"relations"`
+		Keywords         []source.Keyword         `json:"keywords"`
+	}
+	if err := json.Unmarshal(normalizedJSON, &normalizedPayload); err != nil {
+		t.Fatalf("decode normalized PubMed payload: %v", err)
+	}
+	assertJSONOmitsKeys(t, normalizedJSON, "tree_number", "tree_numbers")
+	if len(normalizedPayload.AbstractSections) != 2 ||
+		normalizedPayload.AbstractSections[0].Label != "BACKGROUND" ||
+		normalizedPayload.AbstractSections[1].NLMCategory != "METHODS" {
+		t.Errorf(
+			"normalized abstract sections = %#v, want structured PubMed abstract",
+			normalizedPayload.AbstractSections,
+		)
+	}
+	if len(normalizedPayload.MeSHHeadings) != 2 ||
+		normalizedPayload.MeSHHeadings[0].Descriptor.UI != "D009369" ||
+		!normalizedPayload.MeSHHeadings[0].Descriptor.MajorTopic ||
+		len(normalizedPayload.MeSHHeadings[0].Qualifiers) != 2 ||
+		normalizedPayload.MeSHHeadings[0].Qualifiers[0].UI != "Q000628" ||
+		!normalizedPayload.MeSHHeadings[0].Qualifiers[0].MajorTopic {
+		t.Errorf(
+			"normalized MeSH headings = %#v, want descriptors, qualifiers, and major flags",
+			normalizedPayload.MeSHHeadings,
+		)
+	}
+	if len(normalizedPayload.PublicationTypes) != 3 ||
+		normalizedPayload.PublicationTypes[0].Name != "Journal Article" ||
+		normalizedPayload.PublicationTypes[1].Name != "Randomized Controlled Trial" ||
+		normalizedPayload.PublicationTypes[2].Name != "Meta-Analysis" {
+		t.Errorf(
+			"normalized publication types = %#v, want exact PubMed types",
+			normalizedPayload.PublicationTypes,
+		)
+	}
+	if len(normalizedPayload.Relations) != 2 ||
+		normalizedPayload.Relations[0].Type != "CommentIn" ||
+		normalizedPayload.Relations[1].Type != "ErratumIn" {
+		t.Errorf(
+			"normalized relations = %#v, want comment and correction relations",
+			normalizedPayload.Relations,
+		)
+	}
+	if len(normalizedPayload.Keywords) != 1 ||
+		normalizedPayload.Keywords[0].DisplayName != "immune checkpoint blockade" ||
+		normalizedPayload.Keywords[0].Score == nil ||
+		*normalizedPayload.Keywords[0].Score != 0.97 {
+		t.Errorf("normalized keywords = %#v, want scored keyword", normalizedPayload.Keywords)
+	}
+	if len(normalizedPayload.Identifiers) != 3 ||
+		normalizedPayload.Identifiers[0] != (source.Identifier{
+			Scheme: source.IdentifierPMID,
+			Value:  "76543210",
+		}) ||
+		normalizedPayload.Identifiers[1] != (source.Identifier{
+			Scheme: source.IdentifierDOI,
+			Value:  "10.1000/pubmed.biomedical",
+		}) ||
+		normalizedPayload.Identifiers[2] != (source.Identifier{
+			Scheme: source.IdentifierPMCID,
+			Value:  "PMC76543210",
+		}) {
+		t.Errorf(
+			"normalized identifiers = %#v, want PMID, PMCID, and DOI",
+			normalizedPayload.Identifiers,
+		)
+	}
+
+	candidate, err := NewProjectionCandidate(
+		normalized,
+		source.ScopeDecision{
+			Status: source.ScopeIncluded,
+			Reason: "controlled_identity_present",
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("Project() error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("Project(replay) error = %v", err)
+	}
+
+	var projectionJSON []byte
+	var projectionPayloadMatchesNormalized bool
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			assertion.record_payload,
+			assertion.record_payload = normalized.normalized_payload
+		FROM ingestion_projection_assertions AS assertion
+		JOIN ingestion_normalized_records AS normalized
+		  ON normalized.raw_event_id = assertion.raw_event_id
+		WHERE assertion.raw_event_id = $1
+		  AND assertion.scope_policy_version = 'scope/pubmed-v1'
+		  AND assertion.projection_policy_version = 'projection/pubmed-v1'
+	`, raw.ID).Scan(
+		&projectionJSON,
+		&projectionPayloadMatchesNormalized,
+	); err != nil {
+		t.Fatalf("query immutable projection payload: %v", err)
+	}
+	if !projectionPayloadMatchesNormalized {
+		t.Fatal("projection assertion payload differs from immutable normalized payload")
+	}
+	assertJSONOmitsKeys(t, projectionJSON, "tree_number", "tree_numbers")
+
+	var publicTreeTable, searchPathTreeTable *string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			to_regclass('public.mesh_descriptor_tree_numbers')::text,
+			to_regclass('mesh_descriptor_tree_numbers')::text
+	`).Scan(&publicTreeTable, &searchPathTreeTable); err != nil {
+		t.Fatalf("query forbidden Tree Number table: %v", err)
+	}
+	if publicTreeTable != nil || searchPathTreeTable != nil {
+		t.Fatalf(
+			"Tree Number table = public %v/search_path %v, want absent",
+			publicTreeTable,
+			searchPathTreeTable,
+		)
+	}
+
+	var headingCount int
+	var headings string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(*),
+			COALESCE(string_agg(
+				descriptor.descriptor_ui || '|' ||
+				heading.source_path || '|' ||
+				heading.descriptor_label || '|' ||
+				heading.is_major_topic::text,
+				E'\n'
+				ORDER BY heading.source_path
+			), '')
+		FROM work_mesh_headings AS heading
+		JOIN mesh_descriptors AS descriptor
+		  ON descriptor.id = heading.descriptor_id
+	`).Scan(&headingCount, &headings); err != nil {
+		t.Fatalf("query persisted MeSH headings: %v", err)
+	}
+	wantHeadings := strings.Join([]string{
+		"D009369|/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[1]/DescriptorName|Neoplasms|true",
+		"D001943|/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[2]/DescriptorName|Breast Neoplasms|false",
+	}, "\n")
+	if headingCount != 2 || headings != wantHeadings {
+		t.Fatalf("persisted MeSH headings = %d/%q, want 2/%q", headingCount, headings, wantHeadings)
+	}
+
+	var qualifierCount int
+	var qualifiers string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(*),
+			COALESCE(string_agg(
+				qualifier.qualifier_ui || '|' ||
+				assertion.source_path || '|' ||
+				assertion.qualifier_label || '|' ||
+				assertion.is_major_topic::text,
+				E'\n'
+				ORDER BY assertion.source_path
+			), '')
+		FROM work_mesh_qualifiers AS assertion
+		JOIN mesh_qualifiers AS qualifier
+		  ON qualifier.id = assertion.qualifier_id
+	`).Scan(&qualifierCount, &qualifiers); err != nil {
+		t.Fatalf("query persisted MeSH qualifiers: %v", err)
+	}
+	wantQualifiers := strings.Join([]string{
+		"Q000628|/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[1]/QualifierName[1]|therapy|true",
+		"Q000235|/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[1]/QualifierName[2]|genetics|false",
+		"Q000503|/PubmedArticle/MedlineCitation/MeshHeadingList/MeshHeading[2]/QualifierName[1]|pathology|true",
+	}, "\n")
+	if qualifierCount != 3 || qualifiers != wantQualifiers {
+		t.Fatalf(
+			"persisted MeSH qualifiers = %d/%q, want 3/%q",
+			qualifierCount,
+			qualifiers,
+			wantQualifiers,
+		)
+	}
+
+	var publicationTypeCount int
+	var publicationTypes string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(*),
+			COALESCE(string_agg(
+				publication_type.publication_type_ui || '|' ||
+				assertion.source_path || '|' ||
+				assertion.publication_type_label,
+				E'\n'
+				ORDER BY assertion.source_path
+			), '')
+		FROM work_publication_types AS assertion
+		JOIN publication_types AS publication_type
+		  ON publication_type.id = assertion.publication_type_id
+	`).Scan(&publicationTypeCount, &publicationTypes); err != nil {
+		t.Fatalf("query persisted Publication Types: %v", err)
+	}
+	wantPublicationTypes := strings.Join([]string{
+		"D016428|/PubmedArticle/MedlineCitation/Article/PublicationTypeList/PublicationType[1]|Journal Article",
+		"D016449|/PubmedArticle/MedlineCitation/Article/PublicationTypeList/PublicationType[2]|Randomized Controlled Trial",
+		"D017418|/PubmedArticle/MedlineCitation/Article/PublicationTypeList/PublicationType[3]|Meta-Analysis",
+	}, "\n")
+	if publicationTypeCount != 3 || publicationTypes != wantPublicationTypes {
+		t.Fatalf(
+			"persisted Publication Types = %d/%q, want 3/%q",
+			publicationTypeCount,
+			publicationTypes,
+			wantPublicationTypes,
+		)
+	}
+
+	var genericPaperTypes int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM field_assertions
+		WHERE field_name = 'paper_type'
+	`).Scan(&genericPaperTypes); err != nil {
+		t.Fatalf("count generic paper type assertions: %v", err)
+	}
+	if genericPaperTypes != 0 {
+		t.Fatalf("generic paper type assertions = %d, want 0", genericPaperTypes)
+	}
+}
+
+func TestPostgresRepositoryRejectsProjectionCandidateBiomedicalMutations(t *testing.T) {
+	testCases := []struct {
+		name   string
+		mutate func(*source.Record)
+	}{
+		{
+			name: "descriptor UI",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0].Descriptor.UI = "D999999"
+			},
+		},
+		{
+			name: "descriptor label",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0].Descriptor.Name = "Mutated Neoplasms"
+			},
+		},
+		{
+			name: "major topic",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0].Descriptor.MajorTopic =
+					!record.MeSHHeadings[0].Descriptor.MajorTopic
+			},
+		},
+		{
+			name: "heading order",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0], record.MeSHHeadings[1] =
+					record.MeSHHeadings[1], record.MeSHHeadings[0]
+			},
+		},
+		{
+			name: "publication type",
+			mutate: func(record *source.Record) {
+				record.PublicationTypes[0].Name = "Mutated Publication Type"
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIngestionTestPool(t)
+			repository := mustPostgresRepository(t, pool)
+			ctx := context.Background()
+			suffix := strings.ToLower(strings.ReplaceAll(testCase.name, " ", "-"))
+			envelope := pubMedBiomedicalRepositoryEnvelope(
+				t,
+				"76543250",
+				"10.1000/pubmed.candidate-mutation."+suffix,
+				time.Date(2026, time.July, 17, 8, 30, 0, 0, time.UTC),
+			)
+			job := startPubMedRepositoryJob(t, repository, "candidate-mutation-"+suffix)
+			raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+			if err != nil {
+				t.Fatalf("PersistRaw() error = %v", err)
+			}
+			normalized, err := repository.Normalize(
+				ctx,
+				job.ID,
+				raw,
+				"normalization/pubmed-v1",
+			)
+			if err != nil {
+				t.Fatalf("Normalize() error = %v", err)
+			}
+			candidate, err := NewProjectionCandidate(
+				normalized,
+				source.ScopeDecision{
+					Status: source.ScopeIncluded,
+					Reason: "controlled_identity_present",
+				},
+			)
+			if err != nil {
+				t.Fatalf("NewProjectionCandidate() error = %v", err)
+			}
+			testCase.mutate(&candidate.Record)
+
+			_, err = repository.Project(
+				ctx,
+				job.ID,
+				candidate,
+				"scope/pubmed-v1",
+				"projection/pubmed-v1",
+			)
+			if err == nil ||
+				!strings.Contains(
+					err.Error(),
+					"projection candidate differs from immutable normalized payload",
+				) {
+				t.Fatalf(
+					"Project(mutated candidate) error = %v, want immutable normalized payload rejection",
+					err,
+				)
+			}
+
+			var projectionRows, semanticRows, canonicalRows, workRows int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+					(SELECT count(*) FROM ingestion_projection_assertions),
+					(
+						(SELECT count(*) FROM work_mesh_headings) +
+						(SELECT count(*) FROM work_mesh_qualifiers) +
+						(SELECT count(*) FROM work_publication_types)
+					),
+					(
+						(SELECT count(*) FROM mesh_descriptors) +
+						(SELECT count(*) FROM mesh_qualifiers) +
+						(SELECT count(*) FROM publication_types)
+					),
+					(SELECT count(*) FROM works)
+			`).Scan(
+				&projectionRows,
+				&semanticRows,
+				&canonicalRows,
+				&workRows,
+			); err != nil {
+				t.Fatalf("query mutated candidate rollback state: %v", err)
+			}
+			if projectionRows != 0 ||
+				semanticRows != 0 ||
+				canonicalRows != 0 ||
+				workRows != 0 {
+				t.Fatalf(
+					"mutated candidate rollback = projection %d semantic %d canonical %d work %d, want all zero",
+					projectionRows,
+					semanticRows,
+					canonicalRows,
+					workRows,
+				)
+			}
+		})
+	}
+}
+
+func TestPostgresRepositoryRejectsInvalidPubMedBiomedicalSemanticsAtomically(t *testing.T) {
+	testCases := []struct {
+		name      string
+		mutate    func(*source.Record)
+		wantError string
+	}{
+		{
+			name: "blank descriptor UI",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0].Descriptor.UI = "   "
+			},
+			wantError: "MeSH descriptor 1 UI is required",
+		},
+		{
+			name: "blank descriptor label",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0].Descriptor.Name = "   "
+			},
+			wantError: "MeSH descriptor 1 source label is required",
+		},
+		{
+			name: "blank qualifier UI",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0].Qualifiers[0].UI = "   "
+			},
+			wantError: "MeSH qualifier 1.1 UI is required",
+		},
+		{
+			name: "blank qualifier label",
+			mutate: func(record *source.Record) {
+				record.MeSHHeadings[0].Qualifiers[0].Name = "   "
+			},
+			wantError: "MeSH qualifier 1.1 source label is required",
+		},
+		{
+			name: "blank publication type UI",
+			mutate: func(record *source.Record) {
+				record.PublicationTypes[0].UI = "   "
+			},
+			wantError: "Publication Type 1 UI is required",
+		},
+		{
+			name: "blank publication type label",
+			mutate: func(record *source.Record) {
+				record.PublicationTypes[0].Name = "   "
+			},
+			wantError: "Publication Type 1 source label is required",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIngestionTestPool(t)
+			repository := mustPostgresRepository(t, pool)
+			ctx := context.Background()
+			suffix := strings.ToLower(strings.ReplaceAll(testCase.name, " ", "-"))
+			envelope := pubMedBiomedicalRepositoryEnvelope(
+				t,
+				"76543300",
+				"10.1000/pubmed.invalid."+suffix,
+				time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			)
+			testCase.mutate(&envelope.Record)
+			if err := envelope.Validate(); err != nil {
+				t.Fatalf("mutated envelope validation error = %v", err)
+			}
+
+			job := startPubMedRepositoryJob(t, repository, "invalid-"+suffix)
+			raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+			if err != nil {
+				t.Fatalf("PersistRaw() error = %v", err)
+			}
+			normalized, err := repository.Normalize(
+				ctx,
+				job.ID,
+				raw,
+				"normalization/pubmed-v1",
+			)
+			if err != nil {
+				t.Fatalf("Normalize() error = %v", err)
+			}
+			candidate, err := NewProjectionCandidate(
+				normalized,
+				source.ScopeDecision{
+					Status: source.ScopeIncluded,
+					Reason: "controlled_identity_present",
+				},
+			)
+			if err != nil {
+				t.Fatalf("NewProjectionCandidate() error = %v", err)
+			}
+			_, err = repository.Project(
+				ctx,
+				job.ID,
+				candidate,
+				"scope/pubmed-v1",
+				"projection/pubmed-v1",
+			)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+				t.Fatalf("Project() error = %v, want %q", err, testCase.wantError)
+			}
+
+			var projectionRows, canonicalRows, semanticRows, workRows int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+					(SELECT count(*) FROM ingestion_projection_assertions),
+					(
+						(SELECT count(*) FROM mesh_descriptors) +
+						(SELECT count(*) FROM mesh_qualifiers) +
+						(SELECT count(*) FROM publication_types)
+					),
+					(
+						(SELECT count(*) FROM work_mesh_headings) +
+						(SELECT count(*) FROM work_mesh_qualifiers) +
+						(SELECT count(*) FROM work_publication_types)
+					),
+					(SELECT count(*) FROM works)
+			`).Scan(
+				&projectionRows,
+				&canonicalRows,
+				&semanticRows,
+				&workRows,
+			); err != nil {
+				t.Fatalf("query rollback state: %v", err)
+			}
+			if projectionRows != 0 ||
+				canonicalRows != 0 ||
+				semanticRows != 0 ||
+				workRows != 0 {
+				t.Fatalf(
+					"rollback state = projections %d canonical %d semantics %d works %d, want all zero",
+					projectionRows,
+					canonicalRows,
+					semanticRows,
+					workRows,
+				)
+			}
+		})
+	}
+}
+
+func TestPostgresRepositoryKeepsPubMedSemanticAssertionsForNonWinningEvents(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	baseTime := time.Date(2026, time.July, 17, 10, 0, 0, 0, time.UTC)
+	older := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543400",
+		"10.1000/pubmed.semantic-history",
+		baseTime,
+	)
+	older = pubMedEnvelopeWithDescriptorLabel(
+		t,
+		older,
+		"Historical Neoplasms",
+		"historical",
+	)
+	newer := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543400",
+		"10.1000/pubmed.semantic-history",
+		baseTime.Add(time.Hour),
+	)
+	newer = pubMedEnvelopeWithDescriptorLabel(
+		t,
+		newer,
+		"Current Neoplasms",
+		"current",
+	)
+
+	for index, envelope := range []Envelope{newer, older} {
+		job := startPubMedRepositoryJob(
+			t,
+			repository,
+			fmt.Sprintf("semantic-history-%d", index),
+		)
+		raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+		if err != nil {
+			t.Fatalf("PersistRaw(%d) error = %v", index, err)
+		}
+		normalized, err := repository.Normalize(
+			ctx,
+			job.ID,
+			raw,
+			"normalization/pubmed-v1",
+		)
+		if err != nil {
+			t.Fatalf("Normalize(%d) error = %v", index, err)
+		}
+		candidate, err := NewProjectionCandidate(
+			normalized,
+			source.ScopeDecision{
+				Status: source.ScopeIncluded,
+				Reason: "controlled_identity_present",
+			},
+		)
+		if err != nil {
+			t.Fatalf("NewProjectionCandidate(%d) error = %v", index, err)
+		}
+		result, err := repository.Project(
+			ctx,
+			job.ID,
+			candidate,
+			"scope/pubmed-v1",
+			"projection/pubmed-v1",
+		)
+		if err != nil {
+			t.Fatalf("Project(%d) error = %v", index, err)
+		}
+		if index == 1 && result.Status != ProjectionStatusUnchanged {
+			t.Fatalf("older semantic projection status = %q, want unchanged", result.Status)
+		}
+	}
+
+	var assertionCount int
+	var retainedLabels string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			count(DISTINCT assertion.id),
+			string_agg(
+				heading.descriptor_label,
+				'|' ORDER BY heading.descriptor_label
+			)
+		FROM ingestion_projection_assertions AS assertion
+		JOIN work_mesh_headings AS heading
+		  ON heading.projection_assertion_id = assertion.id
+		JOIN mesh_descriptors AS descriptor
+		  ON descriptor.id = heading.descriptor_id
+		WHERE descriptor.descriptor_ui = 'D009369'
+	`).Scan(&assertionCount, &retainedLabels); err != nil {
+		t.Fatalf("query retained semantic assertions: %v", err)
+	}
+	if assertionCount != 2 ||
+		retainedLabels != "Current Neoplasms|Historical Neoplasms" {
+		t.Fatalf(
+			"retained semantics = %d/%q, want both historical and current assertions",
+			assertionCount,
+			retainedLabels,
+		)
+	}
+
+	var currentLabel string
+	if err := pool.QueryRow(ctx, `
+		SELECT heading.descriptor_label
+		FROM work_projection_states AS state
+		JOIN ingestion_projection_assertions AS assertion
+		  ON assertion.raw_event_id = state.raw_event_id
+		 AND assertion.source_record_uuid = state.source_record_uuid
+		 AND assertion.work_id = state.work_id
+		 AND assertion.scope_policy_version = state.scope_policy_version
+		 AND assertion.projection_policy_version = state.projection_policy_version
+		JOIN work_mesh_headings AS heading
+		  ON heading.projection_assertion_id = assertion.id
+		JOIN mesh_descriptors AS descriptor
+		  ON descriptor.id = heading.descriptor_id
+		WHERE descriptor.descriptor_ui = 'D009369'
+	`).Scan(&currentLabel); err != nil {
+		t.Fatalf("query current semantic assertion: %v", err)
+	}
+	if currentLabel != "Current Neoplasms" {
+		t.Fatalf("current semantic label = %q, want current winner", currentLabel)
+	}
+}
+
+func TestPostgresRepositoryBindsCurrentPubMedSemanticsToCompletePolicyTuple(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76543500",
+		"10.1000/pubmed.semantic-policies",
+		time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC),
+	)
+	job := startPubMedRepositoryJob(t, repository, "semantic-policies")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+	normalized, err := repository.Normalize(
+		ctx,
+		job.ID,
+		raw,
+		"normalization/pubmed-v1",
+	)
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	decision := source.ScopeDecision{
+		Status: source.ScopeIncluded,
+		Reason: "controlled_identity_present",
+	}
+	candidate, err := NewProjectionCandidate(normalized, decision)
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("Project(first policy) error = %v", err)
+	}
+
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v2",
+		"projection/pubmed-v2",
+	); err != nil {
+		t.Fatalf("Project(second policy) error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v2",
+		"projection/pubmed-v2",
+	); err != nil {
+		t.Fatalf("Project(second policy replay) error = %v", err)
+	}
+
+	var (
+		assertionCount                 int
+		distinctProjectionAssertionIDs int
+		distinctSemanticFingerprints   int
+		canonicalDescriptorCount       int
+	)
+	if err := pool.QueryRow(ctx, `
+		WITH policy_assertions AS (
+			SELECT
+				assertion.id,
+				md5(
+					COALESCE((
+						SELECT string_agg(
+							descriptor.descriptor_ui || '|' ||
+							heading.source_path || '|' ||
+							heading.descriptor_label || '|' ||
+							heading.is_major_topic::text,
+							E'\n' ORDER BY heading.source_path
+						)
+						FROM work_mesh_headings AS heading
+						JOIN mesh_descriptors AS descriptor
+						  ON descriptor.id = heading.descriptor_id
+						WHERE heading.projection_assertion_id = assertion.id
+					), '') || E'\n--qualifiers--\n' ||
+					COALESCE((
+						SELECT string_agg(
+							qualifier.qualifier_ui || '|' ||
+							semantic.source_path || '|' ||
+							semantic.qualifier_label || '|' ||
+							semantic.is_major_topic::text,
+							E'\n' ORDER BY semantic.source_path
+						)
+						FROM work_mesh_qualifiers AS semantic
+						JOIN mesh_qualifiers AS qualifier
+						  ON qualifier.id = semantic.qualifier_id
+						WHERE semantic.projection_assertion_id = assertion.id
+					), '') || E'\n--publication-types--\n' ||
+					COALESCE((
+						SELECT string_agg(
+							publication_type.publication_type_ui || '|' ||
+							semantic.source_path || '|' ||
+							semantic.publication_type_label,
+							E'\n' ORDER BY semantic.source_path
+						)
+						FROM work_publication_types AS semantic
+						JOIN publication_types AS publication_type
+						  ON publication_type.id = semantic.publication_type_id
+						WHERE semantic.projection_assertion_id = assertion.id
+					), '')
+				) AS semantic_fingerprint
+			FROM ingestion_projection_assertions AS assertion
+			WHERE assertion.raw_event_id = $1
+		)
+		SELECT
+			count(*),
+			count(DISTINCT id),
+			count(DISTINCT semantic_fingerprint),
+			(
+				SELECT count(*)
+				FROM mesh_descriptors
+				WHERE descriptor_ui = 'D009369'
+			)
+		FROM policy_assertions
+	`, raw.ID).Scan(
+		&assertionCount,
+		&distinctProjectionAssertionIDs,
+		&distinctSemanticFingerprints,
+		&canonicalDescriptorCount,
+	); err != nil {
+		t.Fatalf("query policy assertion counts: %v", err)
+	}
+	if assertionCount != 2 ||
+		distinctProjectionAssertionIDs != 2 ||
+		distinctSemanticFingerprints != 1 ||
+		canonicalDescriptorCount != 1 {
+		t.Fatalf(
+			"policy assertions/IDs/semantic fingerprints/canonical descriptors = %d/%d/%d/%d, want 2/2/1/1",
+			assertionCount,
+			distinctProjectionAssertionIDs,
+			distinctSemanticFingerprints,
+			canonicalDescriptorCount,
+		)
+	}
+
+	var sourceRecordOnlyMatches int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM work_projection_states AS state
+		JOIN ingestion_projection_assertions AS assertion
+		  ON assertion.source_record_uuid = state.source_record_uuid
+		 AND assertion.work_id = state.work_id
+		JOIN work_mesh_headings AS heading
+		  ON heading.projection_assertion_id = assertion.id
+		JOIN mesh_descriptors AS descriptor
+		  ON descriptor.id = heading.descriptor_id
+		WHERE descriptor.descriptor_ui = 'D009369'
+	`).Scan(&sourceRecordOnlyMatches); err != nil {
+		t.Fatalf("query source-record-only semantic matches: %v", err)
+	}
+	if sourceRecordOnlyMatches != 2 {
+		t.Fatalf(
+			"source-record-only semantic matches = %d, want ambiguous 2",
+			sourceRecordOnlyMatches,
+		)
+	}
+
+	var completeTupleMatches int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM work_projection_states AS state
+		JOIN ingestion_projection_assertions AS assertion
+		  ON assertion.raw_event_id = state.raw_event_id
+		 AND assertion.source_record_uuid = state.source_record_uuid
+		 AND assertion.work_id = state.work_id
+		 AND assertion.scope_policy_version = state.scope_policy_version
+		 AND assertion.projection_policy_version = state.projection_policy_version
+	`).Scan(&completeTupleMatches); err != nil {
+		t.Fatalf("query complete winner tuple matches: %v", err)
+	}
+	if completeTupleMatches != 1 {
+		t.Fatalf("complete winner tuple matches = %d, want exactly 1", completeTupleMatches)
+	}
+
+	var currentLabel, currentQualifierLabel, currentPublicationTypeLabel string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			heading.descriptor_label,
+			qualifier.qualifier_label,
+			publication_type.publication_type_label
+		FROM work_projection_states AS state
+		JOIN ingestion_projection_assertions AS assertion
+		  ON assertion.raw_event_id = state.raw_event_id
+		 AND assertion.source_record_uuid = state.source_record_uuid
+		 AND assertion.work_id = state.work_id
+		 AND assertion.scope_policy_version = state.scope_policy_version
+		 AND assertion.projection_policy_version = state.projection_policy_version
+		JOIN work_mesh_headings AS heading
+		  ON heading.projection_assertion_id = assertion.id
+		JOIN mesh_descriptors AS descriptor
+		  ON descriptor.id = heading.descriptor_id
+		JOIN work_mesh_qualifiers AS qualifier
+		  ON qualifier.work_mesh_heading_id = heading.id
+		JOIN mesh_qualifiers AS canonical_qualifier
+		  ON canonical_qualifier.id = qualifier.qualifier_id
+		JOIN work_publication_types AS publication_type
+		  ON publication_type.projection_assertion_id = assertion.id
+		JOIN publication_types AS canonical_publication_type
+		  ON canonical_publication_type.id = publication_type.publication_type_id
+		WHERE descriptor.descriptor_ui = 'D009369'
+		  AND canonical_qualifier.qualifier_ui = 'Q000628'
+		  AND canonical_publication_type.publication_type_ui = 'D016428'
+	`).Scan(
+		&currentLabel,
+		&currentQualifierLabel,
+		&currentPublicationTypeLabel,
+	); err != nil {
+		t.Fatalf("query complete-tuple current semantics: %v", err)
+	}
+	if currentLabel != "Neoplasms" ||
+		currentQualifierLabel != "therapy" ||
+		currentPublicationTypeLabel != "Journal Article" {
+		t.Fatalf(
+			"current tuple semantics = %q/%q/%q, want immutable normalized labels",
+			currentLabel,
+			currentQualifierLabel,
+			currentPublicationTypeLabel,
+		)
+	}
+
+	var currentScopePolicy, currentProjectionPolicy string
+	if err := pool.QueryRow(ctx, `
+		SELECT scope_policy_version, projection_policy_version
+		FROM work_projection_states
+	`).Scan(&currentScopePolicy, &currentProjectionPolicy); err != nil {
+		t.Fatalf("query current policy tuple: %v", err)
+	}
+	if currentScopePolicy != "scope/pubmed-v2" ||
+		currentProjectionPolicy != "projection/pubmed-v2" {
+		t.Fatalf(
+			"current policy tuple = %q/%q, want scope/pubmed-v2/projection/pubmed-v2",
+			currentScopePolicy,
+			currentProjectionPolicy,
+		)
+	}
+}
 
 func TestPostgresRepositoryPersistsRawSnapshotsIdempotently(t *testing.T) {
 	pool := openIngestionTestPool(t)
@@ -737,8 +1705,15 @@ func TestPostgresRepositoryRejectsConflictingProjectionAssertionReplay(t *testin
 		second,
 		"scope/v1",
 		"projection/v1",
-	); err == nil || !strings.Contains(err.Error(), "projection assertion replay conflicts") {
-		t.Fatalf("Project(conflicting replay) error = %v, want immutable conflict", err)
+	); err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"projection candidate differs from immutable normalized payload",
+		) {
+		t.Fatalf(
+			"Project(conflicting replay) error = %v, want immutable normalized payload conflict",
+			err,
+		)
 	}
 }
 
@@ -897,7 +1872,6 @@ func TestPostgresRepositoryReplaysSameRawSnapshotUnderExplicitPolicyVersions(t *
 	if err != nil {
 		t.Fatalf("NewProjectionCandidate(first) error = %v", err)
 	}
-	first.Record.Title = "Projection policy v1 title"
 	if _, err := repository.Project(
 		ctx,
 		job.ID,
@@ -909,7 +1883,6 @@ func TestPostgresRepositoryReplaysSameRawSnapshotUnderExplicitPolicyVersions(t *
 	}
 
 	second := first.Clone()
-	second.Record.Title = "Projection policy v2 title"
 	result, err := repository.Project(
 		ctx,
 		job.ID,
@@ -955,7 +1928,7 @@ func TestPostgresRepositoryReplaysSameRawSnapshotUnderExplicitPolicyVersions(t *
 		sourceProjectionPolicy != "projection/v2" ||
 		winnerScopePolicy != "scope/v2" ||
 		winnerProjectionPolicy != "projection/v2" ||
-		title != second.Record.Title {
+		title != normalized.Record.Title {
 		t.Fatalf(
 			"replayed projection = source %q/%q winner %q/%q title %q",
 			sourceScopePolicy,
@@ -1252,8 +2225,6 @@ func TestPostgresRepositoryProjectAndDeletionUseConsistentLockOrder(t *testing.T
 			replayJob = job
 		}
 	}
-	replayCandidate.Record.Title = "OpenAlex replayed winner"
-
 	deletionRaw, err := source.NewRawRecord([]byte(`{"delete":"W103103"}`))
 	if err != nil {
 		t.Fatalf("NewRawRecord(deletion) error = %v", err)
@@ -1490,6 +2461,206 @@ func startRepositoryJob(
 		t.Fatalf("Start() error = %v", err)
 	}
 	return started
+}
+
+func startPubMedRepositoryJob(
+	t *testing.T,
+	repository *PostgresRepository,
+	suffix string,
+) Job {
+	t.Helper()
+	job, err := NewJob(
+		"sync/pubmed/"+suffix,
+		source.PubMed,
+		"test:pubmed:"+suffix,
+		map[string]any{"test": suffix},
+	)
+	if err != nil {
+		t.Fatalf("NewJob(PubMed) error = %v", err)
+	}
+	started, err := repository.Start(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Start(PubMed) error = %v", err)
+	}
+	return started
+}
+
+func assertJSONOmitsKeys(t *testing.T, payload []byte, keys ...string) {
+	t.Helper()
+	forbidden := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		forbidden[key] = struct{}{}
+	}
+	var decoded any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("decode JSON key assertion payload: %v", err)
+	}
+	var walk func(any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, nested := range typed {
+				if _, found := forbidden[key]; found {
+					t.Fatalf("JSON payload contains forbidden key %q", key)
+				}
+				walk(nested)
+			}
+		case []any:
+			for _, nested := range typed {
+				walk(nested)
+			}
+		}
+	}
+	walk(decoded)
+}
+
+func pubMedBiomedicalRepositoryEnvelope(
+	t *testing.T,
+	pmid string,
+	doi string,
+	sourceTime time.Time,
+) Envelope {
+	t.Helper()
+	return pubMedBiomedicalRepositoryEnvelopeFromXML(
+		t,
+		pmid,
+		doi,
+		sourceTime,
+		"Neoplasms",
+		"default",
+	)
+}
+
+func pubMedBiomedicalRepositoryEnvelopeFromXML(
+	t *testing.T,
+	pmid string,
+	doi string,
+	sourceTime time.Time,
+	descriptorLabel string,
+	titleMarker string,
+) Envelope {
+	t.Helper()
+	record, err := pubmed.ParseRecord([]byte(fmt.Sprintf(`
+<PubmedArticle Status="MEDLINE">
+  <MedlineCitation Status="MEDLINE" Owner="NLM">
+    <PMID Version="1">%s</PMID>
+    <DateCompleted>
+      <Year>2026</Year><Month>07</Month><Day>16</Day>
+    </DateCompleted>
+    <DateRevised>
+      <Year>2026</Year><Month>07</Month><Day>17</Day>
+    </DateRevised>
+    <Article PubModel="Print-Electronic">
+      <Journal>
+        <ISSN IssnType="Print">0028-0836</ISSN>
+        <ISSN IssnType="Electronic">2049-3630</ISSN>
+        <JournalIssue CitedMedium="Internet">
+          <PubDate>
+            <Year>2026</Year><Month>07</Month><Day>15</Day>
+          </PubDate>
+        </JournalIssue>
+        <Title>Journal of Biomedical Evidence</Title>
+        <ISOAbbreviation>J Biomed Evid</ISOAbbreviation>
+      </Journal>
+      <ArticleTitle>Biomedical repository paper %s</ArticleTitle>
+      <Abstract>
+        <AbstractText Label="BACKGROUND" NlmCategory="BACKGROUND">Tumor response was evaluated.</AbstractText>
+        <AbstractText Label="METHODS" NlmCategory="METHODS">The randomized trial improved survival.</AbstractText>
+      </Abstract>
+      <PublicationTypeList>
+        <PublicationType UI="D016428">Journal Article</PublicationType>
+        <PublicationType UI="D016449">Randomized Controlled Trial</PublicationType>
+        <PublicationType UI="D017418">Meta-Analysis</PublicationType>
+      </PublicationTypeList>
+      <ArticleDate DateType="Electronic">
+        <Year>2026</Year><Month>07</Month><Day>14</Day>
+      </ArticleDate>
+      <ELocationID EIdType="doi" ValidYN="Y">%s</ELocationID>
+    </Article>
+    <MedlineJournalInfo>
+      <Country>United States</Country>
+      <MedlineTA>J Biomed Evid</MedlineTA>
+      <NlmUniqueID>7654321</NlmUniqueID>
+      <ISSNLinking>0028-0836</ISSNLinking>
+    </MedlineJournalInfo>
+    <CommentsCorrectionsList>
+      <CommentsCorrections RefType="CommentIn">
+        <RefSource>Commented on by</RefSource><PMID>76543211</PMID>
+      </CommentsCorrections>
+      <CommentsCorrections RefType="ErratumIn">
+        <RefSource>Corrected by</RefSource><PMID>76543212</PMID>
+      </CommentsCorrections>
+    </CommentsCorrectionsList>
+    <MeshHeadingList>
+      <MeshHeading>
+        <DescriptorName UI="D009369" MajorTopicYN="Y">%s</DescriptorName>
+        <QualifierName UI="Q000628" MajorTopicYN="Y">therapy</QualifierName>
+        <QualifierName UI="Q000235" MajorTopicYN="N">genetics</QualifierName>
+      </MeshHeading>
+      <MeshHeading>
+        <DescriptorName UI="D001943" MajorTopicYN="N">Breast Neoplasms</DescriptorName>
+        <QualifierName UI="Q000503" MajorTopicYN="Y">pathology</QualifierName>
+      </MeshHeading>
+    </MeshHeadingList>
+  </MedlineCitation>
+  <PubmedData>
+    <ArticleIdList>
+      <ArticleId IdType="pubmed">%s</ArticleId>
+      <ArticleId IdType="pmc">PMC%s</ArticleId>
+      <ArticleId IdType="doi">%s</ArticleId>
+    </ArticleIdList>
+  </PubmedData>
+</PubmedArticle>`,
+		pmid,
+		titleMarker,
+		doi,
+		descriptorLabel,
+		pmid,
+		pmid,
+		doi,
+	)))
+	if err != nil {
+		t.Fatalf("pubmed.ParseRecord() error = %v", err)
+	}
+	keywordScore := 0.97
+	// PubMed ParseRecord does not parse KeywordList. This keyword is deliberate
+	// generic normalized-payload data and has no PubMed semantic source_path.
+	record.Keywords = []source.Keyword{
+		{
+			DisplayName: "immune checkpoint blockade",
+			Score:       &keywordScore,
+		},
+	}
+	envelope, err := NewEnvelope(
+		source.PubMed,
+		"pubmed:"+pmid,
+		sourceTime,
+		"pubmed-record-1",
+		1,
+		record,
+		record.Raw,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope(PubMed) error = %v", err)
+	}
+	return envelope
+}
+
+func pubMedEnvelopeWithDescriptorLabel(
+	t *testing.T,
+	envelope Envelope,
+	label string,
+	rawMarker string,
+) Envelope {
+	t.Helper()
+	return pubMedBiomedicalRepositoryEnvelopeFromXML(
+		t,
+		envelope.Record.SourceRecordID,
+		envelope.Record.Identity.Value(),
+		envelope.SourceTime,
+		label,
+		rawMarker,
+	)
 }
 
 func repositoryEnvelope(

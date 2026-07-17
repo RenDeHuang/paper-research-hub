@@ -496,21 +496,26 @@ func (repository *PostgresRepository) persistRawEvent(
 }
 
 type persistedRecordPayload struct {
-	Source           string                 `json:"source"`
-	SourceRecordID   string                 `json:"source_record_id"`
-	CanonicalKey     string                 `json:"canonical_key,omitempty"`
-	Identifiers      []source.Identifier    `json:"identifiers"`
-	Title            string                 `json:"title"`
-	Abstract         string                 `json:"abstract,omitempty"`
-	PublishedAt      *time.Time             `json:"published_at,omitempty"`
-	Authors          []source.Author        `json:"authors"`
-	Topics           []source.Topic         `json:"topics"`
-	CitedByCount     *int                   `json:"cited_by_count,omitempty"`
-	Venue            *source.Venue          `json:"venue,omitempty"`
-	Retracted        *bool                  `json:"retracted,omitempty"`
-	CodeURLs         []string               `json:"code_urls"`
-	Evidence         []source.FieldEvidence `json:"evidence"`
-	AuthorsTruncated *bool                  `json:"authors_truncated,omitempty"`
+	Source           string                   `json:"source"`
+	SourceRecordID   string                   `json:"source_record_id"`
+	CanonicalKey     string                   `json:"canonical_key,omitempty"`
+	Identifiers      []source.Identifier      `json:"identifiers"`
+	Title            string                   `json:"title"`
+	Abstract         string                   `json:"abstract,omitempty"`
+	AbstractSections []source.AbstractSection `json:"abstract_sections"`
+	PublishedAt      *time.Time               `json:"published_at,omitempty"`
+	Authors          []source.Author          `json:"authors"`
+	MeSHHeadings     []source.MeSHHeading     `json:"mesh_headings"`
+	PublicationTypes []source.PublicationType `json:"publication_types"`
+	Relations        []source.Relation        `json:"relations"`
+	Topics           []source.Topic           `json:"topics"`
+	Keywords         []source.Keyword         `json:"keywords"`
+	CitedByCount     *int                     `json:"cited_by_count,omitempty"`
+	Venue            *source.Venue            `json:"venue,omitempty"`
+	Retracted        *bool                    `json:"retracted,omitempty"`
+	CodeURLs         []string                 `json:"code_urls"`
+	Evidence         []source.FieldEvidence   `json:"evidence"`
+	AuthorsTruncated *bool                    `json:"authors_truncated,omitempty"`
 }
 
 func recordPayload(record source.Record) persistedRecordPayload {
@@ -525,9 +530,14 @@ func recordPayload(record source.Record) persistedRecordPayload {
 		Identifiers:      append([]source.Identifier(nil), record.Identifiers...),
 		Title:            record.Title,
 		Abstract:         record.Abstract,
+		AbstractSections: slices.Clone(record.AbstractSections),
 		PublishedAt:      cloneRepositoryTime(record.PublishedAt),
 		Authors:          append([]source.Author(nil), record.Authors...),
+		MeSHHeadings:     cloneMeSHHeadings(record.MeSHHeadings),
+		PublicationTypes: slices.Clone(record.PublicationTypes),
+		Relations:        slices.Clone(record.Relations),
 		Topics:           append([]source.Topic(nil), record.Topics...),
+		Keywords:         cloneKeywords(record.Keywords),
 		CitedByCount:     cloneRepositoryInt(record.CitedByCount),
 		Venue:            cloneRepositoryVenue(record.Venue),
 		Retracted:        cloneRepositoryBool(record.Retracted),
@@ -757,6 +767,15 @@ func (repository *PostgresRepository) Project(
 	); err != nil {
 		return ProjectionResult{}, err
 	}
+	sourceRecordUUID, payload, normalizedRecord, err := immutableNormalizedProjectionPayload(
+		ctx,
+		tx,
+		candidate.RawID,
+		candidate.Record,
+	)
+	if err != nil {
+		return ProjectionResult{}, err
+	}
 
 	identifiers, identity, err := controlledIdentifiers(candidate.Record)
 	if err != nil {
@@ -778,10 +797,6 @@ func (repository *PostgresRepository) Project(
 		identifiers,
 		identity,
 	)
-	if err != nil {
-		return ProjectionResult{}, err
-	}
-	sourceRecordUUID, err := normalizedSourceRecordID(ctx, tx, candidate.RawID)
 	if err != nil {
 		return ProjectionResult{}, err
 	}
@@ -807,25 +822,23 @@ func (repository *PostgresRepository) Project(
 	); err != nil {
 		return ProjectionResult{}, err
 	}
-	payload, err := json.Marshal(recordPayload(candidate.Record))
-	if err != nil {
-		return ProjectionResult{}, fmt.Errorf("encode projection assertion: %w", err)
-	}
-	command, err := tx.Exec(ctx, `
+	var projectionAssertionID string
+	err = tx.QueryRow(ctx, `
 			INSERT INTO ingestion_projection_assertions (
-			raw_event_id,
-			source_record_uuid,
-			work_id,
-			job_id,
-			scope_policy_version,
-			projection_policy_version,
-			record_payload
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (
-			raw_event_id,
-			scope_policy_version,
-			projection_policy_version
-		) DO NOTHING
+				raw_event_id,
+				source_record_uuid,
+				work_id,
+				job_id,
+				scope_policy_version,
+				projection_policy_version,
+				record_payload
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (
+				raw_event_id,
+				scope_policy_version,
+				projection_policy_version
+			) DO NOTHING
+			RETURNING id::text
 	`,
 		candidate.RawID,
 		sourceRecordUUID,
@@ -834,15 +847,16 @@ func (repository *PostgresRepository) Project(
 		scopePolicyVersion,
 		projectionPolicyVersion,
 		payload,
-	)
-	if err != nil {
+	).Scan(&projectionAssertionID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return ProjectionResult{}, fmt.Errorf("persist projection assertion: %w", err)
 	}
-	if command.RowsAffected() == 0 {
+	if errors.Is(err, pgx.ErrNoRows) {
 		var existingSourceRecordUUID, existingWorkID string
 		var payloadMatches bool
 		if err := tx.QueryRow(ctx, `
 			SELECT
+				id::text,
 				source_record_uuid::text,
 				work_id::text,
 				record_payload = $4::jsonb
@@ -856,6 +870,7 @@ func (repository *PostgresRepository) Project(
 			projectionPolicyVersion,
 			payload,
 		).Scan(
+			&projectionAssertionID,
 			&existingSourceRecordUUID,
 			&existingWorkID,
 			&payloadMatches,
@@ -872,6 +887,16 @@ func (repository *PostgresRepository) Project(
 				"projection assertion replay conflicts with immutable assertion",
 			)
 		}
+	}
+	if err := persistBiomedicalSemanticAssertions(
+		ctx,
+		tx,
+		projectionAssertionID,
+		sourceRecordUUID,
+		workID,
+		normalizedRecord,
+	); err != nil {
+		return ProjectionResult{}, err
 	}
 	stateChanged, err := upsertSourceState(
 		ctx,
@@ -1165,6 +1190,56 @@ func normalizedSourceRecordID(
 	return id, nil
 }
 
+func immutableNormalizedProjectionPayload(
+	ctx context.Context,
+	tx pgx.Tx,
+	rawEventID string,
+	candidate source.Record,
+) (string, []byte, persistedRecordPayload, error) {
+	candidatePayload, err := json.Marshal(recordPayload(candidate))
+	if err != nil {
+		return "", nil, persistedRecordPayload{}, fmt.Errorf(
+			"encode projection candidate normalized payload: %w",
+			err,
+		)
+	}
+
+	var sourceRecordID string
+	var persistedPayload []byte
+	var payloadMatches bool
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			source_record_uuid::text,
+			normalized_payload,
+			normalized_payload = $2::jsonb
+		FROM ingestion_normalized_records
+		WHERE raw_event_id = $1
+	`, rawEventID, candidatePayload).Scan(
+		&sourceRecordID,
+		&persistedPayload,
+		&payloadMatches,
+	); err != nil {
+		return "", nil, persistedRecordPayload{}, fmt.Errorf(
+			"read immutable normalized projection payload: %w",
+			err,
+		)
+	}
+	if !payloadMatches {
+		return "", nil, persistedRecordPayload{}, errors.New(
+			"projection candidate differs from immutable normalized payload",
+		)
+	}
+
+	var persisted persistedRecordPayload
+	if err := json.Unmarshal(persistedPayload, &persisted); err != nil {
+		return "", nil, persistedRecordPayload{}, fmt.Errorf(
+			"decode immutable normalized projection payload: %w",
+			err,
+		)
+	}
+	return sourceRecordID, persistedPayload, persisted, nil
+}
+
 func associateSourceRecord(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -1298,6 +1373,504 @@ func persistScopeDecision(
 			!evidenceMatches {
 			return errors.New("scope decision replay conflicts with immutable decision")
 		}
+	}
+	return nil
+}
+
+type biomedicalMeSHQualifierAssertion struct {
+	UI         string
+	Label      string
+	SourcePath string
+	MajorTopic bool
+}
+
+type biomedicalMeSHHeadingAssertion struct {
+	UI         string
+	Label      string
+	SourcePath string
+	MajorTopic bool
+	Qualifiers []biomedicalMeSHQualifierAssertion
+}
+
+type biomedicalPublicationTypeAssertion struct {
+	UI         string
+	Label      string
+	SourcePath string
+}
+
+func persistBiomedicalSemanticAssertions(
+	ctx context.Context,
+	tx pgx.Tx,
+	projectionAssertionID string,
+	sourceRecordID string,
+	workID string,
+	record persistedRecordPayload,
+) error {
+	headings, publicationTypes, err := normalizedBiomedicalSemanticAssertions(record)
+	if err != nil {
+		return err
+	}
+	for _, heading := range headings {
+		descriptorID, err := resolveBiomedicalCanonicalID(
+			ctx,
+			tx,
+			"mesh descriptor",
+			heading.UI,
+		)
+		if err != nil {
+			return err
+		}
+		headingID, err := persistMeSHHeadingAssertion(
+			ctx,
+			tx,
+			projectionAssertionID,
+			sourceRecordID,
+			workID,
+			descriptorID,
+			heading,
+		)
+		if err != nil {
+			return err
+		}
+		for _, qualifier := range heading.Qualifiers {
+			qualifierID, err := resolveBiomedicalCanonicalID(
+				ctx,
+				tx,
+				"mesh qualifier",
+				qualifier.UI,
+			)
+			if err != nil {
+				return err
+			}
+			if err := persistMeSHQualifierAssertion(
+				ctx,
+				tx,
+				projectionAssertionID,
+				sourceRecordID,
+				workID,
+				headingID,
+				qualifierID,
+				qualifier,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	for _, publicationType := range publicationTypes {
+		publicationTypeID, err := resolveBiomedicalCanonicalID(
+			ctx,
+			tx,
+			"publication type",
+			publicationType.UI,
+		)
+		if err != nil {
+			return err
+		}
+		if err := persistPublicationTypeAssertion(
+			ctx,
+			tx,
+			projectionAssertionID,
+			sourceRecordID,
+			workID,
+			publicationTypeID,
+			publicationType,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizedBiomedicalSemanticAssertions(
+	record persistedRecordPayload,
+) ([]biomedicalMeSHHeadingAssertion, []biomedicalPublicationTypeAssertion, error) {
+	if strings.TrimSpace(record.Source) != source.PubMed {
+		return nil, nil, nil
+	}
+	headings := make([]biomedicalMeSHHeadingAssertion, len(record.MeSHHeadings))
+	for headingIndex, heading := range record.MeSHHeadings {
+		descriptorUI, descriptorLabel, err := normalizedBiomedicalIdentity(
+			heading.Descriptor.UI,
+			heading.Descriptor.Name,
+			fmt.Sprintf("PubMed MeSH descriptor %d", headingIndex+1),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		qualifiers := make(
+			[]biomedicalMeSHQualifierAssertion,
+			len(heading.Qualifiers),
+		)
+		for qualifierIndex, qualifier := range heading.Qualifiers {
+			qualifierUI, qualifierLabel, err := normalizedBiomedicalIdentity(
+				qualifier.UI,
+				qualifier.Name,
+				fmt.Sprintf(
+					"PubMed MeSH qualifier %d.%d",
+					headingIndex+1,
+					qualifierIndex+1,
+				),
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+			qualifiers[qualifierIndex] = biomedicalMeSHQualifierAssertion{
+				UI:    qualifierUI,
+				Label: qualifierLabel,
+				SourcePath: fmt.Sprintf(
+					"/PubmedArticle/MedlineCitation/MeshHeadingList/"+
+						"MeshHeading[%d]/QualifierName[%d]",
+					headingIndex+1,
+					qualifierIndex+1,
+				),
+				MajorTopic: qualifier.MajorTopic,
+			}
+		}
+		headings[headingIndex] = biomedicalMeSHHeadingAssertion{
+			UI:    descriptorUI,
+			Label: descriptorLabel,
+			SourcePath: fmt.Sprintf(
+				"/PubmedArticle/MedlineCitation/MeshHeadingList/"+
+					"MeshHeading[%d]/DescriptorName",
+				headingIndex+1,
+			),
+			MajorTopic: heading.Descriptor.MajorTopic,
+			Qualifiers: qualifiers,
+		}
+	}
+
+	publicationTypes := make(
+		[]biomedicalPublicationTypeAssertion,
+		len(record.PublicationTypes),
+	)
+	for typeIndex, publicationType := range record.PublicationTypes {
+		publicationTypeUI, publicationTypeLabel, err := normalizedBiomedicalIdentity(
+			publicationType.UI,
+			publicationType.Name,
+			fmt.Sprintf("PubMed Publication Type %d", typeIndex+1),
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		publicationTypes[typeIndex] = biomedicalPublicationTypeAssertion{
+			UI:    publicationTypeUI,
+			Label: publicationTypeLabel,
+			SourcePath: fmt.Sprintf(
+				"/PubmedArticle/MedlineCitation/Article/"+
+					"PublicationTypeList/PublicationType[%d]",
+				typeIndex+1,
+			),
+		}
+	}
+	return headings, publicationTypes, nil
+}
+
+func normalizedBiomedicalIdentity(
+	rawUI string,
+	rawLabel string,
+	identityName string,
+) (string, string, error) {
+	ui := strings.TrimSpace(rawUI)
+	if ui == "" {
+		return "", "", fmt.Errorf("%s UI is required", identityName)
+	}
+	label := strings.TrimSpace(rawLabel)
+	if label == "" {
+		return "", "", fmt.Errorf("%s source label is required", identityName)
+	}
+	return ui, label, nil
+}
+
+func resolveBiomedicalCanonicalID(
+	ctx context.Context,
+	tx pgx.Tx,
+	kind string,
+	ui string,
+) (string, error) {
+	var insertQuery, selectQuery string
+	switch kind {
+	case "mesh descriptor":
+		insertQuery = `
+			INSERT INTO mesh_descriptors (descriptor_ui)
+			VALUES ($1)
+			ON CONFLICT (descriptor_ui) DO NOTHING
+			RETURNING id::text
+		`
+		selectQuery = `
+			SELECT id::text
+			FROM mesh_descriptors
+			WHERE descriptor_ui = $1
+		`
+	case "mesh qualifier":
+		insertQuery = `
+			INSERT INTO mesh_qualifiers (qualifier_ui)
+			VALUES ($1)
+			ON CONFLICT (qualifier_ui) DO NOTHING
+			RETURNING id::text
+		`
+		selectQuery = `
+			SELECT id::text
+			FROM mesh_qualifiers
+			WHERE qualifier_ui = $1
+		`
+	case "publication type":
+		insertQuery = `
+			INSERT INTO publication_types (publication_type_ui)
+			VALUES ($1)
+			ON CONFLICT (publication_type_ui) DO NOTHING
+			RETURNING id::text
+		`
+		selectQuery = `
+			SELECT id::text
+			FROM publication_types
+			WHERE publication_type_ui = $1
+		`
+	default:
+		return "", fmt.Errorf("unsupported biomedical canonical kind %q", kind)
+	}
+
+	var id string
+	err := tx.QueryRow(ctx, insertQuery, ui).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("insert canonical %s %q: %w", kind, ui, err)
+	}
+	if err := tx.QueryRow(ctx, selectQuery, ui).Scan(&id); err != nil {
+		return "", fmt.Errorf("read canonical %s %q: %w", kind, ui, err)
+	}
+	return id, nil
+}
+
+func persistMeSHHeadingAssertion(
+	ctx context.Context,
+	tx pgx.Tx,
+	projectionAssertionID string,
+	sourceRecordID string,
+	workID string,
+	descriptorID string,
+	heading biomedicalMeSHHeadingAssertion,
+) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx, `
+		INSERT INTO work_mesh_headings (
+			projection_assertion_id,
+			source_record_id,
+			work_id,
+			descriptor_id,
+			source_path,
+			descriptor_label,
+			is_major_topic
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (projection_assertion_id, descriptor_id) DO NOTHING
+		RETURNING id::text
+	`,
+		projectionAssertionID,
+		sourceRecordID,
+		workID,
+		descriptorID,
+		heading.SourcePath,
+		heading.Label,
+		heading.MajorTopic,
+	).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("persist PubMed MeSH heading %q: %w", heading.UI, err)
+	}
+
+	var existingSourceRecordID, existingWorkID, sourcePath, label string
+	var majorTopic bool
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			id::text,
+			source_record_id::text,
+			work_id::text,
+			source_path,
+			descriptor_label,
+			is_major_topic
+		FROM work_mesh_headings
+		WHERE projection_assertion_id = $1
+		  AND descriptor_id = $2
+	`,
+		projectionAssertionID,
+		descriptorID,
+	).Scan(
+		&id,
+		&existingSourceRecordID,
+		&existingWorkID,
+		&sourcePath,
+		&label,
+		&majorTopic,
+	); err != nil {
+		return "", fmt.Errorf("read replayed PubMed MeSH heading %q: %w", heading.UI, err)
+	}
+	if existingSourceRecordID != sourceRecordID ||
+		existingWorkID != workID ||
+		sourcePath != heading.SourcePath ||
+		label != heading.Label ||
+		majorTopic != heading.MajorTopic {
+		return "", fmt.Errorf(
+			"PubMed MeSH heading %q replay conflicts with immutable assertion",
+			heading.UI,
+		)
+	}
+	return id, nil
+}
+
+func persistMeSHQualifierAssertion(
+	ctx context.Context,
+	tx pgx.Tx,
+	projectionAssertionID string,
+	sourceRecordID string,
+	workID string,
+	headingID string,
+	qualifierID string,
+	qualifier biomedicalMeSHQualifierAssertion,
+) error {
+	command, err := tx.Exec(ctx, `
+		INSERT INTO work_mesh_qualifiers (
+			projection_assertion_id,
+			source_record_id,
+			work_id,
+			work_mesh_heading_id,
+			qualifier_id,
+			source_path,
+			qualifier_label,
+			is_major_topic
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (work_mesh_heading_id, qualifier_id) DO NOTHING
+	`,
+		projectionAssertionID,
+		sourceRecordID,
+		workID,
+		headingID,
+		qualifierID,
+		qualifier.SourcePath,
+		qualifier.Label,
+		qualifier.MajorTopic,
+	)
+	if err != nil {
+		return fmt.Errorf("persist PubMed MeSH qualifier %q: %w", qualifier.UI, err)
+	}
+	if command.RowsAffected() == 1 {
+		return nil
+	}
+
+	var existingProjectionAssertionID, existingSourceRecordID, existingWorkID string
+	var sourcePath, label string
+	var majorTopic bool
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			projection_assertion_id::text,
+			source_record_id::text,
+			work_id::text,
+			source_path,
+			qualifier_label,
+			is_major_topic
+		FROM work_mesh_qualifiers
+		WHERE work_mesh_heading_id = $1
+		  AND qualifier_id = $2
+	`,
+		headingID,
+		qualifierID,
+	).Scan(
+		&existingProjectionAssertionID,
+		&existingSourceRecordID,
+		&existingWorkID,
+		&sourcePath,
+		&label,
+		&majorTopic,
+	); err != nil {
+		return fmt.Errorf("read replayed PubMed MeSH qualifier %q: %w", qualifier.UI, err)
+	}
+	if existingProjectionAssertionID != projectionAssertionID ||
+		existingSourceRecordID != sourceRecordID ||
+		existingWorkID != workID ||
+		sourcePath != qualifier.SourcePath ||
+		label != qualifier.Label ||
+		majorTopic != qualifier.MajorTopic {
+		return fmt.Errorf(
+			"PubMed MeSH qualifier %q replay conflicts with immutable assertion",
+			qualifier.UI,
+		)
+	}
+	return nil
+}
+
+func persistPublicationTypeAssertion(
+	ctx context.Context,
+	tx pgx.Tx,
+	projectionAssertionID string,
+	sourceRecordID string,
+	workID string,
+	publicationTypeID string,
+	publicationType biomedicalPublicationTypeAssertion,
+) error {
+	command, err := tx.Exec(ctx, `
+		INSERT INTO work_publication_types (
+			projection_assertion_id,
+			source_record_id,
+			work_id,
+			publication_type_id,
+			source_path,
+			publication_type_label
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (projection_assertion_id, publication_type_id) DO NOTHING
+	`,
+		projectionAssertionID,
+		sourceRecordID,
+		workID,
+		publicationTypeID,
+		publicationType.SourcePath,
+		publicationType.Label,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"persist PubMed Publication Type %q: %w",
+			publicationType.UI,
+			err,
+		)
+	}
+	if command.RowsAffected() == 1 {
+		return nil
+	}
+
+	var existingSourceRecordID, existingWorkID, sourcePath, label string
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			source_record_id::text,
+			work_id::text,
+			source_path,
+			publication_type_label
+		FROM work_publication_types
+		WHERE projection_assertion_id = $1
+		  AND publication_type_id = $2
+	`,
+		projectionAssertionID,
+		publicationTypeID,
+	).Scan(
+		&existingSourceRecordID,
+		&existingWorkID,
+		&sourcePath,
+		&label,
+	); err != nil {
+		return fmt.Errorf(
+			"read replayed PubMed Publication Type %q: %w",
+			publicationType.UI,
+			err,
+		)
+	}
+	if existingSourceRecordID != sourceRecordID ||
+		existingWorkID != workID ||
+		sourcePath != publicationType.SourcePath ||
+		label != publicationType.Label {
+		return fmt.Errorf(
+			"PubMed Publication Type %q replay conflicts with immutable assertion",
+			publicationType.UI,
+		)
 	}
 	return nil
 }
