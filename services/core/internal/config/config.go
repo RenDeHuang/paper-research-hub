@@ -20,6 +20,7 @@ const (
 	RoleAPI                Role = "api"
 	RoleMigrate            Role = "migrate"
 	RoleCatalogPublish     Role = "catalog-publish"
+	RoleVenueAssessment    Role = "venue-assessment"
 	RoleOpenAlexSync       Role = "openalex-sync"
 	RolePubMedSync         Role = "pubmed-sync"
 	RolePubMedImport       Role = "pubmed-import"
@@ -313,7 +314,7 @@ func (cfg Config) validateRole(role Role) error {
 	switch role {
 	case RoleAPI:
 		return validateCatalogCursorSecret(cfg.Catalog.CursorSecret)
-	case RoleMigrate, RoleCatalogPublish:
+	case RoleMigrate, RoleCatalogPublish, RoleVenueAssessment:
 		return nil
 	case RoleOpenAlexSync:
 		if strings.TrimSpace(cfg.OpenAlex.APIKey) == "" {
@@ -360,6 +361,7 @@ func supportedRole(role Role) bool {
 	case RoleAPI,
 		RoleMigrate,
 		RoleCatalogPublish,
+		RoleVenueAssessment,
 		RoleOpenAlexSync,
 		RolePubMedSync,
 		RolePubMedImport,

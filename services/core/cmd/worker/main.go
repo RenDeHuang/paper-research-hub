@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
@@ -42,6 +43,7 @@ const (
 	commandSyncCrossref   commandKind = "sync_crossref"
 	commandImportJCR      commandKind = "import_jcr"
 	commandImportSubjects commandKind = "import_subjects"
+	commandAssessVenues   commandKind = "assess_venues"
 	commandPublishCatalog commandKind = "publish_catalog"
 	maxSyncResults                    = 1000
 )
@@ -57,6 +59,10 @@ type workerCommand struct {
 	File           string
 	FormulaVersion string
 	GeneratedAt    time.Time
+	MetricYear     int
+	PolicyVersion  string
+	AssessedAt     time.Time
+	JCRReceipt     string
 }
 
 type commandRunner func(
@@ -117,8 +123,18 @@ func realMain(
 func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	if len(args) < 2 {
 		return workerCommand{}, "", errors.New(
-			"usage: paper-hub-worker <sync|import|publish> <source> [flags]",
+			"usage: paper-hub-worker <sync|import|assess|publish> <source> [flags]",
 		)
+	}
+	if args[0] == "assess" {
+		if args[1] != "venues" {
+			return workerCommand{}, "", fmt.Errorf(
+				"unsupported assess target %q; expected venues",
+				args[1],
+			)
+		}
+		command, err := parseVenueAssessmentCommand(args[2:])
+		return command, config.RoleVenueAssessment, err
 	}
 	if args[0] == "publish" {
 		if args[1] != "catalog" {
@@ -147,7 +163,7 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	}
 	if args[0] != "sync" {
 		return workerCommand{}, "", errors.New(
-			"usage: paper-hub-worker <sync|import|publish> <source> [flags]",
+			"usage: paper-hub-worker <sync|import|assess|publish> <source> [flags]",
 		)
 	}
 	switch args[1] {
@@ -166,6 +182,100 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 			args[1],
 		)
 	}
+}
+
+func parseVenueAssessmentCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("assess venues", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	var assessedAt string
+	set.IntVar(
+		&command.MetricYear,
+		"metric-year",
+		0,
+		"authorized JCR metric year",
+	)
+	set.StringVar(
+		&command.PolicyVersion,
+		"policy-version",
+		"",
+		"Venue policy version",
+	)
+	set.StringVar(
+		&assessedAt,
+		"assessed-at",
+		"",
+		"explicit RFC3339Nano assessment time",
+	)
+	set.StringVar(
+		&command.JCRReceipt,
+		"jcr-receipt",
+		"",
+		"authorized JCR import receipt UUID",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"parse Venue assessment flags: %w",
+			err,
+		)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected Venue assessment arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+
+	command.Kind = commandAssessVenues
+	if command.MetricYear < 1900 || command.MetricYear > 3000 {
+		return workerCommand{}, errors.New(
+			"Venue assessment requires --metric-year between 1900 and 3000",
+		)
+	}
+	if command.PolicyVersion != venue.JournalJIFOrQ1PolicyVersion {
+		return workerCommand{}, fmt.Errorf(
+			"Venue assessment --policy-version must equal %s",
+			venue.JournalJIFOrQ1PolicyVersion,
+		)
+	}
+	if assessedAt == "" {
+		return workerCommand{}, errors.New(
+			"Venue assessment requires an explicit --assessed-at",
+		)
+	}
+	if assessedAt != strings.TrimSpace(assessedAt) {
+		return workerCommand{}, errors.New(
+			"Venue assessment assessed-at must be trimmed",
+		)
+	}
+	parsedAssessedAt, err := time.Parse(time.RFC3339Nano, assessedAt)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"Venue assessment assessed-at must use RFC3339Nano: %w",
+			err,
+		)
+	}
+	if parsedAssessedAt.IsZero() {
+		return workerCommand{}, errors.New(
+			"Venue assessment assessed-at must be non-zero",
+		)
+	}
+	command.AssessedAt = parsedAssessedAt
+	command.JCRReceipt = strings.TrimSpace(command.JCRReceipt)
+	if command.JCRReceipt == "" {
+		return workerCommand{}, errors.New(
+			"Venue assessment requires an explicit --jcr-receipt",
+		)
+	}
+	parsedReceipt, err := uuid.Parse(command.JCRReceipt)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"Venue assessment jcr-receipt must be a UUID: %w",
+			err,
+		)
+	}
+	command.JCRReceipt = parsedReceipt.String()
+	return command, nil
 }
 
 func parseCatalogPublishCommand(args []string) (workerCommand, error) {
@@ -448,6 +558,8 @@ func runCommand(
 	switch command.Kind {
 	case commandPublishCatalog:
 		return runCatalogPublish(ctx, pool, command)
+	case commandAssessVenues:
+		return runVenueAssessment(ctx, pool, command)
 	case commandImportJCR:
 		return runJCRImport(ctx, pool, cfg, command)
 	case commandImportSubjects:
@@ -455,6 +567,41 @@ func runCommand(
 	default:
 		return runSync(ctx, pool, cfg, command)
 	}
+}
+
+func runVenueAssessment(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	command workerCommand,
+) (map[string]any, error) {
+	store, err := venue.NewPostgresAssessmentStore(pool)
+	if err != nil {
+		return nil, fmt.Errorf("create Venue assessment store: %w", err)
+	}
+	service, err := venue.NewAssessmentService(store)
+	if err != nil {
+		return nil, fmt.Errorf("create Venue assessment service: %w", err)
+	}
+	summary, err := service.Assess(ctx, venue.AssessmentInput{
+		JCRImportReceiptID: command.JCRReceipt,
+		MetricYear:         command.MetricYear,
+		PolicyVersion:      command.PolicyVersion,
+		AssessedAt:         command.AssessedAt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("assess Venues: %w", err)
+	}
+	return map[string]any{
+		"jcr_receipt":    command.JCRReceipt,
+		"metric_year":    command.MetricYear,
+		"policy_version": command.PolicyVersion,
+		"assessed_at":    command.AssessedAt.UTC().Format(time.RFC3339Nano),
+		"total":          summary.Total,
+		"accepted":       summary.Accepted,
+		"rejected":       summary.Rejected,
+		"unknown":        summary.Unknown,
+		"not_applicable": summary.NotApplicable,
+	}, nil
 }
 
 func runCatalogPublish(
