@@ -25,11 +25,12 @@ type Publisher struct {
 }
 
 type catalogSnapshot struct {
-	stats   json.RawMessage
-	papers  []publishedPaper
-	topics  []publishedTaxonomy
-	methods []publishedTaxonomy
-	sources []sourceRevisionFact
+	stats     json.RawMessage
+	papers    []publishedPaper
+	topics    []publishedTaxonomy
+	methods   []publishedTaxonomy
+	sources   []sourceRevisionFact
+	curations []curationRevisionFact
 }
 
 type sourceRevisionFact struct {
@@ -165,6 +166,12 @@ type curationPayload struct {
 	AssessedAt    string          `json:"assessed_at"`
 }
 
+type curationRevisionFact struct {
+	WorkID   uuid.UUID       `json:"work_id"`
+	VenueID  uuid.UUID       `json:"venue_id"`
+	Curation curationPayload `json:"curation"`
+}
+
 func NewPublisher(database transactionBeginner) (*Publisher, error) {
 	if database == nil {
 		return nil, errors.New("catalog publisher requires a PostgreSQL database")
@@ -240,6 +247,38 @@ func validatePublishInput(input PublishInput) error {
 	if input.GeneratedAt.IsZero() {
 		return fmt.Errorf("%w: generated_at is required", ErrCatalogNotReady)
 	}
+	if input.JCRMetricYear < 1900 || input.JCRMetricYear > 3000 {
+		return fmt.Errorf(
+			"%w: JCR metric year must be between 1900 and 3000",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.VenuePolicyName == "" ||
+		input.VenuePolicyName != strings.TrimSpace(input.VenuePolicyName) {
+		return fmt.Errorf(
+			"%w: Venue policy name must be non-empty and trimmed",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.VenuePolicyVersion < 1 {
+		return fmt.Errorf(
+			"%w: Venue policy version must be positive",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.SubjectVersion == "" ||
+		input.SubjectVersion != strings.TrimSpace(input.SubjectVersion) {
+		return fmt.Errorf(
+			"%w: Subject version must be non-empty and trimmed",
+			ErrCatalogNotReady,
+		)
+	}
+	if input.JCRImportReceipt == uuid.Nil {
+		return fmt.Errorf(
+			"%w: JCR import receipt is required",
+			ErrCatalogNotReady,
+		)
+	}
 	return nil
 }
 
@@ -267,13 +306,15 @@ func buildCurrentSnapshot(
 	tx pgx.Tx,
 	input PublishInput,
 ) (catalogSnapshot, string, error) {
+	if err := validateCurationReferences(ctx, tx, input); err != nil {
+		return catalogSnapshot{}, "", err
+	}
 	states, err := loadCurrentSourceStates(ctx, tx)
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
 
 	visible := make(map[uuid.UUID]*workSources)
-	revisionSources := make([]sourceRevisionFact, 0)
 	for _, state := range states {
 		if state.isDeleted {
 			continue
@@ -318,22 +359,6 @@ func buildCurrentSnapshot(
 		}
 		entry.states = append(entry.states, state)
 		entry.sourceRecordIDs = append(entry.sourceRecordIDs, state.sourceRecordID)
-		revisionSources = append(revisionSources, sourceRevisionFact{
-			LogicalSource:              state.logicalSource,
-			EventKey:                   state.eventKey,
-			NormalizedAssertionID:      state.normalizedAssertionID.String(),
-			RawEventID:                 state.rawEventID.String(),
-			SourceRecordID:             state.sourceRecordID.String(),
-			WorkID:                     state.workID.String(),
-			SourceTime:                 state.sourceTime.UTC().Format(time.RFC3339Nano),
-			TieBreakKey:                state.tieBreakKey,
-			Position:                   state.position,
-			ScopePolicyVersion:         state.scopePolicyVersion,
-			ProjectionPolicyVersion:    state.projectionPolicyVersion,
-			NormalizationPolicyVersion: state.normalizationPolicyVersion,
-			NormalizedPayloadSchema:    state.normalizedPayloadSchema,
-			NormalizedPayload:          state.normalizedPayload,
-		})
 	}
 	if len(visible) == 0 {
 		return catalogSnapshot{}, "", ErrEmptyDomain
@@ -346,6 +371,51 @@ func buildCurrentSnapshot(
 	sort.Slice(workIDs, func(i, j int) bool {
 		return workIDs[i].String() < workIDs[j].String()
 	})
+	eligibleWorkIDs := make([]uuid.UUID, 0, len(workIDs))
+	curationsByWork := make(map[uuid.UUID]catalogValue, len(workIDs))
+	curationFacts := make([]curationRevisionFact, 0, len(workIDs))
+	revisionSources := make([]sourceRevisionFact, 0)
+	for _, workID := range workIDs {
+		curation, accepted, curationErr := loadAcceptedCuration(
+			ctx,
+			tx,
+			workID,
+			input,
+		)
+		if curationErr != nil {
+			return catalogSnapshot{}, "", curationErr
+		}
+		if !accepted {
+			continue
+		}
+		eligibleWorkIDs = append(eligibleWorkIDs, workID)
+		curationsByWork[workID] = catalogValue{
+			State: "known",
+			Value: curation.Curation,
+		}
+		curationFacts = append(curationFacts, curation)
+		for _, state := range visible[workID].states {
+			revisionSources = append(revisionSources, sourceRevisionFact{
+				LogicalSource:              state.logicalSource,
+				EventKey:                   state.eventKey,
+				NormalizedAssertionID:      state.normalizedAssertionID.String(),
+				RawEventID:                 state.rawEventID.String(),
+				SourceRecordID:             state.sourceRecordID.String(),
+				WorkID:                     state.workID.String(),
+				SourceTime:                 state.sourceTime.UTC().Format(time.RFC3339Nano),
+				TieBreakKey:                state.tieBreakKey,
+				Position:                   state.position,
+				ScopePolicyVersion:         state.scopePolicyVersion,
+				ProjectionPolicyVersion:    state.projectionPolicyVersion,
+				NormalizationPolicyVersion: state.normalizationPolicyVersion,
+				NormalizedPayloadSchema:    state.normalizedPayloadSchema,
+				NormalizedPayload:          state.normalizedPayload,
+			})
+		}
+	}
+	if len(eligibleWorkIDs) == 0 {
+		return catalogSnapshot{}, "", ErrEmptyDomain
+	}
 	sort.Slice(revisionSources, func(i, j int) bool {
 		left, right := revisionSources[i], revisionSources[j]
 		if left.LogicalSource != right.LogicalSource {
@@ -356,13 +426,14 @@ func buildCurrentSnapshot(
 
 	topicFacts := make(map[uuid.UUID]*taxonomyFact)
 	methodFacts := make(map[uuid.UUID]*taxonomyFact)
-	papers := make([]publishedPaper, 0, len(workIDs))
-	for _, workID := range workIDs {
+	papers := make([]publishedPaper, 0, len(eligibleWorkIDs))
+	for _, workID := range eligibleWorkIDs {
 		paper, topics, methods, err := buildPaper(
 			ctx,
 			tx,
 			workID,
 			visible[workID],
+			curationsByWork[workID],
 		)
 		if err != nil {
 			return catalogSnapshot{}, "", err
@@ -393,13 +464,14 @@ func buildCurrentSnapshot(
 	}
 
 	snapshot := catalogSnapshot{
-		stats:   stats,
-		papers:  papers,
-		topics:  topics,
-		methods: methods,
-		sources: revisionSources,
+		stats:     stats,
+		papers:    papers,
+		topics:    topics,
+		methods:   methods,
+		sources:   revisionSources,
+		curations: curationFacts,
 	}
-	sourceRevision, err := snapshotRevision(input.FormulaVersion, snapshot)
+	sourceRevision, err := snapshotRevision(input, snapshot)
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
@@ -531,18 +603,15 @@ func buildPaper(
 	tx pgx.Tx,
 	workID uuid.UUID,
 	sources *workSources,
+	curation catalogValue,
 ) (publishedPaper, []taxonomyFact, []taxonomyFact, error) {
-	var (
-		paper       publishedPaper
-		venueIDText string
-	)
+	var paper publishedPaper
 	err := tx.QueryRow(ctx, `
 		SELECT
 			id,
 			canonical_key,
 			title,
-			status,
-			COALESCE(venue_id::text, '')
+			status
 		FROM works
 		WHERE id = $1
 	`, workID).Scan(
@@ -550,7 +619,6 @@ func buildPaper(
 		&paper.CanonicalKey,
 		&paper.Title,
 		&paper.LifecycleStatus,
-		&venueIDText,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return publishedPaper{}, nil, nil, fmt.Errorf(
@@ -656,10 +724,6 @@ func buildPaper(
 	paper.SourceNames = sourceNames(sources.states)
 
 	authors, err := loadAuthors(ctx, tx, workID)
-	if err != nil {
-		return publishedPaper{}, nil, nil, err
-	}
-	curation, err := loadCuration(ctx, tx, venueIDText)
 	if err != nil {
 		return publishedPaper{}, nil, nil, err
 	}
@@ -1255,6 +1319,148 @@ func loadCuration(
 	}, nil
 }
 
+func validateCurationReferences(
+	ctx context.Context,
+	tx pgx.Tx,
+	input PublishInput,
+) error {
+	var receiptExists, subjectVersionExists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			EXISTS (
+				SELECT 1
+				FROM jcr_import_receipts
+				WHERE id = $1
+			),
+			EXISTS (
+				SELECT 1
+				FROM subject_versions
+				WHERE version_key = $2
+			)
+	`,
+		input.JCRImportReceipt,
+		input.SubjectVersion,
+	).Scan(&receiptExists, &subjectVersionExists); err != nil {
+		return fmt.Errorf("validate Catalog curation references: %w", err)
+	}
+	if !receiptExists {
+		return fmt.Errorf(
+			"%w: JCR import receipt %s does not exist",
+			ErrCatalogNotReady,
+			input.JCRImportReceipt,
+		)
+	}
+	if !subjectVersionExists {
+		return fmt.Errorf(
+			"%w: Subject version %q does not exist",
+			ErrCatalogNotReady,
+			input.SubjectVersion,
+		)
+	}
+	return nil
+}
+
+func loadAcceptedCuration(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+	input PublishInput,
+) (curationRevisionFact, bool, error) {
+	var (
+		fact          curationRevisionFact
+		decision      string
+		matchedRules  []byte
+		evidence      []byte
+		metricYear    int
+		policyName    string
+		policyVersion int
+		assessedAt    time.Time
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT
+			work.id,
+			venue.id,
+			assessment.decision,
+			assessment.matched_rules,
+			assessment.evidence,
+			assessment.metric_year,
+			policy.policy_name,
+			policy.version_number,
+			assessment.assessed_at
+		FROM works AS work
+		JOIN venues AS venue
+		  ON venue.id = work.venue_id
+		JOIN venue_policy_versions AS policy
+		  ON policy.policy_name = $2
+		 AND policy.version_number = $3
+		JOIN venue_policy_assessments AS assessment
+		  ON assessment.venue_id = venue.id
+		 AND assessment.policy_version_id = policy.id
+		 AND assessment.metric_year = $4
+		WHERE work.id = $1
+		  AND work.status = 'active'
+		  AND venue.venue_type = 'journal'
+		  AND COALESCE(venue.issn_l, venue.issn, venue.eissn) IS NOT NULL
+		  AND assessment.decision = 'accepted'
+		  AND assessment.evidence ->> 'jcr_import_receipt_id' = ($5::uuid)::text
+		  AND EXISTS (
+				SELECT 1
+				FROM jcr_import_receipt_metrics AS receipt_metric
+				JOIN venue_metric_snapshots AS metric
+				  ON metric.id = receipt_metric.metric_snapshot_id
+				JOIN journal_subject_metrics AS journal_subject
+				  ON journal_subject.venue_metric_snapshot_id = metric.id
+				JOIN biomedical_subject_rules AS subject_rule
+				  ON subject_rule.id = journal_subject.subject_rule_id
+				JOIN subject_versions AS subject_version
+				  ON subject_version.id = subject_rule.subject_version_id
+				WHERE receipt_metric.import_receipt_id = $5::uuid
+				  AND metric.venue_id = venue.id
+				  AND metric.metric_year = $4
+				  AND subject_version.version_key = $6
+				  AND journal_subject.jcr_category = metric.category
+				  AND subject_rule.jcr_category = metric.category
+		  )
+	`,
+		workID,
+		input.VenuePolicyName,
+		input.VenuePolicyVersion,
+		input.JCRMetricYear,
+		input.JCRImportReceipt,
+		input.SubjectVersion,
+	).Scan(
+		&fact.WorkID,
+		&fact.VenueID,
+		&decision,
+		&matchedRules,
+		&evidence,
+		&metricYear,
+		&policyName,
+		&policyVersion,
+		&assessedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return curationRevisionFact{}, false, nil
+	}
+	if err != nil {
+		return curationRevisionFact{}, false, fmt.Errorf(
+			"query Work %s accepted curation: %w",
+			workID,
+			err,
+		)
+	}
+	fact.Curation = curationPayload{
+		Decision:      decision,
+		MatchedRules:  json.RawMessage(matchedRules),
+		Evidence:      json.RawMessage(evidence),
+		MetricYear:    metricYear,
+		PolicyName:    policyName,
+		PolicyVersion: policyVersion,
+		AssessedAt:    assessedAt.UTC().Format(time.RFC3339Nano),
+	}
+	return fact, true, nil
+}
+
 func sourceNames(states []sourceState) []string {
 	unique := make(map[string]struct{}, len(states))
 	for _, state := range states {
@@ -1393,19 +1599,31 @@ func boolRatio(
 	return catalogValue{State: "unknown"}
 }
 
-func snapshotRevision(formulaVersion string, snapshot catalogSnapshot) (string, error) {
+func snapshotRevision(input PublishInput, snapshot catalogSnapshot) (string, error) {
 	material := struct {
-		FormulaVersion string               `json:"formula_version"`
-		Sources        []sourceRevisionFact `json:"sources"`
-		Papers         []publishedPaper     `json:"papers"`
-		Topics         []publishedTaxonomy  `json:"topics"`
-		Methods        []publishedTaxonomy  `json:"methods"`
+		FormulaVersion     string                 `json:"formula_version"`
+		JCRMetricYear      int                    `json:"jcr_metric_year"`
+		VenuePolicyName    string                 `json:"venue_policy_name"`
+		VenuePolicyVersion int                    `json:"venue_policy_version"`
+		SubjectVersion     string                 `json:"subject_version"`
+		JCRImportReceipt   uuid.UUID              `json:"jcr_import_receipt"`
+		Sources            []sourceRevisionFact   `json:"sources"`
+		Curations          []curationRevisionFact `json:"curations"`
+		Papers             []publishedPaper       `json:"papers"`
+		Topics             []publishedTaxonomy    `json:"topics"`
+		Methods            []publishedTaxonomy    `json:"methods"`
 	}{
-		FormulaVersion: formulaVersion,
-		Sources:        snapshot.sources,
-		Papers:         snapshot.papers,
-		Topics:         snapshot.topics,
-		Methods:        snapshot.methods,
+		FormulaVersion:     input.FormulaVersion,
+		JCRMetricYear:      input.JCRMetricYear,
+		VenuePolicyName:    input.VenuePolicyName,
+		VenuePolicyVersion: input.VenuePolicyVersion,
+		SubjectVersion:     input.SubjectVersion,
+		JCRImportReceipt:   input.JCRImportReceipt,
+		Sources:            snapshot.sources,
+		Curations:          snapshot.curations,
+		Papers:             snapshot.papers,
+		Topics:             snapshot.topics,
+		Methods:            snapshot.methods,
 	}
 	encoded, err := json.Marshal(material)
 	if err != nil {
@@ -1468,9 +1686,14 @@ func persistSnapshot(
 	snapshot catalogSnapshot,
 ) (Generation, error) {
 	metadata, err := json.Marshal(map[string]any{
-		"papers":  len(snapshot.papers),
-		"topics":  len(snapshot.topics),
-		"methods": len(snapshot.methods),
+		"papers":               len(snapshot.papers),
+		"topics":               len(snapshot.topics),
+		"methods":              len(snapshot.methods),
+		"jcr_metric_year":      input.JCRMetricYear,
+		"venue_policy_name":    input.VenuePolicyName,
+		"venue_policy_version": input.VenuePolicyVersion,
+		"subject_version":      input.SubjectVersion,
+		"jcr_import_receipt":   input.JCRImportReceipt,
 	})
 	if err != nil {
 		return Generation{}, fmt.Errorf("encode public catalog generation metadata: %w", err)

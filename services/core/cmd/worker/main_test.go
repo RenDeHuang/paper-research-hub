@@ -99,6 +99,16 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 			"public-catalog/v1",
 			"--generated-at",
 			"2026-07-16T08:09:10.123456789Z",
+			"--jcr-metric-year",
+			"2025",
+			"--venue-policy-name",
+			"journal-jif-or-q1",
+			"--venue-policy-version",
+			"1",
+			"--subject-version",
+			"biomedical-jcr-subjects/v1",
+			"--jcr-import-receipt",
+			"00000000-0000-0000-0000-000000000501",
 		},
 		&stdout,
 		&stderr,
@@ -128,6 +138,13 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 	}
 	if !received.GeneratedAt.Equal(generatedAt) {
 		t.Fatalf("GeneratedAt = %s, want %s", received.GeneratedAt, generatedAt)
+	}
+	if received.MetricYear != 2025 ||
+		received.VenuePolicyName != "journal-jif-or-q1" ||
+		received.VenuePolicyVersion != 1 ||
+		received.SubjectVersion != "biomedical-jcr-subjects/v1" ||
+		received.JCRReceipt != "00000000-0000-0000-0000-000000000501" {
+		t.Fatalf("Catalog curation inputs = %#v", received)
 	}
 
 	var output struct {

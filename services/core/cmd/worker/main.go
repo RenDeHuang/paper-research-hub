@@ -49,20 +49,23 @@ const (
 )
 
 type workerCommand struct {
-	Kind           commandKind
-	Query          string
-	Filter         string
-	FromDate       time.Time
-	ToDate         time.Time
-	ISSNs          []string
-	MaxResults     int
-	File           string
-	FormulaVersion string
-	GeneratedAt    time.Time
-	MetricYear     int
-	PolicyVersion  string
-	AssessedAt     time.Time
-	JCRReceipt     string
+	Kind               commandKind
+	Query              string
+	Filter             string
+	FromDate           time.Time
+	ToDate             time.Time
+	ISSNs              []string
+	MaxResults         int
+	File               string
+	FormulaVersion     string
+	GeneratedAt        time.Time
+	MetricYear         int
+	PolicyVersion      string
+	AssessedAt         time.Time
+	JCRReceipt         string
+	VenuePolicyName    string
+	VenuePolicyVersion int
+	SubjectVersion     string
 }
 
 type commandRunner func(
@@ -295,6 +298,36 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 		"",
 		"explicit RFC3339Nano generation time",
 	)
+	set.IntVar(
+		&command.MetricYear,
+		"jcr-metric-year",
+		0,
+		"authorized JCR metric year",
+	)
+	set.StringVar(
+		&command.VenuePolicyName,
+		"venue-policy-name",
+		"",
+		"Venue policy name",
+	)
+	set.IntVar(
+		&command.VenuePolicyVersion,
+		"venue-policy-version",
+		0,
+		"Venue policy version number",
+	)
+	set.StringVar(
+		&command.SubjectVersion,
+		"subject-version",
+		"",
+		"biomedical Subject registry version",
+	)
+	set.StringVar(
+		&command.JCRReceipt,
+		"jcr-import-receipt",
+		"",
+		"authorized JCR import receipt UUID",
+	)
 	if err := set.Parse(args); err != nil {
 		return workerCommand{}, fmt.Errorf("parse catalog publish flags: %w", err)
 	}
@@ -333,6 +366,50 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 		return workerCommand{}, errors.New("catalog generated-at must be non-zero")
 	}
 	command.GeneratedAt = parsed
+	if command.MetricYear < 1900 || command.MetricYear > 3000 {
+		return workerCommand{}, errors.New(
+			"catalog publish requires --jcr-metric-year between 1900 and 3000",
+		)
+	}
+	if command.VenuePolicyName == "" {
+		return workerCommand{}, errors.New(
+			"catalog publish requires an explicit --venue-policy-name",
+		)
+	}
+	if command.VenuePolicyName != strings.TrimSpace(command.VenuePolicyName) {
+		return workerCommand{}, errors.New(
+			"catalog venue-policy-name must be trimmed",
+		)
+	}
+	if command.VenuePolicyVersion < 1 {
+		return workerCommand{}, errors.New(
+			"catalog publish requires a positive --venue-policy-version",
+		)
+	}
+	if command.SubjectVersion == "" {
+		return workerCommand{}, errors.New(
+			"catalog publish requires an explicit --subject-version",
+		)
+	}
+	if command.SubjectVersion != strings.TrimSpace(command.SubjectVersion) {
+		return workerCommand{}, errors.New(
+			"catalog subject-version must be trimmed",
+		)
+	}
+	command.JCRReceipt = strings.TrimSpace(command.JCRReceipt)
+	if command.JCRReceipt == "" {
+		return workerCommand{}, errors.New(
+			"catalog publish requires an explicit --jcr-import-receipt",
+		)
+	}
+	parsedReceipt, err := uuid.Parse(command.JCRReceipt)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"catalog jcr-import-receipt must be a UUID: %w",
+			err,
+		)
+	}
+	command.JCRReceipt = parsedReceipt.String()
 	return command, nil
 }
 
@@ -614,13 +691,24 @@ func runCatalogPublish(
 		return nil, fmt.Errorf("create catalog publisher: %w", err)
 	}
 	generation, err := publisher.PublishCurrent(ctx, catalog.PublishInput{
-		FormulaVersion: command.FormulaVersion,
-		GeneratedAt:    command.GeneratedAt,
+		FormulaVersion:     command.FormulaVersion,
+		GeneratedAt:        command.GeneratedAt,
+		JCRMetricYear:      command.MetricYear,
+		VenuePolicyName:    command.VenuePolicyName,
+		VenuePolicyVersion: command.VenuePolicyVersion,
+		SubjectVersion:     command.SubjectVersion,
+		JCRImportReceipt:   uuid.MustParse(command.JCRReceipt),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("publish current catalog: %w", err)
 	}
-	return catalogGenerationResult(generation), nil
+	result := catalogGenerationResult(generation)
+	result["jcr_metric_year"] = command.MetricYear
+	result["venue_policy_name"] = command.VenuePolicyName
+	result["venue_policy_version"] = command.VenuePolicyVersion
+	result["subject_version"] = command.SubjectVersion
+	result["jcr_import_receipt"] = command.JCRReceipt
+	return result, nil
 }
 
 func catalogGenerationResult(generation catalog.Generation) map[string]any {

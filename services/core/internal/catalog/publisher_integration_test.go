@@ -39,17 +39,16 @@ func TestPublisherBuildsAndAtomicallyPublishesNormalizedCurrentState(t *testing.
 	})
 	publisher := mustPublisher(t, pool)
 	generatedAt := time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC)
+	input := catalogCurationInputAt(generatedAt)
+	preparePublisherAcceptedCuration(t, pool, input, fixture)
 
-	generation, err := publisher.PublishCurrent(context.Background(), PublishInput{
-		FormulaVersion: "public-catalog/v1",
-		GeneratedAt:    generatedAt,
-	})
+	generation, err := publisher.PublishCurrent(context.Background(), input)
 	if err != nil {
 		t.Fatalf("PublishCurrent() error = %v", err)
 	}
 	if generation.ID == uuid.Nil ||
 		generation.GeneratedAt != generatedAt ||
-		generation.FormulaVersion != "public-catalog/v1" {
+		generation.FormulaVersion != input.FormulaVersion {
 		t.Fatalf("published generation = %#v, want requested immutable generation", generation)
 	}
 	if len(generation.SourceRevision) != 64 {
@@ -205,22 +204,22 @@ func TestPublisherPreservesKnownUnknownAndMissingWithoutInventingValues(t *testi
 	})
 
 	publisher := mustPublisher(t, pool)
-	if _, err := publisher.PublishCurrent(context.Background(), PublishInput{
-		FormulaVersion: "public-catalog/v1",
-		GeneratedAt:    time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
-	}); err != nil {
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
+	)
+	preparePublisherAcceptedCuration(t, pool, input, known, unknown, missing)
+	if _, err := publisher.PublishCurrent(context.Background(), input); err != nil {
 		t.Fatalf("PublishCurrent() error = %v", err)
 	}
 	repository := mustRepository(t, pool)
 
 	for _, test := range []struct {
-		name  string
-		id    uuid.UUID
-		state string
+		name string
+		id   uuid.UUID
 	}{
-		{"known", known.workID, "known"},
-		{"unknown", unknown.workID, "unknown"},
-		{"missing", missing.workID, "missing"},
+		{"known", known.workID},
+		{"unknown", unknown.workID},
+		{"missing", missing.workID},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			document, err := repository.Paper(context.Background(), test.id)
@@ -231,7 +230,7 @@ func TestPublisherPreservesKnownUnknownAndMissingWithoutInventingValues(t *testi
 				t,
 				document.Payload,
 				[]string{"curation", "state"},
-				test.state,
+				"known",
 			)
 		})
 	}
@@ -267,11 +266,12 @@ func TestPublisherReturnsEmptyDomainWithoutWritingGeneration(t *testing.T) {
 		sourceTime:        time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC),
 	})
 	publisher := mustPublisher(t, pool)
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
+	)
+	preparePublisherEmptyCurationReferences(t, pool, input)
 
-	_, err := publisher.PublishCurrent(context.Background(), PublishInput{
-		FormulaVersion: "public-catalog/v1",
-		GeneratedAt:    time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
-	})
+	_, err := publisher.PublishCurrent(context.Background(), input)
 	if !errors.Is(err, ErrEmptyDomain) {
 		t.Fatalf("PublishCurrent() error = %v, want ErrEmptyDomain", err)
 	}
@@ -316,11 +316,12 @@ func TestPublisherReturnsNotReadyForPendingOrBrokenIncludedStateWithoutWrites(t 
 			pool := openCatalogTestPool(t)
 			insertPublisherVisibleWork(t, pool, test.options)
 			publisher := mustPublisher(t, pool)
+			input := catalogCurationInputAt(
+				time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
+			)
+			preparePublisherEmptyCurationReferences(t, pool, input)
 
-			_, err := publisher.PublishCurrent(context.Background(), PublishInput{
-				FormulaVersion: "public-catalog/v1",
-				GeneratedAt:    time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
-			})
+			_, err := publisher.PublishCurrent(context.Background(), input)
 			if !errors.Is(err, ErrCatalogNotReady) {
 				t.Fatalf("PublishCurrent() error = %v, want ErrCatalogNotReady", err)
 			}
@@ -331,8 +332,9 @@ func TestPublisherReturnsNotReadyForPendingOrBrokenIncludedStateWithoutWrites(t 
 
 func TestPublisherRejectsDeterministicSlugCollisionsWithoutPartialPublication(t *testing.T) {
 	pool := openCatalogTestPool(t)
+	var fixtures []publisherWorkFixture
 	for index, topic := range []string{"Agent Systems", "Agent-Systems"} {
-		insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		fixtures = append(fixtures, insertPublisherVisibleWork(t, pool, publisherWorkOptions{
 			eventKey:          fmt.Sprintf("openalex:publisher-collision-%d", index),
 			canonicalKey:      fmt.Sprintf("doi:10.1000/publisher-collision-%d", index),
 			title:             fmt.Sprintf("Collision Work %d", index),
@@ -342,14 +344,15 @@ func TestPublisherRejectsDeterministicSlugCollisionsWithoutPartialPublication(t 
 			includeWorkID:     true,
 			includeNormalized: true,
 			sourceTime:        time.Date(2026, time.July, 15, 9+index, 0, 0, 0, time.UTC),
-		})
+		}))
 	}
 	publisher := mustPublisher(t, pool)
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
+	)
+	preparePublisherAcceptedCuration(t, pool, input, fixtures...)
 
-	_, err := publisher.PublishCurrent(context.Background(), PublishInput{
-		FormulaVersion: "public-catalog/v1",
-		GeneratedAt:    time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
-	})
+	_, err := publisher.PublishCurrent(context.Background(), input)
 	if !errors.Is(err, ErrCatalogNotReady) {
 		t.Fatalf("PublishCurrent() error = %v, want ErrCatalogNotReady", err)
 	}
@@ -358,7 +361,7 @@ func TestPublisherRejectsDeterministicSlugCollisionsWithoutPartialPublication(t 
 
 func TestPublisherRetryReusesIdenticalImmutableGeneration(t *testing.T) {
 	pool := openCatalogTestPool(t)
-	insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
 		eventKey:          "openalex:publisher-retry",
 		canonicalKey:      "doi:10.1000/publisher-retry",
 		title:             "Retry Work",
@@ -369,18 +372,18 @@ func TestPublisherRetryReusesIdenticalImmutableGeneration(t *testing.T) {
 		sourceTime:        time.Date(2026, time.July, 15, 9, 0, 0, 0, time.UTC),
 	})
 	publisher := mustPublisher(t, pool)
+	firstInput := catalogCurationInputAt(
+		time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
+	)
+	preparePublisherAcceptedCuration(t, pool, firstInput, fixture)
 
-	first, err := publisher.PublishCurrent(context.Background(), PublishInput{
-		FormulaVersion: "public-catalog/v1",
-		GeneratedAt:    time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
-	})
+	first, err := publisher.PublishCurrent(context.Background(), firstInput)
 	if err != nil {
 		t.Fatalf("PublishCurrent(first) error = %v", err)
 	}
-	second, err := publisher.PublishCurrent(context.Background(), PublishInput{
-		FormulaVersion: "public-catalog/v1",
-		GeneratedAt:    time.Date(2026, time.July, 15, 13, 0, 0, 0, time.UTC),
-	})
+	secondInput := firstInput
+	secondInput.GeneratedAt = time.Date(2026, time.July, 15, 13, 0, 0, 0, time.UTC)
+	second, err := publisher.PublishCurrent(context.Background(), secondInput)
 	if err != nil {
 		t.Fatalf("PublishCurrent(second) error = %v", err)
 	}

@@ -19,8 +19,13 @@ var (
 )
 
 type PublishInput struct {
-	FormulaVersion string
-	GeneratedAt    time.Time
+	FormulaVersion     string
+	GeneratedAt        time.Time
+	JCRMetricYear      int
+	VenuePolicyName    string
+	VenuePolicyVersion int
+	SubjectVersion     string
+	JCRImportReceipt   uuid.UUID
 }
 
 type Generation struct {
