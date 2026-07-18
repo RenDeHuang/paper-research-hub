@@ -1,0 +1,12 @@
+registry_name,registry_version,source_key,display_name,identifier_scheme,official_host,allowed_domain,lifecycle
+medpaperhub-trusted-preprints,preprint-sources/v1,biorxiv,bioRxiv,biorxiv,www.biorxiv.org,biology,active
+medpaperhub-trusted-preprints,preprint-sources/v1,medrxiv,medRxiv,medrxiv,www.medrxiv.org,medicine,active
+medpaperhub-trusted-preprints,preprint-sources/v1,arxiv,arXiv,arxiv,arxiv.org,biology,active
+medpaperhub-trusted-preprints,preprint-sources/v1,arxiv,arXiv,arxiv,arxiv.org,computer_science,active
+medpaperhub-trusted-preprints,preprint-sources/v1,europe-pmc-preprints,Europe PMC Preprints,europe_pmc,europepmc.org,medicine,active
+medpaperhub-trusted-preprints,preprint-sources/v1,europe-pmc-preprints,Europe PMC Preprints,europe_pmc,europepmc.org,biology,active
+medpaperhub-trusted-preprints,preprint-sources/v1,nih-preprint-pilot,NIH Preprint Pilot,pmcid,www.ncbi.nlm.nih.gov,medicine,active
+medpaperhub-trusted-preprints,preprint-sources/v1,nih-preprint-pilot,NIH Preprint Pilot,pmcid,www.ncbi.nlm.nih.gov,biology,active
+medpaperhub-trusted-preprints,preprint-sources/v1,research-square,Research Square,research_square,www.researchsquare.com,medicine,active
+medpaperhub-trusted-preprints,preprint-sources/v1,research-square,Research Square,research_square,www.researchsquare.com,biology,active
+medpaperhub-trusted-preprints,preprint-sources/v1,research-square,Research Square,research_square,www.researchsquare.com,computer_science,active

@@ -1,4 +1,45 @@
-# Biomedical JCR Subject registry
+# Research domain and legacy biomedical Subject registries
+
+`research-domains-jcr-subjects.v2.csv` is the current public-scope Registry.
+Its only top-level domain identities are:
+
+```text
+medicine
+biology
+computer_science
+```
+
+The exact header is:
+
+```text
+registry_name,registry_version,domain,display_label,jcr_category,article_level_required
+```
+
+Each JCR Category mapping is an explicit row. The same exact Category may map
+to more than one domain only when every mapping is present as a separate CSV
+row. Import and lookup do not trim, case-fold, spell-correct, alias, prefix
+match, or approximately match Category values.
+
+`article_level_required=true` prevents a journal-level Category from assigning
+an individual Work to a domain. In particular, multidisciplinary journal
+articles require a later article-level domain assertion before they may enter
+domain trends.
+
+The Registry import records its exact bytes as SHA-256 in `domain_versions`,
+with immutable `research_domains` and `domain_category_rules` children.
+Identical bytes for the same version are idempotent; different bytes for an
+existing version are rejected.
+
+Preprints and conferences use the independent versioned Registries:
+
+```text
+data/sources/preprint-sources.v1.csv
+data/venues/conference-venues.v1.csv
+```
+
+They never use JCR evidence.
+
+## Legacy biomedical Registry
 
 `biomedical-jcr-subjects.v1.csv` is the immutable first version of the
 medpaperhub biomedical Subject allowlist. Each row records one stable Subject
@@ -39,6 +80,7 @@ paper-hub-worker import subjects \
 Re-importing the identical file is idempotent. Reusing the same source/version
 with different bytes is rejected atomically.
 
-The registry contains Category rules only. It does not contain JIF, Quartile,
-or synthetic Venue metrics, and synthetic JCR fixtures must never be used to
-publish a production Catalog generation.
+This legacy Registry remains readable for migration replay. It is not a new
+public top-level domain. Neither Registry contains JIF, Quartile, or synthetic
+Venue metrics, and synthetic JCR fixtures must never be used to publish a
+production Catalog generation.

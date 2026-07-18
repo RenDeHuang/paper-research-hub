@@ -69,6 +69,9 @@ func (store *PostgresPublicEligibilityStore) LoadEligibility(
 			"public eligibility requires an exact Subject version key",
 		)
 	}
+	if err := ValidateLegacyBiomedicalSubjectVersion(subjectVersionKey); err != nil {
+		return PublicEligibilityLoad{}, err
+	}
 
 	var subjectVersionID string
 	if err := store.pool.QueryRow(ctx, `

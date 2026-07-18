@@ -59,6 +59,15 @@ func TestParseWorkerCommandRequiresExplicitBiomedicalEligibilityInputs(t *testin
 			want: "trimmed",
 		},
 		{
+			name: "research domain Registry requires channel admission",
+			args: replaceBiomedicalEligibilityFlag(
+				valid,
+				"--subject-version",
+				"research-domains-jcr-subjects/v2",
+			),
+			want: "channel admission",
+		},
+		{
 			name: "missing policy version",
 			args: removeBiomedicalEligibilityFlag(valid, "--policy-version"),
 			want: "--policy-version",

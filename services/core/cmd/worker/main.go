@@ -1003,6 +1003,11 @@ func parseBiomedicalEligibilityCommand(
 			"biomedical eligibility subject-version must be trimmed",
 		)
 	}
+	if err := biomed.ValidateLegacyBiomedicalSubjectVersion(
+		command.SubjectVersion,
+	); err != nil {
+		return workerCommand{}, err
+	}
 	if command.PolicyVersion == "" {
 		return workerCommand{}, errors.New(
 			"biomedical eligibility requires an explicit --policy-version",

@@ -1,0 +1,13 @@
+registry_name,registry_version,provider,series_key,series_name,event_key,event_name,event_year,identifier_scheme,identifier_value,official_host,allowed_domain,lifecycle,reviewed
+medpaperhub-conferences,conference-venues/v1,ieee,cvpr,IEEE/CVF Conference on Computer Vision and Pattern Recognition,cvpr-2026,CVPR 2026,2026,doi_prefix,10.1109,ieeexplore.ieee.org,computer_science,active,false
+medpaperhub-conferences,conference-venues/v1,ieee,isbi,IEEE International Symposium on Biomedical Imaging,isbi-2026,ISBI 2026,2026,doi_prefix,10.1109,ieeexplore.ieee.org,medicine,active,false
+medpaperhub-conferences,conference-venues/v1,ieee,isbi,IEEE International Symposium on Biomedical Imaging,isbi-2026,ISBI 2026,2026,doi_prefix,10.1109,ieeexplore.ieee.org,biology,active,false
+medpaperhub-conferences,conference-venues/v1,ieee,isbi,IEEE International Symposium on Biomedical Imaging,isbi-2026,ISBI 2026,2026,doi_prefix,10.1109,ieeexplore.ieee.org,computer_science,active,false
+medpaperhub-conferences,conference-venues/v1,acm,sigkdd,ACM SIGKDD Conference on Knowledge Discovery and Data Mining,kdd-2026,KDD 2026,2026,doi_prefix,10.1145,dl.acm.org,computer_science,active,false
+medpaperhub-conferences,conference-venues/v1,acm,bcb,ACM International Conference on Bioinformatics Computational Biology and Health Informatics,bcb-2026,ACM BCB 2026,2026,doi_prefix,10.1145,dl.acm.org,biology,active,false
+medpaperhub-conferences,conference-venues/v1,acm,bcb,ACM International Conference on Bioinformatics Computational Biology and Health Informatics,bcb-2026,ACM BCB 2026,2026,doi_prefix,10.1145,dl.acm.org,computer_science,active,false
+medpaperhub-conferences,conference-venues/v1,reviewed_allowlist,recomb,Research in Computational Molecular Biology,recomb-2026,RECOMB 2026,2026,series_issn,1528-4305,recomb.org,biology,active,true
+medpaperhub-conferences,conference-venues/v1,reviewed_allowlist,recomb,Research in Computational Molecular Biology,recomb-2026,RECOMB 2026,2026,series_issn,1528-4305,recomb.org,computer_science,active,true
+medpaperhub-conferences,conference-venues/v1,reviewed_allowlist,miccai,Medical Image Computing and Computer Assisted Intervention,miccai-2026,MICCAI 2026,2026,series_issn,0302-9743,miccai.org,medicine,active,true
+medpaperhub-conferences,conference-venues/v1,reviewed_allowlist,miccai,Medical Image Computing and Computer Assisted Intervention,miccai-2026,MICCAI 2026,2026,series_issn,0302-9743,miccai.org,biology,active,true
+medpaperhub-conferences,conference-venues/v1,reviewed_allowlist,miccai,Medical Image Computing and Computer Assisted Intervention,miccai-2026,MICCAI 2026,2026,series_issn,0302-9743,miccai.org,computer_science,active,true

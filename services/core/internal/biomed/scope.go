@@ -8,9 +8,13 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	researchscope "github.com/RenDeHuang/paper-research-hub/services/core/internal/scope"
 )
 
 const BiomedicalPublicEligibilityPolicyVersion = "biomedical-public-eligibility/v1"
+
+const ResearchDomainRegistryVersion = researchscope.ResearchDomainRegistryVersion
 
 type PublicEligibilityDecision string
 
@@ -107,6 +111,19 @@ func validatePublicEligibilityIdentity(
 	if subjectVersionKey != strings.TrimSpace(subjectVersionKey) {
 		return errors.New(
 			"biomedical public eligibility Subject version key must be trimmed",
+		)
+	}
+	if err := ValidateLegacyBiomedicalSubjectVersion(subjectVersionKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ValidateLegacyBiomedicalSubjectVersion(version string) error {
+	if version == ResearchDomainRegistryVersion {
+		return fmt.Errorf(
+			"research domain Registry %q requires scope channel admission and cannot use legacy biomedical eligibility",
+			version,
 		)
 	}
 	return nil

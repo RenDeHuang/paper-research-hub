@@ -1,0 +1,24 @@
+registry_name,registry_version,domain,display_label,jcr_category,article_level_required
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Medicine; General & Internal,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Medicine; Research & Experimental,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Oncology,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Immunology,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Clinical Neurology,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Pharmacology & Pharmacy,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Medical Informatics,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Biology,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Biochemistry & Molecular Biology,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Cell Biology,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Genetics & Heredity,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Microbiology,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Neurosciences,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Artificial Intelligence,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Information Systems,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Theory & Methods,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Interdisciplinary Applications,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Cybernetics,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Software Engineering,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Medical Informatics,false
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Multidisciplinary Sciences,true
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Multidisciplinary Sciences,true
+medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Multidisciplinary Sciences,true

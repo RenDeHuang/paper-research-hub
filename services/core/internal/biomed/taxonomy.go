@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	researchscope "github.com/RenDeHuang/paper-research-hub/services/core/internal/scope"
 )
 
 const (
@@ -634,6 +636,12 @@ func ReconcileJournalSubjectMetrics(
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("reconcile exact JCR Category Subject links: %w", err)
+	}
+	if _, err := researchscope.ReconcileJournalDomainMetrics(ctx, tx); err != nil {
+		return 0, fmt.Errorf(
+			"reconcile exact JCR Category research domain links: %w",
+			err,
+		)
 	}
 	return tag.RowsAffected(), nil
 }

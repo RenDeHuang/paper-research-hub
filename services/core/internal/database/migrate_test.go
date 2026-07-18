@@ -82,6 +82,23 @@ var expectedSchemaTables = []string{
 	"research_opportunity_snapshots",
 	"research_opportunity_supporting_works",
 	"work_publication_event_assertions",
+	"domain_versions",
+	"research_domains",
+	"domain_category_rules",
+	"journal_domain_metrics",
+	"preprint_source_versions",
+	"trusted_preprint_sources",
+	"conference_registry_versions",
+	"conference_series",
+	"conference_events",
+	"conference_registry_entries",
+	"conference_identifiers",
+	"conference_official_hosts",
+	"work_channel_assertions",
+	"work_channel_decisions",
+	"work_lifecycle_assertions",
+	"work_lifecycle_states",
+	"work_channel_admission_decisions",
 }
 
 var expectedSchemaTablesWithoutGeneratedID = []string{
@@ -90,6 +107,103 @@ var expectedSchemaTablesWithoutGeneratedID = []string{
 	"public_catalog_subjects",
 	"public_catalog_journals",
 	"work_publication_states",
+	"content_channels",
+}
+
+var expectedScopeAndChannelConstraints = []string{
+	"domain_versions_registry_name_check",
+	"domain_versions_registry_version_check",
+	"domain_versions_file_sha256_check",
+	"domain_versions_counts_check",
+	"domain_versions_registry_version_key",
+	"domain_versions_file_sha256_key",
+	"research_domains_version_fkey",
+	"research_domains_domain_key_check",
+	"research_domains_display_label_check",
+	"research_domains_version_domain_key",
+	"research_domains_id_version_key",
+	"domain_category_rules_version_fkey",
+	"domain_category_rules_domain_version_fkey",
+	"domain_category_rules_category_check",
+	"domain_category_rules_version_domain_category_key",
+	"domain_category_rules_id_category_key",
+	"journal_domain_metrics_category_check",
+	"journal_domain_metrics_metric_category_fkey",
+	"journal_domain_metrics_rule_category_fkey",
+	"journal_domain_metrics_metric_rule_key",
+	"content_channels_key_check",
+	"preprint_source_versions_name_check",
+	"preprint_source_versions_version_check",
+	"preprint_source_versions_sha_check",
+	"preprint_source_versions_counts_check",
+	"preprint_source_versions_registry_version_key",
+	"preprint_source_versions_file_sha256_key",
+	"trusted_preprint_sources_version_fkey",
+	"trusted_preprint_sources_source_key_check",
+	"trusted_preprint_sources_display_name_check",
+	"trusted_preprint_sources_identifier_scheme_check",
+	"trusted_preprint_sources_official_host_check",
+	"trusted_preprint_sources_domains_check",
+	"trusted_preprint_sources_lifecycle_check",
+	"trusted_preprint_sources_channel_check",
+	"trusted_preprint_sources_version_source_key",
+	"conference_registry_versions_name_check",
+	"conference_registry_versions_version_check",
+	"conference_registry_versions_sha_check",
+	"conference_registry_versions_counts_check",
+	"conference_registry_versions_registry_version_key",
+	"conference_registry_versions_file_sha256_key",
+	"conference_series_version_fkey",
+	"conference_series_provider_check",
+	"conference_series_key_check",
+	"conference_series_name_check",
+	"conference_series_version_provider_key",
+	"conference_events_series_fkey",
+	"conference_events_key_check",
+	"conference_events_name_check",
+	"conference_events_year_check",
+	"conference_events_series_event_key",
+	"conference_registry_entries_version_fkey",
+	"conference_registry_entries_event_fkey",
+	"conference_registry_entries_domains_check",
+	"conference_registry_entries_lifecycle_check",
+	"conference_registry_entries_channel_check",
+	"conference_registry_entries_version_event_key",
+	"conference_identifiers_entry_fkey",
+	"conference_identifiers_scheme_check",
+	"conference_identifiers_value_check",
+	"conference_identifiers_entry_scheme_value_key",
+	"conference_official_hosts_entry_fkey",
+	"conference_official_hosts_host_check",
+	"conference_official_hosts_entry_host_key",
+	"work_channel_assertions_channel_fkey",
+	"work_channel_assertions_source_path_check",
+	"work_channel_assertions_source_record_work_fkey",
+	"work_channel_assertions_projection_provenance_fkey",
+	"work_channel_assertions_projection_path_key",
+	"work_channel_decisions_state_check",
+	"work_channel_decisions_shape_check",
+	"work_channel_decisions_source_path_check",
+	"work_channel_decisions_policy_check",
+	"work_channel_decisions_evidence_check",
+	"work_channel_decisions_identity_key",
+	"work_lifecycle_assertions_fact_check",
+	"work_lifecycle_assertions_source_path_check",
+	"work_lifecycle_assertions_source_record_work_fkey",
+	"work_lifecycle_assertions_projection_provenance_fkey",
+	"work_lifecycle_assertions_projection_path_key",
+	"work_lifecycle_states_state_check",
+	"work_lifecycle_states_source_path_check",
+	"work_lifecycle_states_policy_check",
+	"work_lifecycle_states_evidence_check",
+	"work_lifecycle_states_identity_key",
+	"work_channel_admission_decisions_decision_check",
+	"work_channel_admission_decisions_reason_check",
+	"work_channel_admission_decisions_source_path_check",
+	"work_channel_admission_decisions_policy_check",
+	"work_channel_admission_decisions_registry_check",
+	"work_channel_admission_decisions_evidence_check",
+	"work_channel_admission_decisions_identity_key",
 }
 
 func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
@@ -124,6 +238,20 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 			t.Errorf("expected table %q was not created", table)
 		}
 	}
+	assertNamesExist(t, pool, `
+		SELECT conname
+		FROM pg_constraint
+		WHERE connamespace = 'public'::regnamespace
+	`, expectedScopeAndChannelConstraints)
+	assertNamesExist(t, pool, `
+		SELECT tgname
+		FROM pg_trigger
+		WHERE NOT tgisinternal
+	`, []string{
+		"domain_versions_content_integrity",
+		"preprint_source_versions_content_integrity",
+		"conference_registry_versions_content_integrity",
+	})
 
 	rows, err = pool.Query(ctx, `
 		SELECT version, name, checksum, applied_at
@@ -157,6 +285,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 17, name: "biomedical_analysis_snapshots"},
 		{version: 18, name: "publication_event_assertions"},
 		{version: 19, name: "jcr_registry_v2"},
+		{version: 20, name: "scope_and_channel_registries"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -200,8 +329,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 19 {
-		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
+	if len(migrations) != 20 {
+		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -296,6 +425,13 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 		t.Fatalf(
 			"nineteenth migration = %#v, want 000019_jcr_registry_v2",
 			migrations[18],
+		)
+	}
+	if migrations[19].Version != 20 ||
+		migrations[19].Name != "scope_and_channel_registries" {
+		t.Fatalf(
+			"twentieth migration = %#v, want 000020_scope_and_channel_registries",
+			migrations[19],
 		)
 	}
 }
@@ -2635,8 +2771,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 19 {
-		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
+	if len(migrations) != 20 {
+		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -4057,8 +4193,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 19 {
-		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
+	if len(migrations) != 20 {
+		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -5877,8 +6013,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 19 {
-		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
+	if len(migrations) != 20 {
+		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
 	}
 
 	pool := openTestPool(t)

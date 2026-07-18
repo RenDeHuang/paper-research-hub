@@ -2,6 +2,7 @@ package biomed
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"os"
@@ -10,6 +11,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/scope"
 )
 
 func TestParseSubjectRegistryRequiresExactVersionedCSV(t *testing.T) {
@@ -173,6 +177,95 @@ func TestCommittedSubjectRegistryContainsReviewedExactJCRCategories(t *testing.T
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("committed exact JCR Categories = %#v, want %#v", got, want)
+	}
+}
+
+func TestExactDomainRegistryReconcilesThroughLegacyJCRImportBoundary(t *testing.T) {
+	pool := openBiomedScopeTestPool(t)
+	importer, err := scope.NewPostgresDomainImporter(
+		pool,
+		func() time.Time {
+			return time.Date(2026, time.July, 18, 6, 0, 0, 0, time.UTC)
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewPostgresDomainImporter() error = %v", err)
+	}
+	registry := "" +
+		"registry_name,registry_version,domain,display_label,jcr_category,article_level_required\n" +
+		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Medicine; General & Internal,false\n" +
+		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Biology,false\n" +
+		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Artificial Intelligence,false\n"
+	if _, err := importer.Import(
+		context.Background(),
+		strings.NewReader(registry),
+	); err != nil {
+		t.Fatalf("Import(domain Registry) error = %v", err)
+	}
+
+	ctx := biomedScopeTestContext(t)
+	var venueID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO venues (venue_type, display_title, issn_l)
+		VALUES ('journal', 'Domain bridge journal', '2468-1357')
+		RETURNING id::text
+	`).Scan(&venueID); err != nil {
+		t.Fatalf("insert bridge Venue: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			venue_id, metric_year, category, jif, quartile, metric_status,
+			source_name, source_license, registry_version, edition_year,
+			jif_rank, category_journal_count, jif_percentile
+		) VALUES (
+			$1, 2025, 'Medicine; General & Internal',
+			5, 'Q1', 'known', 'authorized-jcr', 'authorized-license',
+			'jcr-registry/v2', 2026, 1, 100, 99
+		)
+	`, venueID); err != nil {
+		t.Fatalf("insert bridge Venue metric: %v", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin Registry reconciliation: %v", err)
+	}
+	if _, err := ReconcileJournalSubjectMetrics(ctx, tx); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("ReconcileJournalSubjectMetrics() error = %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit Registry reconciliation: %v", err)
+	}
+
+	var links int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM journal_domain_metrics AS link
+		JOIN domain_category_rules AS rule
+		  ON rule.id = link.domain_category_rule_id
+		WHERE link.jcr_category = 'Medicine; General & Internal'
+		  AND NOT rule.article_level_required
+	`).Scan(&links); err != nil {
+		t.Fatalf("query bridged domain links: %v", err)
+	}
+	if links != 1 {
+		t.Fatalf("bridged exact domain links = %d, want 1", links)
+	}
+}
+
+func TestResearchDomainRegistryCannotUseLegacyBiomedicalEligibility(t *testing.T) {
+	err := validatePublicEligibilityIdentity(
+		"00000000-0000-0000-0000-000000000901",
+		BiomedicalPublicEligibilityPolicyVersion,
+		2025,
+		scope.ResearchDomainRegistryVersion,
+	)
+	if err == nil || !strings.Contains(err.Error(), "channel admission") {
+		t.Fatalf(
+			"validatePublicEligibilityIdentity(research domains) error = %v, want channel admission boundary",
+			err,
+		)
 	}
 }
 
