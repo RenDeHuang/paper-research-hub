@@ -685,6 +685,1001 @@ func TestPostgresRepositoryReplaysRawEventWithNewNormalizedPayloadSchema(t *test
 	}
 }
 
+func TestPostgresRepositoryReplaysPublicationSchemaV3(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543261",
+		"10.1000/pubmed.publication-schema-v3",
+		"pubmed:76543261",
+		time.Date(2026, time.July, 17, 8, 50, 0, 0, time.UTC),
+		"schema-v3",
+		1,
+		"Print-Electronic",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			{
+				Status: "accepted",
+				Date: source.SourceDate{
+					Year:      2026,
+					Month:     time.July,
+					Day:       1,
+					Precision: source.DatePrecisionDay,
+				},
+				SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				Ordinal:    1,
+			},
+			{
+				Status: "aheadofprint",
+				Date: source.SourceDate{
+					Year:      2026,
+					Month:     time.July,
+					Precision: source.DatePrecisionMonth,
+				},
+				SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[2]",
+				Ordinal:    2,
+			},
+			{
+				Status: "epublish",
+				Date: source.SourceDate{
+					Year:      2026,
+					Precision: source.DatePrecisionYear,
+				},
+				SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[3]",
+				Ordinal:    3,
+			},
+		},
+	)
+	job := startPubMedRepositoryJob(t, repository, "publication-schema-v3")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+
+	identityJSON, err := json.Marshal(map[string]any{
+		"canonical_key": envelope.Record.Identity.CanonicalKey(),
+		"identifiers":   envelope.Record.Identifiers,
+	})
+	if err != nil {
+		t.Fatalf("encode v2 source identity: %v", err)
+	}
+	rawJSON, err := sourceRecordJSON(envelope.Raw)
+	if err != nil {
+		t.Fatalf("encode v2 source raw payload: %v", err)
+	}
+	legacyV2Payload := []byte(
+		`{"source":"pubmed","source_record_id":"76543261",` +
+			`"canonical_key":"doi:10.1000/pubmed.publication-schema-v3",` +
+			`"identifiers":[{"Scheme":"doi","Value":"10.1000/pubmed.publication-schema-v3"},` +
+			`{"Scheme":"pmid","Value":"76543261"}],` +
+			`"title":"Publication evidence schema-v3",` +
+			`"abstract_sections":[],"authors":[],"mesh_headings":[],` +
+			`"publication_types":[],"relations":[],"topics":[],"keywords":[],` +
+			`"code_urls":[],"evidence":[]}`,
+	)
+	var sourceRecordID, legacyV2AssertionID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO source_records (
+			source, source_record_id, source_identity, source_time,
+			content_hash, raw_payload
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id::text
+	`,
+		envelope.LogicalSource,
+		envelope.Record.SourceRecordID,
+		identityJSON,
+		envelope.SourceTime,
+		envelope.Raw.SHA256,
+		rawJSON,
+	).Scan(&sourceRecordID); err != nil {
+		t.Fatalf("insert v2 source record: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO ingestion_normalized_records (
+			raw_event_id, source_record_uuid, normalization_policy_version,
+			payload_schema_version, normalized_payload
+		) VALUES ($1, $2, 'normalization/pubmed-v1', 'normalized-record/v2', $3)
+		RETURNING id::text
+	`, raw.ID, sourceRecordID, legacyV2Payload).Scan(&legacyV2AssertionID); err != nil {
+		t.Fatalf("insert v2 normalized assertion: %v", err)
+	}
+
+	first, err := repository.Normalize(ctx, job.ID, raw, "normalization/pubmed-v1")
+	if err != nil {
+		t.Fatalf("Normalize(v3 first) error = %v", err)
+	}
+	second, err := repository.Normalize(ctx, job.ID, raw, "normalization/pubmed-v1")
+	if err != nil {
+		t.Fatalf("Normalize(v3 replay) error = %v", err)
+	}
+	if first.PayloadSchemaVersion != "normalized-record/v3" ||
+		second.PayloadSchemaVersion != "normalized-record/v3" ||
+		first.AssertionID == legacyV2AssertionID ||
+		second.AssertionID != first.AssertionID {
+		t.Fatalf(
+			"v3 normalization = first %q/%q second %q/%q legacy %q",
+			first.AssertionID,
+			first.PayloadSchemaVersion,
+			second.AssertionID,
+			second.PayloadSchemaVersion,
+			legacyV2AssertionID,
+		)
+	}
+
+	wantV3Payload := []byte(
+		`{"source":"pubmed","source_record_id":"76543261",` +
+			`"canonical_key":"doi:10.1000/pubmed.publication-schema-v3",` +
+			`"identifiers":[{"Scheme":"doi","Value":"10.1000/pubmed.publication-schema-v3"},` +
+			`{"Scheme":"pmid","Value":"76543261"}],` +
+			`"title":"Publication evidence schema-v3",` +
+			`"abstract_sections":[],"publication_model":"Print-Electronic",` +
+			`"publication_status":"ppublish","publication_history":[` +
+			`{"status":"accepted","date":{"year":2026,"month":7,"day":1,"precision":"day"},` +
+			`"source_path":"/PubmedArticle/PubmedData/History/PubMedPubDate[1]","ordinal":1},` +
+			`{"status":"aheadofprint","date":{"year":2026,"month":7,"precision":"month"},` +
+			`"source_path":"/PubmedArticle/PubmedData/History/PubMedPubDate[2]","ordinal":2},` +
+			`{"status":"epublish","date":{"year":2026,"precision":"year"},` +
+			`"source_path":"/PubmedArticle/PubmedData/History/PubMedPubDate[3]","ordinal":3}],` +
+			`"authors":[],"mesh_headings":[],"publication_types":[],"relations":[],` +
+			`"topics":[],"keywords":[],"code_urls":[],"evidence":[]}`,
+	)
+	var persistedV3Payload []byte
+	var normalizedCount int
+	var legacyV2Matches, legacyV2ContainsPublicationFields bool
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(
+				SELECT normalized_payload
+				FROM ingestion_normalized_records
+				WHERE id = $2
+			),
+			count(*),
+			bool_and(
+				CASE
+					WHEN payload_schema_version = 'normalized-record/v2'
+					THEN normalized_payload = $3::jsonb
+					ELSE true
+				END
+			),
+			bool_or(
+				payload_schema_version = 'normalized-record/v2'
+				AND normalized_payload ?| ARRAY[
+					'publication_model',
+					'publication_status',
+					'publication_history'
+				]
+			)
+		FROM ingestion_normalized_records
+		WHERE raw_event_id = $1
+	`, raw.ID, first.AssertionID, legacyV2Payload).Scan(
+		&persistedV3Payload,
+		&normalizedCount,
+		&legacyV2Matches,
+		&legacyV2ContainsPublicationFields,
+	); err != nil {
+		t.Fatalf("query v2/v3 normalized assertions: %v", err)
+	}
+	assertCanonicalJSONEqual(t, persistedV3Payload, wantV3Payload)
+	if normalizedCount != 2 || !legacyV2Matches || legacyV2ContainsPublicationFields {
+		t.Fatalf(
+			"v2/v3 rows = count %d v2_matches %v v2_publication_fields %v",
+			normalizedCount,
+			legacyV2Matches,
+			legacyV2ContainsPublicationFields,
+		)
+	}
+
+	candidate, err := NewProjectionCandidate(first, source.ScopeDecision{
+		Status: source.ScopeIncluded,
+		Reason: "controlled_identity_present",
+	})
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("Project(v3) error = %v", err)
+	}
+	var projectionNormalizedID, projectionSchemaVersion string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			assertion.normalized_assertion_id::text,
+			normalized.payload_schema_version
+		FROM ingestion_projection_assertions AS assertion
+		JOIN ingestion_normalized_records AS normalized
+		  ON normalized.id = assertion.normalized_assertion_id
+		WHERE assertion.raw_event_id = $1
+	`, raw.ID).Scan(
+		&projectionNormalizedID,
+		&projectionSchemaVersion,
+	); err != nil {
+		t.Fatalf("query v3 projection binding: %v", err)
+	}
+	if projectionNormalizedID != first.AssertionID ||
+		projectionSchemaVersion != "normalized-record/v3" {
+		t.Fatalf(
+			"projection binding = %q/%q, want %q/normalized-record/v3",
+			projectionNormalizedID,
+			projectionSchemaVersion,
+			first.AssertionID,
+		)
+	}
+}
+
+func TestPostgresRepositoryPersistsPublicationEventsAndProjectsCurrentState(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543262",
+		"10.1000/pubmed.publication-events",
+		"pubmed:76543262",
+		time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+		"publication-events",
+		1,
+		"Print-Electronic",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("accepted", 2026, time.July, 1, source.DatePrecisionDay, 1),
+			publicationHistoryEntry("accepted", 2026, time.July, 1, source.DatePrecisionDay, 2),
+			publicationHistoryEntry("aheadofprint", 2026, time.July, 0, source.DatePrecisionMonth, 3),
+			publicationHistoryEntry("epublish", 2026, 0, 0, source.DatePrecisionYear, 4),
+			publicationHistoryEntry("ppublish", 2026, time.July, 15, source.DatePrecisionDay, 5),
+			publicationHistoryEntry("FutureStatus", 2026, time.July, 16, source.DatePrecisionDay, 6),
+		},
+	)
+	job := startPubMedRepositoryJob(t, repository, "publication-events")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+	normalized, err := repository.Normalize(ctx, job.ID, raw, "normalization/pubmed-v1")
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	candidate, err := NewProjectionCandidate(normalized, source.ScopeDecision{
+		Status: source.ScopeIncluded,
+		Reason: "controlled_identity_present",
+	})
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	candidate.Record.PublicationModel = "Candidate-Only-Model"
+	candidate.Record.PublicationStatus = "epublish"
+	candidate.Record.PublicationHistory[0].Status = "ppublish"
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("Project() error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("Project(replay) error = %v", err)
+	}
+
+	eventRows := readPublicationEventRows(t, pool)
+	if len(eventRows) != 5 {
+		t.Fatalf("publication event assertion count = %d, want 5", len(eventRows))
+	}
+	wantKinds := []string{
+		"accepted",
+		"accepted",
+		"ahead_of_print",
+		"electronic_published",
+		"print_published",
+	}
+	wantDates := []*time.Time{
+		publicationDate(2026, time.July, 1),
+		publicationDate(2026, time.July, 1),
+		nil,
+		nil,
+		publicationDate(2026, time.July, 15),
+	}
+	wantPrecisions := []string{"day", "day", "month", "year", "day"}
+	wantSourceDates := [][]byte{
+		[]byte(`{"year":2026,"month":7,"day":1,"precision":"day"}`),
+		[]byte(`{"year":2026,"month":7,"day":1,"precision":"day"}`),
+		[]byte(`{"year":2026,"month":7,"precision":"month"}`),
+		[]byte(`{"year":2026,"precision":"year"}`),
+		[]byte(`{"year":2026,"month":7,"day":15,"precision":"day"}`),
+	}
+	wantStatuses := []string{"accepted", "accepted", "aheadofprint", "epublish", "ppublish"}
+	for index, row := range eventRows {
+		if row.Ordinal != index+1 ||
+			row.EventKind != wantKinds[index] ||
+			row.DatePrecision != wantPrecisions[index] ||
+			row.StatusRaw != wantStatuses[index] ||
+			row.PublicationModelRaw == nil ||
+			*row.PublicationModelRaw != "Print-Electronic" ||
+			row.SourcePath != fmt.Sprintf(
+				"/PubmedArticle/PubmedData/History/PubMedPubDate[%d]",
+				index+1,
+			) {
+			t.Fatalf("publication event row %d = %#v", index, row)
+		}
+		assertOptionalPublicationDate(t, row.EventDate, wantDates[index])
+		assertCanonicalJSONEqual(t, row.SourceDate, wantSourceDates[index])
+	}
+
+	var (
+		printDate, electronicDate, aheadDate, acceptedDate *time.Time
+		printState, electronicState, aheadState            string
+		acceptedState                                      string
+		publicationModelRaw, publicationStatusRaw          *string
+		stateProjectionID, assertionProjectionID           string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			state.print_published_on,
+			state.print_published_state,
+			state.electronic_published_on,
+			state.electronic_published_state,
+			state.ahead_of_print_on,
+			state.ahead_of_print_state,
+			state.accepted_on,
+			state.accepted_state,
+			state.publication_model_raw,
+			state.publication_status_raw,
+			state.projection_assertion_id::text,
+			assertion.id::text
+		FROM work_publication_states AS state
+		JOIN ingestion_projection_assertions AS assertion
+		  ON assertion.normalized_assertion_id = $1
+	`, normalized.AssertionID).Scan(
+		&printDate,
+		&printState,
+		&electronicDate,
+		&electronicState,
+		&aheadDate,
+		&aheadState,
+		&acceptedDate,
+		&acceptedState,
+		&publicationModelRaw,
+		&publicationStatusRaw,
+		&stateProjectionID,
+		&assertionProjectionID,
+	); err != nil {
+		t.Fatalf("query current publication state: %v", err)
+	}
+	assertOptionalPublicationDate(t, printDate, publicationDate(2026, time.July, 15))
+	assertOptionalPublicationDate(t, electronicDate, nil)
+	assertOptionalPublicationDate(t, aheadDate, nil)
+	assertOptionalPublicationDate(t, acceptedDate, publicationDate(2026, time.July, 1))
+	if printState != "known" ||
+		electronicState != "missing" ||
+		aheadState != "missing" ||
+		acceptedState != "known" ||
+		publicationModelRaw == nil ||
+		*publicationModelRaw != "Print-Electronic" ||
+		publicationStatusRaw == nil ||
+		*publicationStatusRaw != "ppublish" ||
+		stateProjectionID != assertionProjectionID {
+		t.Fatalf(
+			"current publication state = %q/%q/%q/%q model=%v status=%v projection=%q/%q",
+			printState,
+			electronicState,
+			aheadState,
+			acceptedState,
+			publicationModelRaw,
+			publicationStatusRaw,
+			stateProjectionID,
+			assertionProjectionID,
+		)
+	}
+}
+
+func TestPostgresRepositoryPersistsPublicationEventsSuppressesAheadOfPrintEPublish(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543263",
+		"10.1000/pubmed.ahead-suppression",
+		"pubmed:76543263",
+		time.Date(2026, time.July, 17, 9, 10, 0, 0, time.UTC),
+		"ahead-suppression",
+		1,
+		"Electronic",
+		"aheadofprint",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("epublish", 2026, time.July, 10, source.DatePrecisionDay, 1),
+			publicationHistoryEntry("aheadofprint", 2026, time.July, 10, source.DatePrecisionDay, 2),
+		},
+	)
+	_, _, normalized, _ := projectPublicationEnvelope(
+		t,
+		repository,
+		envelope,
+		"ahead-suppression",
+		nil,
+	)
+
+	eventRows := readPublicationEventRows(t, pool)
+	if len(eventRows) != 1 ||
+		eventRows[0].Ordinal != 2 ||
+		eventRows[0].EventKind != "ahead_of_print" {
+		t.Fatalf("suppressed epublish assertions = %#v, want only ordinal 2 ahead_of_print", eventRows)
+	}
+	var electronicState, aheadState string
+	var electronicDate, aheadDate *time.Time
+	var normalizedHistoryLength int
+	var normalizedFirstStatus string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			state.electronic_published_state,
+			state.electronic_published_on,
+			state.ahead_of_print_state,
+			state.ahead_of_print_on,
+			jsonb_array_length(normalized.normalized_payload -> 'publication_history'),
+			normalized.normalized_payload #>> '{publication_history,0,status}'
+		FROM work_publication_states AS state
+		JOIN ingestion_normalized_records AS normalized
+		  ON normalized.id = $1
+	`, normalized.AssertionID).Scan(
+		&electronicState,
+		&electronicDate,
+		&aheadState,
+		&aheadDate,
+		&normalizedHistoryLength,
+		&normalizedFirstStatus,
+	); err != nil {
+		t.Fatalf("query ahead-of-print suppression state: %v", err)
+	}
+	assertOptionalPublicationDate(t, electronicDate, nil)
+	assertOptionalPublicationDate(t, aheadDate, publicationDate(2026, time.July, 10))
+	if electronicState != "missing" ||
+		aheadState != "known" ||
+		normalizedHistoryLength != 2 ||
+		normalizedFirstStatus != "epublish" {
+		t.Fatalf(
+			"suppression state = electronic %q ahead %q history %d/%q",
+			electronicState,
+			aheadState,
+			normalizedHistoryLength,
+			normalizedFirstStatus,
+		)
+	}
+}
+
+func TestPostgresRepositoryPersistsPublicationEventsProjectsConflicts(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543264",
+		"10.1000/pubmed.publication-conflict",
+		"pubmed:76543264",
+		time.Date(2026, time.July, 17, 9, 20, 0, 0, time.UTC),
+		"publication-conflict",
+		1,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("ppublish", 2026, time.July, 10, source.DatePrecisionDay, 1),
+			publicationHistoryEntry("ppublish", 2026, time.July, 11, source.DatePrecisionDay, 2),
+			publicationHistoryEntry("accepted", 2026, time.July, 0, source.DatePrecisionMonth, 3),
+		},
+	)
+	projectPublicationEnvelope(t, repository, envelope, "publication-conflict", nil)
+
+	var printDate, acceptedDate *time.Time
+	var printState, acceptedState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			print_published_on,
+			print_published_state,
+			accepted_on,
+			accepted_state
+		FROM work_publication_states
+	`).Scan(
+		&printDate,
+		&printState,
+		&acceptedDate,
+		&acceptedState,
+	); err != nil {
+		t.Fatalf("query conflicting publication state: %v", err)
+	}
+	assertOptionalPublicationDate(t, printDate, nil)
+	assertOptionalPublicationDate(t, acceptedDate, nil)
+	if printState != "conflict" || acceptedState != "missing" {
+		t.Fatalf(
+			"conflicting publication state = print %q accepted %q",
+			printState,
+			acceptedState,
+		)
+	}
+	if eventRows := readPublicationEventRows(t, pool); len(eventRows) != 3 {
+		t.Fatalf("partial/conflicting assertions = %d, want 3 retained", len(eventRows))
+	}
+}
+
+func TestPostgresRepositoryPersistsPublicationEventsKeepsOlderAssertionWithoutRegressingState(
+	t *testing.T,
+) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	baseTime := time.Date(2026, time.July, 17, 9, 30, 0, 0, time.UTC)
+	newer := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543265",
+		"10.1000/pubmed.publication-history",
+		"pubmed:76543265",
+		baseTime.Add(time.Hour),
+		"publication-newer",
+		2,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("ppublish", 2026, time.July, 20, source.DatePrecisionDay, 1),
+		},
+	)
+	older := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543265",
+		"10.1000/pubmed.publication-history",
+		"pubmed:76543265",
+		baseTime,
+		"publication-older",
+		1,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("ppublish", 2026, time.July, 10, source.DatePrecisionDay, 1),
+		},
+	)
+	_, _, newerNormalized, _ := projectPublicationEnvelope(
+		t,
+		repository,
+		newer,
+		"publication-newer",
+		nil,
+	)
+	_, _, olderNormalized, olderResult := projectPublicationEnvelope(
+		t,
+		repository,
+		older,
+		"publication-older",
+		nil,
+	)
+	if olderResult.Status != ProjectionStatusUnchanged {
+		t.Fatalf("older publication projection status = %q, want unchanged", olderResult.Status)
+	}
+
+	var (
+		eventAssertionCount int
+		currentPrintDate    *time.Time
+		currentProjectionID string
+		newerProjectionID   string
+		olderProjectionID   string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM work_publication_event_assertions),
+			(SELECT print_published_on FROM work_publication_states),
+			(SELECT projection_assertion_id::text FROM work_publication_states),
+			(
+				SELECT id::text
+				FROM ingestion_projection_assertions
+				WHERE normalized_assertion_id = $1
+			),
+			(
+				SELECT id::text
+				FROM ingestion_projection_assertions
+				WHERE normalized_assertion_id = $2
+			)
+	`, newerNormalized.AssertionID, olderNormalized.AssertionID).Scan(
+		&eventAssertionCount,
+		&currentPrintDate,
+		&currentProjectionID,
+		&newerProjectionID,
+		&olderProjectionID,
+	); err != nil {
+		t.Fatalf("query retained older publication assertion: %v", err)
+	}
+	assertOptionalPublicationDate(t, currentPrintDate, publicationDate(2026, time.July, 20))
+	if eventAssertionCount != 2 ||
+		currentProjectionID != newerProjectionID ||
+		currentProjectionID == olderProjectionID {
+		t.Fatalf(
+			"retained/current publication assertions = count %d current %q newer %q older %q",
+			eventAssertionCount,
+			currentProjectionID,
+			newerProjectionID,
+			olderProjectionID,
+		)
+	}
+}
+
+func TestPostgresRepositoryPersistsPublicationEventsSwitchesWinnerAndDeletionClearsState(
+	t *testing.T,
+) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	baseTime := time.Date(2026, time.July, 17, 9, 40, 0, 0, time.UTC)
+	older := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543266",
+		"10.1000/pubmed.publication-winner-switch",
+		"pubmed:76543266",
+		baseTime,
+		"winner-older",
+		1,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("accepted", 2026, time.July, 1, source.DatePrecisionDay, 1),
+		},
+	)
+	newer := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543266",
+		"10.1000/pubmed.publication-winner-switch",
+		"pubmed:76543266",
+		baseTime.Add(time.Hour),
+		"winner-newer",
+		2,
+		"Electronic",
+		"epublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("epublish", 2026, time.July, 18, source.DatePrecisionDay, 1),
+		},
+	)
+	projectPublicationEnvelope(t, repository, older, "winner-older", nil)
+	var acceptedDate *time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT accepted_on FROM work_publication_states
+	`).Scan(&acceptedDate); err != nil {
+		t.Fatalf("query older winner publication state: %v", err)
+	}
+	assertOptionalPublicationDate(t, acceptedDate, publicationDate(2026, time.July, 1))
+
+	projectPublicationEnvelope(t, repository, newer, "winner-newer", nil)
+	var electronicDate *time.Time
+	var acceptedState, electronicState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			accepted_state,
+			electronic_published_on,
+			electronic_published_state
+		FROM work_publication_states
+	`).Scan(
+		&acceptedState,
+		&electronicDate,
+		&electronicState,
+	); err != nil {
+		t.Fatalf("query switched publication winner: %v", err)
+	}
+	assertOptionalPublicationDate(t, electronicDate, publicationDate(2026, time.July, 18))
+	if acceptedState != "missing" || electronicState != "known" {
+		t.Fatalf(
+			"switched publication winner = accepted %q electronic %q",
+			acceptedState,
+			electronicState,
+		)
+	}
+
+	deletionRaw, err := source.NewRawRecord([]byte(`{"delete":"76543266"}`))
+	if err != nil {
+		t.Fatalf("NewRawRecord(deletion) error = %v", err)
+	}
+	deletion, err := NewDeletionEnvelope(
+		source.PubMed,
+		newer.EventKey,
+		baseTime.Add(2*time.Hour),
+		"winner-delete",
+		3,
+		deletionRaw,
+	)
+	if err != nil {
+		t.Fatalf("NewDeletionEnvelope() error = %v", err)
+	}
+	deleteJob := startPubMedRepositoryJob(t, repository, "winner-delete")
+	persistedDeletion, err := repository.PersistDeletion(ctx, deleteJob.ID, deletion)
+	if err != nil {
+		t.Fatalf("PersistDeletion() error = %v", err)
+	}
+	if _, err := repository.ApplyDeletion(
+		ctx,
+		deleteJob.ID,
+		persistedDeletion,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err != nil {
+		t.Fatalf("ApplyDeletion() error = %v", err)
+	}
+	var projectionStates, publicationStates, retainedEventAssertions int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM work_projection_states),
+			(SELECT count(*) FROM work_publication_states),
+			(SELECT count(*) FROM work_publication_event_assertions)
+	`).Scan(
+		&projectionStates,
+		&publicationStates,
+		&retainedEventAssertions,
+	); err != nil {
+		t.Fatalf("query publication deletion state: %v", err)
+	}
+	if projectionStates != 0 ||
+		publicationStates != 0 ||
+		retainedEventAssertions != 2 {
+		t.Fatalf(
+			"deletion state = projections %d publication %d assertions %d, want 0/0/2",
+			projectionStates,
+			publicationStates,
+			retainedEventAssertions,
+		)
+	}
+}
+
+func TestPostgresRepositoryPersistsPublicationEventsDoesNotStitchAcrossSources(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	doi := "10.1000/publication-source-boundary"
+	baseTime := time.Date(2026, time.July, 17, 10, 0, 0, 0, time.UTC)
+	pubMed := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543267",
+		doi,
+		"pubmed:76543267",
+		baseTime,
+		"source-boundary-pubmed",
+		1,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("ppublish", 2026, time.July, 12, source.DatePrecisionDay, 1),
+		},
+	)
+	crossref := publicationRepositoryEnvelope(
+		t,
+		source.Crossref,
+		doi,
+		doi,
+		"crossref:"+doi,
+		baseTime.Add(time.Hour),
+		"source-boundary-crossref",
+		1,
+		"",
+		"",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("ppublish", 2026, time.July, 30, source.DatePrecisionDay, 1),
+		},
+	)
+	crossrefPublishedAt := time.Date(2026, time.July, 31, 0, 0, 0, 0, time.UTC)
+	crossref.Record.PublishedAt = &crossrefPublishedAt
+
+	projectPublicationEnvelope(t, repository, pubMed, "source-boundary-pubmed", nil)
+	_, _, crossrefNormalized, _ := projectPublicationEnvelope(
+		t,
+		repository,
+		crossref,
+		"source-boundary-crossref",
+		nil,
+	)
+
+	var (
+		eventAssertionCount                          int
+		printDate, electronicDate, aheadDate         *time.Time
+		acceptedDate                                 *time.Time
+		printState, electronicState, aheadState      string
+		acceptedState                                string
+		publicationModelRaw, publicationStatusRaw    *string
+		currentNormalizedID, currentProjectionSource string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM work_publication_event_assertions),
+			state.print_published_on,
+			state.print_published_state,
+			state.electronic_published_on,
+			state.electronic_published_state,
+			state.ahead_of_print_on,
+			state.ahead_of_print_state,
+			state.accepted_on,
+			state.accepted_state,
+			state.publication_model_raw,
+			state.publication_status_raw,
+			state.normalized_assertion_id::text,
+			source_record.source
+		FROM work_publication_states AS state
+		JOIN source_records AS source_record
+		  ON source_record.id = state.source_record_id
+	`).Scan(
+		&eventAssertionCount,
+		&printDate,
+		&printState,
+		&electronicDate,
+		&electronicState,
+		&aheadDate,
+		&aheadState,
+		&acceptedDate,
+		&acceptedState,
+		&publicationModelRaw,
+		&publicationStatusRaw,
+		&currentNormalizedID,
+		&currentProjectionSource,
+	); err != nil {
+		t.Fatalf("query cross-source publication state: %v", err)
+	}
+	assertOptionalPublicationDate(t, printDate, nil)
+	assertOptionalPublicationDate(t, electronicDate, nil)
+	assertOptionalPublicationDate(t, aheadDate, nil)
+	assertOptionalPublicationDate(t, acceptedDate, nil)
+	if eventAssertionCount != 1 ||
+		printState != "missing" ||
+		electronicState != "missing" ||
+		aheadState != "missing" ||
+		acceptedState != "missing" ||
+		publicationModelRaw != nil ||
+		publicationStatusRaw != nil ||
+		currentNormalizedID != crossrefNormalized.AssertionID ||
+		currentProjectionSource != source.Crossref {
+		t.Fatalf(
+			"cross-source state = assertions %d states %q/%q/%q/%q model=%v status=%v normalized=%q source=%q",
+			eventAssertionCount,
+			printState,
+			electronicState,
+			aheadState,
+			acceptedState,
+			publicationModelRaw,
+			publicationStatusRaw,
+			currentNormalizedID,
+			currentProjectionSource,
+		)
+	}
+}
+
+func TestPostgresRepositoryPersistsPublicationEventsRejectsConflictingReplay(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543268",
+		"10.1000/pubmed.publication-replay-conflict",
+		"pubmed:76543268",
+		time.Date(2026, time.July, 17, 10, 10, 0, 0, time.UTC),
+		"publication-replay-conflict",
+		1,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry("accepted", 2026, time.July, 2, source.DatePrecisionDay, 1),
+		},
+	)
+	job := startPubMedRepositoryJob(t, repository, "publication-replay-conflict")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+	normalized, err := repository.Normalize(ctx, job.ID, raw, "normalization/pubmed-v1")
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	candidate, err := NewProjectionCandidate(normalized, source.ScopeDecision{
+		Status: source.ScopeIncluded,
+		Reason: "controlled_identity_present",
+	})
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE FUNCTION inject_conflicting_publication_event_assertion()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			INSERT INTO work_publication_event_assertions (
+				projection_assertion_id,
+				normalized_assertion_id,
+				source_record_id,
+				work_id,
+				event_kind,
+				event_date,
+				date_precision,
+				source_date,
+				status_raw,
+				publication_model_raw,
+				source_path,
+				ordinal
+			) VALUES (
+				NEW.id,
+				NEW.normalized_assertion_id,
+				NEW.source_record_uuid,
+				NEW.work_id,
+				'print_published',
+				DATE '2026-07-03',
+				'day',
+				'{"year":2026,"month":7,"day":3,"precision":"day"}'::jsonb,
+				'ppublish',
+				'Print',
+				'/conflicting/replay',
+				1
+			);
+			RETURN NEW;
+		END;
+		$$;
+
+		CREATE TRIGGER inject_conflicting_publication_event_assertion
+		AFTER INSERT ON ingestion_projection_assertions
+		FOR EACH ROW
+		EXECUTE FUNCTION inject_conflicting_publication_event_assertion()
+	`); err != nil {
+		t.Fatalf("install publication assertion replay conflict fixture: %v", err)
+	}
+
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/pubmed-v1",
+		"projection/pubmed-v1",
+	); err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"publication event assertion replay conflicts with immutable assertion",
+		) {
+		t.Fatalf(
+			"Project(conflicting publication replay) error = %v, want immutable assertion conflict",
+			err,
+		)
+	}
+	var projectionAssertions, eventAssertions, sourceStates int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM ingestion_projection_assertions),
+			(SELECT count(*) FROM work_publication_event_assertions),
+			(SELECT count(*) FROM ingestion_source_states)
+	`).Scan(
+		&projectionAssertions,
+		&eventAssertions,
+		&sourceStates,
+	); err != nil {
+		t.Fatalf("query conflicting publication replay rollback: %v", err)
+	}
+	if projectionAssertions != 0 || eventAssertions != 0 || sourceStates != 0 {
+		t.Fatalf(
+			"conflicting publication replay committed partial rows = %d/%d/%d",
+			projectionAssertions,
+			eventAssertions,
+			sourceStates,
+		)
+	}
+}
+
 func TestPostgresRepositoryRejectsInvalidPubMedBiomedicalSemanticsAtomically(t *testing.T) {
 	testCases := []struct {
 		name      string
@@ -835,12 +1830,12 @@ func TestNormalizedBiomedicalSemanticAssertionsRejectDuplicateUIs(t *testing.T) 
 	).Record)
 	testCases := []struct {
 		name      string
-		mutate    func(*persistedRecordPayload)
+		mutate    func(*persistedRecordPayloadV3)
 		wantError string
 	}{
 		{
 			name: "descriptor UI",
-			mutate: func(record *persistedRecordPayload) {
+			mutate: func(record *persistedRecordPayloadV3) {
 				record.MeSHHeadings[1].Descriptor.UI =
 					record.MeSHHeadings[0].Descriptor.UI
 			},
@@ -848,7 +1843,7 @@ func TestNormalizedBiomedicalSemanticAssertionsRejectDuplicateUIs(t *testing.T) 
 		},
 		{
 			name: "qualifier UI within one heading",
-			mutate: func(record *persistedRecordPayload) {
+			mutate: func(record *persistedRecordPayloadV3) {
 				record.MeSHHeadings[0].Qualifiers[1].UI =
 					record.MeSHHeadings[0].Qualifiers[0].UI
 			},
@@ -856,7 +1851,7 @@ func TestNormalizedBiomedicalSemanticAssertionsRejectDuplicateUIs(t *testing.T) 
 		},
 		{
 			name: "publication type UI",
-			mutate: func(record *persistedRecordPayload) {
+			mutate: func(record *persistedRecordPayloadV3) {
 				record.PublicationTypes[1].UI = record.PublicationTypes[0].UI
 			},
 			wantError: `duplicate PubMed Publication Type UI "D016428"`,
@@ -2987,6 +3982,29 @@ func startPubMedRepositoryJob(
 	return started
 }
 
+func startSourceRepositoryJob(
+	t *testing.T,
+	repository *PostgresRepository,
+	logicalSource string,
+	suffix string,
+) Job {
+	t.Helper()
+	job, err := NewJob(
+		"sync/"+logicalSource+"/"+suffix,
+		logicalSource,
+		"test:"+logicalSource+":"+suffix,
+		map[string]any{"test": suffix},
+	)
+	if err != nil {
+		t.Fatalf("NewJob(%s) error = %v", logicalSource, err)
+	}
+	started, err := repository.Start(context.Background(), job)
+	if err != nil {
+		t.Fatalf("Start(%s) error = %v", logicalSource, err)
+	}
+	return started
+}
+
 func assertJSONOmitsKeys(t *testing.T, payload []byte, keys ...string) {
 	t.Helper()
 	forbidden := make(map[string]struct{}, len(keys))
@@ -3014,6 +4032,274 @@ func assertJSONOmitsKeys(t *testing.T, payload []byte, keys ...string) {
 		}
 	}
 	walk(decoded)
+}
+
+type publicationEventRow struct {
+	ProjectionAssertionID string
+	NormalizedAssertionID string
+	SourceRecordID        string
+	WorkID                string
+	EventKind             string
+	EventDate             *time.Time
+	DatePrecision         string
+	SourceDate            []byte
+	StatusRaw             string
+	PublicationModelRaw   *string
+	SourcePath            string
+	Ordinal               int
+}
+
+func readPublicationEventRows(
+	t *testing.T,
+	pool *pgxpool.Pool,
+) []publicationEventRow {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT
+			projection_assertion_id::text,
+			normalized_assertion_id::text,
+			source_record_id::text,
+			work_id::text,
+			event_kind,
+			event_date,
+			date_precision,
+			source_date,
+			status_raw,
+			publication_model_raw,
+			source_path,
+			ordinal
+		FROM work_publication_event_assertions
+		ORDER BY projection_assertion_id, ordinal
+	`)
+	if err != nil {
+		t.Fatalf("query publication event assertions: %v", err)
+	}
+	defer rows.Close()
+
+	assertions := make([]publicationEventRow, 0)
+	for rows.Next() {
+		var assertion publicationEventRow
+		if err := rows.Scan(
+			&assertion.ProjectionAssertionID,
+			&assertion.NormalizedAssertionID,
+			&assertion.SourceRecordID,
+			&assertion.WorkID,
+			&assertion.EventKind,
+			&assertion.EventDate,
+			&assertion.DatePrecision,
+			&assertion.SourceDate,
+			&assertion.StatusRaw,
+			&assertion.PublicationModelRaw,
+			&assertion.SourcePath,
+			&assertion.Ordinal,
+		); err != nil {
+			t.Fatalf("scan publication event assertion: %v", err)
+		}
+		assertions = append(assertions, assertion)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate publication event assertions: %v", err)
+	}
+	return assertions
+}
+
+func publicationHistoryEntry(
+	status string,
+	year int,
+	month time.Month,
+	day int,
+	precision source.DatePrecision,
+	ordinal int,
+) source.PublicationHistoryEntry {
+	return source.PublicationHistoryEntry{
+		Status: status,
+		Date: source.SourceDate{
+			Year:      year,
+			Month:     month,
+			Day:       day,
+			Precision: precision,
+		},
+		SourcePath: fmt.Sprintf(
+			"/PubmedArticle/PubmedData/History/PubMedPubDate[%d]",
+			ordinal,
+		),
+		Ordinal: ordinal,
+	}
+}
+
+func publicationDate(year int, month time.Month, day int) *time.Time {
+	value := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	return &value
+}
+
+func assertOptionalPublicationDate(
+	t *testing.T,
+	got *time.Time,
+	want *time.Time,
+) {
+	t.Helper()
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil || want == nil:
+		t.Fatalf("publication date = %v, want %v", got, want)
+	case !got.Equal(*want):
+		t.Fatalf("publication date = %s, want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
+func assertCanonicalJSONEqual(t *testing.T, got []byte, want []byte) {
+	t.Helper()
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("decode actual JSON %q: %v", got, err)
+	}
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("decode expected JSON %q: %v", want, err)
+	}
+	gotCanonical, err := json.Marshal(gotValue)
+	if err != nil {
+		t.Fatalf("canonicalize actual JSON: %v", err)
+	}
+	wantCanonical, err := json.Marshal(wantValue)
+	if err != nil {
+		t.Fatalf("canonicalize expected JSON: %v", err)
+	}
+	if !bytes.Equal(gotCanonical, wantCanonical) {
+		t.Fatalf("JSON = %s, want %s", gotCanonical, wantCanonical)
+	}
+}
+
+func projectPublicationEnvelope(
+	t *testing.T,
+	repository *PostgresRepository,
+	envelope Envelope,
+	suffix string,
+	mutateCandidate func(*ProjectionCandidate),
+) (Job, PersistedRaw, NormalizedRecord, ProjectionResult) {
+	t.Helper()
+	ctx := context.Background()
+	job := startSourceRepositoryJob(
+		t,
+		repository,
+		envelope.LogicalSource,
+		suffix,
+	)
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw(%s) error = %v", suffix, err)
+	}
+	normalized, err := repository.Normalize(
+		ctx,
+		job.ID,
+		raw,
+		"normalization/"+envelope.LogicalSource+"-v1",
+	)
+	if err != nil {
+		t.Fatalf("Normalize(%s) error = %v", suffix, err)
+	}
+	candidate, err := NewProjectionCandidate(
+		normalized,
+		source.ScopeDecision{
+			Status: source.ScopeIncluded,
+			Reason: "controlled_identity_present",
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate(%s) error = %v", suffix, err)
+	}
+	if mutateCandidate != nil {
+		mutateCandidate(&candidate)
+	}
+	result, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/"+envelope.LogicalSource+"-v1",
+		"projection/"+envelope.LogicalSource+"-v1",
+	)
+	if err != nil {
+		t.Fatalf("Project(%s) error = %v", suffix, err)
+	}
+	return job, raw, normalized, result
+}
+
+func publicationRepositoryEnvelope(
+	t *testing.T,
+	logicalSource string,
+	sourceRecordID string,
+	doi string,
+	eventKey string,
+	sourceTime time.Time,
+	tieBreakKey string,
+	position int64,
+	publicationModel string,
+	publicationStatus string,
+	publicationHistory []source.PublicationHistoryEntry,
+) Envelope {
+	t.Helper()
+	raw, err := source.NewRawRecord([]byte(fmt.Sprintf(
+		`{"event_key":%q,"marker":%q,"publication_model":%q,`+
+			`"publication_status":%q,"source":%q}`,
+		eventKey,
+		tieBreakKey,
+		publicationModel,
+		publicationStatus,
+		logicalSource,
+	)))
+	if err != nil {
+		t.Fatalf("NewRawRecord(publication evidence) error = %v", err)
+	}
+	identity, err := paper.NewIdentifier(paper.SchemeDOI, doi)
+	if err != nil {
+		t.Fatalf("NewIdentifier(publication DOI) error = %v", err)
+	}
+	identifiers := []source.Identifier{
+		{Scheme: source.IdentifierDOI, Value: doi},
+	}
+	if logicalSource == source.PubMed {
+		identifiers = append(identifiers, source.Identifier{
+			Scheme: source.IdentifierPMID,
+			Value:  sourceRecordID,
+		})
+	}
+	record := source.Record{
+		Source:             logicalSource,
+		SourceRecordID:     sourceRecordID,
+		Identity:           identity,
+		Identifiers:        identifiers,
+		Raw:                raw,
+		Title:              "Publication evidence " + tieBreakKey,
+		AbstractSections:   make([]source.AbstractSection, 0),
+		PublicationModel:   publicationModel,
+		PublicationStatus:  publicationStatus,
+		PublicationHistory: slices.Clone(publicationHistory),
+		Authors:            make([]source.Author, 0),
+		MeSHHeadings:       make([]source.MeSHHeading, 0),
+		PublicationTypes:   make([]source.PublicationType, 0),
+		Relations:          make([]source.Relation, 0),
+		Topics:             make([]source.Topic, 0),
+		Keywords:           make([]source.Keyword, 0),
+		CodeURLs:           make([]string, 0),
+		Evidence:           make([]source.FieldEvidence, 0),
+		Scope: source.ScopeDecision{
+			Status: source.ScopePending,
+			Reason: source.ScopeReasonAwaitingDeterministicEvaluation,
+		},
+	}
+	envelope, err := NewEnvelope(
+		logicalSource,
+		eventKey,
+		sourceTime,
+		tieBreakKey,
+		position,
+		record,
+		raw,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope(publication evidence) error = %v", err)
+	}
+	return envelope
 }
 
 func pubMedBiomedicalRepositoryEnvelope(
