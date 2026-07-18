@@ -108,6 +108,33 @@ func TestCitationAnalysisInputRequiresExactDeclaredScope(t *testing.T) {
 	}
 }
 
+func TestCitationAcceptedJournalMetricPredicateIsQ1Only(t *testing.T) {
+	t.Parallel()
+
+	if strings.Contains(citationAcceptedJournalMetricPredicate, "jif") {
+		t.Fatalf(
+			"citation accepted journal predicate uses JIF threshold: %s",
+			citationAcceptedJournalMetricPredicate,
+		)
+	}
+	for _, required := range []string{
+		"metric.metric_status = 'known'",
+		"metric.registry_version = 'jcr-registry/v2'",
+		"metric.quartile = 'Q1'",
+	} {
+		if !strings.Contains(
+			citationAcceptedJournalMetricPredicate,
+			required,
+		) {
+			t.Fatalf(
+				"citation accepted journal predicate missing %q: %s",
+				required,
+				citationAcceptedJournalMetricPredicate,
+			)
+		}
+	}
+}
+
 func TestNewPostgresAnalysisServiceRejectsNilPoolAndClock(t *testing.T) {
 	t.Parallel()
 
@@ -126,7 +153,12 @@ func TestPostgresAnalysisServicePersistsOneImmutableSourceSpecificRun(
 	fixture := openCitationPostgresFixture(t)
 	input := validCitationAnalysisInput()
 	input.MinimumCohortSize = 2
-	prepareCitationAnalysisScope(t, fixture.Pool, fixture.WorkID, input)
+	q2HighJIFWorkID := prepareCitationAnalysisScope(
+		t,
+		fixture.Pool,
+		fixture.WorkID,
+		input,
+	)
 	insertCurrentPubMedPublicationType(
 		t,
 		fixture.Pool,
@@ -179,6 +211,22 @@ func TestPostgresAnalysisServicePersistsOneImmutableSourceSpecificRun(
 		summary.KnownPercentiles != 0 ||
 		summary.InsufficientPercentile != 1 {
 		t.Fatalf("Analyze() summary = %#v", summary)
+	}
+	var q2SnapshotCount int
+	if err := fixture.Pool.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM citation_analysis_work_snapshots
+		WHERE analysis_run_id = $1
+		  AND work_id = $2
+	`, summary.RunID, q2HighJIFWorkID).Scan(&q2SnapshotCount); err != nil {
+		t.Fatalf("count Q2 high-JIF citation snapshots: %v", err)
+	}
+	if q2SnapshotCount != 0 {
+		t.Fatalf(
+			"Q2 high-JIF Work %s produced %d citation snapshots",
+			q2HighJIFWorkID,
+			q2SnapshotCount,
+		)
 	}
 
 	var (
@@ -332,7 +380,7 @@ func prepareCitationAnalysisScope(
 	pool *pgxpool.Pool,
 	workID uuid.UUID,
 	input AnalysisInput,
-) {
+) uuid.UUID {
 	t.Helper()
 	ctx := context.Background()
 	venueID := uuid.New()
@@ -346,6 +394,22 @@ func prepareCitationAnalysisScope(
 	`, venueID); err != nil {
 		t.Fatalf("insert analysis Venue: %v", err)
 	}
+	q2HighJIFVenueID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO venues (
+			id,
+			venue_type,
+			display_title,
+			issn_l
+		) VALUES (
+			$1,
+			'journal',
+			'Citation Analysis Q2 High JIF Journal',
+			'2468-1350'
+		)
+	`, q2HighJIFVenueID); err != nil {
+		t.Fatalf("insert Q2 high-JIF analysis Venue: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		UPDATE works
 		SET venue_id = $2,
@@ -353,6 +417,25 @@ func prepareCitationAnalysisScope(
 		WHERE id = $1
 	`, workID, venueID); err != nil {
 		t.Fatalf("bind analysis Work Venue/year: %v", err)
+	}
+	var q2HighJIFWorkID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO works (
+			canonical_key,
+			status,
+			title,
+			published_at,
+			venue_id
+		) VALUES (
+			'doi:10.1000/citation-q2-high-jif',
+			'active',
+			'Q2 high-JIF citation decoy',
+			'2026-06-02T00:00:00Z',
+			$1
+		)
+		RETURNING id
+	`, q2HighJIFVenueID).Scan(&q2HighJIFWorkID); err != nil {
+		t.Fatalf("insert Q2 high-JIF analysis Work: %v", err)
 	}
 
 	subjectReceiptID := uuid.New()
@@ -423,6 +506,8 @@ func prepareCitationAnalysisScope(
 	}
 
 	metricID := uuid.New()
+	q2HighJIFMetricID := uuid.New()
+	q2HighJIFSubjectLinkID := uuid.New()
 	tx, err = pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin analysis JCR fixture: %v", err)
@@ -442,8 +527,8 @@ func prepareCitationAnalysisScope(
 			$2,
 			'authorized-jcr',
 			'2026-07-17T08:30:00Z',
-			1,
-			1,
+			2,
+			2,
 			0
 		)
 	`, input.JCRImportReceipt, strings.Repeat("b", 64)); err != nil {
@@ -505,25 +590,146 @@ func prepareCitationAnalysisScope(
 	`, metricID, subjectRuleID); err != nil {
 		t.Fatalf("link analysis Subject metric: %v", err)
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO venue_metric_snapshots (
+			id,
+			venue_id,
+			metric_year,
+			category,
+			registry_version,
+			edition_year,
+			jif,
+			jif_rank,
+			category_journal_count,
+			jif_percentile,
+			quartile,
+			metric_status,
+			source_name,
+			source_license,
+			captured_at,
+			jcr_import_receipt_id
+		) VALUES (
+			$1,
+			$2,
+			$3,
+			'Oncology',
+			'jcr-registry/v2',
+			2026,
+			20,
+			30,
+			100,
+			70,
+			'Q2',
+			'known',
+			'authorized-jcr',
+			'institution-authorized',
+			'2026-07-17T08:30:01Z',
+			$4
+		)
+	`,
+		q2HighJIFMetricID,
+		q2HighJIFVenueID,
+		input.JCRMetricYear,
+		input.JCRImportReceipt,
+	); err != nil {
+		t.Fatalf("insert Q2 high-JIF analysis JCR metric: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO jcr_import_receipt_metrics (
+			import_receipt_id,
+			metric_snapshot_id
+		) VALUES ($1, $2)
+	`, input.JCRImportReceipt, q2HighJIFMetricID); err != nil {
+		t.Fatalf("link Q2 high-JIF JCR receipt metric: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO journal_subject_metrics (
+			id,
+			venue_metric_snapshot_id,
+			subject_rule_id,
+			jcr_category
+		) VALUES ($1, $2, $3, 'Oncology')
+	`,
+		q2HighJIFSubjectLinkID,
+		q2HighJIFMetricID,
+		subjectRuleID,
+	); err != nil {
+		t.Fatalf("link Q2 high-JIF Subject metric: %v", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit analysis JCR fixture: %v", err)
 	}
 
-	assessmentStore, err := venue.NewPostgresAssessmentStore(pool)
-	if err != nil {
-		t.Fatalf("NewPostgresAssessmentStore() error = %v", err)
-	}
-	assessmentService, err := venue.NewAssessmentService(assessmentStore)
-	if err != nil {
-		t.Fatalf("NewAssessmentService() error = %v", err)
-	}
-	if _, err := assessmentService.Assess(ctx, venue.AssessmentInput{
-		JCRImportReceiptID: input.JCRImportReceipt.String(),
-		MetricYear:         input.JCRMetricYear,
-		PolicyVersion:      venue.JournalAllQ1PolicyVersion,
-		AssessedAt:         input.AsOf.Add(-2 * time.Hour),
-	}); err != nil {
-		t.Fatalf("assess analysis Venue policy: %v", err)
+	for _, assessment := range []struct {
+		venueID  uuid.UUID
+		jif      string
+		quartile string
+	}{
+		{venueID: venueID, jif: "12", quartile: "Q1"},
+		{
+			venueID:  q2HighJIFVenueID,
+			jif:      "20",
+			quartile: "Q2",
+		},
+	} {
+		evidence := fmt.Sprintf(`{
+			"jcr_import_receipt_id":%q,
+			"policy_version":"journal-all-q1/v2",
+			"metric_year":%d,
+			"venue_type":"journal",
+			"categories":[{
+				"category":"Oncology",
+				"registry_version":"jcr-registry/v2",
+				"edition_year":2026,
+				"jif":%q,
+				"jif_rank":1,
+				"category_journal_count":100,
+				"jif_percentile":"99",
+				"quartile":%q,
+				"status":"known",
+				"source_name":"authorized-jcr"
+			}]
+		}`,
+			input.JCRImportReceipt.String(),
+			input.JCRMetricYear,
+			assessment.jif,
+			assessment.quartile,
+		)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO venue_policy_assessments (
+				venue_id,
+				policy_version_id,
+				metric_year,
+				decision,
+				matched_rules,
+				evidence,
+				assessed_at
+			)
+			SELECT
+				$1,
+				policy.id,
+				$2,
+				'accepted',
+				'["jcr_q1"]'::jsonb,
+				$3::jsonb,
+				$4
+			FROM venue_policy_versions AS policy
+			WHERE policy.policy_name = $5
+			  AND policy.version_number = $6
+		`,
+			assessment.venueID,
+			input.JCRMetricYear,
+			evidence,
+			input.AsOf.Add(-2*time.Hour),
+			venue.JournalAllQ1PolicyName,
+			venue.JournalAllQ1PolicyRevision,
+		); err != nil {
+			t.Fatalf(
+				"insert adversarial Venue assessment for %s: %v",
+				assessment.venueID,
+				err,
+			)
+		}
 	}
 
 	eligibilityStore, err := biomed.NewPostgresPublicEligibilityStore(pool)
@@ -536,25 +742,39 @@ func prepareCitationAnalysisScope(
 	if err != nil {
 		t.Fatalf("NewPublicEligibilityService() error = %v", err)
 	}
-	assessment, err := eligibilityService.Assess(
-		ctx,
-		biomed.PublicEligibilityInput{
-			WorkID:            workID.String(),
-			PolicyVersion:     input.EligibilityPolicyVersion,
-			MetricYear:        input.JCRMetricYear,
-			SubjectVersionKey: input.SubjectVersion,
-			AssessedAt:        input.AsOf.Add(-time.Hour),
-		},
-	)
-	if err != nil {
-		t.Fatalf("assess analysis biomedical eligibility: %v", err)
-	}
-	if assessment.Decision != biomed.PublicEligibilityDecisionAccepted {
-		t.Fatalf(
-			"analysis eligibility = %q, want accepted",
-			assessment.Decision,
+	for index, eligibleWorkID := range []uuid.UUID{
+		workID,
+		q2HighJIFWorkID,
+	} {
+		assessment, err := eligibilityService.Assess(
+			ctx,
+			biomed.PublicEligibilityInput{
+				WorkID:            eligibleWorkID.String(),
+				PolicyVersion:     input.EligibilityPolicyVersion,
+				MetricYear:        input.JCRMetricYear,
+				SubjectVersionKey: input.SubjectVersion,
+				AssessedAt: input.AsOf.Add(
+					-time.Duration(index+1) * time.Hour,
+				),
+			},
 		)
+		if err != nil {
+			t.Fatalf(
+				"assess analysis biomedical eligibility for %s: %v",
+				eligibleWorkID,
+				err,
+			)
+		}
+		if assessment.Decision !=
+			biomed.PublicEligibilityDecisionAccepted {
+			t.Fatalf(
+				"analysis eligibility for %s = %q, want accepted",
+				eligibleWorkID,
+				assessment.Decision,
+			)
+		}
 	}
+	return q2HighJIFWorkID
 }
 
 func insertCurrentPubMedPublicationType(

@@ -538,24 +538,18 @@ func validateBiomedicalAnalysisScope(
 		)
 	}
 	command.JCRReceipt = parsedReceipt.String()
-	if command.VenuePolicyName == "" {
+	if command.VenuePolicyName != venue.JournalAllQ1PolicyName {
 		return workerCommand{}, fmt.Errorf(
-			"%s analysis requires an explicit --venue-policy-name",
+			"%s analysis --venue-policy-name must equal %s",
 			target,
+			venue.JournalAllQ1PolicyName,
 		)
 	}
-	if command.VenuePolicyName != strings.TrimSpace(
-		command.VenuePolicyName,
-	) {
+	if command.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
 		return workerCommand{}, fmt.Errorf(
-			"%s analysis venue-policy-name must be trimmed",
+			"%s analysis --venue-policy-version must equal version %d",
 			target,
-		)
-	}
-	if command.VenuePolicyVersion < 1 {
-		return workerCommand{}, fmt.Errorf(
-			"%s analysis requires a positive --venue-policy-version",
-			target,
+			venue.JournalAllQ1PolicyRevision,
 		)
 	}
 	return command, nil
@@ -1178,19 +1172,16 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 			"catalog publish requires --jcr-metric-year between 1900 and 3000",
 		)
 	}
-	if command.VenuePolicyName == "" {
-		return workerCommand{}, errors.New(
-			"catalog publish requires an explicit --venue-policy-name",
+	if command.VenuePolicyName != venue.JournalAllQ1PolicyName {
+		return workerCommand{}, fmt.Errorf(
+			"catalog --venue-policy-name must equal %s",
+			venue.JournalAllQ1PolicyName,
 		)
 	}
-	if command.VenuePolicyName != strings.TrimSpace(command.VenuePolicyName) {
-		return workerCommand{}, errors.New(
-			"catalog venue-policy-name must be trimmed",
-		)
-	}
-	if command.VenuePolicyVersion < 1 {
-		return workerCommand{}, errors.New(
-			"catalog publish requires a positive --venue-policy-version",
+	if command.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
+		return workerCommand{}, fmt.Errorf(
+			"catalog --venue-policy-version must equal version %d",
+			venue.JournalAllQ1PolicyRevision,
 		)
 	}
 	if command.EligibilityPolicyVersion == "" {

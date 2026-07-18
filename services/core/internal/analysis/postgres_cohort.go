@@ -54,14 +54,17 @@ func loadAcceptedCohortWorks(
 	ctx context.Context,
 	tx pgx.Tx,
 	subjectVersionID uuid.UUID,
-	policyVersion string,
+	eligibilityPolicyVersion string,
 	metricYear int,
+	jcrImportReceipt uuid.UUID,
+	venuePolicyName string,
+	venuePolicyRevision int,
 ) ([]cohortWork, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT
 			work.id,
 			work.venue_id,
-			COALESCE(venue.venue_type, ''),
+			venue.venue_type,
 			work.published_at
 		FROM works AS work
 		JOIN biomedical_publication_eligibility_decisions AS eligibility
@@ -70,12 +73,62 @@ func loadAcceptedCohortWorks(
 		 AND eligibility.metric_year = $2
 		 AND eligibility.subject_version_id = $3
 		 AND eligibility.decision = 'accepted'
-		LEFT JOIN venues AS venue
+		JOIN venues AS venue
 		  ON venue.id = work.venue_id
+		 AND eligibility.venue_id = venue.id
+		JOIN venue_policy_versions AS policy
+		  ON policy.policy_name = $5
+		 AND policy.version_number = $6
+		JOIN venue_policy_assessments AS assessment
+		  ON assessment.venue_id = venue.id
+		 AND assessment.policy_version_id = policy.id
+		 AND assessment.metric_year = $2
+		 AND assessment.decision = 'accepted'
+		 AND assessment.evidence ->> 'jcr_import_receipt_id' =
+		     ($4::uuid)::text
 		WHERE work.status = 'active'
 		  AND work.published_at IS NOT NULL
+		  AND venue.venue_type = 'journal'
+		  AND COALESCE(venue.issn_l, venue.issn, venue.eissn) IS NOT NULL
+		  AND EXISTS (
+				SELECT 1
+				FROM jcr_import_receipt_metrics AS receipt_metric
+				JOIN venue_metric_snapshots AS metric
+				  ON metric.id = receipt_metric.metric_snapshot_id
+				WHERE receipt_metric.import_receipt_id = $4
+				  AND metric.venue_id = venue.id
+				  AND metric.metric_year = $2
+				  AND metric.metric_status = 'known'
+				  AND metric.registry_version = 'jcr-registry/v2'
+				  AND metric.quartile = 'Q1'
+		  )
+		  AND EXISTS (
+				SELECT 1
+				FROM jcr_import_receipt_metrics AS receipt_metric
+				JOIN venue_metric_snapshots AS metric
+				  ON metric.id = receipt_metric.metric_snapshot_id
+				JOIN journal_subject_metrics AS subject_metric
+				  ON subject_metric.venue_metric_snapshot_id = metric.id
+				JOIN biomedical_subject_rules AS subject_rule
+				  ON subject_rule.id = subject_metric.subject_rule_id
+				WHERE receipt_metric.import_receipt_id = $4
+				  AND subject_metric.id =
+				      eligibility.journal_subject_metric_id
+				  AND metric.venue_id = venue.id
+				  AND metric.metric_year = $2
+				  AND subject_rule.subject_version_id = $3
+				  AND subject_metric.jcr_category = metric.category
+				  AND subject_rule.jcr_category = metric.category
+		  )
 		ORDER BY work.id
-	`, policyVersion, metricYear, subjectVersionID)
+	`,
+		eligibilityPolicyVersion,
+		metricYear,
+		subjectVersionID,
+		jcrImportReceipt,
+		venuePolicyName,
+		venuePolicyRevision,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("query accepted cohort Works: %w", err)
 	}

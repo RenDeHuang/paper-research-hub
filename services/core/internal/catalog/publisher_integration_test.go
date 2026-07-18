@@ -1574,7 +1574,7 @@ func TestPublisherRejectsInconsistentExactJIFAcrossJCRCategories(t *testing.T) {
 	assertNoCatalogWrites(t, pool)
 }
 
-func TestPublisherRejectsForgedAcceptedAssessmentBelowJCRAdmissionThreshold(
+func TestPublisherRejectsForgedAcceptedAssessmentForQ2HighJIF(
 	t *testing.T,
 ) {
 	pool := openCatalogTestPool(t)
@@ -1615,7 +1615,7 @@ func TestPublisherRejectsForgedAcceptedAssessmentBelowJCRAdmissionThreshold(
 			withSubject: true,
 			primaryMetric: &catalogJCRMetricFixture{
 				category: "Oncology",
-				jif:      "9.999",
+				jif:      "20",
 				quartile: "Q2",
 			},
 		}},

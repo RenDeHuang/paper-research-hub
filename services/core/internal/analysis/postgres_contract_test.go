@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venue"
 	"github.com/google/uuid"
 )
 
@@ -212,6 +213,18 @@ func TestOpportunityAnalysisInputRequiresExactRunsAndScope(t *testing.T) {
 				input.VenuePolicyName = ""
 			},
 		},
+		{
+			name: "legacy venue policy name",
+			alter: func(input *OpportunityAnalysisInput) {
+				input.VenuePolicyName = "journal-jif-or-q1"
+			},
+		},
+		{
+			name: "legacy venue policy version",
+			alter: func(input *OpportunityAnalysisInput) {
+				input.VenuePolicyVersion = 1
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -222,6 +235,86 @@ func TestOpportunityAnalysisInputRequiresExactRunsAndScope(t *testing.T) {
 			test.alter(&input)
 			if err := input.validate(); err == nil {
 				t.Fatal("OpportunityAnalysisInput.validate() error = nil")
+			}
+		})
+	}
+}
+
+func TestBiomedicalAnalysisInputsRequireCurrentAllQ1VenuePolicy(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	asOf := time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)
+	receipt := uuid.MustParse(
+		"00000000-0000-0000-0000-000000000501",
+	)
+	tests := []struct {
+		name     string
+		validate func(string, int) error
+	}{
+		{
+			name: "publication trends",
+			validate: func(policyName string, policyVersion int) error {
+				return (TrendAnalysisInput{
+					AsOf:                           asOf,
+					FormulaVersion:                 PublicationTrendFormulaVersion,
+					ModelSelectionRule:             TrendModelSelectionDispersionThreshold,
+					DispersionThreshold:            1.5,
+					SubjectVersion:                 "biomedical-jcr-subjects/v1",
+					EligibilityPolicyVersion:       "biomedical-public-eligibility/v1",
+					JCRMetricYear:                  2025,
+					JCRImportReceipt:               receipt,
+					VenuePolicyName:                policyName,
+					VenuePolicyVersion:             policyVersion,
+					RecentWindowDays:               56,
+					BaselineWindowDays:             364,
+					MinimumPaperCount:              20,
+					MinimumIndependentJournalCount: 3,
+					MinimumIndependentTeamCount:    3,
+				}).validate()
+			},
+		},
+		{
+			name: "journal patterns",
+			validate: func(policyName string, policyVersion int) error {
+				return (JournalPatternAnalysisInput{
+					AsOf:                      asOf,
+					FormulaVersion:            JournalPatternFormulaVersion,
+					SubjectVersion:            "biomedical-jcr-subjects/v1",
+					EligibilityPolicyVersion:  "biomedical-public-eligibility/v1",
+					JCRMetricYear:             2025,
+					JCRImportReceipt:          receipt,
+					VenuePolicyName:           policyName,
+					VenuePolicyVersion:        policyVersion,
+					WindowDays:                364,
+					MinimumSupportCount:       10,
+					MinimumFieldBaselineCount: 40,
+					MinimumCoverage:           0.8,
+				}).validate()
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := test.validate(
+				venue.JournalAllQ1PolicyName,
+				2,
+			); err != nil {
+				t.Fatalf("current all-Q1 policy validate() error = %v", err)
+			}
+			if err := test.validate("journal-jif-or-q1", 2); err == nil {
+				t.Fatal("legacy Venue policy name validate() error = nil")
+			}
+			if err := test.validate(
+				venue.JournalAllQ1PolicyName,
+				1,
+			); err == nil {
+				t.Fatal("legacy Venue policy version validate() error = nil")
 			}
 		})
 	}

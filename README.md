@@ -117,20 +117,23 @@ cp .env.example .env
 6. `assess venues`；
 7. `assess biomedical-eligibility`；
 8. `analyze citations` 从一个明确来源生成不可变引用分析 run；
-9. `publish catalog` 显式绑定该引用来源和 analysis run；
-10. 启动并验证独立的 Go API 与 Nuxt Web。
+9. `analyze trends` 生成不可变 publication trend run；
+10. `analyze journals` 生成不可变 journal editorial-pattern run；
+11. `analyze opportunities` 显式绑定 citation、trend、journal 三个上游 run；
+12. `publish catalog` 显式绑定 citation source 与四个 analysis run ID；
+13. 启动并验证独立的 Go API 与 Nuxt Web。
 
 完整 Docker volume mount、本地原生命令、全部 Worker flags、receipt 查询和验证 SQL 见 [`docs/deployment/biomedical-pipeline.md`](docs/deployment/biomedical-pipeline.md)。
 
-公开 Catalog 的唯一 Venue 准入门槛是：
+公开 Catalog 的正式期刊准入仅接受授权 JCR Q1 证据：
 
 ```text
-任一授权 JCR Category 为 Q1 OR exact JIF >= 10
+任一授权 JCR Category 为 Q1
 ```
 
-对应固定策略版本 `journal-jif-or-q1/v1`。Biomedical Subject exact-link 是公开范围约束，不是第二套期刊质量阈值；系统不会以引用数、OpenAlex `2yr_mean_citedness`、标题相似度或其他推断指标替代 JCR。
+固定策略身份为 policy name=`journal-all-q1`、policy revision=`2`，完整 policy version/label=`journal-all-q1/v2`。JIF、JIF percentile 和 rank 只作为授权 JCR 证据字段，不参与准入阈值。Biomedical Subject exact-link 是公开范围约束，不是第二套期刊质量阈值；系统不会以引用数、OpenAlex `2yr_mean_citedness`、标题相似度或其他推断指标替代 JCR。
 
-`data/venues/jcr-q1.example.csv` 是纯合成测试 fixture，**禁止用于生产导入或 Catalog 发布**。如果没有用户授权的 JCR CSV，不能执行后续 assessment 或 publish；空库 API 的真实路由 `/api/v1/home`、`/api/v1/subjects`、`/api/v1/journals` 必须继续返回 `503 catalog_not_published`，Nuxt `/`、`/subjects`、`/journals` 只呈现等待状态，不生成假数据。
+`data/venues/jcr-q1.example.csv` 是纯合成测试 fixture，**禁止用于生产导入或 Catalog 发布**。如果没有用户授权的 JCR CSV，不能执行后续 assessment、analysis 或 publish；空库 API 的真实路由 `/api/v1/home`、`/api/v1/subjects`、`/api/v1/journals` 必须继续返回 `503 catalog_not_published`，Nuxt `/`、`/subjects`、`/journals` 只呈现等待状态，不生成假数据。
 
 完成发布后启动服务并验证：
 
@@ -194,10 +197,13 @@ make typecheck
 - **Crossref**：`sync crossref`，需要 `CROSSREF_CONTACT_EMAIL`，用于 DOI、ISSN、许可和出版关系增强。
 - **Biomedical Subject**：`import subjects`，导入不可变、版本化、exact JCR Category allowlist，并在事务内执行 exact-link reconciliation。
 - **JCR**：`import jcr`，`JCR_IMPORT_PATH` 必须指向用户明确授权的 CSV，`JCR_SOURCE_LICENSE` 必须记录该导出的授权或许可依据。系统不会推断许可，也不会用推断指标替代 JCR 数据。
-- **Venue assessment**：`assess venues`，仅接受 `journal-jif-or-q1/v1`，并绑定明确的 JCR receipt 与 metric year。
+- **Venue assessment**：`assess venues`，仅接受完整 policy version/label `journal-all-q1/v2`，并绑定明确的 JCR receipt 与 metric year。
 - **Biomedical eligibility**：`assess biomedical-eligibility`，对当前 Work 批量固化 exact Subject 资格决定。
 - **Citation analysis**：`analyze citations`，从一个明确 citation source 生成不可变 citation count、velocity 与 cohort percentile 结果；不会混合来源或把证据不足填成 `0`。
-- **Catalog**：`publish catalog`，要求显式传入 formula、时间、JCR 年份、Venue policy、eligibility policy、Subject version、JCR receipt、citation source 与 citation analysis run ID，生成并发布 immutable generation。
+- **Trend analysis**：`analyze trends`，按预声明窗口、支持度和模型选择边界生成不可变 publication trend run。
+- **Journal analysis**：`analyze journals`，按预声明窗口和最低支持度生成不可变 editorial-pattern run。
+- **Opportunity analysis**：`analyze opportunities`，显式绑定 citation、trend、journal 三个同范围上游 run。
+- **Catalog**：`publish catalog`，要求显式传入 curation scope、citation source 以及 citation、trend、journal、opportunity 四个 analysis run ID，生成并发布 immutable generation。
 
 尚未注册为 Worker 命令的规划能力：
 
@@ -237,7 +243,7 @@ docker compose run --rm \
 - PostgreSQL 使用托管实例，并通过生产级 Secret 管理 `DATABASE_URL`。
 - API 必须通过生产 Secret 管理器注入独立的 `CATALOG_CURSOR_SECRET`。该 secret 必须至少 32 bytes、不能带首尾空白、不能写入日志，并且所有 API 副本必须使用同一稳定值；轮换会使轮换前签发的分页 cursor 失效。
 - API 必须显式配置 `API_CORS_ALLOWED_ORIGINS`。每个值都是浏览器可见 Web 的精确 `http://` 或 `https://` origin；生产环境不得使用通配符，也不得把内部容器地址加入浏览器 allowlist。
-- Catalog 发布 Job 使用只要求数据库配置的 `catalog-publish` role，并始终显式传入经过版本管理的 `--formula-version`、确定性的 `--generated-at`、JCR/Subject/policy 版本和 JCR receipt；生产发布流程不得隐式使用当前时间。
+- Catalog 发布 Job 使用只要求数据库配置的 `catalog-publish` role，并始终显式传入经过版本管理的 `--formula-version`、确定性的 `--generated-at`、JCR metric year、Subject version、Venue policy name/revision、JCR receipt、citation source 与四个 analysis run ID；生产发布流程不得隐式使用当前时间。
 - 迁移在发布前作为独立作业运行；采用 expand/contract 迁移，旧版本应用必须能与扩展后的数据库并存。
 - Web 对浏览器暴露的 `NUXT_PUBLIC_API_BASE_URL` 必须是外部可解析的 HTTPS 地址；容器内部访问使用私有服务地址。
 - Subject 与 JCR CSV 只允许以只读 volume 挂载到对应的一次性 Worker Job；不得复制进运行镜像或由 API/Web 自动扫描。

@@ -15,7 +15,7 @@ useHead({
   meta: [
     {
       name: "description",
-      content: "浏览当前 Catalog generation 中通过 JCR Q1 或 JIF 不低于 10 规则的期刊。",
+      content: "浏览当前 Catalog generation 中通过全部 JCR Q1 准入规则的期刊。",
     },
   ],
 })

@@ -10,8 +10,10 @@ const catalogApi = vi.hoisted(() => ({
   getJournal: vi.fn(),
   listJournals: vi.fn(),
 }))
+const useHead = vi.hoisted(() => vi.fn())
 
 mockNuxtImport("useCatalogApi", () => () => catalogApi)
+mockNuxtImport("useHead", () => useHead)
 
 const journalPages = import.meta.glob<{ default: Component }>(
   "../app/pages/journals/*.vue",
@@ -145,6 +147,7 @@ async function loadJournalPage(file: "index.vue" | "[slug].vue") {
 
 describe("journal intelligence pages", () => {
   beforeEach(() => {
+    useHead.mockReset()
     catalogApi.getJournal.mockReset()
     catalogApi.listJournals.mockReset()
     catalogApi.getJournal.mockResolvedValue(journal)
@@ -162,6 +165,12 @@ describe("journal intelligence pages", () => {
     })
     expect(wrapper.get("h1").text()).toBe("期刊")
     expect(wrapper.text()).toContain("Journal of Clinical Oncology")
+    const headInput = useHead.mock.calls.at(-1)?.[0]
+    const description = headInput?.meta?.find(
+      (item: { name?: string }) => item.name === "description",
+    )?.content
+    expect(description).toContain("全部 JCR Q1")
+    expect(description).not.toContain("JIF 不低于 10")
     expect(wrapper.text()).toContain("JCR 指标年份")
     expect(wrapper.text()).toContain("taxonomy version")
     expect(wrapper.text()).toContain("jcr-biomedical-2025-v1")

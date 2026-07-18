@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venue"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -182,11 +183,23 @@ func (input JournalPatternAnalysisInput) validate() error {
 	if input.JCRImportReceipt == uuid.Nil {
 		return &InvalidInputError{Field: "jcr_import_receipt", Reason: "is required"}
 	}
-	if err := validateTrimmed("venue_policy_name", input.VenuePolicyName); err != nil {
-		return err
+	if input.VenuePolicyName != venue.JournalAllQ1PolicyName {
+		return &InvalidInputError{
+			Field: "venue_policy_name",
+			Reason: fmt.Sprintf(
+				"must equal %s",
+				venue.JournalAllQ1PolicyName,
+			),
+		}
 	}
-	if input.VenuePolicyVersion < 1 {
-		return &InvalidInputError{Field: "venue_policy_version", Reason: "must be positive"}
+	if input.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
+		return &InvalidInputError{
+			Field: "venue_policy_version",
+			Reason: fmt.Sprintf(
+				"must equal version %d",
+				venue.JournalAllQ1PolicyRevision,
+			),
+		}
 	}
 	if input.WindowDays < 1 || input.WindowDays > 3650 {
 		return &InvalidInputError{Field: "window_days", Reason: "must be between 1 and 3650"}
@@ -227,7 +240,16 @@ func (service *PostgresAnalysisService) AnalyzeJournalPatterns(
 	if err := validateJCRReceiptScope(ctx, tx, input.JCRImportReceipt, input.JCRMetricYear); err != nil {
 		return AnalysisRunSummary{}, err
 	}
-	works, err := loadAcceptedCohortWorks(ctx, tx, subjectVersionID, input.EligibilityPolicyVersion, input.JCRMetricYear)
+	works, err := loadAcceptedCohortWorks(
+		ctx,
+		tx,
+		subjectVersionID,
+		input.EligibilityPolicyVersion,
+		input.JCRMetricYear,
+		input.JCRImportReceipt,
+		input.VenuePolicyName,
+		input.VenuePolicyVersion,
+	)
 	if err != nil {
 		return AnalysisRunSummary{}, err
 	}

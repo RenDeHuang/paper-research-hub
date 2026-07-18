@@ -5,7 +5,7 @@
         medpaperhub
       </p>
       <p>
-        医学与生物学 · JCR Q1 或 JIF ≥ 10
+        医学与生物学 · 全部 JCR Q1
       </p>
     </div>
   </footer>

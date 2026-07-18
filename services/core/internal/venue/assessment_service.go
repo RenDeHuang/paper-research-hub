@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	JournalAllQ1PolicyName    = "journal-all-q1"
-	JournalAllQ1PolicyVersion = "journal-all-q1/v2"
+	JournalAllQ1PolicyName     = "journal-all-q1"
+	JournalAllQ1PolicyRevision = 2
+	JournalAllQ1PolicyVersion  = "journal-all-q1/v2"
 )
 
 type AssessmentInput struct {

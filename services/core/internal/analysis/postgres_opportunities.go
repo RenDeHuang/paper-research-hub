@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venue"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -140,16 +141,22 @@ func (input OpportunityAnalysisInput) validate() error {
 			Reason: "is required",
 		}
 	}
-	if err := validateTrimmed(
-		"venue_policy_name",
-		input.VenuePolicyName,
-	); err != nil {
-		return err
-	}
-	if input.VenuePolicyVersion < 1 {
+	if input.VenuePolicyName != venue.JournalAllQ1PolicyName {
 		return &InvalidInputError{
-			Field:  "venue_policy_version",
-			Reason: "must be positive",
+			Field: "venue_policy_name",
+			Reason: fmt.Sprintf(
+				"must equal %s",
+				venue.JournalAllQ1PolicyName,
+			),
+		}
+	}
+	if input.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
+		return &InvalidInputError{
+			Field: "venue_policy_version",
+			Reason: fmt.Sprintf(
+				"must equal version %d",
+				venue.JournalAllQ1PolicyRevision,
+			),
 		}
 	}
 	if input.CitationAnalysisRunID == uuid.Nil {
@@ -415,6 +422,9 @@ func (service *PostgresAnalysisService) AnalyzeResearchOpportunities(
 		subjectVersionID,
 		input.EligibilityPolicyVersion,
 		input.JCRMetricYear,
+		input.JCRImportReceipt,
+		input.VenuePolicyName,
+		input.VenuePolicyVersion,
 	)
 	if err != nil {
 		return AnalysisRunSummary{}, err

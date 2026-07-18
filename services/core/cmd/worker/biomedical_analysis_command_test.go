@@ -255,6 +255,24 @@ func TestParseBiomedicalAnalysisRejectsMissingOrInvalidBoundaries(
 			want: "--venue-policy-version",
 		},
 		{
+			name: "analysis venue policy name is legacy",
+			args: replaceWorkerFlag(
+				trendAnalysisCommandArgs(),
+				"--venue-policy-name",
+				"journal-jif-or-q1",
+			),
+			want: "journal-all-q1",
+		},
+		{
+			name: "analysis venue policy version is legacy",
+			args: replaceWorkerFlag(
+				trendAnalysisCommandArgs(),
+				"--venue-policy-version",
+				"1",
+			),
+			want: "version 2",
+		},
+		{
 			name: "opportunity missing trend run",
 			args: removeWorkerFlag(
 				opportunityAnalysisCommandArgs(),

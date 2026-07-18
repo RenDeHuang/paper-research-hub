@@ -17,6 +17,7 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/analysis"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/citation"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venue"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -497,17 +498,18 @@ func validatePublishInput(input PublishInput) error {
 			ErrCatalogNotReady,
 		)
 	}
-	if input.VenuePolicyName == "" ||
-		input.VenuePolicyName != strings.TrimSpace(input.VenuePolicyName) {
+	if input.VenuePolicyName != venue.JournalAllQ1PolicyName {
 		return fmt.Errorf(
-			"%w: Venue policy name must be non-empty and trimmed",
+			"%w: Venue policy name must equal %s",
 			ErrCatalogNotReady,
+			venue.JournalAllQ1PolicyName,
 		)
 	}
-	if input.VenuePolicyVersion < 1 {
+	if input.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
 		return fmt.Errorf(
-			"%w: Venue policy version must be positive",
+			"%w: Venue policy version must equal version %d",
 			ErrCatalogNotReady,
+			venue.JournalAllQ1PolicyRevision,
 		)
 	}
 	if input.EligibilityPolicyVersion !=

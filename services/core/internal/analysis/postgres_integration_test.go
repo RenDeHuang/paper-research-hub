@@ -31,11 +31,12 @@ const (
 )
 
 type analysisTrendFixture struct {
-	pool             *pgxpool.Pool
-	asOf             time.Time
-	jcrReceiptID     uuid.UUID
-	acceptedWorkIDs  []uuid.UUID
-	unassessedWorkID uuid.UUID
+	pool                *pgxpool.Pool
+	asOf                time.Time
+	jcrReceiptID        uuid.UUID
+	acceptedWorkIDs     []uuid.UUID
+	rejectedVenueWorkID uuid.UUID
+	unassessedWorkID    uuid.UUID
 }
 
 type analysisTrendWorkRow struct {
@@ -173,7 +174,9 @@ func openAnalysisTrendFixture(t *testing.T) analysisTrendFixture {
 		fixture.jcrReceiptID,
 		fixture.asOf,
 	)
-	fixture.acceptedWorkIDs, fixture.unassessedWorkID =
+	fixture.acceptedWorkIDs,
+		fixture.rejectedVenueWorkID,
+		fixture.unassessedWorkID =
 		insertAnalysisTrendWorks(t, fixture, venueIDs)
 	return fixture
 }
@@ -200,6 +203,12 @@ func insertAnalysisTrendVenues(
 			issnL: "9876-5434",
 			issn:  "9876-5434",
 			eissn: "1357-2466",
+		},
+		{
+			title: "Analysis Trend Journal Q2 High JIF",
+			issnL: "2468-1350",
+			issn:  "2468-1350",
+			eissn: "8642-9752",
 		},
 	}
 	result := make([]uuid.UUID, 0, len(rows))
@@ -292,7 +301,8 @@ func importAnalysisTrendJCR(
 	}
 	jcrCSV := "title,issn_l,issn,eissn,edition_year,metric_year,category,jif,jif_rank,category_journal_count,jif_percentile,quartile,status,source\n" +
 		"Analysis Trend Journal A,1234-5679,1234-5679,2049-3630,2026,2025,Oncology,12,1,100,99,Q1,known,authorized-jcr-trend-test\n" +
-		"Analysis Trend Journal B,9876-5434,9876-5434,1357-2466,2026,2025,Oncology,12,1,100,99,Q1,known,authorized-jcr-trend-test\n"
+		"Analysis Trend Journal B,9876-5434,9876-5434,1357-2466,2026,2025,Oncology,12,1,100,99,Q1,known,authorized-jcr-trend-test\n" +
+		"Analysis Trend Journal Q2 High JIF,2468-1350,2468-1350,8642-9752,2026,2025,Oncology,20,30,100,70,Q2,known,authorized-jcr-trend-test\n"
 	receipt, err := importer.Import(
 		t.Context(),
 		strings.NewReader(jcrCSV),
@@ -338,9 +348,10 @@ func assertAnalysisTrendVenuePolicy(
 	if err != nil {
 		t.Fatalf("Assess(analysis trend Venues) error = %v", err)
 	}
-	if summary.Total != 2 || summary.Accepted != 2 {
+	if summary.Total != 3 || summary.Accepted != 2 ||
+		summary.Rejected != 1 {
 		t.Fatalf(
-			"Venue policy summary = %#v, want two JCR Q1 accepts",
+			"Venue policy summary = %#v, want two Q1 accepts and one Q2 rejection",
 			summary,
 		)
 	}
@@ -350,10 +361,10 @@ func insertAnalysisTrendWorks(
 	t *testing.T,
 	fixture analysisTrendFixture,
 	venueIDs []uuid.UUID,
-) ([]uuid.UUID, uuid.UUID) {
+) ([]uuid.UUID, uuid.UUID, uuid.UUID) {
 	t.Helper()
-	if len(venueIDs) != 2 {
-		t.Fatalf("analysis trend Venue count = %d, want 2", len(venueIDs))
+	if len(venueIDs) != 3 {
+		t.Fatalf("analysis trend Venue count = %d, want 3", len(venueIDs))
 	}
 	var cohortMethodID, caseControlMethodID, institutionID uuid.UUID
 	if err := fixture.pool.QueryRow(t.Context(), `
@@ -460,18 +471,52 @@ func insertAnalysisTrendWorks(
 		accepted = append(accepted, workID)
 	}
 
-	unassessed := insertAnalysisTrendWork(
+	rejectedVenueWorkID := insertAnalysisTrendWork(
 		t,
 		fixture.pool,
 		institutionID,
 		len(rows)+1,
+		analysisTrendWorkRow{
+			venueID:     venueIDs[2],
+			methodID:    cohortMethodID,
+			publishedAt: fixture.asOf.Add(-12 * time.Hour),
+		},
+	)
+	rejectedVenueEligibility, err := service.Assess(
+		t.Context(),
+		biomed.PublicEligibilityInput{
+			WorkID: rejectedVenueWorkID.String(),
+			PolicyVersion: biomed.
+				BiomedicalPublicEligibilityPolicyVersion,
+			MetricYear:        analysisTrendMetricYear,
+			SubjectVersionKey: analysisTrendSubjectVersion,
+			AssessedAt:        fixture.asOf.Add(-30 * time.Minute),
+		},
+	)
+	if err != nil {
+		t.Fatalf("Assess(Q2 high-JIF Work) error = %v", err)
+	}
+	if rejectedVenueEligibility.Decision !=
+		biomed.PublicEligibilityDecisionAccepted {
+		t.Fatalf(
+			"Q2 high-JIF Work eligibility = %q, want accepted Subject eligibility",
+			rejectedVenueEligibility.Decision,
+		)
+	}
+	accepted = append(accepted, rejectedVenueWorkID)
+
+	unassessed := insertAnalysisTrendWork(
+		t,
+		fixture.pool,
+		institutionID,
+		len(rows)+2,
 		analysisTrendWorkRow{
 			venueID:     venueIDs[0],
 			methodID:    cohortMethodID,
 			publishedAt: fixture.asOf.Add(-12 * time.Hour),
 		},
 	)
-	return accepted, unassessed
+	return accepted, rejectedVenueWorkID, unassessed
 }
 
 func insertAnalysisTrendWork(
@@ -623,6 +668,32 @@ func assertTrendAcceptedCohort(
 			"unassessed Work %s has %d eligibility decisions",
 			fixture.unassessedWorkID,
 			unassessedCount,
+		)
+	}
+	var rejectedVenueDecision string
+	if err := fixture.pool.QueryRow(t.Context(), `
+		SELECT assessment.decision
+		FROM works AS work
+		JOIN venue_policy_versions AS policy
+		  ON policy.policy_name = $2
+		 AND policy.version_number = $3
+		JOIN venue_policy_assessments AS assessment
+		  ON assessment.venue_id = work.venue_id
+		 AND assessment.policy_version_id = policy.id
+		 AND assessment.metric_year = $4
+		WHERE work.id = $1
+	`,
+		fixture.rejectedVenueWorkID,
+		venue.JournalAllQ1PolicyName,
+		venue.JournalAllQ1PolicyRevision,
+		analysisTrendMetricYear,
+	).Scan(&rejectedVenueDecision); err != nil {
+		t.Fatalf("query Q2 high-JIF Venue assessment: %v", err)
+	}
+	if rejectedVenueDecision != "rejected" {
+		t.Fatalf(
+			"Q2 high-JIF Venue assessment = %q, want rejected",
+			rejectedVenueDecision,
 		)
 	}
 

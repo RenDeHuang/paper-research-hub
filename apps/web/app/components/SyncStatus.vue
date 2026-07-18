@@ -32,7 +32,7 @@ const items = computed(() => [
   { label: "时区", value: props.calendarTimezone },
   {
     label: "收录范围",
-    value: `JCR ${props.jcrMetricYear} · Q1 / JIF ≥ 10`,
+    value: `JCR ${props.jcrMetricYear} · 全部 Q1`,
   },
 ])
 </script>

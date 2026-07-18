@@ -354,6 +354,24 @@ func TestValidatePublishInputRequiresExplicitBiomedicalEligibilityPolicyVersion(
 	}
 }
 
+func TestValidatePublishInputRequiresCurrentAllQ1VenuePolicy(t *testing.T) {
+	t.Parallel()
+
+	input := catalogCurationInput()
+	input.VenuePolicyName = "journal-jif-or-q1"
+	if err := validatePublishInput(input); err == nil ||
+		!strings.Contains(err.Error(), "journal-all-q1") {
+		t.Fatalf("validatePublishInput(legacy Venue policy) error = %v", err)
+	}
+
+	input = catalogCurationInput()
+	input.VenuePolicyVersion = 1
+	if err := validatePublishInput(input); err == nil ||
+		!strings.Contains(err.Error(), "version 2") {
+		t.Fatalf("validatePublishInput(legacy Venue policy version) error = %v", err)
+	}
+}
+
 func TestValidatePublishInputRequiresExplicitCitationSource(t *testing.T) {
 	t.Parallel()
 

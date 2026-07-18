@@ -99,7 +99,7 @@ describe("DiscoveryRail", () => {
           state: "known",
         },
         quickFilters: {
-          items: [{ label: "JIF ≥ 10", to: "/papers?jif_min=10" }],
+          items: [{ label: "JCR Q1", to: "/papers?jcr_quartile=Q1" }],
           state: "known",
         },
         savedViews: {
@@ -129,7 +129,7 @@ describe("DiscoveryRail", () => {
       "保存视图",
     ])
     expect(wrapper.findAll("a > span").map((label) => label.text())).toEqual([
-      "JIF ≥ 10",
+      "JCR Q1",
       "肿瘤学",
       "Nature Medicine",
       "我的高影响力视图",
@@ -203,7 +203,7 @@ describe("SyncStatus", () => {
       "2026-07-17",
       "2026-07-17 08:30 UTC",
       "UTC",
-      "JCR 2025 · Q1 / JIF ≥ 10",
+      "JCR 2025 · 全部 Q1",
     ])
   })
 })
@@ -350,7 +350,8 @@ describe("AppFooter", () => {
     expect(wrapper.get(".app-footer__brand").text()).toBe("medpaperhub")
     expect(wrapper.text()).not.toContain("Paper Research Hub")
     expect(wrapper.text()).toContain("医学与生物学")
-    expect(wrapper.text()).toContain("JCR Q1 或 JIF ≥ 10")
+    expect(wrapper.text()).toContain("全部 JCR Q1")
+    expect(wrapper.text()).not.toContain("JIF ≥ 10")
     expect(wrapper.find("a").exists()).toBe(false)
     expect(wrapper.text()).not.toContain("研究机会")
   })

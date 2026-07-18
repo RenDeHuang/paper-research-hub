@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venue"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -20,12 +21,15 @@ import (
 )
 
 const (
-	CitationIntelligenceAnalysisType   = "citation_intelligence"
-	CitationIntelligenceFormulaVersion = "citation-intelligence/v1"
-	citationAnalysisModelProvider      = "internal"
-	citationAnalysisModelName          = "deterministic"
-	citationVenuePolicyName            = "journal-all-q1"
-	citationVenuePolicyVersion         = 2
+	CitationIntelligenceAnalysisType       = "citation_intelligence"
+	CitationIntelligenceFormulaVersion     = "citation-intelligence/v1"
+	citationAnalysisModelProvider          = "internal"
+	citationAnalysisModelName              = "deterministic"
+	citationAcceptedJournalMetricPredicate = `
+		metric.metric_status = 'known'
+		AND metric.registry_version = 'jcr-registry/v2'
+		AND metric.quartile = 'Q1'
+	`
 )
 
 type AnalysisInput struct {
@@ -261,8 +265,8 @@ func (service *PostgresAnalysisService) Analyze(
 	scope := citationScopePayload{
 		JCRMetricYear:            input.JCRMetricYear,
 		JCRImportReceipt:         input.JCRImportReceipt,
-		VenuePolicyName:          citationVenuePolicyName,
-		VenuePolicyVersion:       citationVenuePolicyVersion,
+		VenuePolicyName:          venue.JournalAllQ1PolicyName,
+		VenuePolicyVersion:       venue.JournalAllQ1PolicyRevision,
 		EligibilityPolicyVersion: input.EligibilityPolicyVersion,
 		SubjectVersion:           input.SubjectVersion,
 		SubjectVersionID:         subjectVersionID,
@@ -424,8 +428,8 @@ func insertRunningAnalysis(
 		EligibilityPolicyVersion: input.EligibilityPolicyVersion,
 		JCRMetricYear:            input.JCRMetricYear,
 		JCRImportReceipt:         input.JCRImportReceipt,
-		VenuePolicyName:          citationVenuePolicyName,
-		VenuePolicyVersion:       citationVenuePolicyVersion,
+		VenuePolicyName:          venue.JournalAllQ1PolicyName,
+		VenuePolicyVersion:       venue.JournalAllQ1PolicyRevision,
 	}
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
@@ -508,11 +512,7 @@ func loadAnalysisWorks(
 				WHERE receipt_metric.import_receipt_id = $1
 				  AND metric.venue_id = venue.id
 				  AND metric.metric_year = $5
-				  AND metric.metric_status = 'known'
-				  AND (
-						metric.quartile = 'Q1'
-						OR metric.jif >= 10
-				  )
+				  AND `+citationAcceptedJournalMetricPredicate+`
 		  )
 		  AND EXISTS (
 				SELECT 1
@@ -539,8 +539,8 @@ func loadAnalysisWorks(
 		input.SubjectVersion,
 		input.EligibilityPolicyVersion,
 		input.JCRMetricYear,
-		citationVenuePolicyName,
-		citationVenuePolicyVersion,
+		venue.JournalAllQ1PolicyName,
+		venue.JournalAllQ1PolicyRevision,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query citation analysis Works: %w", err)

@@ -138,6 +138,51 @@ func TestParseCatalogPublishRequiresExactEligibilityPolicyVersion(t *testing.T) 
 	}
 }
 
+func TestParseCatalogPublishRequiresCurrentAllQ1VenuePolicy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		flag  string
+		value string
+		want  string
+	}{
+		{
+			name:  "legacy policy name",
+			flag:  "--venue-policy-name",
+			value: "journal-jif-or-q1",
+			want:  "journal-all-q1",
+		},
+		{
+			name:  "legacy policy version",
+			flag:  "--venue-policy-version",
+			value: "1",
+			want:  "version 2",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			args := replaceCatalogPublishFlag(
+				catalogPublishCommandArgs(),
+				test.flag,
+				test.value,
+			)
+			_, _, err := parseWorkerCommand(args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"parseWorkerCommand() error = %v, want containing %q",
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
 func TestRealMainParsesCatalogBiomedicalCurationInputs(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	var received workerCommand
