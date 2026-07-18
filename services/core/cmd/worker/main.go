@@ -900,10 +900,10 @@ func parseVenueAssessmentCommand(args []string) (workerCommand, error) {
 			"Venue assessment requires --metric-year between 1900 and 3000",
 		)
 	}
-	if command.PolicyVersion != venue.JournalJIFOrQ1PolicyVersion {
+	if command.PolicyVersion != venue.JournalAllQ1PolicyVersion {
 		return workerCommand{}, fmt.Errorf(
 			"Venue assessment --policy-version must equal %s",
-			venue.JournalJIFOrQ1PolicyVersion,
+			venue.JournalAllQ1PolicyVersion,
 		)
 	}
 	if assessedAt == "" {

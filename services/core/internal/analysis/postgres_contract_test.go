@@ -168,8 +168,8 @@ func TestOpportunityAnalysisInputRequiresExactRunsAndScope(t *testing.T) {
 		JCRImportReceipt: uuid.MustParse(
 			"00000000-0000-0000-0000-000000000501",
 		),
-		VenuePolicyName:    "journal-jif-or-q1",
-		VenuePolicyVersion: 1,
+		VenuePolicyName:    "journal-all-q1",
+		VenuePolicyVersion: 2,
 		CitationAnalysisRunID: uuid.MustParse(
 			"00000000-0000-0000-0000-000000000701",
 		),
@@ -251,8 +251,8 @@ func TestValidateOpportunityUpstreamRunsRequiresExactScopeAndCohort(
 		JCRImportReceipt: uuid.MustParse(
 			"00000000-0000-0000-0000-000000000501",
 		),
-		VenuePolicyName:    "journal-jif-or-q1",
-		VenuePolicyVersion: 1,
+		VenuePolicyName:    "journal-all-q1",
+		VenuePolicyVersion: 2,
 		CitationAnalysisRunID: uuid.MustParse(
 			"00000000-0000-0000-0000-000000000701",
 		),

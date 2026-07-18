@@ -200,8 +200,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 18 {
-		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
+	if len(migrations) != 19 {
+		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -289,6 +289,13 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 		t.Fatalf(
 			"eighteenth migration = %#v, want 000018_publication_event_assertions",
 			migrations[17],
+		)
+	}
+	if migrations[18].Version != 19 ||
+		migrations[18].Name != "jcr_registry_v2" {
+		t.Fatalf(
+			"nineteenth migration = %#v, want 000019_jcr_registry_v2",
+			migrations[18],
 		)
 	}
 }
@@ -2628,8 +2635,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 18 {
-		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
+	if len(migrations) != 19 {
+		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -4050,8 +4057,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 18 {
-		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
+	if len(migrations) != 19 {
+		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -5870,8 +5877,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 18 {
-		t.Fatalf("embedded migration count = %d, want 18", len(migrations))
+	if len(migrations) != 19 {
+		t.Fatalf("embedded migration count = %d, want 19", len(migrations))
 	}
 
 	pool := openTestPool(t)

@@ -1638,7 +1638,7 @@ func TestPublisherRejectsForgedAcceptedAssessmentBelowJCRAdmissionThreshold(
 		input,
 	)
 	if !errors.Is(err, ErrCatalogNotReady) ||
-		!strings.Contains(err.Error(), "does not satisfy JCR Q1 OR JIF >= 10") {
+		!strings.Contains(err.Error(), "does not satisfy JCR Q1") {
 		t.Fatalf(
 			"PublishCurrent(forged accepted assessment) error = %v, want exact JCR admission rejection",
 			err,
@@ -1697,10 +1697,10 @@ func TestPublisherRejectsAcceptedAssessmentWhoseEvidenceDiffersFromExactReceipt(
 		input.VenuePolicyVersion,
 		input.JCRMetricYear,
 		"accepted",
-		`["jif_gte_10","jcr_q1"]`,
+		`["jcr_q1"]`,
 		fmt.Sprintf(`{
 			"jcr_import_receipt_id":%q,
-			"policy_version":"journal-jif-or-q1/v1",
+			"policy_version":"journal-all-q1/v2",
 			"metric_year":%d,
 			"venue_type":"journal",
 			"categories":[{

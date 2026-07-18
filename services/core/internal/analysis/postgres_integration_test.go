@@ -25,8 +25,8 @@ const (
 	analysisTrendPostgresDatabase = "analysis_trend_test"
 
 	analysisTrendSubjectVersion = "biomedical-jcr-subjects/v1"
-	analysisTrendPolicyName     = "journal-jif-or-q1"
-	analysisTrendPolicyVersion  = 1
+	analysisTrendPolicyName     = "journal-all-q1"
+	analysisTrendPolicyVersion  = 2
 	analysisTrendMetricYear     = 2025
 )
 
@@ -290,9 +290,9 @@ func importAnalysisTrendJCR(
 	if err != nil {
 		t.Fatalf("NewJCRImporter() error = %v", err)
 	}
-	jcrCSV := "title,issn_l,issn,eissn,metric_year,category,jif,quartile,status,source\n" +
-		"Analysis Trend Journal A,1234-5679,1234-5679,2049-3630,2025,Oncology,12,Q1,known,authorized-jcr-trend-test\n" +
-		"Analysis Trend Journal B,9876-5434,9876-5434,1357-2466,2025,Oncology,12,Q1,known,authorized-jcr-trend-test\n"
+	jcrCSV := "title,issn_l,issn,eissn,edition_year,metric_year,category,jif,jif_rank,category_journal_count,jif_percentile,quartile,status,source\n" +
+		"Analysis Trend Journal A,1234-5679,1234-5679,2049-3630,2026,2025,Oncology,12,1,100,99,Q1,known,authorized-jcr-trend-test\n" +
+		"Analysis Trend Journal B,9876-5434,9876-5434,1357-2466,2026,2025,Oncology,12,1,100,99,Q1,known,authorized-jcr-trend-test\n"
 	receipt, err := importer.Import(
 		t.Context(),
 		strings.NewReader(jcrCSV),
@@ -331,7 +331,7 @@ func assertAnalysisTrendVenuePolicy(
 		venue.AssessmentInput{
 			JCRImportReceiptID: receiptID.String(),
 			MetricYear:         analysisTrendMetricYear,
-			PolicyVersion:      venue.JournalJIFOrQ1PolicyVersion,
+			PolicyVersion:      venue.JournalAllQ1PolicyVersion,
 			AssessedAt:         asOf.Add(-2 * time.Hour),
 		},
 	)
@@ -340,7 +340,7 @@ func assertAnalysisTrendVenuePolicy(
 	}
 	if summary.Total != 2 || summary.Accepted != 2 {
 		t.Fatalf(
-			"Venue policy summary = %#v, want two JCR Q1/JIF>=10 accepts",
+			"Venue policy summary = %#v, want two JCR Q1 accepts",
 			summary,
 		)
 	}

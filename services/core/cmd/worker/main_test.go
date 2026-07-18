@@ -102,9 +102,9 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 			"--jcr-metric-year",
 			"2025",
 			"--venue-policy-name",
-			"journal-jif-or-q1",
+			"journal-all-q1",
 			"--venue-policy-version",
-			"1",
+			"2",
 			"--eligibility-policy-version",
 			"biomedical-public-eligibility/v1",
 			"--subject-version",
@@ -152,8 +152,8 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 		t.Fatalf("GeneratedAt = %s, want %s", received.GeneratedAt, generatedAt)
 	}
 	if received.MetricYear != 2025 ||
-		received.VenuePolicyName != "journal-jif-or-q1" ||
-		received.VenuePolicyVersion != 1 ||
+		received.VenuePolicyName != "journal-all-q1" ||
+		received.VenuePolicyVersion != 2 ||
 		received.EligibilityPolicyVersion !=
 			"biomedical-public-eligibility/v1" ||
 		received.SubjectVersion != "biomedical-jcr-subjects/v1" ||

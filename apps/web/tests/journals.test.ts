@@ -66,7 +66,7 @@ const journal = {
         value: "45.3",
       },
     ],
-    matched_rules: ["jcr_q1", "jif_gte_10"],
+    matched_rules: ["jcr_q1"],
     metric_year: 2025,
     policy_name: "biomedical-journal-admission",
     policy_version: 3,

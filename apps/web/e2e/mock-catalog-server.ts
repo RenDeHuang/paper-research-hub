@@ -80,7 +80,7 @@ const jcrAssessment = known({
         venue_metric_snapshot_id: venueMetricSnapshotID,
       },
     ],
-    policy_version: "journal-jif-or-q1/v1",
+    policy_version: "journal-all-q1/v2",
     subject_version_id: subjectVersionID,
     subject_version_key: "jcr-biomedical-2025-v1",
     venue: {
@@ -90,7 +90,7 @@ const jcrAssessment = known({
   },
   id: eligibilityRevisionID,
   metric_year: 2025,
-  policy_version: "journal-jif-or-q1/v1",
+  policy_version: "journal-all-q1/v2",
   subject_version_id: subjectVersionID,
   subject_version_key: "jcr-biomedical-2025-v1",
 })

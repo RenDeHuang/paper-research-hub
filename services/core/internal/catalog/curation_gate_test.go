@@ -606,8 +606,8 @@ func catalogCurationInputAt(generatedAt time.Time) PublishInput {
 		FormulaVersion:           "public-catalog/biomedical-v1",
 		GeneratedAt:              generatedAt,
 		JCRMetricYear:            2025,
-		VenuePolicyName:          "journal-jif-or-q1",
-		VenuePolicyVersion:       1,
+		VenuePolicyName:          "journal-all-q1",
+		VenuePolicyVersion:       2,
 		EligibilityPolicyVersion: biomed.BiomedicalPublicEligibilityPolicyVersion,
 		SubjectVersion:           "biomedical-jcr-subjects/v1",
 		JCRImportReceipt:         uuid.MustParse("00000000-0000-0000-0000-000000000501"),
@@ -1458,7 +1458,12 @@ func insertCatalogJCRBundle(
 				venue_id,
 				metric_year,
 				category,
+				registry_version,
+				edition_year,
 				jif,
+				jif_rank,
+				category_journal_count,
+				jif_percentile,
 				quartile,
 				metric_status,
 				source_name,
@@ -1470,7 +1475,12 @@ func insertCatalogJCRBundle(
 				$2,
 				$3,
 				$4,
+				'jcr-registry/v2',
+				2026,
 				$5::numeric,
+				1,
+				100,
+				99,
 				$6,
 				'known',
 				'authorized-jcr',
@@ -1543,7 +1553,7 @@ func assessCatalogVenuePolicy(
 		venue.AssessmentInput{
 			JCRImportReceiptID: input.JCRImportReceipt.String(),
 			MetricYear:         input.JCRMetricYear,
-			PolicyVersion:      venue.JournalJIFOrQ1PolicyVersion,
+			PolicyVersion:      venue.JournalAllQ1PolicyVersion,
 			AssessedAt:         input.GeneratedAt.Add(-time.Hour),
 		},
 	)
@@ -1569,7 +1579,7 @@ func insertCatalogVenueAssessment(
 	matchedRules := `[]`
 	reason := `"no_policy_rule_matched"`
 	if decision == "accepted" {
-		matchedRules = `["jif_gte_10","jcr_q1"]`
+		matchedRules = `["jcr_q1"]`
 		reason = `null`
 	}
 	if decision == "unknown" {
@@ -1585,7 +1595,18 @@ func insertCatalogVenueAssessment(
 			"metric_year":%d,
 			"venue_type":%q,
 			"reason":%s,
-			"categories":[{"category":"Oncology","jif":"12","quartile":"Q1","status":"known","source_name":"authorized-jcr"}]
+			"categories":[{
+				"category":"Oncology",
+				"registry_version":"jcr-registry/v2",
+				"edition_year":2026,
+				"jif":"12",
+				"jif_rank":1,
+				"category_journal_count":100,
+				"jif_percentile":"99",
+				"quartile":"Q1",
+				"status":"known",
+				"source_name":"authorized-jcr"
+			}]
 		}`,
 		input.JCRImportReceipt.String(),
 		fmt.Sprintf("%s/v%d", policyName, policyVersion),

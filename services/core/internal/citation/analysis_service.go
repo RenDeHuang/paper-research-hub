@@ -24,8 +24,8 @@ const (
 	CitationIntelligenceFormulaVersion = "citation-intelligence/v1"
 	citationAnalysisModelProvider      = "internal"
 	citationAnalysisModelName          = "deterministic"
-	citationVenuePolicyName            = "journal-jif-or-q1"
-	citationVenuePolicyVersion         = 1
+	citationVenuePolicyName            = "journal-all-q1"
+	citationVenuePolicyVersion         = 2
 )
 
 type AnalysisInput struct {

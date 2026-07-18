@@ -384,11 +384,16 @@ type curationRevisionFact struct {
 }
 
 type jcrAssessmentCategoryEvidence struct {
-	Category   string  `json:"category"`
-	JIF        *string `json:"jif"`
-	Quartile   string  `json:"quartile,omitempty"`
-	Status     string  `json:"status"`
-	SourceName string  `json:"source_name"`
+	Category             string  `json:"category"`
+	RegistryVersion      string  `json:"registry_version"`
+	EditionYear          *int    `json:"edition_year"`
+	JIF                  *string `json:"jif"`
+	JIFRank              *int    `json:"jif_rank"`
+	CategoryJournalCount *int    `json:"category_journal_count"`
+	JIFPercentile        *string `json:"jif_percentile"`
+	Quartile             string  `json:"quartile,omitempty"`
+	Status               string  `json:"status"`
+	SourceName           string  `json:"source_name"`
 }
 
 type jcrAssessmentEvidence struct {
@@ -4173,16 +4178,13 @@ func validateExactJCRAdmission(
 	input PublishInput,
 	venueID uuid.UUID,
 ) error {
-	var matchedQ1, matchedJIF bool
+	var matchedQ1 bool
 	if err := tx.QueryRow(ctx, `
 		SELECT
 			COALESCE(bool_or(
 				metric.metric_status = 'known'
+				AND metric.registry_version = 'jcr-registry/v2'
 				AND metric.quartile = 'Q1'
-			), false),
-			COALESCE(bool_or(
-				metric.metric_status = 'known'
-				AND metric.jif >= 10
 			), false)
 		FROM jcr_import_receipt_metrics AS receipt_metric
 		JOIN venue_metric_snapshots AS metric
@@ -4194,16 +4196,16 @@ func validateExactJCRAdmission(
 		input.JCRImportReceipt,
 		venueID,
 		input.JCRMetricYear,
-	).Scan(&matchedQ1, &matchedJIF); err != nil {
+	).Scan(&matchedQ1); err != nil {
 		return fmt.Errorf(
 			"validate Journal %s exact JCR admission evidence: %w",
 			venueID,
 			err,
 		)
 	}
-	if !matchedQ1 && !matchedJIF {
+	if !matchedQ1 {
 		return fmt.Errorf(
-			"%w: Journal %s does not satisfy JCR Q1 OR JIF >= 10 in receipt %s for metric year %d",
+			"%w: Journal %s does not satisfy JCR Q1 in receipt %s for metric year %d",
 			ErrCatalogNotReady,
 			venueID,
 			input.JCRImportReceipt,
@@ -4223,12 +4225,18 @@ func validateExactJCRAssessmentEvidence(
 	rows, err := tx.Query(ctx, `
 		SELECT
 			metric.category,
+			metric.registry_version,
+			metric.edition_year,
 			metric.jif::text,
+			metric.jif_rank,
+			metric.category_journal_count,
+			metric.jif_percentile::text,
 			COALESCE(metric.quartile, ''),
 			metric.metric_status,
 			metric.source_name,
-			metric.metric_status = 'known' AND metric.jif >= 10,
-			metric.metric_status = 'known' AND metric.quartile = 'Q1'
+			metric.metric_status = 'known'
+				AND metric.registry_version = 'jcr-registry/v2'
+				AND metric.quartile = 'Q1'
 		FROM jcr_import_receipt_metrics AS receipt_metric
 		JOIN venue_metric_snapshots AS metric
 		  ON metric.id = receipt_metric.metric_snapshot_id
@@ -4247,21 +4255,23 @@ func validateExactJCRAssessmentEvidence(
 	defer rows.Close()
 
 	expectedCategories := make([]jcrAssessmentCategoryEvidence, 0)
-	matchedJIF := false
 	matchedQ1 := false
 	for rows.Next() {
 		var (
-			category      jcrAssessmentCategoryEvidence
-			rowMatchedJIF bool
-			rowMatchedQ1  bool
+			category     jcrAssessmentCategoryEvidence
+			rowMatchedQ1 bool
 		)
 		if err := rows.Scan(
 			&category.Category,
+			&category.RegistryVersion,
+			&category.EditionYear,
 			&category.JIF,
+			&category.JIFRank,
+			&category.CategoryJournalCount,
+			&category.JIFPercentile,
 			&category.Quartile,
 			&category.Status,
 			&category.SourceName,
-			&rowMatchedJIF,
 			&rowMatchedQ1,
 		); err != nil {
 			return fmt.Errorf(
@@ -4271,7 +4281,6 @@ func validateExactJCRAssessmentEvidence(
 			)
 		}
 		expectedCategories = append(expectedCategories, category)
-		matchedJIF = matchedJIF || rowMatchedJIF
 		matchedQ1 = matchedQ1 || rowMatchedQ1
 	}
 	if err := rows.Err(); err != nil {
@@ -4282,10 +4291,7 @@ func validateExactJCRAssessmentEvidence(
 		)
 	}
 
-	expectedRules := make([]string, 0, 2)
-	if matchedJIF {
-		expectedRules = append(expectedRules, "jif_gte_10")
-	}
+	expectedRules := make([]string, 0, 1)
 	if matchedQ1 {
 		expectedRules = append(expectedRules, "jcr_q1")
 	}
@@ -4355,14 +4361,32 @@ func equalJCRAssessmentCategories(
 	}
 	for index := range left {
 		if left[index].Category != right[index].Category ||
+			left[index].RegistryVersion != right[index].RegistryVersion ||
+			!equalOptionalInt(left[index].EditionYear, right[index].EditionYear) ||
 			left[index].Quartile != right[index].Quartile ||
 			left[index].Status != right[index].Status ||
 			left[index].SourceName != right[index].SourceName ||
-			!equalOptionalString(left[index].JIF, right[index].JIF) {
+			!equalOptionalString(left[index].JIF, right[index].JIF) ||
+			!equalOptionalInt(left[index].JIFRank, right[index].JIFRank) ||
+			!equalOptionalInt(
+				left[index].CategoryJournalCount,
+				right[index].CategoryJournalCount,
+			) ||
+			!equalOptionalString(
+				left[index].JIFPercentile,
+				right[index].JIFPercentile,
+			) {
 			return false
 		}
 	}
 	return true
+}
+
+func equalOptionalInt(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func sourceNames(states []sourceState) []string {

@@ -22,7 +22,7 @@ func TestParseWorkerCommandRequiresExplicitVenueAssessmentInputs(t *testing.T) {
 			name: "missing metric year",
 			args: []string{
 				"assess", "venues",
-				"--policy-version", "journal-jif-or-q1/v1",
+				"--policy-version", "journal-all-q1/v2",
 				"--assessed-at", "2026-07-17T09:00:00Z",
 				"--jcr-receipt", "00000000-0000-0000-0000-000000000501",
 			},
@@ -33,18 +33,18 @@ func TestParseWorkerCommandRequiresExplicitVenueAssessmentInputs(t *testing.T) {
 			args: []string{
 				"assess", "venues",
 				"--metric-year", "2025",
-				"--policy-version", "journal-jif-or-q1/v2",
+				"--policy-version", "journal-all-q1/v1",
 				"--assessed-at", "2026-07-17T09:00:00Z",
 				"--jcr-receipt", "00000000-0000-0000-0000-000000000501",
 			},
-			want: "journal-jif-or-q1/v1",
+			want: "journal-all-q1/v2",
 		},
 		{
 			name: "missing assessed at",
 			args: []string{
 				"assess", "venues",
 				"--metric-year", "2025",
-				"--policy-version", "journal-jif-or-q1/v1",
+				"--policy-version", "journal-all-q1/v2",
 				"--jcr-receipt", "00000000-0000-0000-0000-000000000501",
 			},
 			want: "--assessed-at",
@@ -54,7 +54,7 @@ func TestParseWorkerCommandRequiresExplicitVenueAssessmentInputs(t *testing.T) {
 			args: []string{
 				"assess", "venues",
 				"--metric-year", "2025",
-				"--policy-version", "journal-jif-or-q1/v1",
+				"--policy-version", "journal-all-q1/v2",
 				"--assessed-at", "2026-07-17",
 				"--jcr-receipt", "00000000-0000-0000-0000-000000000501",
 			},
@@ -65,7 +65,7 @@ func TestParseWorkerCommandRequiresExplicitVenueAssessmentInputs(t *testing.T) {
 			args: []string{
 				"assess", "venues",
 				"--metric-year", "2025",
-				"--policy-version", "journal-jif-or-q1/v1",
+				"--policy-version", "journal-all-q1/v2",
 				"--assessed-at", "2026-07-17T09:00:00Z",
 			},
 			want: "--jcr-receipt",
@@ -100,7 +100,7 @@ func TestRealMainParsesVenueAssessmentCommand(t *testing.T) {
 			"--metric-year",
 			"2025",
 			"--policy-version",
-			"journal-jif-or-q1/v1",
+			"journal-all-q1/v2",
 			"--assessed-at",
 			"2026-07-17T09:00:00.123456789Z",
 			"--jcr-receipt",
@@ -133,7 +133,7 @@ func TestRealMainParsesVenueAssessmentCommand(t *testing.T) {
 	}
 	if received.Kind != commandAssessVenues ||
 		received.MetricYear != 2025 ||
-		received.PolicyVersion != "journal-jif-or-q1/v1" ||
+		received.PolicyVersion != "journal-all-q1/v2" ||
 		received.JCRReceipt != "00000000-0000-0000-0000-000000000501" ||
 		!received.AssessedAt.Equal(
 			time.Date(2026, time.July, 17, 9, 0, 0, 123456789, time.UTC),

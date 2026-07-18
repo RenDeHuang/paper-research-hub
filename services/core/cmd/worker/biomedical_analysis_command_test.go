@@ -68,8 +68,8 @@ func TestParseBiomedicalAnalysisCommandsRequireExactScope(t *testing.T) {
 				command.MetricYear != 2025 ||
 				command.JCRReceipt !=
 					"00000000-0000-0000-0000-000000000501" ||
-				command.VenuePolicyName != "journal-jif-or-q1" ||
-				command.VenuePolicyVersion != 1 {
+				command.VenuePolicyName != "journal-all-q1" ||
+				command.VenuePolicyVersion != 2 {
 				t.Fatalf("parsed biomedical analysis command = %#v", command)
 			}
 		})
@@ -143,8 +143,8 @@ func TestBiomedicalAnalysisInputMappingPreservesExactScope(t *testing.T) {
 	}
 	trend := trendAnalysisInput(trendCommand)
 	if trend.FormulaVersion != analysis.PublicationTrendFormulaVersion ||
-		trend.VenuePolicyName != "journal-jif-or-q1" ||
-		trend.VenuePolicyVersion != 1 ||
+		trend.VenuePolicyName != "journal-all-q1" ||
+		trend.VenuePolicyVersion != 2 ||
 		trend.MinimumPaperCount != 20 ||
 		trend.MinimumIndependentJournalCount != 3 ||
 		trend.MinimumIndependentTeamCount != 3 {
@@ -159,8 +159,8 @@ func TestBiomedicalAnalysisInputMappingPreservesExactScope(t *testing.T) {
 	}
 	journal := journalAnalysisInput(journalCommand)
 	if journal.FormulaVersion != analysis.JournalPatternFormulaVersion ||
-		journal.VenuePolicyName != "journal-jif-or-q1" ||
-		journal.VenuePolicyVersion != 1 ||
+		journal.VenuePolicyName != "journal-all-q1" ||
+		journal.VenuePolicyVersion != 2 ||
 		journal.WindowDays != 364 ||
 		journal.MinimumSupportCount != 10 ||
 		journal.MinimumFieldBaselineCount != 40 {
@@ -176,8 +176,8 @@ func TestBiomedicalAnalysisInputMappingPreservesExactScope(t *testing.T) {
 	opportunity := opportunityAnalysisInput(opportunityCommand)
 	if opportunity.FormulaVersion != analysis.OpportunityFormulaVersion ||
 		opportunity.RuleSetVersion != analysis.OpportunityRuleSetVersion ||
-		opportunity.VenuePolicyName != "journal-jif-or-q1" ||
-		opportunity.VenuePolicyVersion != 1 ||
+		opportunity.VenuePolicyName != "journal-all-q1" ||
+		opportunity.VenuePolicyVersion != 2 ||
 		opportunity.CitationAnalysisRunID != uuid.MustParse(
 			"00000000-0000-0000-0000-000000000701",
 		) ||
@@ -376,8 +376,8 @@ func biomedicalAnalysisScopeArgs() []string {
 		"--jcr-import-receipt",
 		"00000000-0000-0000-0000-000000000501",
 		"--venue-policy-name",
-		"journal-jif-or-q1",
+		"journal-all-q1",
 		"--venue-policy-version",
-		"1",
+		"2",
 	}
 }

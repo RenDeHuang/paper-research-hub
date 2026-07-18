@@ -27,9 +27,9 @@ func TestParseCatalogPublishRequiresExplicitBiomedicalCurationInputs(t *testing.
 		"--jcr-metric-year",
 		"2025",
 		"--venue-policy-name",
-		"journal-jif-or-q1",
+		"journal-all-q1",
 		"--venue-policy-version",
-		"1",
+		"2",
 		"--eligibility-policy-version",
 		"biomedical-public-eligibility/v1",
 		"--subject-version",
@@ -153,9 +153,9 @@ func TestRealMainParsesCatalogBiomedicalCurationInputs(t *testing.T) {
 			"--jcr-metric-year",
 			"2025",
 			"--venue-policy-name",
-			"journal-jif-or-q1",
+			"journal-all-q1",
 			"--venue-policy-version",
-			"1",
+			"2",
 			"--eligibility-policy-version",
 			"biomedical-public-eligibility/v1",
 			"--subject-version",
@@ -190,8 +190,8 @@ func TestRealMainParsesCatalogBiomedicalCurationInputs(t *testing.T) {
 		t.Fatalf("realMain() code = %d, stderr = %s", code, stderr.String())
 	}
 	if received.MetricYear != 2025 ||
-		received.VenuePolicyName != "journal-jif-or-q1" ||
-		received.VenuePolicyVersion != 1 ||
+		received.VenuePolicyName != "journal-all-q1" ||
+		received.VenuePolicyVersion != 2 ||
 		received.EligibilityPolicyVersion !=
 			biomed.BiomedicalPublicEligibilityPolicyVersion ||
 		received.SubjectVersion != "biomedical-jcr-subjects/v1" ||
@@ -299,9 +299,9 @@ func catalogPublishCommandArgs() []string {
 		"--jcr-metric-year",
 		"2025",
 		"--venue-policy-name",
-		"journal-jif-or-q1",
+		"journal-all-q1",
 		"--venue-policy-version",
-		"1",
+		"2",
 		"--eligibility-policy-version",
 		biomed.BiomedicalPublicEligibilityPolicyVersion,
 		"--subject-version",
