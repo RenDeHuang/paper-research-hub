@@ -1673,7 +1673,7 @@ func loadLegacyPublicationStateAbsence(
 		)
 	}
 	switch normalizedSchema {
-	case "normalized-record/v1", "normalized-record/v2":
+	case "normalized-record/v2":
 		return nil, nil
 	default:
 		return nil, fmt.Errorf(

@@ -282,6 +282,38 @@ func TestPublisherRejectsV3WinnerWithoutPublicationState(t *testing.T) {
 	assertNoCatalogWrites(t, pool)
 }
 
+func TestPublisherRejectsV1WinnerWithoutPublicationState(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:                "pubmed:catalog-v1-no-publication-state",
+		logicalSource:           "pubmed",
+		canonicalKey:            "doi:10.1000/catalog-v1-no-publication-state",
+		title:                   "V1 winner without publication state",
+		paperType:               "research_article",
+		publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+		sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+		scopeStatus:             "included",
+		includeWorkLink:         true,
+		includeWorkID:           true,
+		includeNormalized:       true,
+		normalizedPayloadSchema: "normalized-record/v1",
+		noJCRAssessment:         true,
+	})
+	input := catalogCurationInput()
+	preparePublisherAcceptedCuration(t, pool, input, fixture)
+	insertPublisherBiomedicalProjection(t, pool, fixture)
+
+	_, err := mustPublisher(t, pool).PublishCurrent(context.Background(), input)
+	if !errors.Is(err, ErrCatalogNotReady) ||
+		!strings.Contains(err.Error(), "publication state") {
+		t.Fatalf(
+			"PublishCurrent(v1 winner without publication state) error = %v, want ErrCatalogNotReady",
+			err,
+		)
+	}
+	assertNoCatalogWrites(t, pool)
+}
+
 func TestPublisherPersistsBiomedicalCoverageMarkerBeforePublication(t *testing.T) {
 	pool := openCatalogTestPool(t)
 	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
