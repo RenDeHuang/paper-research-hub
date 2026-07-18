@@ -10,6 +10,13 @@ fail() {
   exit 1
 }
 
+secret_pattern='(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_(live|test)_[A-Za-z0-9]{16,}|Bearer[[:space:]]+eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})'
+
+deploy_contract_secret_value_is_forbidden() {
+  printf '%s\n' "$1" |
+    grep -E "${secret_pattern}" >/dev/null 2>&1
+}
+
 assert_fails_with() {
   label="$1"
   expected="$2"
@@ -25,6 +32,8 @@ assert_fails_with() {
 }
 
 required_files='
+Makefile
+.github/workflows/container.yml
 deploy/README.md
 deploy/compose/compose.local.yml
 deploy/env/local.env.example
@@ -79,9 +88,62 @@ grep -F 'path: ./deploy/env/.env.pipeline' \
   deploy/compose/compose.local.yml >/dev/null ||
   fail "local Compose overlay must read the ignored pipeline environment file"
 
-if grep -R -E 'sk-[A-Za-z0-9_-]{16,}' deploy >/dev/null 2>&1; then
-  fail "deploy files must not contain a real-looking API key"
+if ! command -v deploy_contract_secret_value_is_forbidden >/dev/null 2>&1; then
+  fail "secret scanner does not validate common real key and token shapes"
 fi
+
+openai_key_candidate='sk-''abcdefghijklmnopqrstuvwxyz012345'
+github_token_candidate='ghp_''abcdefghijklmnopqrstuvwxyz0123456789'
+aws_key_candidate='AKIA''ABCDEFGHIJKLMNOP'
+google_key_candidate='AIza''abcdefghijklmnopqrstuvwxyz0123456789'
+slack_token_candidate='xoxb-''123456789012-abcdefghijklmnopqrstuvwxyz'
+jwt_candidate='Bearer eyJ''hbGciOiJIUzI1NiJ9.eyJ''zdWIiOiIxMjM0NTY3ODkwIn0.signaturevalue'
+
+for forbidden_secret in \
+  "${openai_key_candidate}" \
+  "${github_token_candidate}" \
+  "${aws_key_candidate}" \
+  "${google_key_candidate}" \
+  "${slack_token_candidate}" \
+  "${jwt_candidate}"; do
+  deploy_contract_secret_value_is_forbidden "${forbidden_secret}" ||
+    fail "secret scanner accepted a common real key or token shape"
+done
+
+if deploy_contract_secret_value_is_forbidden '<replace-with-api-key>'; then
+  fail "secret scanner rejected an explicit placeholder"
+fi
+
+task_scope_files="$(
+  git ls-files -- Makefile .github/workflows/container.yml deploy
+)"
+[ -n "${task_scope_files}" ] ||
+  fail "cannot enumerate tracked Task 0 files for secret scanning"
+
+for task_scope_file in ${task_scope_files}; do
+  if grep -E "${secret_pattern}" "${task_scope_file}" >/dev/null 2>&1; then
+    fail "Task 0 file contains a common real key or token shape: ${task_scope_file}"
+  fi
+
+  case "${task_scope_file}" in
+    *example*)
+      awk '
+        {
+          line = $0
+          sub(/^[[:space:]]*#[[:space:]]*/, "", line)
+          if (line ~ /^[A-Z][A-Z0-9_]*_API_KEY=/) {
+            value = line
+            sub(/^[^=]*=/, "", value)
+            if (value !~ /^<[^<>]+>$/) {
+              exit 1
+            }
+          }
+        }
+      ' "${task_scope_file}" ||
+        fail "${task_scope_file} must assign every *_API_KEY example to a <...> placeholder"
+      ;;
+  esac
+done
 
 grep -F 'count(paper.paper_id)' deploy/sql/verify-release.sql >/dev/null ||
   fail "release SQL must count the public_catalog_papers primary-key column"
