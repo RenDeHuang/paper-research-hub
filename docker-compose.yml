@@ -14,8 +14,8 @@ x-core-service: &core-service
   environment:
     APP_ENV: ${APP_ENV:-development}
     DATABASE_URL: ${DOCKER_DATABASE_URL:-postgres://paper_hub:paper_hub_local@postgres:5432/paper_hub?sslmode=disable}
-    # Only the API role consumes this value. The default is intentionally local-development-only.
-    CATALOG_CURSOR_SECRET: ${CATALOG_CURSOR_SECRET:-development-only-catalog-cursor-secret-change-me}
+    # Only the API role consumes this value. Replace the local placeholder before use.
+    CATALOG_CURSOR_SECRET: ${CATALOG_CURSOR_SECRET:-replace-with-at-least-32-byte-local-secret}
     JCR_IMPORT_PATH: ${JCR_IMPORT_PATH:-}
     JCR_SOURCE_LICENSE: ${JCR_SOURCE_LICENSE:-}
   networks:

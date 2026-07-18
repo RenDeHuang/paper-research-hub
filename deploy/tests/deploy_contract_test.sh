@@ -10,11 +10,44 @@ fail() {
   exit 1
 }
 
-secret_pattern='(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_(live|test)_[A-Za-z0-9]{16,}|Bearer[[:space:]]+eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})'
+secret_pattern='(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_(live|test)_[A-Za-z0-9]{16,}|(Bearer[[:space:]]+)?eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})'
+assignment_pattern="^[[:space:]]*(#[[:space:]]*)?(export[[:space:]]+)?[\"']?[A-Z][A-Z0-9_]*_(API_KEY|TOKEN|SECRET)[\"']?[[:space:]]*[:=]"
 
 deploy_contract_secret_value_is_forbidden() {
   printf '%s\n' "$1" |
     grep -E "${secret_pattern}" >/dev/null 2>&1
+}
+
+deploy_contract_secret_assignment_is_allowed() {
+  assignment_value="$1"
+  assignment_path="$2"
+
+  case "${assignment_value}" in
+    "")
+      return 0
+      ;;
+    replace-* | optional-*)
+      [ -n "${assignment_value#*-}" ]
+      return
+      ;;
+  esac
+
+  if printf '%s\n' "${assignment_value}" |
+    grep -E '^<[^<>]+>$|^\$\{[A-Za-z_][A-Za-z0-9_]*\}$|^\$\{\{[[:space:]]*(secrets|env)\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\}\}$|^\$\{[A-Za-z_][A-Za-z0-9_]*:-((replace|optional)-[^}]+)?\}$' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  case "${assignment_path}" in
+    */test/* | */tests/* | */e2e/* | */fixture/* | */fixtures/* | \
+      *_test.* | *.test.* | *.spec.* | docker-compose.test.yml)
+      [ "${#assignment_value}" -le 32 ] || return 1
+      printf '%s\n' "${assignment_value}" |
+        grep -E '^[A-Za-z0-9._-]+$' >/dev/null 2>&1
+      return
+      ;;
+  esac
+
+  return 1
 }
 
 assert_fails_with() {
@@ -52,6 +85,10 @@ for required_file in ${required_files}; do
   [ -f "${required_file}" ] ||
     fail "missing required file: ${required_file}"
 done
+
+test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/medpaperhub-deploy-contract.XXXXXX")"
+trap 'find "${test_tmp}" -type f -delete 2>/dev/null; find "${test_tmp}" -depth -type d -exec rmdir {} \; 2>/dev/null' 0 1 2 3 15
+failure_index=0
 
 for shell_file in deploy/scripts/*.sh deploy/tests/*.sh; do
   sh -n "${shell_file}" ||
@@ -114,43 +151,89 @@ if deploy_contract_secret_value_is_forbidden '<replace-with-api-key>'; then
   fail "secret scanner rejected an explicit placeholder"
 fi
 
-task_scope_files="$(
-  git ls-files -- Makefile .github/workflows/container.yml deploy
-)"
-[ -n "${task_scope_files}" ] ||
-  fail "cannot enumerate tracked Task 0 files for secret scanning"
+for allowed_assignment in \
+  "" \
+  '<replace-with-api-key>' \
+  'replace-with-api-key' \
+  'optional-authorized-key' \
+  '${OPENAI_API_KEY}' \
+  '${{ secrets.GITHUB_TOKEN }}'; do
+  deploy_contract_secret_assignment_is_allowed \
+    "${allowed_assignment}" \
+    "config/example.env" ||
+    fail "secret assignment scanner rejected an allowed placeholder form"
+done
+deploy_contract_secret_assignment_is_allowed \
+  "short-test-secret" \
+  "services/example/config_test.go" ||
+  fail "secret assignment scanner rejected a short test fixture"
+if deploy_contract_secret_assignment_is_allowed \
+  "development-only-catalog-cursor-secret-change-me" \
+  ".env.example"; then
+  fail "secret assignment scanner accepted an obvious non-placeholder value"
+fi
 
-for task_scope_file in ${task_scope_files}; do
-  if grep -E "${secret_pattern}" "${task_scope_file}" >/dev/null 2>&1; then
-    fail "Task 0 file contains a common real key or token shape: ${task_scope_file}"
-  fi
+if git grep -I -n -E "${secret_pattern}" -- \
+  >"${test_tmp}/secret-shape-matches"; then
+  fail "Git tracked worktree contains a common real key or token shape"
+else
+  grep_status="$?"
+  [ "${grep_status}" -eq 1 ] ||
+    fail "git grep failed while scanning tracked files for secret shapes"
+fi
 
-  case "${task_scope_file}" in
-    *example*)
-      awk '
-        {
-          line = $0
-          sub(/^[[:space:]]*#[[:space:]]*/, "", line)
-          if (line ~ /^[A-Z][A-Z0-9_]*_API_KEY=/) {
-            value = line
-            sub(/^[^=]*=/, "", value)
-            if (value !~ /^<[^<>]+>$/) {
-              exit 1
-            }
-          }
-        }
-      ' "${task_scope_file}" ||
-        fail "${task_scope_file} must assign every *_API_KEY example to a <...> placeholder"
+if git grep -I -n -E "${assignment_pattern}" -- \
+  >"${test_tmp}/sensitive-assignments"; then
+  :
+else
+  grep_status="$?"
+  [ "${grep_status}" -eq 1 ] ||
+    fail "git grep failed while scanning tracked sensitive assignments"
+fi
+
+while IFS=: read -r assignment_path assignment_line assignment_text; do
+  [ -n "${assignment_path}" ] || continue
+  normalized_assignment="$(
+    printf '%s\n' "${assignment_text}" |
+      sed \
+        -e 's/^[[:space:]]*//' \
+        -e 's/^#[[:space:]]*//' \
+        -e 's/^export[[:space:]][[:space:]]*//' \
+        -e 's/^"//' \
+        -e "s/^'//"
+  )"
+  assignment_key="$(
+    printf '%s\n' "${normalized_assignment}" |
+      sed \
+        -e 's/[[:space:]]*[:=].*$//' \
+        -e 's/"$//' \
+        -e "s/'$//"
+  )"
+  assignment_value="$(
+    printf '%s\n' "${normalized_assignment}" |
+      sed \
+        -e 's/^[^:=]*[[:space:]]*[:=][[:space:]]*//' \
+        -e 's/[[:space:]]*,[[:space:]]*$//' \
+        -e 's/[[:space:]]*$//'
+  )"
+  case "${assignment_value}" in
+    \"*\")
+      assignment_value="${assignment_value#\"}"
+      assignment_value="${assignment_value%\"}"
+      ;;
+    \'*\')
+      assignment_value="${assignment_value#\'}"
+      assignment_value="${assignment_value%\'}"
       ;;
   esac
-done
+  deploy_contract_secret_assignment_is_allowed \
+    "${assignment_value}" \
+    "${assignment_path}" ||
+    fail "tracked sensitive assignment must use a placeholder: ${assignment_path}:${assignment_line}:${assignment_key}"
+done <"${test_tmp}/sensitive-assignments"
 
 grep -F 'count(paper.paper_id)' deploy/sql/verify-release.sql >/dev/null ||
   fail "release SQL must count the public_catalog_papers primary-key column"
-
-test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/medpaperhub-deploy-contract.XXXXXX")"
-trap 'find "${test_tmp}" -type f -delete 2>/dev/null; find "${test_tmp}" -depth -type d -exec rmdir {} \; 2>/dev/null' 0 1 2 3 15
-failure_index=0
 
 assert_fails_with \
   "missing manifest" \
