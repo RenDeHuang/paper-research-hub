@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/analysis"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -343,6 +344,7 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 						date:       &firstConflict,
 						precision:  "day",
 						statusRaw:  "ppublish",
+						modelRaw:   stringPointer("Electronic"),
 						sourcePath: "/PubmedArticle/JournalIssue/PubDate[1]",
 						ordinal:    1,
 					},
@@ -351,6 +353,7 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 						date:       &secondConflict,
 						precision:  "day",
 						statusRaw:  "ppublish",
+						modelRaw:   stringPointer("Electronic"),
 						sourcePath: "/PubmedArticle/JournalIssue/PubDate[2]",
 						ordinal:    2,
 					},
@@ -359,6 +362,7 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 						precision:  "month",
 						sourceDate: `{"year":2026,"month":7,"precision":"month"}`,
 						statusRaw:  "epublish",
+						modelRaw:   stringPointer("Electronic"),
 						sourcePath: "/PubmedArticle/ArticleDate[1]",
 						ordinal:    3,
 					},
@@ -367,6 +371,7 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 						date:       &oldAhead,
 						precision:  "day",
 						statusRaw:  "aheadofprint",
+						modelRaw:   stringPointer("Electronic"),
 						sourcePath: "/PubmedArticle/PubMedPubDate[1]",
 						ordinal:    4,
 					},
@@ -375,6 +380,7 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 						date:       &futureAccepted,
 						precision:  "day",
 						statusRaw:  "accepted",
+						modelRaw:   stringPointer("Electronic"),
 						sourcePath: "/PubmedArticle/PubMedPubDate[2]",
 						ordinal:    5,
 					},
@@ -427,6 +433,193 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 		assertPublicationUpdateCollectionMetadata(t, formal, 1, 0, 0)
 		assertPublicationUpdateCollectionMetadata(t, accepted, 7, 0, 1)
 		assertPublicationUpdateCollectionMetadata(t, ahead, 7, 0, 1)
+	})
+
+	t.Run("sorts real collection items by date canonical key and event kind", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInputAt(
+			time.Date(2026, time.July, 18, 23, 30, 0, 0, time.UTC),
+		)
+		fixtureA := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"sorting-a",
+			"doi:10.1000/publication-sorting-a",
+		)
+		fixtureB := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"sorting-b",
+			"doi:10.1000/publication-sorting-b",
+		)
+		fixtureC := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"sorting-c",
+			"doi:10.1000/publication-sorting-c",
+		)
+		fixtures := []publisherWorkFixture{fixtureA, fixtureB, fixtureC}
+		preparePublisherAcceptedCuration(t, pool, input, fixtures...)
+		for _, fixture := range fixtures {
+			insertPublisherBiomedicalProjection(t, pool, fixture)
+		}
+
+		today := publicationUpdateDate(2026, time.July, 18)
+		olderAcceptance := publicationUpdateDate(2026, time.July, 16)
+		newerAcceptance := publicationUpdateDate(2026, time.July, 17)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixtureA,
+			publisherPublicationStateFixture{
+				printDate:         &today,
+				printState:        "known",
+				electronicDate:    &today,
+				electronicState:   "known",
+				aheadState:        "missing",
+				acceptedDate:      &olderAcceptance,
+				acceptedState:     "known",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+				events: []publisherPublicationEventFixture{
+					{
+						kind:       "print_published",
+						date:       &today,
+						precision:  "day",
+						statusRaw:  "ppublish",
+						modelRaw:   stringPointer("Electronic"),
+						sourcePath: "/PubmedArticle/SortingA/Print",
+						ordinal:    1,
+					},
+					{
+						kind:       "electronic_published",
+						date:       &today,
+						precision:  "day",
+						statusRaw:  "epublish",
+						modelRaw:   stringPointer("Electronic"),
+						sourcePath: "/PubmedArticle/SortingA/Electronic",
+						ordinal:    2,
+					},
+					{
+						kind:       "accepted",
+						date:       &olderAcceptance,
+						precision:  "day",
+						statusRaw:  "accepted",
+						modelRaw:   stringPointer("Electronic"),
+						sourcePath: "/PubmedArticle/SortingA/Accepted",
+						ordinal:    3,
+					},
+				},
+			},
+		)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixtureB,
+			publisherPublicationStateFixture{
+				printDate:         &today,
+				printState:        "known",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedDate:      &olderAcceptance,
+				acceptedState:     "known",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+				events: []publisherPublicationEventFixture{
+					{
+						kind:       "print_published",
+						date:       &today,
+						precision:  "day",
+						statusRaw:  "ppublish",
+						modelRaw:   stringPointer("Electronic"),
+						sourcePath: "/PubmedArticle/SortingB/Print",
+						ordinal:    1,
+					},
+					{
+						kind:       "accepted",
+						date:       &olderAcceptance,
+						precision:  "day",
+						statusRaw:  "accepted",
+						modelRaw:   stringPointer("Electronic"),
+						sourcePath: "/PubmedArticle/SortingB/Accepted",
+						ordinal:    2,
+					},
+				},
+			},
+		)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixtureC,
+			publisherPublicationStateFixture{
+				printDate:         &today,
+				printState:        "known",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedDate:      &newerAcceptance,
+				acceptedState:     "known",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+				events: []publisherPublicationEventFixture{
+					{
+						kind:       "print_published",
+						date:       &today,
+						precision:  "day",
+						statusRaw:  "ppublish",
+						modelRaw:   stringPointer("Electronic"),
+						sourcePath: "/PubmedArticle/SortingC/Print",
+						ordinal:    1,
+					},
+					{
+						kind:       "accepted",
+						date:       &newerAcceptance,
+						precision:  "day",
+						statusRaw:  "accepted",
+						modelRaw:   stringPointer("Electronic"),
+						sourcePath: "/PubmedArticle/SortingC/Accepted",
+						ordinal:    2,
+					},
+				},
+			},
+		)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent() error = %v", err)
+		}
+		home, err := mustRepository(t, pool).Home(context.Background())
+		if err != nil {
+			t.Fatalf("Home() error = %v", err)
+		}
+		assertPublicationUpdateItemOrder(
+			t,
+			publicationUpdateCollection(
+				t,
+				home.Payload,
+				"recent_acceptances",
+			)["items"].([]any),
+			[]string{
+				"2026-07-17|doi:10.1000/publication-sorting-c|accepted",
+				"2026-07-16|doi:10.1000/publication-sorting-a|accepted",
+				"2026-07-16|doi:10.1000/publication-sorting-b|accepted",
+			},
+		)
+		assertPublicationUpdateItemOrder(
+			t,
+			publicationUpdateCollection(
+				t,
+				home.Payload,
+				"formal_publications_today",
+			)["items"].([]any),
+			[]string{
+				"2026-07-18|doi:10.1000/publication-sorting-a|electronic_published",
+				"2026-07-18|doi:10.1000/publication-sorting-a|print_published",
+				"2026-07-18|doi:10.1000/publication-sorting-b|print_published",
+				"2026-07-18|doi:10.1000/publication-sorting-c|print_published",
+			},
+		)
 	})
 
 	t.Run("keeps old v2 work publishable with empty updates", func(t *testing.T) {
@@ -526,10 +719,200 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 		}
 		formal := publicationUpdateCollection(t, home.Payload, "formal_publications_today")
 		event := formal["items"].([]any)[0].(map[string]any)["event"].(map[string]any)
-		if event["publication_status"] != nil || event["publication_model"] != nil {
-			t.Fatalf("missing publication metadata event = %#v, want explicit nulls", event)
+		if event["publication_status"] != "ppublish" ||
+			event["publication_model"] != nil {
+			t.Fatalf(
+				"missing publication metadata event = %#v, want assertion status and null model",
+				event,
+			)
 		}
 	})
+}
+
+func TestPublisherPublicationUpdatesRespectSingleEligibilityGates(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 18, 23, 30, 0, 0, time.UTC),
+	)
+	specs := []struct {
+		name        string
+		canonical   string
+		jcrDecision string
+		withSubject bool
+	}{
+		{
+			name:        "accepted-control",
+			canonical:   "doi:10.1000/publication-gate-accepted",
+			jcrDecision: "accepted",
+			withSubject: true,
+		},
+		{
+			name:        "rejected-jcr",
+			canonical:   "doi:10.1000/publication-gate-rejected-jcr",
+			jcrDecision: "rejected",
+			withSubject: true,
+		},
+		{
+			name:        "non-biomedical",
+			canonical:   "doi:10.1000/publication-gate-non-biomedical",
+			jcrDecision: "accepted",
+			withSubject: false,
+		},
+		{
+			name:        "retracted",
+			canonical:   "doi:10.1000/publication-gate-retracted",
+			jcrDecision: "accepted",
+			withSubject: true,
+		},
+		{
+			name:        "excluded",
+			canonical:   "doi:10.1000/publication-gate-excluded",
+			jcrDecision: "accepted",
+			withSubject: true,
+		},
+	}
+
+	fixtures := make(map[string]publisherWorkFixture, len(specs))
+	for _, spec := range specs {
+		fixture := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"single-gate-"+spec.name,
+			spec.canonical,
+		)
+		fixtures[spec.name] = fixture
+		insertPublisherBiomedicalProjection(t, pool, fixture)
+		today := publicationUpdateDate(2026, time.July, 18)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printDate:         &today,
+				printState:        "known",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedState:     "missing",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+				events: []publisherPublicationEventFixture{{
+					kind:       "print_published",
+					date:       &today,
+					precision:  "day",
+					statusRaw:  "ppublish",
+					modelRaw:   stringPointer("Electronic"),
+					sourcePath: "/PubmedArticle/SingleGate/JournalIssue/PubDate",
+					ordinal:    1,
+				}},
+			},
+		)
+	}
+
+	_, subjectRuleID := insertCatalogSubjectVersion(t, pool, input.SubjectVersion)
+	jcrFixtures := make([]catalogJCRVenueFixture, 0, len(specs))
+	for index, spec := range specs {
+		fixture := fixtures[spec.name]
+		venueID := catalogWorkVenueID(t, pool, fixture.workID)
+		if _, err := pool.Exec(context.Background(), `
+			UPDATE venues
+			SET venue_type = 'journal',
+			    issn_l = $2
+			WHERE id = $1
+		`, venueID, deterministicCatalogISSN(1400+index)); err != nil {
+			t.Fatalf("prepare %s Venue identity: %v", spec.name, err)
+		}
+		jcrFixtures = append(jcrFixtures, catalogJCRVenueFixture{
+			venueID:     venueID,
+			index:       1400 + index,
+			withSubject: spec.withSubject,
+		})
+	}
+	insertCatalogJCRBundle(t, pool, input, subjectRuleID, jcrFixtures)
+	for _, spec := range specs {
+		fixture := fixtures[spec.name]
+		insertCatalogVenueAssessment(
+			t,
+			pool,
+			input,
+			catalogWorkVenueID(t, pool, fixture.workID),
+			input.VenuePolicyName,
+			input.VenuePolicyVersion,
+			input.JCRMetricYear,
+			spec.jcrDecision,
+		)
+		wantEligibility := biomed.PublicEligibilityDecisionAccepted
+		if spec.name == "non-biomedical" {
+			wantEligibility = biomed.PublicEligibilityDecisionRejected
+		}
+		assertCatalogBiomedicalEligibilityDecision(
+			t,
+			pool,
+			fixture.workID,
+			input,
+			wantEligibility,
+		)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE works SET status = 'retracted' WHERE id = $1
+	`, fixtures["retracted"].workID); err != nil {
+		t.Fatalf("mark single-gate Work retracted: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE ingestion_source_states
+		SET scope_status = 'excluded'
+		WHERE work_id = $1
+	`, fixtures["excluded"].workID); err != nil {
+		t.Fatalf("mark single-gate source excluded: %v", err)
+	}
+
+	control := fixtures["accepted-control"]
+	insertCatalogCitationAnalysisRun(t, pool, input, control.workID)
+	controlCohortRevision := catalogBiomedicalCohortRevisionForFixtures(
+		t,
+		pool,
+		input,
+		[]publisherWorkFixture{control},
+	)
+	insertCatalogBiomedicalPublicationFixtures(
+		t,
+		pool,
+		input,
+		controlCohortRevision,
+		controlCohortRevision,
+		input.TrendAnalysisRunID,
+		control,
+	)
+
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf("PublishCurrent() error = %v", err)
+	}
+	home, err := mustRepository(t, pool).Home(context.Background())
+	if err != nil {
+		t.Fatalf("Home() error = %v", err)
+	}
+	formal := publicationUpdateCollection(t, home.Payload, "formal_publications_today")
+	assertPublicationUpdateCollectionMetadata(t, formal, 1, 1, 1)
+	items := formal["items"].([]any)
+	assertPublicationUpdateItemOrder(
+		t,
+		items,
+		[]string{
+			"2026-07-18|doi:10.1000/publication-gate-accepted|print_published",
+		},
+	)
+	for _, name := range []string{
+		"rejected-jcr",
+		"non-biomedical",
+		"retracted",
+		"excluded",
+	} {
+		if publicationUpdateItemsContainWork(items, fixtures[name].workID) {
+			t.Fatalf("%s Work unexpectedly entered publication updates", name)
+		}
+	}
 }
 
 func TestPublisherPublishesExactBiomedicalAnalysisSnapshots(t *testing.T) {
@@ -817,7 +1200,7 @@ func assertPublicationUpdateEvent(
 		"kind":               kind,
 		"date":               date,
 		"date_precision":     "day",
-		"publication_status": "epublish",
+		"publication_status": statusRaw,
 		"publication_model":  "Print-Electronic",
 	} {
 		if event[field] != want {
@@ -839,6 +1222,93 @@ func assertPublicationUpdateEvent(
 		if provenance[field] != want {
 			t.Fatalf("publication update provenance[%q] = %#v, want %#v", field, provenance[field], want)
 		}
+	}
+}
+
+func assertPublicationUpdateItemOrder(
+	t *testing.T,
+	items []any,
+	want []string,
+) {
+	t.Helper()
+	got := make([]string, 0, len(items))
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			t.Fatalf("publication update item = %#v, want object", rawItem)
+		}
+		paper, ok := item["paper"].(map[string]any)
+		if !ok {
+			t.Fatalf("publication update paper = %#v, want object", item["paper"])
+		}
+		event, ok := item["event"].(map[string]any)
+		if !ok {
+			t.Fatalf("publication update event = %#v, want object", item["event"])
+		}
+		got = append(
+			got,
+			fmt.Sprintf(
+				"%s|%s|%s",
+				event["date"],
+				paper["canonical_key"],
+				event["kind"],
+			),
+		)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("publication update order = %#v, want %#v", got, want)
+	}
+}
+
+func publicationUpdateItemsContainWork(items []any, workID uuid.UUID) bool {
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		paper, ok := item["paper"].(map[string]any)
+		if ok && paper["id"] == workID.String() {
+			return true
+		}
+	}
+	return false
+}
+
+func assertCatalogBiomedicalEligibilityDecision(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	workID uuid.UUID,
+	input PublishInput,
+	want biomed.PublicEligibilityDecision,
+) {
+	t.Helper()
+	store, err := biomed.NewPostgresPublicEligibilityStore(pool)
+	if err != nil {
+		t.Fatalf("create Catalog biomedical eligibility store: %v", err)
+	}
+	service, err := biomed.NewPublicEligibilityService(store)
+	if err != nil {
+		t.Fatalf("create Catalog biomedical eligibility service: %v", err)
+	}
+	assessment, err := service.Assess(
+		context.Background(),
+		biomed.PublicEligibilityInput{
+			WorkID:            workID.String(),
+			PolicyVersion:     biomed.BiomedicalPublicEligibilityPolicyVersion,
+			MetricYear:        input.JCRMetricYear,
+			SubjectVersionKey: input.SubjectVersion,
+			AssessedAt:        input.GeneratedAt.Add(-30 * time.Minute),
+		},
+	)
+	if err != nil {
+		t.Fatalf("assess Catalog biomedical eligibility: %v", err)
+	}
+	if assessment.Decision != want {
+		t.Fatalf(
+			"Catalog biomedical eligibility decision = %q, want %q",
+			assessment.Decision,
+			want,
+		)
 	}
 }
 

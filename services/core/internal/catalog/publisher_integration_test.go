@@ -196,6 +196,90 @@ func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 		}
 		assertNoCatalogWrites(t, pool)
 	})
+
+	t.Run("event assertion publication model differs from exact state", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		fixture := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"event-model-mismatch",
+			"doi:10.1000/publication-event-model-mismatch",
+		)
+		input := catalogCurationInput()
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		insertPublisherBiomedicalProjection(t, pool, fixture)
+		printDate := publicationUpdateDate(2026, time.July, 17)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printDate:         &printDate,
+				printState:        "known",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedState:     "missing",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+				events: []publisherPublicationEventFixture{{
+					kind:       "print_published",
+					date:       &printDate,
+					precision:  "day",
+					statusRaw:  "ppublish",
+					modelRaw:   stringPointer("Decoy"),
+					sourcePath: "/PubmedArticle/JournalIssue/PubDate",
+					ordinal:    1,
+				}},
+			},
+		)
+
+		_, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		)
+		if !errors.Is(err, ErrCatalogNotReady) ||
+			!strings.Contains(err.Error(), "publication event assertion") {
+			t.Fatalf(
+				"PublishCurrent(publication event model mismatch) error = %v, want ErrCatalogNotReady",
+				err,
+			)
+		}
+		assertNoCatalogWrites(t, pool)
+	})
+}
+
+func TestPublisherRejectsV3WinnerWithoutPublicationState(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:                "pubmed:catalog-v3-no-publication-state",
+		logicalSource:           "pubmed",
+		canonicalKey:            "doi:10.1000/catalog-v3-no-publication-state",
+		title:                   "V3 winner without publication state",
+		paperType:               "research_article",
+		publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+		sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+		scopeStatus:             "included",
+		includeWorkLink:         true,
+		includeWorkID:           true,
+		includeNormalized:       true,
+		normalizedPayloadSchema: "normalized-record/v3",
+		publicationModel:        "Electronic",
+		publicationStatus:       "epublish",
+		noJCRAssessment:         true,
+	})
+	input := catalogCurationInput()
+	preparePublisherAcceptedCuration(t, pool, input, fixture)
+	insertPublisherBiomedicalProjection(t, pool, fixture)
+
+	_, err := mustPublisher(t, pool).PublishCurrent(context.Background(), input)
+	if !errors.Is(err, ErrCatalogNotReady) ||
+		!strings.Contains(err.Error(), "publication state") {
+		t.Fatalf(
+			"PublishCurrent(v3 winner without publication state) error = %v, want ErrCatalogNotReady",
+			err,
+		)
+	}
+	assertNoCatalogWrites(t, pool)
 }
 
 func TestPublisherPersistsBiomedicalCoverageMarkerBeforePublication(t *testing.T) {
@@ -1959,6 +2043,60 @@ func insertPublisherVisibleWork(
 	); err != nil {
 		t.Fatalf("insert publisher source state: %v", err)
 	}
+	if options.includeWorkLink &&
+		options.includeWorkID &&
+		options.includeNormalized {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO ingestion_projection_assertions (
+				raw_event_id,
+				normalized_assertion_id,
+				source_record_uuid,
+				work_id,
+				job_id,
+				scope_policy_version,
+				projection_policy_version,
+				record_payload
+			) VALUES (
+				$1, $2, $3, $4, $5,
+				'scope/v1', 'projection/v1', '{"fixture":"publisher-winner"}'
+			)
+		`,
+			fixture.rawEventID,
+			fixture.normalizedAssertionID,
+			fixture.sourceRecord,
+			fixture.workID,
+			jobID,
+		); err != nil {
+			t.Fatalf("insert publisher projection winner assertion: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO work_projection_states (
+				work_id,
+				raw_event_id,
+				normalized_assertion_id,
+				source_record_uuid,
+				source_time,
+				tie_break_key,
+				position,
+				scope_policy_version,
+				projection_policy_version
+			)
+			SELECT
+				$1,
+				raw_event_id,
+				normalized_assertion_id,
+				source_record_uuid,
+				source_time,
+				tie_break_key,
+				position,
+				scope_policy_version,
+				projection_policy_version
+			FROM ingestion_source_states
+			WHERE work_id = $1
+		`, fixture.workID); err != nil {
+			t.Fatalf("insert publisher projection winner state: %v", err)
+		}
+	}
 
 	if options.includeWorkLink {
 		assertions := map[string]map[string]any{
@@ -2440,30 +2578,46 @@ func insertPublisherBiomedicalProjection(
 	`, fixture.rawEventID).Scan(&jobID); err != nil {
 		t.Fatalf("query publisher biomedical job: %v", err)
 	}
-	projectionAssertionID := uuid.New()
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO ingestion_projection_assertions (
-			id,
-			raw_event_id,
-			normalized_assertion_id,
-			source_record_uuid,
-			work_id,
-			job_id,
-			scope_policy_version,
-			projection_policy_version,
-			record_payload
-		) VALUES (
-			$1, $2, $3, $4, $5, $6,
-			'scope/v1', 'projection/v1', '{"fixture":"biomedical"}'
+	var projectionAssertionID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		WITH inserted AS (
+			INSERT INTO ingestion_projection_assertions (
+				id,
+				raw_event_id,
+				normalized_assertion_id,
+				source_record_uuid,
+				work_id,
+				job_id,
+				scope_policy_version,
+				projection_policy_version,
+				record_payload
+			) VALUES (
+				$1, $2, $3, $4, $5, $6,
+				'scope/v1', 'projection/v1', '{"fixture":"biomedical"}'
+			)
+			ON CONFLICT (
+				normalized_assertion_id,
+				scope_policy_version,
+				projection_policy_version
+			) DO NOTHING
+			RETURNING id
 		)
+		SELECT id FROM inserted
+		UNION ALL
+		SELECT id
+		FROM ingestion_projection_assertions
+		WHERE normalized_assertion_id = $3
+		  AND scope_policy_version = 'scope/v1'
+		  AND projection_policy_version = 'projection/v1'
+		LIMIT 1
 	`,
-		projectionAssertionID,
+		uuid.New(),
 		fixture.rawEventID,
 		fixture.normalizedAssertionID,
 		fixture.sourceRecord,
 		fixture.workID,
 		jobID,
-	); err != nil {
+	).Scan(&projectionAssertionID); err != nil {
 		t.Fatalf("insert publisher biomedical projection assertion: %v", err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -2490,30 +2644,57 @@ func insertPublisherBiomedicalProjection(
 			projection_policy_version
 		FROM ingestion_source_states
 		WHERE work_id = $1
+		ON CONFLICT (work_id) DO NOTHING
 	`, fixture.workID); err != nil {
 		t.Fatalf("insert publisher biomedical winner state: %v", err)
 	}
 
-	descriptorID := uuid.New()
-	qualifierID := uuid.New()
-	publicationTypeID := uuid.New()
+	var descriptorID uuid.UUID
+	var qualifierID uuid.UUID
+	var publicationTypeID uuid.UUID
 	headingID := uuid.New()
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO mesh_descriptors (id, descriptor_ui)
-		VALUES ($1, 'D008175')
-	`, descriptorID); err != nil {
+	if err := tx.QueryRow(ctx, `
+		WITH inserted AS (
+			INSERT INTO mesh_descriptors (id, descriptor_ui)
+			VALUES ($1, 'D008175')
+			ON CONFLICT (descriptor_ui) DO NOTHING
+			RETURNING id
+		)
+		SELECT id FROM inserted
+		UNION ALL
+		SELECT id FROM mesh_descriptors WHERE descriptor_ui = 'D008175'
+		LIMIT 1
+	`, uuid.New()).Scan(&descriptorID); err != nil {
 		t.Fatalf("insert publisher MeSH descriptor: %v", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO mesh_qualifiers (id, qualifier_ui)
-		VALUES ($1, 'Q000401')
-	`, qualifierID); err != nil {
+	if err := tx.QueryRow(ctx, `
+		WITH inserted AS (
+			INSERT INTO mesh_qualifiers (id, qualifier_ui)
+			VALUES ($1, 'Q000401')
+			ON CONFLICT (qualifier_ui) DO NOTHING
+			RETURNING id
+		)
+		SELECT id FROM inserted
+		UNION ALL
+		SELECT id FROM mesh_qualifiers WHERE qualifier_ui = 'Q000401'
+		LIMIT 1
+	`, uuid.New()).Scan(&qualifierID); err != nil {
 		t.Fatalf("insert publisher MeSH qualifier: %v", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO publication_types (id, publication_type_ui)
-		VALUES ($1, 'D016449')
-	`, publicationTypeID); err != nil {
+	if err := tx.QueryRow(ctx, `
+		WITH inserted AS (
+			INSERT INTO publication_types (id, publication_type_ui)
+			VALUES ($1, 'D016449')
+			ON CONFLICT (publication_type_ui) DO NOTHING
+			RETURNING id
+		)
+		SELECT id FROM inserted
+		UNION ALL
+		SELECT id
+		FROM publication_types
+		WHERE publication_type_ui = 'D016449'
+		LIMIT 1
+	`, uuid.New()).Scan(&publicationTypeID); err != nil {
 		t.Fatalf("insert publisher Publication Type: %v", err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -2628,6 +2809,11 @@ func insertPublisherCitationSnapshot(
 			$1, $2, $3, $4, $5,
 			'scope/v1', 'projection/v1', '{"fixture":"citation"}'
 		)
+		ON CONFLICT (
+			normalized_assertion_id,
+			scope_policy_version,
+			projection_policy_version
+		) DO NOTHING
 	`, fixture.rawEventID, fixture.normalizedAssertionID, fixture.sourceRecord, fixture.workID, jobID); err != nil {
 		t.Fatalf("insert publisher citation projection assertion: %v", err)
 	}

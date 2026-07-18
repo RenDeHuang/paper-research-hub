@@ -869,7 +869,6 @@ func buildPublicationUpdates(
 			if event.state.Date.Equal(calendarDate) {
 				item, err := newPublicationUpdateItem(
 					paper,
-					*publication,
 					event.kind,
 					event.state,
 				)
@@ -913,7 +912,6 @@ func buildPublicationUpdates(
 			}
 			item, err := newPublicationUpdateItem(
 				paper,
-				*publication,
 				event.kind,
 				event.state,
 			)
@@ -956,7 +954,6 @@ func buildPublicationUpdates(
 
 func newPublicationUpdateItem(
 	paper publishedPaper,
-	publication publishedPublicationState,
 	eventKind string,
 	eventState publishedPublicationEventState,
 ) (publicationUpdateItem, error) {
@@ -979,8 +976,8 @@ func newPublicationUpdateItem(
 			"kind":               eventKind,
 			"date":               eventState.Date.Format("2006-01-02"),
 			"date_precision":     "day",
-			"publication_status": publication.PublicationStatus,
-			"publication_model":  publication.PublicationModel,
+			"publication_status": eventState.Provenance.StatusRaw,
+			"publication_model":  eventState.PublicationModel,
 			"provenance":         *eventState.Provenance,
 		},
 	}, nil

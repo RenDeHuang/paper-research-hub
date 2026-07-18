@@ -133,9 +133,10 @@ type publishedPublicationState struct {
 }
 
 type publishedPublicationEventState struct {
-	State      string
-	Date       *time.Time
-	Provenance *publishedPublicationEventProvenance
+	State            string
+	Date             *time.Time
+	PublicationModel *string
+	Provenance       *publishedPublicationEventProvenance
 }
 
 type publishedPublicationEventProvenance struct {
@@ -1525,7 +1526,7 @@ func loadCurrentPublicationState(
 				workID,
 			)
 		}
-		return nil, nil
+		return loadLegacyPublicationStateAbsence(ctx, tx, workID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query work %s publication state: %w", workID, err)
@@ -1604,6 +1605,86 @@ func loadCurrentPublicationState(
 	return &state, nil
 }
 
+func loadLegacyPublicationStateAbsence(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+) (*publishedPublicationState, error) {
+	var normalizedSchema string
+	err := tx.QueryRow(ctx, `
+		SELECT normalized.payload_schema_version
+		FROM work_projection_states AS winner
+		JOIN ingestion_projection_assertions AS projection
+		  ON projection.work_id = winner.work_id
+		 AND projection.raw_event_id = winner.raw_event_id
+		 AND projection.normalized_assertion_id =
+		     winner.normalized_assertion_id
+		 AND projection.source_record_uuid = winner.source_record_uuid
+		 AND projection.scope_policy_version =
+		     winner.scope_policy_version
+		 AND projection.projection_policy_version =
+		     winner.projection_policy_version
+		JOIN ingestion_normalized_records AS normalized
+		  ON normalized.id = projection.normalized_assertion_id
+		 AND normalized.raw_event_id = projection.raw_event_id
+		 AND normalized.source_record_uuid =
+		     projection.source_record_uuid
+		JOIN source_records AS source_record
+		  ON source_record.id = winner.source_record_uuid
+		JOIN ingestion_raw_events AS raw
+		  ON raw.id = winner.raw_event_id
+		 AND raw.logical_source = source_record.source
+		 AND raw.source_record_id = source_record.source_record_id
+		JOIN ingestion_source_states AS source_state
+		  ON source_state.logical_source = raw.logical_source
+		 AND source_state.event_key = raw.event_key
+		 AND source_state.raw_event_id = winner.raw_event_id
+		 AND source_state.normalized_assertion_id =
+		     winner.normalized_assertion_id
+		 AND source_state.source_record_uuid =
+		     winner.source_record_uuid
+		 AND source_state.work_id = winner.work_id
+		 AND source_state.source_time = winner.source_time
+		 AND source_state.tie_break_key = winner.tie_break_key
+		 AND source_state.position = winner.position
+		 AND source_state.scope_policy_version =
+		     winner.scope_policy_version
+		 AND source_state.projection_policy_version =
+		     winner.projection_policy_version
+		 AND source_state.scope_status = 'included'
+		 AND NOT source_state.is_deleted
+		JOIN source_record_works AS association
+		  ON association.source_record_id = winner.source_record_uuid
+		 AND association.work_id = winner.work_id
+		WHERE winner.work_id = $1
+	`, workID).Scan(&normalizedSchema)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf(
+			"%w: work %s without publication state lacks exact current normalized winner provenance",
+			ErrCatalogNotReady,
+			workID,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query work %s normalized schema without publication state: %w",
+			workID,
+			err,
+		)
+	}
+	switch normalizedSchema {
+	case "normalized-record/v1", "normalized-record/v2":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf(
+			"%w: work %s current normalized schema %q requires an exact publication state",
+			ErrCatalogNotReady,
+			workID,
+			normalizedSchema,
+		)
+	}
+}
+
 func loadExactPublicationEventStates(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -1611,8 +1692,9 @@ func loadExactPublicationEventStates(
 	state publishedPublicationState,
 ) (map[string]publishedPublicationEventState, error) {
 	type eventDateEvidence struct {
-		date       time.Time
-		provenance publishedPublicationEventProvenance
+		date             time.Time
+		publicationModel *string
+		provenance       publishedPublicationEventProvenance
 	}
 	dayEvidence := map[string]map[string]eventDateEvidence{
 		"print_published":      {},
@@ -1629,6 +1711,7 @@ func loadExactPublicationEventStates(
 			event_date,
 			date_precision,
 			status_raw,
+			publication_model_raw,
 			source_path,
 			ordinal
 		FROM work_publication_event_assertions
@@ -1653,6 +1736,7 @@ func loadExactPublicationEventStates(
 			eventDate             *time.Time
 			datePrecision         string
 			statusRaw             string
+			publicationModelRaw   *string
 			sourcePath            string
 			ordinal               int
 		)
@@ -1664,6 +1748,7 @@ func loadExactPublicationEventStates(
 			&eventDate,
 			&datePrecision,
 			&statusRaw,
+			&publicationModelRaw,
 			&sourcePath,
 			&ordinal,
 		); err != nil {
@@ -1680,6 +1765,7 @@ func loadExactPublicationEventStates(
 			assertionWorkID != workID ||
 			statusRaw == "" ||
 			statusRaw != strings.TrimSpace(statusRaw) ||
+			!equalOptionalString(publicationModelRaw, state.PublicationModel) ||
 			sourcePath == "" ||
 			sourcePath != strings.TrimSpace(sourcePath) ||
 			ordinal < 1 {
@@ -1705,7 +1791,8 @@ func loadExactPublicationEventStates(
 			continue
 		}
 		evidenceByDate[dateKey] = eventDateEvidence{
-			date: *date,
+			date:             *date,
+			publicationModel: copyOptionalString(publicationModelRaw),
 			provenance: publishedPublicationEventProvenance{
 				Source:                state.Source,
 				SourceRecordID:        state.SourceRecordID,
@@ -1734,9 +1821,10 @@ func loadExactPublicationEventStates(
 				date := evidence.date
 				provenance := evidence.provenance
 				result[eventKind] = publishedPublicationEventState{
-					State:      "known",
-					Date:       &date,
-					Provenance: &provenance,
+					State:            "known",
+					Date:             &date,
+					PublicationModel: copyOptionalString(evidence.publicationModel),
+					Provenance:       &provenance,
 				}
 			}
 		default:
@@ -4452,4 +4540,12 @@ func equalOptionalString(left, right *string) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+func copyOptionalString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
 }
