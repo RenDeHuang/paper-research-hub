@@ -10,6 +10,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"time"
 )
 
 const (
@@ -58,6 +59,46 @@ func ParseResearchDomain(value string) (ResearchDomain, error) {
 	default:
 		return "", fmt.Errorf("%w %q", ErrInvalidResearchDomain, value)
 	}
+}
+
+type WorkDomainAssertion struct {
+	ProjectionAssertionID string
+	NormalizedAssertionID string
+	SourceRecordID        string
+	WorkID                string
+	DomainRegistryVersion string
+	DomainCategoryRuleID  string
+	Domain                ResearchDomain
+	SourcePath            string
+	AssertedAt            time.Time
+}
+
+func (assertion WorkDomainAssertion) Validate() error {
+	for field, value := range map[string]string{
+		"projection assertion ID": assertion.ProjectionAssertionID,
+		"normalized assertion ID": assertion.NormalizedAssertionID,
+		"source record ID":        assertion.SourceRecordID,
+		"Work ID":                 assertion.WorkID,
+		"domain Category rule ID": assertion.DomainCategoryRuleID,
+		"source path":             assertion.SourcePath,
+	} {
+		if value == "" || value != strings.TrimSpace(value) {
+			return fmt.Errorf("Work domain assertion requires exact %s", field)
+		}
+	}
+	if assertion.DomainRegistryVersion != ResearchDomainRegistryVersion {
+		return fmt.Errorf(
+			"unsupported domain Registry version %q",
+			assertion.DomainRegistryVersion,
+		)
+	}
+	if _, err := ParseResearchDomain(string(assertion.Domain)); err != nil {
+		return err
+	}
+	if assertion.AssertedAt.IsZero() {
+		return errors.New("Work domain assertion asserted_at is required")
+	}
+	return nil
 }
 
 type DomainCategoryRule struct {

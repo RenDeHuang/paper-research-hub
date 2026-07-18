@@ -37,8 +37,10 @@ func TestAdmissionJournalChannelsRequireAcceptedJournalAllQ1Assessment(t *testin
 			}
 			if decision.Decision != AdmissionAccepted ||
 				decision.Channel != test.channel ||
-				decision.PolicyVersion != ChannelAdmissionPolicyVersion ||
-				decision.RegistryVersion != JournalAllQ1PolicyVersion {
+				decision.AdmissionPolicyVersion != ChannelAdmissionPolicyVersion ||
+				decision.DomainRegistryVersion != ResearchDomainRegistryVersion ||
+				decision.JournalPolicyVersion != JournalAllQ1PolicyVersion ||
+				decision.ChannelRegistryVersion != "" {
 				t.Fatalf("journal admission = %#v", decision)
 			}
 
@@ -118,15 +120,19 @@ func TestAdmissionPreprintRequiresExactRegistryEvidenceAndRejectsJCR(t *testing.
 			Version:         "v1",
 			SourcePath:      "$",
 		},
-		PolicyVersion: ChannelAdmissionPolicyVersion,
-		DecidedAt:     now,
+		AdmissionPolicyVersion: ChannelAdmissionPolicyVersion,
+		DomainRegistryVersion:  ResearchDomainRegistryVersion,
+		DecidedAt:              now,
 	}
 	decision, err := EvaluateAdmission(input, registry, ConferenceRegistry{})
 	if err != nil {
 		t.Fatalf("EvaluateAdmission(preprint) error = %v", err)
 	}
 	if decision.Decision != AdmissionAccepted ||
-		decision.RegistryVersion != PreprintRegistryVersion {
+		decision.AdmissionPolicyVersion != ChannelAdmissionPolicyVersion ||
+		decision.DomainRegistryVersion != ResearchDomainRegistryVersion ||
+		decision.JournalPolicyVersion != "" ||
+		decision.ChannelRegistryVersion != PreprintRegistryVersion {
 		t.Fatalf("preprint admission = %#v", decision)
 	}
 
@@ -258,15 +264,19 @@ func TestAdmissionConferenceRequiresExactEventAndRejectsJCR(t *testing.T) {
 			StableID:        "10.1109/CVPR.2026.123",
 			SourcePath:      "$",
 		},
-		PolicyVersion: ChannelAdmissionPolicyVersion,
-		DecidedAt:     now,
+		AdmissionPolicyVersion: ChannelAdmissionPolicyVersion,
+		DomainRegistryVersion:  ResearchDomainRegistryVersion,
+		DecidedAt:              now,
 	}
 	decision, err := EvaluateAdmission(input, PreprintRegistry{}, registry)
 	if err != nil {
 		t.Fatalf("EvaluateAdmission(conference) error = %v", err)
 	}
 	if decision.Decision != AdmissionAccepted ||
-		decision.RegistryVersion != ConferenceRegistryVersion {
+		decision.AdmissionPolicyVersion != ChannelAdmissionPolicyVersion ||
+		decision.DomainRegistryVersion != ResearchDomainRegistryVersion ||
+		decision.JournalPolicyVersion != "" ||
+		decision.ChannelRegistryVersion != ConferenceRegistryVersion {
 		t.Fatalf("conference admission = %#v", decision)
 	}
 
@@ -362,8 +372,159 @@ func journalAdmissionInput(
 			Decision:      "accepted",
 			SourcePath:    "$.venue_assessment",
 		},
-		PolicyVersion: ChannelAdmissionPolicyVersion,
-		DecidedAt:     now,
+		AdmissionPolicyVersion: ChannelAdmissionPolicyVersion,
+		DomainRegistryVersion:  ResearchDomainRegistryVersion,
+		DecidedAt:              now,
+	}
+}
+
+func TestAdmissionAllChannelsRequireExplicitDomainRegistryVersion(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 18, 10, 0, 0, 0, time.UTC)
+	preprints, err := ParsePreprintRegistry(strings.NewReader(
+		"registry_name,registry_version,source_key,display_name,identifier_scheme,official_host,allowed_domain,lifecycle\n" +
+			"medpaperhub-trusted-preprints,preprint-sources/v1,arxiv,arXiv,arxiv,arxiv.org,computer_science,active\n",
+	))
+	if err != nil {
+		t.Fatalf("ParsePreprintRegistry() error = %v", err)
+	}
+	conferences, err := ParseConferenceRegistry(strings.NewReader(
+		"registry_name,registry_version,provider,series_key,series_name,event_key,event_name,event_year,identifier_scheme,identifier_value,official_host,allowed_domain,lifecycle,reviewed\n" +
+			"medpaperhub-conferences,conference-venues/v1,ieee,cvpr,IEEE/CVF Conference on Computer Vision and Pattern Recognition,cvpr-2026,CVPR 2026,2026,doi_prefix,10.1109,ieeexplore.ieee.org,computer_science,active,false\n",
+	))
+	if err != nil {
+		t.Fatalf("ParseConferenceRegistry() error = %v", err)
+	}
+	preprintInput := AdmissionInput{
+		WorkID: "00000000-0000-0000-0000-000000001101",
+		ChannelDecision: resolvedChannelDecision(
+			"00000000-0000-0000-0000-000000001101",
+			ContentChannelPreprint,
+			now,
+		),
+		Lifecycle: LifecycleProjection{
+			WorkID:        "00000000-0000-0000-0000-000000001101",
+			Channel:       ContentChannelPreprint,
+			State:         LifecycleStatePreprintActive,
+			PolicyVersion: "lifecycle-projection/v1",
+			AssertionIDs:  []string{"00000000-0000-0000-0000-000000001102"},
+			SourcePaths:   []string{"$.posted"},
+			DecidedAt:     now,
+		},
+		Domain:           ResearchDomainComputerScience,
+		DomainSourcePath: "$.domain",
+		OfficialURL: VerifiedOfficialURL{
+			URL:        "https://arxiv.org/abs/2607.12345",
+			Verified:   true,
+			SourcePath: "$.url",
+			Verifier:   "official-url/v1",
+			VerifiedAt: now,
+		},
+		Preprint: &PreprintAdmissionEvidence{
+			RegistryVersion: PreprintRegistryVersion,
+			SourceKey:       "arxiv",
+			StableID:        "2607.12345",
+			PostedDate:      now,
+			Version:         "v1",
+			SourcePath:      "$",
+		},
+		AdmissionPolicyVersion: ChannelAdmissionPolicyVersion,
+		DomainRegistryVersion:  ResearchDomainRegistryVersion,
+		DecidedAt:              now,
+	}
+	conferenceInput := AdmissionInput{
+		WorkID: "00000000-0000-0000-0000-000000001201",
+		ChannelDecision: resolvedChannelDecision(
+			"00000000-0000-0000-0000-000000001201",
+			ContentChannelConferenceProceeding,
+			now,
+		),
+		Lifecycle: LifecycleProjection{
+			WorkID:        "00000000-0000-0000-0000-000000001201",
+			Channel:       ContentChannelConferenceProceeding,
+			State:         LifecycleStateConferencePublished,
+			PolicyVersion: "lifecycle-projection/v1",
+			AssertionIDs:  []string{"00000000-0000-0000-0000-000000001202"},
+			SourcePaths:   []string{"$.published"},
+			DecidedAt:     now,
+		},
+		Domain:           ResearchDomainComputerScience,
+		DomainSourcePath: "$.domain",
+		OfficialURL: VerifiedOfficialURL{
+			URL:        "https://ieeexplore.ieee.org/document/123456",
+			Verified:   true,
+			SourcePath: "$.url",
+			Verifier:   "official-url/v1",
+			VerifiedAt: now,
+		},
+		Conference: &ConferenceAdmissionEvidence{
+			RegistryVersion: ConferenceRegistryVersion,
+			Provider:        "ieee",
+			SeriesKey:       "cvpr",
+			EventKey:        "cvpr-2026",
+			StableID:        "10.1109/CVPR.2026.123",
+			SourcePath:      "$",
+		},
+		AdmissionPolicyVersion: ChannelAdmissionPolicyVersion,
+		DomainRegistryVersion:  ResearchDomainRegistryVersion,
+		DecidedAt:              now,
+	}
+	tests := []struct {
+		name        string
+		input       AdmissionInput
+		preprints   PreprintRegistry
+		conferences ConferenceRegistry
+	}{
+		{
+			name: "journal published",
+			input: journalAdmissionInput(
+				ContentChannelJournalPublished,
+				LifecycleStatePublished,
+				now,
+			),
+		},
+		{
+			name: "accepted early",
+			input: journalAdmissionInput(
+				ContentChannelAcceptedEarly,
+				LifecycleStateAcceptedEarly,
+				now,
+			),
+		},
+		{
+			name:      "preprint",
+			input:     preprintInput,
+			preprints: preprints,
+		},
+		{
+			name:        "conference",
+			input:       conferenceInput,
+			conferences: conferences,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			for _, version := range []string{
+				"",
+				"research-domains-jcr-subjects/v1",
+			} {
+				candidate := cloneAdmissionInput(test.input)
+				candidate.DomainRegistryVersion = version
+				if _, err := EvaluateAdmission(
+					candidate,
+					test.preprints,
+					test.conferences,
+				); err == nil {
+					t.Fatalf(
+						"EvaluateAdmission(domain Registry %q) error = nil",
+						version,
+					)
+				}
+			}
+		})
 	}
 }
 

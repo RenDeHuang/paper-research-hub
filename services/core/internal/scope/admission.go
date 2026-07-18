@@ -90,28 +90,31 @@ type ConferenceAdmissionEvidence struct {
 }
 
 type AdmissionInput struct {
-	WorkID            string
-	ChannelDecision   ChannelDecision
-	Lifecycle         LifecycleProjection
-	Domain            ResearchDomain
-	DomainSourcePath  string
-	OfficialURL       VerifiedOfficialURL
-	JournalAssessment *JournalAdmissionEvidence
-	Preprint          *PreprintAdmissionEvidence
-	Conference        *ConferenceAdmissionEvidence
-	PolicyVersion     string
-	DecidedAt         time.Time
+	WorkID                 string
+	ChannelDecision        ChannelDecision
+	Lifecycle              LifecycleProjection
+	Domain                 ResearchDomain
+	DomainSourcePath       string
+	OfficialURL            VerifiedOfficialURL
+	JournalAssessment      *JournalAdmissionEvidence
+	Preprint               *PreprintAdmissionEvidence
+	Conference             *ConferenceAdmissionEvidence
+	AdmissionPolicyVersion string
+	DomainRegistryVersion  string
+	DecidedAt              time.Time
 }
 
 type AdmissionDecision struct {
-	WorkID          string
-	Channel         ContentChannel
-	Decision        AdmissionStatus
-	Reason          AdmissionReason
-	PolicyVersion   string
-	RegistryVersion string
-	SourcePaths     []string
-	DecidedAt       time.Time
+	WorkID                 string
+	Channel                ContentChannel
+	Decision               AdmissionStatus
+	Reason                 AdmissionReason
+	AdmissionPolicyVersion string
+	DomainRegistryVersion  string
+	JournalPolicyVersion   string
+	ChannelRegistryVersion string
+	SourcePaths            []string
+	DecidedAt              time.Time
 }
 
 func EvaluateAdmission(
@@ -122,10 +125,16 @@ func EvaluateAdmission(
 	if input.WorkID == "" || input.WorkID != strings.TrimSpace(input.WorkID) {
 		return AdmissionDecision{}, errors.New("admission requires an exact Work ID")
 	}
-	if input.PolicyVersion != ChannelAdmissionPolicyVersion {
+	if input.AdmissionPolicyVersion != ChannelAdmissionPolicyVersion {
 		return AdmissionDecision{}, fmt.Errorf(
 			"unsupported admission policy version %q",
-			input.PolicyVersion,
+			input.AdmissionPolicyVersion,
+		)
+	}
+	if input.DomainRegistryVersion != ResearchDomainRegistryVersion {
+		return AdmissionDecision{}, fmt.Errorf(
+			"unsupported domain Registry version %q",
+			input.DomainRegistryVersion,
 		)
 	}
 	if input.DecidedAt.IsZero() {
@@ -140,9 +149,10 @@ func EvaluateAdmission(
 		)
 	}
 	decision := AdmissionDecision{
-		WorkID:        input.WorkID,
-		PolicyVersion: input.PolicyVersion,
-		DecidedAt:     input.DecidedAt.UTC(),
+		WorkID:                 input.WorkID,
+		AdmissionPolicyVersion: input.AdmissionPolicyVersion,
+		DomainRegistryVersion:  input.DomainRegistryVersion,
+		DecidedAt:              input.DecidedAt.UTC(),
 	}
 	if input.ChannelDecision.Status != ChannelDecisionResolved {
 		decision.Decision = AdmissionMissing
@@ -150,6 +160,19 @@ func EvaluateAdmission(
 		return decision, nil
 	}
 	decision.Channel = input.ChannelDecision.Channel
+	switch decision.Channel {
+	case ContentChannelJournalPublished, ContentChannelAcceptedEarly:
+		decision.JournalPolicyVersion = JournalAllQ1PolicyVersion
+	case ContentChannelPreprint:
+		decision.ChannelRegistryVersion = PreprintRegistryVersion
+	case ContentChannelConferenceProceeding:
+		decision.ChannelRegistryVersion = ConferenceRegistryVersion
+	default:
+		return AdmissionDecision{}, fmt.Errorf(
+			"unsupported admission channel %q",
+			decision.Channel,
+		)
+	}
 	if err := input.Lifecycle.Validate(); err != nil {
 		return AdmissionDecision{}, fmt.Errorf("validate lifecycle projection: %w", err)
 	}
@@ -165,7 +188,6 @@ func EvaluateAdmission(
 		return rejectAdmission(
 			decision,
 			AdmissionReasonDomainUnresolved,
-			"",
 			input,
 		), nil
 	}
@@ -174,7 +196,6 @@ func EvaluateAdmission(
 		return rejectAdmission(
 			decision,
 			AdmissionReasonOfficialURLMissing,
-			"",
 			input,
 		), nil
 	}
@@ -185,7 +206,6 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonLifecycleIneligible,
-				JournalAllQ1PolicyVersion,
 				input,
 			), nil
 		}
@@ -195,7 +215,6 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonLifecycleIneligible,
-				JournalAllQ1PolicyVersion,
 				input,
 			), nil
 		}
@@ -205,7 +224,6 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonJCRForbidden,
-				PreprintRegistryVersion,
 				input,
 			), nil
 		}
@@ -213,7 +231,6 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonLifecycleIneligible,
-				PreprintRegistryVersion,
 				input,
 			), nil
 		}
@@ -228,7 +245,6 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonPreprintEvidenceMissing,
-				PreprintRegistryVersion,
 				input,
 			), nil
 		}
@@ -240,17 +256,15 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonPreprintRegistryMismatch,
-				PreprintRegistryVersion,
 				input,
 			), nil
 		}
-		return acceptAdmission(decision, PreprintRegistryVersion, input), nil
+		return acceptAdmission(decision, input), nil
 	case ContentChannelConferenceProceeding:
 		if input.JournalAssessment != nil {
 			return rejectAdmission(
 				decision,
 				AdmissionReasonJCRForbidden,
-				ConferenceRegistryVersion,
 				input,
 			), nil
 		}
@@ -258,7 +272,6 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonLifecycleIneligible,
-				ConferenceRegistryVersion,
 				input,
 			), nil
 		}
@@ -270,7 +283,6 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonConferenceEvidenceMissing,
-				ConferenceRegistryVersion,
 				input,
 			), nil
 		}
@@ -287,17 +299,15 @@ func EvaluateAdmission(
 			return rejectAdmission(
 				decision,
 				AdmissionReasonConferenceRegistryMismatch,
-				ConferenceRegistryVersion,
 				input,
 			), nil
 		}
-		return acceptAdmission(decision, ConferenceRegistryVersion, input), nil
-	default:
-		return AdmissionDecision{}, fmt.Errorf(
-			"unsupported admission channel %q",
-			decision.Channel,
-		)
+		return acceptAdmission(decision, input), nil
 	}
+	return AdmissionDecision{}, fmt.Errorf(
+		"unsupported admission channel %q",
+		decision.Channel,
+	)
 }
 
 func evaluateJournalAdmission(
@@ -315,21 +325,18 @@ func evaluateJournalAdmission(
 		return rejectAdmission(
 			decision,
 			AdmissionReasonJournalQ1NotAccepted,
-			JournalAllQ1PolicyVersion,
 			input,
 		)
 	}
-	return acceptAdmission(decision, JournalAllQ1PolicyVersion, input)
+	return acceptAdmission(decision, input)
 }
 
 func acceptAdmission(
 	decision AdmissionDecision,
-	registryVersion string,
 	input AdmissionInput,
 ) AdmissionDecision {
 	decision.Decision = AdmissionAccepted
 	decision.Reason = AdmissionReasonEligible
-	decision.RegistryVersion = registryVersion
 	decision.SourcePaths = admissionSourcePaths(input)
 	return decision
 }
@@ -337,12 +344,10 @@ func acceptAdmission(
 func rejectAdmission(
 	decision AdmissionDecision,
 	reason AdmissionReason,
-	registryVersion string,
 	input AdmissionInput,
 ) AdmissionDecision {
 	decision.Decision = AdmissionRejected
 	decision.Reason = reason
-	decision.RegistryVersion = registryVersion
 	decision.SourcePaths = admissionSourcePaths(input)
 	return decision
 }

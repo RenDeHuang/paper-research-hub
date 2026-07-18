@@ -22,7 +22,10 @@ import (
 	paperdomain "github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
 )
 
-const initialMigrationChecksum = "3568e26689b33d651fe0ee5089587ba2d3efd74517eb430b83766f9907881404"
+const (
+	initialMigrationChecksum = "3568e26689b33d651fe0ee5089587ba2d3efd74517eb430b83766f9907881404"
+	scopeRegistryV20Checksum = "8131e9168968fa836a336a47c241843957c6eb62a08f9e3a988efd06f6a6b635"
+)
 
 var expectedSchemaTables = []string{
 	"works",
@@ -95,6 +98,7 @@ var expectedSchemaTables = []string{
 	"conference_identifiers",
 	"conference_official_hosts",
 	"work_channel_assertions",
+	"work_domain_assertions",
 	"work_channel_decisions",
 	"work_lifecycle_assertions",
 	"work_lifecycle_states",
@@ -115,6 +119,7 @@ var expectedScopeAndChannelConstraints = []string{
 	"domain_versions_registry_version_check",
 	"domain_versions_file_sha256_check",
 	"domain_versions_counts_check",
+	"domain_versions_sealed_at_check",
 	"domain_versions_registry_version_key",
 	"domain_versions_file_sha256_key",
 	"research_domains_version_fkey",
@@ -127,6 +132,7 @@ var expectedScopeAndChannelConstraints = []string{
 	"domain_category_rules_category_check",
 	"domain_category_rules_version_domain_category_key",
 	"domain_category_rules_id_category_key",
+	"domain_category_rules_assertion_binding_key",
 	"journal_domain_metrics_category_check",
 	"journal_domain_metrics_metric_category_fkey",
 	"journal_domain_metrics_rule_category_fkey",
@@ -136,6 +142,7 @@ var expectedScopeAndChannelConstraints = []string{
 	"preprint_source_versions_version_check",
 	"preprint_source_versions_sha_check",
 	"preprint_source_versions_counts_check",
+	"preprint_source_versions_sealed_at_check",
 	"preprint_source_versions_registry_version_key",
 	"preprint_source_versions_file_sha256_key",
 	"trusted_preprint_sources_version_fkey",
@@ -151,6 +158,7 @@ var expectedScopeAndChannelConstraints = []string{
 	"conference_registry_versions_version_check",
 	"conference_registry_versions_sha_check",
 	"conference_registry_versions_counts_check",
+	"conference_registry_versions_sealed_at_check",
 	"conference_registry_versions_registry_version_key",
 	"conference_registry_versions_file_sha256_key",
 	"conference_series_version_fkey",
@@ -181,6 +189,13 @@ var expectedScopeAndChannelConstraints = []string{
 	"work_channel_assertions_source_record_work_fkey",
 	"work_channel_assertions_projection_provenance_fkey",
 	"work_channel_assertions_projection_path_key",
+	"work_domain_assertions_registry_fkey",
+	"work_domain_assertions_rule_binding_fkey",
+	"work_domain_assertions_domain_binding_fkey",
+	"work_domain_assertions_source_path_check",
+	"work_domain_assertions_source_record_work_fkey",
+	"work_domain_assertions_projection_provenance_fkey",
+	"work_domain_assertions_projection_path_key",
 	"work_channel_decisions_state_check",
 	"work_channel_decisions_shape_check",
 	"work_channel_decisions_source_path_check",
@@ -200,8 +215,11 @@ var expectedScopeAndChannelConstraints = []string{
 	"work_channel_admission_decisions_decision_check",
 	"work_channel_admission_decisions_reason_check",
 	"work_channel_admission_decisions_source_path_check",
-	"work_channel_admission_decisions_policy_check",
-	"work_channel_admission_decisions_registry_check",
+	"work_channel_admission_decisions_admission_policy_check",
+	"work_channel_admission_decisions_domain_registry_check",
+	"work_channel_admission_decisions_journal_policy_check",
+	"work_channel_admission_decisions_channel_registry_check",
+	"work_channel_admission_decisions_version_shape_check",
 	"work_channel_admission_decisions_evidence_check",
 	"work_channel_admission_decisions_identity_key",
 }
@@ -248,9 +266,27 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		FROM pg_trigger
 		WHERE NOT tgisinternal
 	`, []string{
-		"domain_versions_content_integrity",
-		"preprint_source_versions_content_integrity",
-		"conference_registry_versions_content_integrity",
+		"domain_versions_insert_unsealed",
+		"domain_versions_seal",
+		"domain_versions_delete_immutable",
+		"domain_versions_must_be_sealed",
+		"research_domains_parent_unsealed",
+		"domain_category_rules_parent_unsealed",
+		"preprint_source_versions_insert_unsealed",
+		"preprint_source_versions_seal",
+		"preprint_source_versions_delete_immutable",
+		"preprint_source_versions_must_be_sealed",
+		"trusted_preprint_sources_parent_unsealed",
+		"conference_registry_versions_insert_unsealed",
+		"conference_registry_versions_seal",
+		"conference_registry_versions_delete_immutable",
+		"conference_registry_versions_must_be_sealed",
+		"conference_series_parent_unsealed",
+		"conference_events_parent_unsealed",
+		"conference_registry_entries_parent_unsealed",
+		"conference_identifiers_parent_unsealed",
+		"conference_official_hosts_parent_unsealed",
+		"work_domain_assertions_immutable",
 	})
 
 	rows, err = pool.Query(ctx, `
@@ -286,6 +322,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 18, name: "publication_event_assertions"},
 		{version: 19, name: "jcr_registry_v2"},
 		{version: 20, name: "scope_and_channel_registries"},
+		{version: 21, name: "scope_registry_sealing"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -329,8 +366,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 20 {
-		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
+	if len(migrations) != 21 {
+		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -433,6 +470,98 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 			"twentieth migration = %#v, want 000020_scope_and_channel_registries",
 			migrations[19],
 		)
+	}
+	if got := migrationChecksum(migrations[19].SQL); got != scopeRegistryV20Checksum {
+		t.Fatalf(
+			"000020_scope_and_channel_registries checksum = %s, want immutable %s",
+			got,
+			scopeRegistryV20Checksum,
+		)
+	}
+	if migrations[20].Version != 21 ||
+		migrations[20].Name != "scope_registry_sealing" {
+		t.Fatalf(
+			"twenty-first migration = %#v, want 000021_scope_registry_sealing",
+			migrations[20],
+		)
+	}
+}
+
+func TestScopeRegistrySealingAndArticleDomainSchema(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	requiredColumns := map[string]map[string]bool{
+		"domain_versions": {
+			"sealed_at": false,
+		},
+		"preprint_source_versions": {
+			"sealed_at": false,
+		},
+		"conference_registry_versions": {
+			"sealed_at": false,
+		},
+		"work_domain_assertions": {
+			"id":                      true,
+			"projection_assertion_id": true,
+			"normalized_assertion_id": true,
+			"source_record_id":        true,
+			"work_id":                 true,
+			"domain_version_id":       true,
+			"domain_category_rule_id": true,
+			"domain_id":               true,
+			"source_path":             true,
+			"asserted_at":             true,
+			"created_at":              true,
+		},
+		"work_channel_admission_decisions": {
+			"admission_policy_version": true,
+			"domain_registry_version":  true,
+			"journal_policy_version":   false,
+			"channel_registry_version": false,
+		},
+	}
+	for table, columns := range requiredColumns {
+		for column, notNull := range columns {
+			var actualNotNull string
+			if err := pool.QueryRow(ctx, `
+				SELECT is_nullable
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = $1
+				  AND column_name = $2
+			`, table, column).Scan(&actualNotNull); err != nil {
+				t.Fatalf("query %s.%s metadata: %v", table, column, err)
+			}
+			if (actualNotNull == "NO") != notNull {
+				t.Fatalf(
+					"%s.%s nullable = %q, want not-null %t",
+					table,
+					column,
+					actualNotNull,
+					notNull,
+				)
+			}
+		}
+	}
+
+	for _, removed := range []string{"policy_version", "registry_version"} {
+		var count int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'work_channel_admission_decisions'
+			  AND column_name = $1
+		`, removed).Scan(&count); err != nil {
+			t.Fatalf("query removed admission column %s: %v", removed, err)
+		}
+		if count != 0 {
+			t.Fatalf(
+				"work_channel_admission_decisions.%s still exists",
+				removed,
+			)
+		}
 	}
 }
 
@@ -2771,8 +2900,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 20 {
-		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
+	if len(migrations) != 21 {
+		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -4193,8 +4322,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 20 {
-		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
+	if len(migrations) != 21 {
+		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -6013,8 +6142,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 20 {
-		t.Fatalf("embedded migration count = %d, want 20", len(migrations))
+	if len(migrations) != 21 {
+		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
 	}
 
 	pool := openTestPool(t)

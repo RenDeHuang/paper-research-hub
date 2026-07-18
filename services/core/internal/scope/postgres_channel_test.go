@@ -41,7 +41,8 @@ func TestRegistryChannelImportsAreAuditableIdempotentAndConflictSafe(t *testing.
 	if firstPreprint != secondPreprint ||
 		firstPreprint.RegistryVersion() != PreprintRegistryVersion ||
 		firstPreprint.EntryCount() != 3 ||
-		firstPreprint.RuleCount() != 4 {
+		firstPreprint.RuleCount() != 4 ||
+		!firstPreprint.SealedAt().Equal(importedAt) {
 		t.Fatalf("preprint receipts = %#v / %#v", firstPreprint, secondPreprint)
 	}
 
@@ -62,7 +63,8 @@ func TestRegistryChannelImportsAreAuditableIdempotentAndConflictSafe(t *testing.
 	if firstConference != secondConference ||
 		firstConference.RegistryVersion() != ConferenceRegistryVersion ||
 		firstConference.EntryCount() != 3 ||
-		firstConference.RuleCount() != 4 {
+		firstConference.RuleCount() != 4 ||
+		!firstConference.SealedAt().Equal(importedAt) {
 		t.Fatalf("conference receipts = %#v / %#v", firstConference, secondConference)
 	}
 
@@ -203,6 +205,228 @@ func TestRegistryChannelImportsAreAuditableIdempotentAndConflictSafe(t *testing.
 	}
 }
 
+func TestRegistryChannelReceiptsRejectPostCommitPollution(t *testing.T) {
+	pool := openScopeTestPool(t)
+	importedAt := time.Date(2026, time.July, 18, 9, 30, 0, 0, time.UTC)
+	importer, err := NewPostgresChannelRegistryImporter(
+		pool,
+		func() time.Time { return importedAt },
+	)
+	if err != nil {
+		t.Fatalf("NewPostgresChannelRegistryImporter() error = %v", err)
+	}
+	if _, err := importer.ImportPreprints(
+		context.Background(),
+		bytes.NewReader(preprintRegistryFixture()),
+	); err != nil {
+		t.Fatalf("ImportPreprints() error = %v", err)
+	}
+	if _, err := importer.ImportConferences(
+		context.Background(),
+		bytes.NewReader(conferenceRegistryFixture()),
+	); err != nil {
+		t.Fatalf("ImportConferences() error = %v", err)
+	}
+	ctx := scopeTestContext(t)
+	var (
+		preprintVersionID,
+		conferenceVersionID,
+		seriesID,
+		eventID,
+		entryID string
+		preprintSealedAt,
+		conferenceSealedAt time.Time
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT id::text, sealed_at
+		FROM preprint_source_versions
+	`).Scan(&preprintVersionID, &preprintSealedAt); err != nil {
+		t.Fatalf("query sealed preprint receipt: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			version.id::text,
+			version.sealed_at,
+			series.id::text,
+			event.id::text,
+			entry.id::text
+		FROM conference_registry_versions AS version
+		JOIN conference_series AS series
+		  ON series.conference_registry_version_id = version.id
+		JOIN conference_events AS event
+		  ON event.conference_series_id = series.id
+		JOIN conference_registry_entries AS entry
+		  ON entry.conference_event_id = event.id
+		 AND entry.conference_registry_version_id = version.id
+		ORDER BY series.id
+		LIMIT 1
+	`).Scan(
+		&conferenceVersionID,
+		&conferenceSealedAt,
+		&seriesID,
+		&eventID,
+		&entryID,
+	); err != nil {
+		t.Fatalf("query sealed conference receipt chain: %v", err)
+	}
+	if !preprintSealedAt.Equal(importedAt) ||
+		!conferenceSealedAt.Equal(importedAt) {
+		t.Fatalf(
+			"sealed_at = preprint %s conference %s, want %s",
+			preprintSealedAt,
+			conferenceSealedAt,
+			importedAt,
+		)
+	}
+	pollution := []struct {
+		name       string
+		sql        string
+		args       []any
+		constraint string
+	}{
+		{
+			name: "preprint source",
+			sql: `
+				INSERT INTO trusted_preprint_sources (
+					preprint_source_version_id, source_key, display_name,
+					identifier_scheme, official_host, allowed_domains, lifecycle
+				) VALUES (
+					$1, 'polluted', 'Polluted', 'polluted',
+					'polluted.example', ARRAY['medicine'], 'active'
+				)
+			`,
+			args:       []any{preprintVersionID},
+			constraint: "trusted_preprint_sources_parent_unsealed",
+		},
+		{
+			name: "conference series",
+			sql: `
+				INSERT INTO conference_series (
+					conference_registry_version_id, provider,
+					series_key, series_name
+				) VALUES ($1, 'ieee', 'polluted', 'Polluted Conference')
+			`,
+			args:       []any{conferenceVersionID},
+			constraint: "conference_series_parent_unsealed",
+		},
+		{
+			name: "conference event",
+			sql: `
+				INSERT INTO conference_events (
+					conference_series_id, event_key, event_name, event_year
+				) VALUES ($1, 'polluted-2026', 'Polluted 2026', 2026)
+			`,
+			args:       []any{seriesID},
+			constraint: "conference_events_parent_unsealed",
+		},
+		{
+			name: "conference entry",
+			sql: `
+				INSERT INTO conference_registry_entries (
+					conference_registry_version_id, conference_event_id,
+					allowed_domains, lifecycle, reviewed
+				) VALUES ($1, $2, ARRAY['medicine'], 'active', true)
+			`,
+			args:       []any{conferenceVersionID, eventID},
+			constraint: "conference_registry_entries_parent_unsealed",
+		},
+		{
+			name: "conference identifier",
+			sql: `
+				INSERT INTO conference_identifiers (
+					conference_registry_entry_id,
+					identifier_scheme, identifier_value
+				) VALUES ($1, 'doi_prefix', '10.9999')
+			`,
+			args:       []any{entryID},
+			constraint: "conference_identifiers_parent_unsealed",
+		},
+		{
+			name: "conference official host",
+			sql: `
+				INSERT INTO conference_official_hosts (
+					conference_registry_entry_id, official_host
+				) VALUES ($1, 'polluted.example')
+			`,
+			args:       []any{entryID},
+			constraint: "conference_official_hosts_parent_unsealed",
+		},
+	}
+	for _, test := range pollution {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			_, err := pool.Exec(ctx, test.sql, test.args...)
+			if err == nil {
+				t.Fatalf("post-seal %s INSERT error = nil", test.name)
+			}
+			assertScopeConstraint(t, err, test.constraint)
+		})
+	}
+}
+
+func TestRegistryChannelReceiptsCannotCommitUnsealed(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		insertSQL  string
+		args       []any
+		constraint string
+	}{
+		{
+			name: "preprint",
+			insertSQL: `
+				INSERT INTO preprint_source_versions (
+					registry_name, registry_version, file_sha256,
+					source_count, rule_count, imported_at
+				) VALUES (
+					'manual-preprints', 'preprint-sources/v1',
+					$1, 1, 1, $2
+				)
+			`,
+			args: []any{
+				strings.Repeat("e", 64),
+				time.Date(2026, time.July, 18, 9, 40, 0, 0, time.UTC),
+			},
+			constraint: "preprint_source_versions_must_be_sealed",
+		},
+		{
+			name: "conference",
+			insertSQL: `
+				INSERT INTO conference_registry_versions (
+					registry_name, registry_version, file_sha256,
+					series_count, event_count, rule_count, imported_at
+				) VALUES (
+					'manual-conferences', 'conference-venues/v1',
+					$1, 1, 1, 1, $2
+				)
+			`,
+			args: []any{
+				strings.Repeat("f", 64),
+				time.Date(2026, time.July, 18, 9, 50, 0, 0, time.UTC),
+			},
+			constraint: "conference_registry_versions_must_be_sealed",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			pool := openScopeTestPool(t)
+			ctx := scopeTestContext(t)
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin unsealed %s transaction: %v", test.name, err)
+			}
+			if _, err := tx.Exec(ctx, test.insertSQL, test.args...); err != nil {
+				_ = tx.Rollback(context.Background())
+				t.Fatalf("insert unsealed %s receipt: %v", test.name, err)
+			}
+			err = tx.Commit(ctx)
+			if err == nil {
+				t.Fatalf("commit unsealed %s receipt error = nil", test.name)
+			}
+			assertScopeConstraint(t, err, test.constraint)
+		})
+	}
+}
+
 func TestRegistryAssertionAndProjectionTablesPreserveSourcePathsAndVersions(t *testing.T) {
 	pool := openScopeTestPool(t)
 	fixture := insertScopeProjectionFixture(t, pool, "immutable")
@@ -288,10 +512,18 @@ func TestRegistryAssertionAndProjectionTablesPreserveSourcePathsAndVersions(t *t
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO work_channel_admission_decisions (
 			work_id, channel, decision, reason, source_record_id, source_path,
-			policy_version, registry_version, evidence, decided_at
+			admission_policy_version,
+			domain_registry_version,
+			journal_policy_version,
+			channel_registry_version,
+			evidence,
+			decided_at
 		) VALUES (
 			$1, 'preprint', 'accepted', 'eligible', $2, '$',
-			'channel-admission/v1', 'preprint-sources/v1',
+			'channel-admission/v1',
+			'research-domains-jcr-subjects/v2',
+			NULL,
+			'preprint-sources/v1',
 			jsonb_build_object(
 				'channel_assertion_id', $3::text,
 				'lifecycle_assertion_id', $4::text
@@ -308,14 +540,26 @@ func TestRegistryAssertionAndProjectionTablesPreserveSourcePathsAndVersions(t *t
 		t.Fatalf("insert Work admission decision: %v", err)
 	}
 
-	var channelPath, channelPolicy, lifecyclePath, lifecyclePolicy, registryVersion string
+	var (
+		channelPath,
+		channelPolicy,
+		lifecyclePath,
+		lifecyclePolicy,
+		admissionPolicyVersion,
+		domainRegistryVersion,
+		channelRegistryVersion string
+		journalPolicyVersion *string
+	)
 	if err := pool.QueryRow(ctx, `
 		SELECT
 			channel.source_path,
 			channel.policy_version,
 			lifecycle.source_path,
 			lifecycle.policy_version,
-			admission.registry_version
+			admission.admission_policy_version,
+			admission.domain_registry_version,
+			admission.journal_policy_version,
+			admission.channel_registry_version
 		FROM work_channel_decisions AS channel
 		JOIN work_lifecycle_states AS lifecycle
 		  ON lifecycle.work_id = channel.work_id
@@ -327,7 +571,10 @@ func TestRegistryAssertionAndProjectionTablesPreserveSourcePathsAndVersions(t *t
 		&channelPolicy,
 		&lifecyclePath,
 		&lifecyclePolicy,
-		&registryVersion,
+		&admissionPolicyVersion,
+		&domainRegistryVersion,
+		&journalPolicyVersion,
+		&channelRegistryVersion,
 	); err != nil {
 		t.Fatalf("query versioned scope projections: %v", err)
 	}
@@ -335,14 +582,20 @@ func TestRegistryAssertionAndProjectionTablesPreserveSourcePathsAndVersions(t *t
 		channelPolicy != "channel-projection/v1" ||
 		lifecyclePath != "$.posted" ||
 		lifecyclePolicy != "lifecycle-projection/v1" ||
-		registryVersion != PreprintRegistryVersion {
+		admissionPolicyVersion != ChannelAdmissionPolicyVersion ||
+		domainRegistryVersion != ResearchDomainRegistryVersion ||
+		journalPolicyVersion != nil ||
+		channelRegistryVersion != PreprintRegistryVersion {
 		t.Fatalf(
-			"projection provenance = %q/%q %q/%q %q",
+			"projection provenance = %q/%q %q/%q %q/%q/%v/%q",
 			channelPath,
 			channelPolicy,
 			lifecyclePath,
 			lifecyclePolicy,
-			registryVersion,
+			admissionPolicyVersion,
+			domainRegistryVersion,
+			journalPolicyVersion,
+			channelRegistryVersion,
 		)
 	}
 

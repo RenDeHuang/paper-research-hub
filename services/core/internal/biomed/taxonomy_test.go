@@ -193,9 +193,9 @@ func TestExactDomainRegistryReconcilesThroughLegacyJCRImportBoundary(t *testing.
 	}
 	registry := "" +
 		"registry_name,registry_version,domain,display_label,jcr_category,article_level_required\n" +
-		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Medicine; General & Internal,false\n" +
+		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,\"Medicine, General & Internal\",false\n" +
 		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Biology,false\n" +
-		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Artificial Intelligence,false\n"
+		"medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,\"Computer Science, Artificial Intelligence\",false\n"
 	if _, err := importer.Import(
 		context.Background(),
 		strings.NewReader(registry),
@@ -218,7 +218,7 @@ func TestExactDomainRegistryReconcilesThroughLegacyJCRImportBoundary(t *testing.
 			source_name, source_license, registry_version, edition_year,
 			jif_rank, category_journal_count, jif_percentile
 		) VALUES (
-			$1, 2025, 'Medicine; General & Internal',
+			$1, 2025, 'Medicine, General & Internal',
 			5, 'Q1', 'known', 'authorized-jcr', 'authorized-license',
 			'jcr-registry/v2', 2026, 1, 100, 99
 		)
@@ -244,7 +244,7 @@ func TestExactDomainRegistryReconcilesThroughLegacyJCRImportBoundary(t *testing.
 		FROM journal_domain_metrics AS link
 		JOIN domain_category_rules AS rule
 		  ON rule.id = link.domain_category_rule_id
-		WHERE link.jcr_category = 'Medicine; General & Internal'
+		WHERE link.jcr_category = 'Medicine, General & Internal'
 		  AND NOT rule.article_level_required
 	`).Scan(&links); err != nil {
 		t.Fatalf("query bridged domain links: %v", err)

@@ -35,6 +35,7 @@ type DomainImportReceipt struct {
 	domainCount     int
 	ruleCount       int
 	importedAt      time.Time
+	sealedAt        time.Time
 }
 
 func (receipt DomainImportReceipt) RegistryName() string {
@@ -59,6 +60,10 @@ func (receipt DomainImportReceipt) RuleCount() int {
 
 func (receipt DomainImportReceipt) ImportedAt() time.Time {
 	return receipt.importedAt
+}
+
+func (receipt DomainImportReceipt) SealedAt() time.Time {
+	return receipt.sealedAt
 }
 
 type PostgresDomainImporter struct {
@@ -113,6 +118,7 @@ func (importer *PostgresDomainImporter) Import(
 		domainCount:     registry.DomainCount(),
 		ruleCount:       registry.RuleCount(),
 		importedAt:      importedAt.UTC(),
+		sealedAt:        importedAt.UTC(),
 	}
 
 	tx, err := importer.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -242,6 +248,23 @@ func (importer *PostgresDomainImporter) Import(
 	if _, err := ReconcileJournalDomainMetrics(ctx, tx); err != nil {
 		return DomainImportReceipt{}, err
 	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE domain_versions
+		SET sealed_at = $2
+		WHERE id = $1
+		  AND sealed_at IS NULL
+	`, versionID, receipt.SealedAt())
+	if err != nil {
+		return DomainImportReceipt{}, mapDomainImportError(
+			"seal domain Registry receipt",
+			err,
+		)
+	}
+	if tag.RowsAffected() != 1 {
+		return DomainImportReceipt{}, errors.New(
+			"seal domain Registry receipt: expected one unsealed receipt",
+		)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return DomainImportReceipt{}, mapDomainImportError(
 			"commit domain Registry import",
@@ -261,6 +284,7 @@ func findDomainImportReceipt(
 	version string,
 ) (DomainImportReceipt, bool, error) {
 	var receipt DomainImportReceipt
+	var sealedAt *time.Time
 	err := querier.QueryRow(ctx, `
 		SELECT
 			registry_name,
@@ -268,7 +292,8 @@ func findDomainImportReceipt(
 			file_sha256,
 			domain_count,
 			rule_count,
-			imported_at
+			imported_at,
+			sealed_at
 		FROM domain_versions
 		WHERE registry_version = $1
 	`, version).Scan(
@@ -278,6 +303,7 @@ func findDomainImportReceipt(
 		&receipt.domainCount,
 		&receipt.ruleCount,
 		&receipt.importedAt,
+		&sealedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return DomainImportReceipt{}, false, nil
@@ -288,14 +314,23 @@ func findDomainImportReceipt(
 			err,
 		)
 	}
+	if sealedAt == nil {
+		return DomainImportReceipt{}, false, fmt.Errorf(
+			"find domain Registry receipt: version %q is not sealed",
+			version,
+		)
+	}
 	receipt.importedAt = receipt.importedAt.UTC()
+	receipt.sealedAt = sealedAt.UTC()
 	return receipt, true, nil
 }
 
 func mapDomainImportError(operation string, err error) error {
 	var postgresError *pgconn.PgError
 	if errors.As(err, &postgresError) &&
-		(postgresError.Code == "23505" || postgresError.Code == "23514") {
+		(postgresError.Code == "23505" ||
+			postgresError.Code == "23514" ||
+			postgresError.Code == "55000") {
 		return fmt.Errorf(
 			"%s: %w: %w",
 			operation,
@@ -378,8 +413,8 @@ func NewPostgresDomainStore(
 func (store *PostgresDomainStore) DomainsForJCRCategory(
 	ctx context.Context,
 	registryVersion string,
+	workID string,
 	category string,
-	articleLevelAsserted bool,
 ) ([]ResearchDomain, error) {
 	if ctx == nil {
 		return nil, errors.New("domain lookup context is required")
@@ -396,6 +431,9 @@ func (store *PostgresDomainStore) DomainsForJCRCategory(
 			registryVersion,
 		)
 	}
+	if workID == "" || workID != strings.TrimSpace(workID) {
+		return nil, errors.New("domain lookup requires an exact Work ID")
+	}
 	if category == "" || category != strings.TrimSpace(category) {
 		return nil, nil
 	}
@@ -408,14 +446,25 @@ func (store *PostgresDomainStore) DomainsForJCRCategory(
 		JOIN domain_versions AS version
 		  ON version.id = rule.domain_version_id
 		WHERE version.registry_version = $1
-		  AND rule.jcr_category = $2
-		  AND (NOT rule.article_level_required OR $3)
+		  AND version.sealed_at IS NOT NULL
+		  AND rule.jcr_category = $3
+		  AND (
+			  NOT rule.article_level_required
+			  OR EXISTS (
+				  SELECT 1
+				  FROM work_domain_assertions AS assertion
+				  WHERE assertion.work_id = $2
+				    AND assertion.domain_version_id = rule.domain_version_id
+				    AND assertion.domain_category_rule_id = rule.id
+				    AND assertion.domain_id = rule.domain_id
+			  )
+		  )
 		ORDER BY CASE domain.domain_key
 			WHEN 'medicine' THEN 1
 			WHEN 'biology' THEN 2
 			WHEN 'computer_science' THEN 3
 		END
-	`, registryVersion, category, articleLevelAsserted)
+	`, registryVersion, workID, category)
 	if err != nil {
 		return nil, fmt.Errorf("query exact JCR Category domains: %w", err)
 	}
@@ -436,4 +485,76 @@ func (store *PostgresDomainStore) DomainsForJCRCategory(
 		return nil, fmt.Errorf("iterate exact JCR Category domains: %w", err)
 	}
 	return slices.Clone(result), nil
+}
+
+func (store *PostgresDomainStore) PersistWorkDomainAssertion(
+	ctx context.Context,
+	assertion WorkDomainAssertion,
+) (string, error) {
+	if ctx == nil {
+		return "", errors.New("Work domain assertion context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if store == nil || store.pool == nil {
+		return "", errors.New("PostgresDomainStore is not initialized")
+	}
+	if err := assertion.Validate(); err != nil {
+		return "", err
+	}
+	var assertionID string
+	err := store.pool.QueryRow(ctx, `
+		INSERT INTO work_domain_assertions (
+			projection_assertion_id,
+			normalized_assertion_id,
+			source_record_id,
+			work_id,
+			domain_version_id,
+			domain_category_rule_id,
+			domain_id,
+			source_path,
+			asserted_at
+		)
+		SELECT
+			$1,
+			$2,
+			$3,
+			$4,
+			version.id,
+			rule.id,
+			domain.id,
+			$8,
+			$9
+		FROM domain_versions AS version
+		JOIN domain_category_rules AS rule
+		  ON rule.domain_version_id = version.id
+		JOIN research_domains AS domain
+		  ON domain.id = rule.domain_id
+		 AND domain.domain_version_id = version.id
+		WHERE version.registry_version = $5
+		  AND version.sealed_at IS NOT NULL
+		  AND rule.id = $6
+		  AND domain.domain_key = $7
+		RETURNING id::text
+	`,
+		assertion.ProjectionAssertionID,
+		assertion.NormalizedAssertionID,
+		assertion.SourceRecordID,
+		assertion.WorkID,
+		assertion.DomainRegistryVersion,
+		assertion.DomainCategoryRuleID,
+		assertion.Domain,
+		assertion.SourcePath,
+		assertion.AssertedAt.UTC(),
+	).Scan(&assertionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", errors.New(
+			"Work domain assertion Registry, rule, and domain binding was not found",
+		)
+	}
+	if err != nil {
+		return "", fmt.Errorf("persist Work domain assertion: %w", err)
+	}
+	return assertionID, nil
 }

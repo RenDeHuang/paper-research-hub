@@ -31,6 +31,7 @@ type ChannelRegistryReceipt struct {
 	entryCount      int
 	ruleCount       int
 	importedAt      time.Time
+	sealedAt        time.Time
 }
 
 func (receipt ChannelRegistryReceipt) RegistryName() string {
@@ -55,6 +56,10 @@ func (receipt ChannelRegistryReceipt) RuleCount() int {
 
 func (receipt ChannelRegistryReceipt) ImportedAt() time.Time {
 	return receipt.importedAt
+}
+
+func (receipt ChannelRegistryReceipt) SealedAt() time.Time {
+	return receipt.sealedAt
 }
 
 type PostgresChannelRegistryImporter struct {
@@ -107,6 +112,7 @@ func (importer *PostgresChannelRegistryImporter) ImportPreprints(
 		entryCount:      registry.SourceCount(),
 		ruleCount:       registry.RuleCount(),
 		importedAt:      importedAt,
+		sealedAt:        importedAt,
 	}
 	tx, err := importer.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -202,6 +208,24 @@ func (importer *PostgresChannelRegistryImporter) ImportPreprints(
 			)
 		}
 	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE preprint_source_versions
+		SET sealed_at = $2
+		WHERE id = $1
+		  AND sealed_at IS NULL
+	`, versionID, receipt.SealedAt())
+	if err != nil {
+		return ChannelRegistryReceipt{}, mapChannelRegistryImportError(
+			"seal preprint Registry receipt",
+			ErrConflictingPreprintRegistry,
+			err,
+		)
+	}
+	if tag.RowsAffected() != 1 {
+		return ChannelRegistryReceipt{}, errors.New(
+			"seal preprint Registry receipt: expected one unsealed receipt",
+		)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ChannelRegistryReceipt{}, mapChannelRegistryImportError(
 			"commit preprint Registry import",
@@ -244,6 +268,7 @@ func (importer *PostgresChannelRegistryImporter) ImportConferences(
 		entryCount:      registry.EventCount(),
 		ruleCount:       registry.RuleCount(),
 		importedAt:      importedAt,
+		sealedAt:        importedAt,
 	}
 	tx, err := importer.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -415,6 +440,24 @@ func (importer *PostgresChannelRegistryImporter) ImportConferences(
 			)
 		}
 	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE conference_registry_versions
+		SET sealed_at = $2
+		WHERE id = $1
+		  AND sealed_at IS NULL
+	`, versionID, receipt.SealedAt())
+	if err != nil {
+		return ChannelRegistryReceipt{}, mapChannelRegistryImportError(
+			"seal conference Registry receipt",
+			ErrConflictingConferenceRegistry,
+			err,
+		)
+	}
+	if tag.RowsAffected() != 1 {
+		return ChannelRegistryReceipt{}, errors.New(
+			"seal conference Registry receipt: expected one unsealed receipt",
+		)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return ChannelRegistryReceipt{}, mapChannelRegistryImportError(
 			"commit conference Registry import",
@@ -456,6 +499,7 @@ func findPreprintReceipt(
 	version string,
 ) (ChannelRegistryReceipt, bool, error) {
 	var receipt ChannelRegistryReceipt
+	var sealedAt *time.Time
 	err := querier.QueryRow(ctx, `
 		SELECT
 			registry_name,
@@ -463,7 +507,8 @@ func findPreprintReceipt(
 			file_sha256,
 			source_count,
 			rule_count,
-			imported_at
+			imported_at,
+			sealed_at
 		FROM preprint_source_versions
 		WHERE registry_version = $1
 	`, version).Scan(
@@ -473,6 +518,7 @@ func findPreprintReceipt(
 		&receipt.entryCount,
 		&receipt.ruleCount,
 		&receipt.importedAt,
+		&sealedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelRegistryReceipt{}, false, nil
@@ -483,7 +529,14 @@ func findPreprintReceipt(
 			err,
 		)
 	}
+	if sealedAt == nil {
+		return ChannelRegistryReceipt{}, false, fmt.Errorf(
+			"find preprint Registry receipt: version %q is not sealed",
+			version,
+		)
+	}
 	receipt.importedAt = receipt.importedAt.UTC()
+	receipt.sealedAt = sealedAt.UTC()
 	return receipt, true, nil
 }
 
@@ -493,6 +546,7 @@ func findConferenceReceipt(
 	version string,
 ) (ChannelRegistryReceipt, bool, error) {
 	var receipt ChannelRegistryReceipt
+	var sealedAt *time.Time
 	err := querier.QueryRow(ctx, `
 		SELECT
 			registry_name,
@@ -500,7 +554,8 @@ func findConferenceReceipt(
 			file_sha256,
 			event_count,
 			rule_count,
-			imported_at
+			imported_at,
+			sealed_at
 		FROM conference_registry_versions
 		WHERE registry_version = $1
 	`, version).Scan(
@@ -510,6 +565,7 @@ func findConferenceReceipt(
 		&receipt.entryCount,
 		&receipt.ruleCount,
 		&receipt.importedAt,
+		&sealedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChannelRegistryReceipt{}, false, nil
@@ -520,7 +576,14 @@ func findConferenceReceipt(
 			err,
 		)
 	}
+	if sealedAt == nil {
+		return ChannelRegistryReceipt{}, false, fmt.Errorf(
+			"find conference Registry receipt: version %q is not sealed",
+			version,
+		)
+	}
 	receipt.importedAt = receipt.importedAt.UTC()
+	receipt.sealedAt = sealedAt.UTC()
 	return receipt, true, nil
 }
 
@@ -531,7 +594,9 @@ func mapChannelRegistryImportError(
 ) error {
 	var postgresError *pgconn.PgError
 	if errors.As(err, &postgresError) &&
-		(postgresError.Code == "23505" || postgresError.Code == "23514") {
+		(postgresError.Code == "23505" ||
+			postgresError.Code == "23514" ||
+			postgresError.Code == "55000") {
 		return fmt.Errorf("%s: %w: %w", operation, sentinel, err)
 	}
 	return fmt.Errorf("%s: %w", operation, err)

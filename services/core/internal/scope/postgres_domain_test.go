@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -126,8 +127,8 @@ func TestRegistryDomainImportPersistsReceiptAndExactManyDomainRules(t *testing.T
 	automatic, err := store.DomainsForJCRCategory(
 		ctx,
 		ResearchDomainRegistryVersion,
+		formatTestUUID(9999),
 		"Multidisciplinary Sciences",
-		false,
 	)
 	if err != nil {
 		t.Fatalf("DomainsForJCRCategory(automatic) error = %v", err)
@@ -135,26 +136,11 @@ func TestRegistryDomainImportPersistsReceiptAndExactManyDomainRules(t *testing.T
 	if len(automatic) != 0 {
 		t.Fatalf("automatic multidisciplinary domains = %#v, want none", automatic)
 	}
-	asserted, err := store.DomainsForJCRCategory(
-		ctx,
-		ResearchDomainRegistryVersion,
-		"Multidisciplinary Sciences",
-		true,
-	)
-	if err != nil {
-		t.Fatalf("DomainsForJCRCategory(article asserted) error = %v", err)
-	}
-	if got, want := asserted, []ResearchDomain{
-		ResearchDomainMedicine,
-		ResearchDomainBiology,
-	}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("article-level domains = %#v, want %#v", got, want)
-	}
 	unknown, err := store.DomainsForJCRCategory(
 		ctx,
 		ResearchDomainRegistryVersion,
+		formatTestUUID(9999),
 		"multidisciplinary sciences",
-		true,
 	)
 	if err != nil {
 		t.Fatalf("DomainsForJCRCategory(normalized) error = %v", err)
@@ -165,7 +151,7 @@ func TestRegistryDomainImportPersistsReceiptAndExactManyDomainRules(t *testing.T
 
 	conflicting := bytes.Replace(
 		contents,
-		[]byte("Medicine; General & Internal"),
+		[]byte("Medicine, General & Internal"),
 		[]byte("Medicine"),
 		1,
 	)
@@ -185,6 +171,227 @@ func TestRegistryDomainImportPersistsReceiptAndExactManyDomainRules(t *testing.T
 	if _, err := pool.Exec(ctx, "DELETE FROM domain_category_rules"); err == nil {
 		t.Fatal("immutable domain rule DELETE error = nil")
 	}
+}
+
+func TestWorkDomainAssertionsBindSpecificWorkForArticleLevelCategories(
+	t *testing.T,
+) {
+	pool := openScopeTestPool(t)
+	importer, err := NewPostgresDomainImporter(pool, time.Now)
+	if err != nil {
+		t.Fatalf("NewPostgresDomainImporter() error = %v", err)
+	}
+	if _, err := importer.Import(
+		context.Background(),
+		bytes.NewReader(domainRegistryFixture()),
+	); err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	firstWork := insertScopeProjectionFixture(t, pool, "domain-first")
+	secondWork := insertScopeProjectionFixture(t, pool, "domain-second")
+	ctx := scopeTestContext(t)
+	var medicineRuleID string
+	if err := pool.QueryRow(ctx, `
+		SELECT rule.id::text
+		FROM domain_category_rules AS rule
+		JOIN research_domains AS domain
+		  ON domain.id = rule.domain_id
+		JOIN domain_versions AS version
+		  ON version.id = rule.domain_version_id
+		WHERE version.registry_version = $1
+		  AND rule.jcr_category = 'Multidisciplinary Sciences'
+		  AND domain.domain_key = 'medicine'
+	`, ResearchDomainRegistryVersion).Scan(&medicineRuleID); err != nil {
+		t.Fatalf("query multidisciplinary medicine rule: %v", err)
+	}
+	store, err := NewPostgresDomainStore(pool)
+	if err != nil {
+		t.Fatalf("NewPostgresDomainStore() error = %v", err)
+	}
+	before, err := store.DomainsForJCRCategory(
+		ctx,
+		ResearchDomainRegistryVersion,
+		firstWork.workID,
+		"Multidisciplinary Sciences",
+	)
+	if err != nil {
+		t.Fatalf("DomainsForJCRCategory(before assertion) error = %v", err)
+	}
+	if len(before) != 0 {
+		t.Fatalf("domains before article assertion = %#v, want none", before)
+	}
+	assertion := WorkDomainAssertion{
+		ProjectionAssertionID: firstWork.projectionAssertionID,
+		NormalizedAssertionID: firstWork.normalizedAssertionID,
+		SourceRecordID:        firstWork.sourceRecordID,
+		WorkID:                firstWork.workID,
+		DomainRegistryVersion: ResearchDomainRegistryVersion,
+		DomainCategoryRuleID:  medicineRuleID,
+		Domain:                ResearchDomainMedicine,
+		SourcePath:            "$.article.domain",
+		AssertedAt:            firstWork.assertedAt,
+	}
+	assertionID, err := store.PersistWorkDomainAssertion(ctx, assertion)
+	if err != nil {
+		t.Fatalf("PersistWorkDomainAssertion() error = %v", err)
+	}
+	if assertionID == "" {
+		t.Fatal("PersistWorkDomainAssertion() ID is empty")
+	}
+	firstDomains, err := store.DomainsForJCRCategory(
+		ctx,
+		ResearchDomainRegistryVersion,
+		firstWork.workID,
+		"Multidisciplinary Sciences",
+	)
+	if err != nil {
+		t.Fatalf("DomainsForJCRCategory(first Work) error = %v", err)
+	}
+	if got, want := firstDomains, []ResearchDomain{
+		ResearchDomainMedicine,
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("first Work domains = %#v, want %#v", got, want)
+	}
+	secondDomains, err := store.DomainsForJCRCategory(
+		ctx,
+		ResearchDomainRegistryVersion,
+		secondWork.workID,
+		"Multidisciplinary Sciences",
+	)
+	if err != nil {
+		t.Fatalf("DomainsForJCRCategory(second Work) error = %v", err)
+	}
+	if len(secondDomains) != 0 {
+		t.Fatalf("second Work domains = %#v, want none", secondDomains)
+	}
+	automatic, err := store.DomainsForJCRCategory(
+		ctx,
+		ResearchDomainRegistryVersion,
+		secondWork.workID,
+		"Medicine, General & Internal",
+	)
+	if err != nil {
+		t.Fatalf("DomainsForJCRCategory(automatic) error = %v", err)
+	}
+	if got, want := automatic, []ResearchDomain{
+		ResearchDomainMedicine,
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("automatic domains = %#v, want %#v", got, want)
+	}
+
+	forged := assertion
+	forged.WorkID = secondWork.workID
+	forged.SourcePath = "$.forged"
+	if _, err := store.PersistWorkDomainAssertion(ctx, forged); err == nil {
+		t.Fatal("PersistWorkDomainAssertion(forged provenance) error = nil")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE work_domain_assertions
+		SET source_path = '$.mutated'
+		WHERE id = $1
+	`, assertionID); err == nil {
+		t.Fatal("immutable Work domain assertion UPDATE error = nil")
+	}
+	if _, err := pool.Exec(
+		ctx,
+		"DELETE FROM work_domain_assertions WHERE id = $1",
+		assertionID,
+	); err == nil {
+		t.Fatal("immutable Work domain assertion DELETE error = nil")
+	}
+}
+
+func TestRegistryDomainReceiptSealsAndRejectsPostCommitPollution(t *testing.T) {
+	pool := openScopeTestPool(t)
+	importedAt := time.Date(2026, time.July, 18, 9, 0, 0, 0, time.UTC)
+	importer, err := NewPostgresDomainImporter(
+		pool,
+		func() time.Time { return importedAt },
+	)
+	if err != nil {
+		t.Fatalf("NewPostgresDomainImporter() error = %v", err)
+	}
+	receipt, err := importer.Import(
+		context.Background(),
+		bytes.NewReader(domainRegistryFixture()),
+	)
+	if err != nil {
+		t.Fatalf("Import() error = %v", err)
+	}
+	if !receipt.SealedAt().Equal(importedAt) {
+		t.Fatalf("receipt sealed_at = %s, want %s", receipt.SealedAt(), importedAt)
+	}
+	ctx := scopeTestContext(t)
+	var versionID, medicineID string
+	var sealedAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			version.id::text,
+			domain.id::text,
+			version.sealed_at
+		FROM domain_versions AS version
+		JOIN research_domains AS domain
+		  ON domain.domain_version_id = version.id
+		 AND domain.domain_key = 'medicine'
+	`).Scan(&versionID, &medicineID, &sealedAt); err != nil {
+		t.Fatalf("query sealed domain Registry: %v", err)
+	}
+	if !sealedAt.Equal(importedAt) {
+		t.Fatalf("stored sealed_at = %s, want %s", sealedAt, importedAt)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO research_domains (
+			domain_version_id, domain_key, display_label
+		) VALUES ($1, 'medicine', 'Medicine')
+	`, versionID); err == nil {
+		t.Fatal("post-seal research domain INSERT error = nil")
+	} else {
+		assertScopeConstraint(t, err, "research_domains_parent_unsealed")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO domain_category_rules (
+			domain_version_id, domain_id, jcr_category,
+			article_level_required
+		) VALUES ($1, $2, 'Polluted Category', false)
+	`, versionID, medicineID); err == nil {
+		t.Fatal("post-seal domain rule INSERT error = nil")
+	} else {
+		assertScopeConstraint(t, err, "domain_category_rules_parent_unsealed")
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE domain_versions
+		SET sealed_at = sealed_at
+		WHERE id = $1
+	`, versionID); err == nil {
+		t.Fatal("sealed domain receipt UPDATE error = nil")
+	}
+}
+
+func TestRegistryDomainReceiptCannotCommitUnsealed(t *testing.T) {
+	pool := openScopeTestPool(t)
+	ctx := scopeTestContext(t)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin unsealed domain receipt transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO domain_versions (
+			registry_name, registry_version, file_sha256,
+			domain_count, rule_count, imported_at
+		) VALUES (
+			'manual-domain-import',
+			'research-domains-jcr-subjects/v2',
+			$1, 3, 3, $2
+		)
+	`, strings.Repeat("d", 64), time.Now().UTC()); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("insert unsealed domain receipt: %v", err)
+	}
+	err = tx.Commit(ctx)
+	if err == nil {
+		t.Fatal("commit unsealed domain receipt error = nil")
+	}
+	assertScopeConstraint(t, err, "domain_versions_must_be_sealed")
 }
 
 func TestRegistryDomainReconciliationUsesExactCategoryBytes(t *testing.T) {
@@ -213,8 +420,8 @@ func TestRegistryDomainReconciliationUsesExactCategoryBytes(t *testing.T) {
 		t.Fatalf("insert journal Venue: %v", err)
 	}
 	for category, target := range map[string]*string{
-		"Medicine; General & Internal": &exactMetricID,
-		"medicine; general & internal": &normalizedMetricID,
+		"Medicine, General & Internal": &exactMetricID,
+		"medicine, general & internal": &normalizedMetricID,
 	} {
 		if err := pool.QueryRow(ctx, `
 			INSERT INTO venue_metric_snapshots (
@@ -264,7 +471,7 @@ func TestRegistryDomainReconciliationUsesExactCategoryBytes(t *testing.T) {
 	}
 	if gotMetricID != exactMetricID ||
 		gotMetricID == normalizedMetricID ||
-		category != "Medicine; General & Internal" ||
+		category != "Medicine, General & Internal" ||
 		domain != "medicine" {
 		t.Fatalf("exact domain link = %q/%q/%q", gotMetricID, category, domain)
 	}
@@ -273,12 +480,28 @@ func TestRegistryDomainReconciliationUsesExactCategoryBytes(t *testing.T) {
 func domainRegistryFixture() []byte {
 	return []byte(
 		"registry_name,registry_version,domain,display_label,jcr_category,article_level_required\n" +
-			"medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Medicine; General & Internal,false\n" +
+			"medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,\"Medicine, General & Internal\",false\n" +
 			"medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Biology,false\n" +
-			"medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,Computer Science; Artificial Intelligence,false\n" +
+			"medpaperhub-research-domains,research-domains-jcr-subjects/v2,computer_science,Computer Science,\"Computer Science, Artificial Intelligence\",false\n" +
 			"medpaperhub-research-domains,research-domains-jcr-subjects/v2,medicine,Medicine,Multidisciplinary Sciences,true\n" +
 			"medpaperhub-research-domains,research-domains-jcr-subjects/v2,biology,Biology,Multidisciplinary Sciences,true\n",
 	)
+}
+
+func assertScopeConstraint(t *testing.T, err error, constraint string) {
+	t.Helper()
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) {
+		t.Fatalf("error = %v, want PostgreSQL constraint %q", err, constraint)
+	}
+	if postgresError.ConstraintName != constraint {
+		t.Fatalf(
+			"PostgreSQL constraint = %q, want %q: %v",
+			postgresError.ConstraintName,
+			constraint,
+			err,
+		)
+	}
 }
 
 func openScopeTestPool(t *testing.T) *pgxpool.Pool {
