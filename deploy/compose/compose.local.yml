@@ -1,0 +1,14 @@
+services:
+  postgres:
+    restart: unless-stopped
+
+  api:
+    restart: unless-stopped
+
+  worker:
+    env_file:
+      - path: ./deploy/env/.env.pipeline
+        required: false
+
+  web:
+    restart: unless-stopped

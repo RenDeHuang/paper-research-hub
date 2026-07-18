@@ -40,6 +40,9 @@ jobs:
           docker version
           docker compose version
 
+      - name: Validate deployment contract
+        run: sh deploy/tests/deploy_contract_test.sh
+
       - name: Validate Compose models
         run: make compose-config
 

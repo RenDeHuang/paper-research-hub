@@ -1,0 +1,4 @@
+# Restricted manifest syntax: top-level KEY: value entries only.
+MANIFEST_VERSION: 1
+JCR_IMPORT_PATH: /absolute/path/to/authorized-jcr-export.csv
+REPLAY_INPUT_PATH: /absolute/path/to/fixed-paper-input.ndjson

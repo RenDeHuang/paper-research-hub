@@ -3,11 +3,13 @@
 COMPOSE := docker compose
 COMPOSE_FILES := -f docker-compose.yml
 COMPOSE_TEST_FILES := -f docker-compose.yml -f docker-compose.test.yml
+COMPOSE_LOCAL_FILES := -f docker-compose.yml -f deploy/compose/compose.local.yml
 SMOKE_PROJECT := paper-research-hub-smoke
 
 .PHONY: help install generate generate-api-types dev-web build build-core build-web typecheck lint-web \
 	test test-core test-web test-race compose-config compose-build compose-up verify-local \
-	compose-down compose-logs smoke
+	compose-down compose-logs smoke local-up local-verify-empty local-release \
+	local-verify-release
 
 help:
 	@printf '%s\n' \
@@ -26,7 +28,11 @@ help:
 		'verify-local    Verify the running API/Web deployment boundary' \
 		'compose-down    Stop the local stack' \
 		'compose-logs    Follow local stack logs' \
-		'smoke           Build and verify an isolated empty-database stack'
+		'smoke           Build and verify an isolated empty-database stack' \
+		'local-up        Reset, start, and verify the deploy/ empty stack' \
+		'local-verify-empty Verify the deploy/ empty Catalog contract' \
+		'local-release   Validate and run MANIFEST=/absolute/path release' \
+		'local-verify-release Verify that a Catalog release is published'
 
 install:
 	pnpm install --frozen-lockfile
@@ -68,6 +74,7 @@ test-race:
 compose-config:
 	$(COMPOSE) $(COMPOSE_FILES) config --quiet
 	$(COMPOSE) $(COMPOSE_TEST_FILES) --profile smoke config --quiet
+	$(COMPOSE) $(COMPOSE_LOCAL_FILES) config --quiet
 
 compose-build: compose-config
 	$(COMPOSE) $(COMPOSE_FILES) build
@@ -102,3 +109,15 @@ smoke: compose-config
 	$(COMPOSE) -p $(SMOKE_PROJECT) $(COMPOSE_TEST_FILES) \
 		down --volumes --remove-orphans; \
 	exit "$$status"
+
+local-up:
+	@sh deploy/scripts/up-empty.sh
+
+local-verify-empty:
+	@sh deploy/scripts/verify-empty.sh
+
+local-release:
+	@MANIFEST="$(MANIFEST)" sh deploy/scripts/local-release.sh
+
+local-verify-release:
+	@sh deploy/scripts/verify-release.sh
