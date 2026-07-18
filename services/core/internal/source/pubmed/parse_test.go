@@ -514,6 +514,66 @@ func TestParsePublicationHistoryRejectsEntryWithoutDate(t *testing.T) {
 	}
 }
 
+func TestParsePublicationHistoryRejectsInvalidShape(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		statusAttribute string
+		date            string
+		wantReason      string
+	}{
+		{
+			name:       "missing PubStatus",
+			date:       `<Year>2026</Year>`,
+			wantReason: "requires a non-empty PubStatus",
+		},
+		{
+			name:            "blank PubStatus",
+			statusAttribute: ` PubStatus="   "`,
+			date:            `<Year>2026</Year>`,
+			wantReason:      "requires a non-empty PubStatus",
+		},
+		{
+			name:            "season precision",
+			statusAttribute: ` PubStatus="accepted"`,
+			date:            `<Year>2026</Year><Season>Summer</Season>`,
+			wantReason:      `date precision "season" is not supported`,
+		},
+		{
+			name:            "MedlineDate text precision",
+			statusAttribute: ` PubStatus="accepted"`,
+			date:            `<MedlineDate>2026 Jul-Aug</MedlineDate>`,
+			wantReason:      `date precision "text" is not supported`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := pubmed.ParseRecord([]byte(`<PubmedArticle>
+  <MedlineCitation><PMID>123</PMID><Article/></MedlineCitation>
+  <PubmedData>
+    <History>
+      <PubMedPubDate` + tt.statusAttribute + `>` + tt.date + `</PubMedPubDate>
+    </History>
+  </PubmedData>
+</PubmedArticle>`))
+			if err == nil {
+				t.Fatal("ParseRecord() accepted invalid publication history shape")
+			}
+			if !strings.Contains(err.Error(), "publication history") ||
+				!strings.Contains(err.Error(), "PubMedPubDate[1]") ||
+				!strings.Contains(err.Error(), tt.wantReason) {
+				t.Fatalf(
+					"ParseRecord() error = %v, want ordinal and reason %q",
+					err,
+					tt.wantReason,
+				)
+			}
+		})
+	}
+}
+
 func TestParsePublicationHistoryDoesNotInferAheadOfPrintFromElectronicArticleDate(t *testing.T) {
 	t.Parallel()
 

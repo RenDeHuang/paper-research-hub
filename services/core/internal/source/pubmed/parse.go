@@ -683,6 +683,13 @@ func parsePublicationHistory(
 	history := make([]source.PublicationHistoryEntry, 0, len(values))
 	for index, value := range values {
 		ordinal := index + 1
+		status := strings.TrimSpace(value.Status)
+		if status == "" {
+			return nil, fmt.Errorf(
+				"parse PubMed publication history PubMedPubDate[%d]: requires a non-empty PubStatus",
+				ordinal,
+			)
+		}
 		date, _, err := parseDate(value.dateXML)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -697,8 +704,19 @@ func parsePublicationHistory(
 				ordinal,
 			)
 		}
+		switch date.Precision {
+		case source.DatePrecisionYear,
+			source.DatePrecisionMonth,
+			source.DatePrecisionDay:
+		default:
+			return nil, fmt.Errorf(
+				"parse PubMed publication history PubMedPubDate[%d]: date precision %q is not supported",
+				ordinal,
+				date.Precision,
+			)
+		}
 		history = append(history, source.PublicationHistoryEntry{
-			Status: strings.TrimSpace(value.Status),
+			Status: status,
 			Date:   *date,
 			SourcePath: fmt.Sprintf(
 				"/PubmedArticle/PubmedData/History/PubMedPubDate[%d]",
