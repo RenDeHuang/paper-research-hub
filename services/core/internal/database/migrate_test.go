@@ -25,6 +25,7 @@ import (
 const (
 	initialMigrationChecksum = "3568e26689b33d651fe0ee5089587ba2d3efd74517eb430b83766f9907881404"
 	scopeRegistryV20Checksum = "8131e9168968fa836a336a47c241843957c6eb62a08f9e3a988efd06f6a6b635"
+	scopeRegistryV21Checksum = "f772b047ba3fa8e84c9246fa801906e497e5a121acd764392d5a00f430915cbd"
 )
 
 var expectedSchemaTables = []string{
@@ -219,6 +220,7 @@ var expectedScopeAndChannelConstraints = []string{
 	"work_channel_admission_decisions_domain_registry_check",
 	"work_channel_admission_decisions_journal_policy_check",
 	"work_channel_admission_decisions_channel_registry_check",
+	"work_channel_admission_decisions_channel_shape_check",
 	"work_channel_admission_decisions_version_shape_check",
 	"work_channel_admission_decisions_evidence_check",
 	"work_channel_admission_decisions_identity_key",
@@ -323,6 +325,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 19, name: "jcr_registry_v2"},
 		{version: 20, name: "scope_and_channel_registries"},
 		{version: 21, name: "scope_registry_sealing"},
+		{version: 22, name: "scope_registry_serialization_and_missing_admissions"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -366,8 +369,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 21 {
-		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
+	if len(migrations) != 22 {
+		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -485,9 +488,24 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 			migrations[20],
 		)
 	}
+	if got := migrationChecksum(migrations[20].SQL); got != scopeRegistryV21Checksum {
+		t.Fatalf(
+			"000021_scope_registry_sealing checksum = %s, want immutable %s",
+			got,
+			scopeRegistryV21Checksum,
+		)
+	}
+	if migrations[21].Version != 22 ||
+		migrations[21].Name !=
+			"scope_registry_serialization_and_missing_admissions" {
+		t.Fatalf(
+			"twenty-second migration = %#v, want 000022_scope_registry_serialization_and_missing_admissions",
+			migrations[21],
+		)
+	}
 }
 
-func TestScopeRegistrySealingAndArticleDomainSchema(t *testing.T) {
+func TestScopeRegistrySealingArticleDomainAndAdmissionSchema(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)
 
@@ -515,6 +533,7 @@ func TestScopeRegistrySealingAndArticleDomainSchema(t *testing.T) {
 			"created_at":              true,
 		},
 		"work_channel_admission_decisions": {
+			"channel":                  false,
 			"admission_policy_version": true,
 			"domain_registry_version":  true,
 			"journal_policy_version":   false,
@@ -562,6 +581,42 @@ func TestScopeRegistrySealingAndArticleDomainSchema(t *testing.T) {
 				removed,
 			)
 		}
+	}
+
+	lockClauses := map[string]string{
+		"require_unsealed_registry_parent":               "FOR SHARE",
+		"require_unsealed_conference_event_parent":       "FOR SHARE OF version",
+		"require_unsealed_conference_entry_parent":       "FOR SHARE OF version",
+		"require_unsealed_conference_entry_child_parent": "FOR SHARE OF version",
+	}
+	for function, clause := range lockClauses {
+		var definition string
+		if err := pool.QueryRow(ctx, `
+			SELECT pg_get_functiondef(oid)
+			FROM pg_proc
+			WHERE pronamespace = 'public'::regnamespace
+			  AND proname = $1
+		`, function).Scan(&definition); err != nil {
+			t.Fatalf("query %s definition: %v", function, err)
+		}
+		if !strings.Contains(definition, clause) {
+			t.Fatalf("%s does not contain %q:\n%s", function, clause, definition)
+		}
+	}
+
+	var nullsNotDistinct bool
+	if err := pool.QueryRow(ctx, `
+		SELECT index.indnullsnotdistinct
+		FROM pg_constraint AS admission_constraint
+		JOIN pg_index AS index
+		  ON index.indexrelid = admission_constraint.conindid
+		WHERE admission_constraint.conname =
+			'work_channel_admission_decisions_identity_key'
+	`).Scan(&nullsNotDistinct); err != nil {
+		t.Fatalf("query admission identity NULL semantics: %v", err)
+	}
+	if !nullsNotDistinct {
+		t.Fatal("admission identity does not use NULLS NOT DISTINCT")
 	}
 }
 
@@ -2900,8 +2955,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 21 {
-		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
+	if len(migrations) != 22 {
+		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -4322,8 +4377,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 21 {
-		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
+	if len(migrations) != 22 {
+		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -6142,8 +6197,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 21 {
-		t.Fatalf("embedded migration count = %d, want 21", len(migrations))
+	if len(migrations) != 22 {
+		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
 	}
 
 	pool := openTestPool(t)

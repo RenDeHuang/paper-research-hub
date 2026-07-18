@@ -117,6 +117,111 @@ type AdmissionDecision struct {
 	DecidedAt              time.Time
 }
 
+func (decision AdmissionDecision) Validate() error {
+	if decision.WorkID == "" || decision.WorkID != strings.TrimSpace(decision.WorkID) {
+		return errors.New("admission decision requires an exact Work ID")
+	}
+	if decision.AdmissionPolicyVersion != ChannelAdmissionPolicyVersion {
+		return fmt.Errorf(
+			"unsupported admission policy version %q",
+			decision.AdmissionPolicyVersion,
+		)
+	}
+	if decision.DomainRegistryVersion != ResearchDomainRegistryVersion {
+		return fmt.Errorf(
+			"unsupported domain Registry version %q",
+			decision.DomainRegistryVersion,
+		)
+	}
+	if decision.DecidedAt.IsZero() {
+		return errors.New("admission decision decided_at is required")
+	}
+	for index, sourcePath := range decision.SourcePaths {
+		if sourcePath == "" || sourcePath != strings.TrimSpace(sourcePath) {
+			return fmt.Errorf(
+				"admission decision source path %d must be exact",
+				index,
+			)
+		}
+	}
+	switch decision.Decision {
+	case AdmissionMissing:
+		if decision.Channel != "" ||
+			decision.Reason != AdmissionReasonChannelUnresolved ||
+			decision.JournalPolicyVersion != "" ||
+			decision.ChannelRegistryVersion != "" {
+			return errors.New(
+				"missing admission requires an unresolved NULL channel shape",
+			)
+		}
+	case AdmissionAccepted, AdmissionRejected:
+		if _, err := ParseContentChannel(string(decision.Channel)); err != nil {
+			return err
+		}
+		if !decision.Reason.validFor(decision.Decision) {
+			return fmt.Errorf(
+				"admission reason %q is invalid for decision %q",
+				decision.Reason,
+				decision.Decision,
+			)
+		}
+		switch decision.Channel {
+		case ContentChannelJournalPublished, ContentChannelAcceptedEarly:
+			if decision.JournalPolicyVersion != JournalAllQ1PolicyVersion ||
+				decision.ChannelRegistryVersion != "" {
+				return errors.New(
+					"journal admission requires only journal policy version",
+				)
+			}
+		case ContentChannelPreprint:
+			if decision.JournalPolicyVersion != "" ||
+				decision.ChannelRegistryVersion != PreprintRegistryVersion {
+				return errors.New(
+					"preprint admission requires only preprint Registry version",
+				)
+			}
+		case ContentChannelConferenceProceeding:
+			if decision.JournalPolicyVersion != "" ||
+				decision.ChannelRegistryVersion != ConferenceRegistryVersion {
+				return errors.New(
+					"conference admission requires only conference Registry version",
+				)
+			}
+		default:
+			return fmt.Errorf(
+				"unsupported admission channel %q",
+				decision.Channel,
+			)
+		}
+	default:
+		return fmt.Errorf("invalid admission decision %q", decision.Decision)
+	}
+	return nil
+}
+
+func (reason AdmissionReason) validFor(status AdmissionStatus) bool {
+	if status == AdmissionAccepted {
+		return reason == AdmissionReasonEligible
+	}
+	if status != AdmissionRejected {
+		return false
+	}
+	switch reason {
+	case AdmissionReasonDomainUnresolved,
+		AdmissionReasonLifecycleIneligible,
+		AdmissionReasonOfficialURLMissing,
+		AdmissionReasonJournalQ1NotAccepted,
+		AdmissionReasonPreprintEvidenceMissing,
+		AdmissionReasonPreprintRegistryMismatch,
+		AdmissionReasonConferenceEvidenceMissing,
+		AdmissionReasonConferenceRegistryMismatch,
+		AdmissionReasonJCRForbidden:
+		return true
+	default:
+		return false
+	}
+}
+
 func EvaluateAdmission(
 	input AdmissionInput,
 	preprints PreprintRegistry,
