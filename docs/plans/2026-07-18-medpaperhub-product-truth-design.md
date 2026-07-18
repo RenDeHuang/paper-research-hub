@@ -1,4 +1,4 @@
-# medpaperhub 产品真相与三源数据架构设计
+# medpaperhub 产品真相与多来源论文情报架构设计
 
 **日期：** 2026-07-18  
 **状态：** 用户已批准  
@@ -45,7 +45,42 @@ Computer Science
 综合期刊中的文章必须通过文章级学科分类后才能进入对应领域的分析结果。分类不覆盖
 或证据不足的文章可以保留在内部来源记录中，但不能被计入领域趋势。
 
-### 3.2 期刊准入
+### 3.2 内容频道
+
+公开论文不能只按期刊论文建模，冻结为四个相互区分的内容频道：
+
+```text
+journal_published       正式期刊论文
+accepted_early          Accepted / Pending / Online First / Ahead of Print
+preprint                预印本及其修订版本
+conference_proceeding   正式会议论文
+```
+
+JCR 只约束期刊频道。预印本和会议论文没有 JCR Quartile，必须使用各自的版本化
+准入注册表。所有频道共同遵守稳定身份、官方 URL、生命周期和来源可追溯门槛。
+
+频道和生命周期不是从 `venue_type`、Crossref type 或内容分析中的 `PaperType`
+推导。权威状态由以下不可变断言和版本化投影组成：
+
+```text
+work_channel_assertions
+work_channel_decisions
+work_lifecycle_assertions
+work_lifecycle_states
+work_channel_admission_decisions
+```
+
+每个决定必须保存 source record、source path、policy version、理由和生效时间。
+
+首页按频道回答：
+
+1. 今日正式发表；
+2. 今日新预印本；
+3. 最新会议论文；
+4. 最近接收或 Online First；
+5. 今日新发现。
+
+### 3.3 正式期刊和 Early Access 准入
 
 期刊注册表来自用户明确授权、带 edition year、metric year、JCR Category、JIF
 Rank、Category Journal Count、JIF Percentile 和导入回执的 JCR 数据。
@@ -54,21 +89,58 @@ Rank、Category Journal Count、JIF Percentile 和导入回执的 JCR 数据。
 
 ```text
 Quartile = Q1
-AND
-JIF Percentile >= 87.5
 ```
 
-若授权导出只提供 Rank 和 Category Journal Count，则使用等价规则：
+`JIF Percentile >= 50` 不作为额外条件，因为 Q1 已经是 Category 内的第一四分位。
+Rank、Category Journal Count 和 JIF Percentile 继续作为公开证据保存，但不再作为
+第二道质量门槛。一个期刊属于多个 Category 时，只要在任意一个允许 Category 中为
+Q1 即可准入。
+
+`accepted_early` 必须属于同一套 Q1 期刊注册表，并且具有同一来源中的明确
+accepted、pending、ahead-of-print 或 online-first 状态和经过验证的官方 URL。
+
+### 3.4 预印本准入
+
+预印本不使用 JCR。公开门槛冻结为：
 
 ```text
-JIF Rank <= ceil(Category Journal Count * 0.125)
+trusted preprint server
+AND stable preprint identifier
+AND official URL verified
+AND posted date and version known
+AND domain assignment resolved
+AND not withdrawn
 ```
 
-一个期刊属于多个 Category 时，只要在任意一个允许 Category 中满足规则即可准入。
-系统必须保存实际命中的 Category、Rank、Percentile、metric year、receipt 和
-policy version，不能只保存一个无来源的 `eligible=true`。
+第一批可信预印本来源：
 
-### 3.3 非目标
+```text
+bioRxiv
+medRxiv
+arXiv
+Europe PMC Preprints
+NIH Preprint Pilot
+Research Square records available through authorized structured sources
+```
+
+预印本必须明确标记为未形成正式 Version of Record，不能与正式期刊论文混用 JCR
+徽标或同行评审状态。
+
+### 3.5 会议论文准入
+
+会议论文不使用 JCR。第一版冻结为：
+
+```text
+official IEEE or ACM proceeding
+OR
+versioned reviewed conference allowlist
+```
+
+会议 Registry 必须区分 registry version、会议系列、具体 event、准入 entry、稳定
+identifier 和官方 host，保存主办组织、年份、来源、版本和审阅记录。不能根据标题
+中的 conference、proceedings 或会议缩写猜测准入。
+
+### 3.6 非目标
 
 第一阶段不做：
 
@@ -79,12 +151,32 @@ policy version，不能只保存一个无来源的 `eligible=true`。
 - 根据标题猜 accepted、ahead-of-print、研究类型或官方 URL；
 - 由大模型自由生成没有结构化证据的“研究机会”；
 - 将 OpenAlex citedness、SJR 或 CiteScore 冒充 JIF。
+- 把预印本标成同行评审论文；
+- 对预印本、会议论文使用 JCR 门槛；
+- 在没有许可依据时抓取或公开受限的出版社全文；
 
-## 4. 三源职责
+## 4. 来源分层与职责
 
-### 4.1 Crossref：实时发现主来源
+### 4.1 官方首发来源
 
-Crossref 是热链路的唯一主要发现源，负责：
+第一方平台用于尽早发现和提供官方 URL：
+
+```text
+bioRxiv / medRxiv API
+arXiv API / OAI-PMH
+IEEE Xplore API
+ACM Digital Library 官方页面或 RSS/TOC
+出版社 API / RSS
+```
+
+第一阶段不为每本期刊开发 DOM 爬虫。只有提供稳定、可授权的 API、OAI-PMH、
+RSS/TOC 或结构化 feed 时才新增官方 connector。
+
+### 4.2 DOI 注册机构
+
+#### Crossref
+
+Crossref 是期刊论文和 accepted/online-first 热链路的主要通用发现源，负责：
 
 - DOI 和期刊文章身份；
 - ISSN、Publisher 和容器信息；
@@ -102,7 +194,17 @@ crossref_updated_watermark
 新记录使用 `from-created-date`，已有记录变化使用 `from-update-date`。不能把
 `indexed` 时间当作新论文时间，因为 Crossref 重新索引旧记录时会改变该字段。
 
-### 4.2 PubMed：医学语义和发表历史
+Crossref 中的 `posted-content` 和显式 `is-preprint-of` / `has-preprint` relation
+也作为预印本版本关系证据，但不能替代预印本服务器的官方状态。
+
+#### DataCite
+
+DataCite 用于补充 Crossref 未覆盖的 DOI 资源、仓储记录和预印本。DataCite 断言作为
+独立 source record 保存，不能覆盖 Crossref 或预印本服务器事实。
+
+### 4.3 医学和生命科学来源
+
+#### PubMed
 
 PubMed 是医学、生物学语义和 publication history 的主来源，负责：
 
@@ -116,7 +218,36 @@ PubMed 通过 E-utilities 每小时增量同步，同时保留 Daily Update 文�
 完整追赶和重放通道。PubMed 缺失不能阻塞 Crossref 热链路公开，但会影响内容分类和
 分析就绪状态。
 
-### 4.3 OpenAlex：引用和研究网络增强
+#### Europe PMC
+
+Europe PMC 负责生命科学论文和预印本增强，包括 PMID/PMCID/DOI 对齐、预印本记录、
+开放全文位置、引用关系和版本关联。Europe PMC 不是对 PubMed 字段的无来源覆盖。
+
+#### bioRxiv / medRxiv
+
+bioRxiv 和 medRxiv API 是对应预印本的第一发现来源，负责预印本标识、posted date、
+version、category、官方 URL 和来源级 usage snapshot。来源级 PDF 下载量可以保存，
+但不得与期刊下载量合并或跨平台比较。
+
+### 4.4 计算机科学和工程来源
+
+#### arXiv
+
+arXiv 是计算机科学预印本的第一发现来源。普通 API 用于小批查询，OAI-PMH 用于持续
+增量同步。系统保存 arXiv ID、版本、submitted/updated 时间和官方 abstract URL。
+
+#### IEEE Xplore
+
+IEEE Xplore 是 IEEE 期刊、会议论文、书籍和标准的官方元数据来源。IEEE 期刊仍须
+满足 JCR Q1；IEEE 会议论文使用会议注册表。生产接入必须保存 API 授权依据和速率
+限制配置。
+
+#### ACM Digital Library
+
+ACM 期刊使用 JCR Q1；ACM 会议论文使用会议注册表。发现优先使用 Crossref DOI 和
+ACM 官方 RSS/TOC/页面，不能假设存在无限制公共 API。
+
+### 4.5 OpenAlex：引用和研究网络增强
 
 OpenAlex 不承担第一发现，按 DOI 或 OpenAlex ID 补全：
 
@@ -131,19 +262,27 @@ OpenAlex 不承担第一发现，按 DOI 或 OpenAlex ID 补全：
 
 ```mermaid
 flowchart LR
-    A["授权 JCR 期刊注册表"] --> B["Crossref created/update 增量"]
-    B --> C["不可变 source record"]
-    C --> D["身份规范化与 Venue 准入"]
-    D --> E["官方 URL 验证"]
-    E --> F["实时 Catalog generation"]
+    A["Crossref / DataCite"] --> S["不可变 source records"]
+    B["PubMed / Europe PMC"] --> S
+    C["bioRxiv / medRxiv"] --> S
+    D["arXiv"] --> S
+    E["IEEE Xplore / ACM feeds"] --> S
+
+    S --> I["身份规范化与 Work Family"]
+    I --> V["频道准入与官方 URL 验证"]
+    V --> J["正式期刊论文"]
+    V --> P["Accepted / Early"]
+    V --> R["预印本"]
+    V --> Q["会议论文"]
+    J --> F["实时 Catalog generation"]
+    P --> F
+    R --> F
+    Q --> F
     F --> G["Go API"]
     G --> H["Nuxt 每日论文流"]
 
-    C --> I["PubMed 小时级补全"]
-    C --> J["OpenAlex DOI 增强"]
-    I --> K["多轴分类"]
-    J --> K
-    K --> L["analysis-ready snapshot"]
+    S --> K["领域来源与 OpenAlex 增强"]
+    K --> L["多轴分类与 analysis-ready snapshot"]
     L --> M["周/月趋势"]
     L --> N["期刊 12/24 月模式"]
     L --> O["技术与范式指标"]
@@ -156,7 +295,11 @@ flowchart LR
 运行节奏：
 
 ```text
-Crossref poll                 每 2 分钟
+Crossref created/update       每 2 分钟
+bioRxiv / medRxiv             每 5 分钟
+arXiv OAI-PMH                 每小时
+IEEE Xplore                   每 10 分钟
+DataCite                      每 10 分钟
 URL verification              候选记录进入后立即执行
 实时 Catalog micro-batch      每 5 分钟
 ```
@@ -164,11 +307,12 @@ URL verification              候选记录进入后立即执行
 目标服务等级：
 
 ```text
-Crossref API 可见后，5 分钟内进入公开 medpaperhub
+对应首发 API 可见后，按该来源调度周期进入 medpaperhub
 ```
 
-该目标不等于“出版社官网上线后 5 分钟”，因为只使用三个聚合来源时无法观测所有
-出版社页面的精确首发时间。
+Crossref 来源的目标仍是 API 可见后 5 分钟内公开。其他来源按各自授权速率和调度周期
+计算。该目标不等于“出版社官网上线后 5 分钟”，因为没有稳定 feed 的出版社仍无法
+观测精确首发时间。
 
 ### 5.2 分析链路
 
@@ -179,6 +323,7 @@ Crossref API 可见后，5 分钟内进入公开 medpaperhub
 ```text
 PubMed E-utilities            每小时
 PubMed Daily Update           每日同源追赶
+Europe PMC                    每 6 小时
 OpenAlex 元数据增强           每 6 小时
 OpenAlex 引用快照             每日
 多轴分类                      每次来源投影变化后
@@ -199,19 +344,23 @@ analysis_cutoff = generated_at - 48 hours
 必须区分：
 
 ```text
-source_created_at      来源第一次创建记录
-source_deposited_at    来源最近一次收到提交
-source_indexed_at      来源内部索引时间
-official_online_date   来源明确声明的在线发表日期
-official_print_date    来源明确声明的印刷日期
-first_observed_at      medpaperhub 第一次看到记录
-url_verified_at        官方链接通过验证
-catalog_published_at   首次进入公开 Catalog
+source_created_at       来源第一次创建记录
+source_deposited_at     来源最近一次收到提交
+source_indexed_at       来源内部索引时间
+official_online_date    来源明确声明的在线发表日期
+official_print_date     来源明确声明的印刷日期
+preprint_posted_date    预印本服务器明确声明的首次 posted 日期
+conference_date         官方 proceeding 声明的会议或发表日期
+first_observed_at       medpaperhub 第一次看到记录
+url_verified_at         官方链接通过验证
+catalog_published_at    首次进入公开 Catalog
 ```
 
 首页的两个集合不能混淆：
 
 - **今日正式发表：** 同一来源断言中 `official_online_date` 或适用的正式发表事件为今天；
+- **今日新预印本：** 可信预印本来源的 `preprint_posted_date` 为今天；
+- **最新会议论文：** 官方 proceeding 来源明确提供会议论文发表或上线事件；
 - **今日新发现：** `first_observed_at` 为今天，正式发表日期可能更早。
 
 系统不能把抓取时间、Crossref indexed 时间或 PubMed Entrez 时间冒充正式发表时间。
@@ -233,14 +382,20 @@ discovered
 ```text
 official_article_url
 doi_url
-pubmed_url
-openalex_url
-open_access_pdf_url
-code_url
-dataset_url
+official_preprint_url
+official_proceeding_url
 ```
 
-URL 验证至少保存：
+URL 数据必须拆成三层：
+
+```text
+work_url_candidates
+work_url_verifications
+current_work_official_links
+```
+
+候选层至少保存来源记录、source path、内容频道、link role 和 parser version。
+验证层至少保存：
 
 - 来源 URL；
 - 完整 redirect chain；
@@ -249,7 +404,14 @@ URL 验证至少保存：
 - 页面或结构化元数据中与 Work 一致的 DOI/官方文章标识；
 - 验证时间；
 - verifier version；
+- policy version；
+- expires_at；
 - 失败原因。
+
+当前官方链接是从验证历史生成的版本化投影，不能覆盖历史验证。期刊和
+`accepted_early` 的当前链接必须是出版社页面或 DOI resolver 且标识一致；预印本
+必须是可信服务器 landing/abstract URL；会议论文必须是官方 proceedings 或
+publisher 页面。PubMed 和 OpenAlex URL 只能作为辅助跳转，不能单独满足公开门槛。
 
 禁止根据标题、期刊名称、卷期页码或 DOI 模式拼接 URL。没有通过验证的记录进入：
 
@@ -262,7 +424,7 @@ url_state = pending
 论文卡片交互固定为：
 
 ```text
-卡片 -> /papers/{id} -> 查看期刊原文 -> official_article_url
+卡片 -> /papers/{id} -> 查看原文 -> current official link
 ```
 
 ## 8. 记录身份、去重与来源冲突
@@ -270,11 +432,40 @@ url_state = pending
 规范身份优先级：
 
 1. 规范化 DOI；
-2. PMID、PMCID、OpenAlex ID 等来源标识；
+2. PMID、PMCID、arXiv ID、bioRxiv/medRxiv DOI、IEEE/ACM article ID、
+   OpenAlex ID 等来源标识；
 3. 出版社页面中的稳定官方文章标识和 canonical URL。
 
 标题相似度不作为自动合并依据。缺少可证明共同身份的记录保持独立，进入人工或后续
 来源对账队列。
+
+同一研究的不同版本必须形成 `Work Family`，而不是覆盖或重复计数：
+
+```text
+Preprint
+-> Revised Preprint
+-> Accepted Manuscript
+-> Online First
+-> Version of Record
+-> Correction / Retraction
+```
+
+Work Family 的权威数据结构至少包括：
+
+```text
+work_families
+work_family_memberships
+work_relation_assertions
+work_relation_decisions
+```
+
+每个 Work 必须且只能有一个当前 family membership；没有已证明关系的 Work 创建
+singleton family。禁止自环和冲突 membership。关系断言必须保存 source path，
+关系决定必须保存 policy version 并支持冲突、撤销和 supersede。
+
+自动建立 family 关系必须依赖来源显式 relation 或稳定共享标识。标题和作者相似度
+只能生成待审候选，不能自动合并。默认趋势按 `work_family_id` 去重；详情页保留完整
+版本时间线。
 
 不同来源的字段保存为独立 assertion。字段获胜策略必须版本化。发表日期、accepted
 状态和 ahead-of-print 状态不能从不同来源拼成一个事件；来源冲突时保留冲突并从
@@ -372,7 +563,7 @@ PubMed Publication Type/MeSH 和来源结构化字段是来源事实；模型标
 `publicly_visible` 至少要求：
 
 ```text
-venue eligible
+content channel eligibility accepted
 AND stable identity
 AND verified outbound URL
 AND not retracted/withdrawn
@@ -381,10 +572,10 @@ AND not retracted/withdrawn
 `analysis_ready` 还要求：
 
 ```text
-published before analysis cutoff
+canonical channel event before analysis cutoff
 AND required classification axes resolved
 AND source provenance complete
-AND journal and subject assignments resolved
+AND domain and applicable Venue assignments resolved
 AND no decisive source conflict
 ```
 
@@ -395,8 +586,9 @@ AND no decisive source conflict
 
 ### 11.1 每日新论文
 
-按今日正式发表、今日新发现、最近 accepted、最近 online first 分组。每条记录展示
-期刊、正式日期、首次发现时间、已知分类标签和官方原文入口。
+按今日正式发表、今日新预印本、最新会议论文、今日新发现、最近 accepted 和最近
+online first 分组。每条记录展示频道、Venue/服务器、正式或 posted 日期、首次发现
+时间、已知分类标签和官方原文入口。
 
 ### 11.2 期刊近期可观察发表模式
 
@@ -457,7 +649,8 @@ Maturity
 ### Nuxt Web
 
 - 不连接 PostgreSQL；
-- 不持有 JCR、NCBI、Crossref、OpenAlex 或数据库凭据；
+- 不持有 JCR、NCBI、Crossref、DataCite、Europe PMC、bioRxiv/medRxiv、arXiv、
+  IEEE、OpenAlex 或数据库凭据；
 - 不自行拼接多个 generation 的分析结果；
 - 不在浏览器进行去重、来源获胜或 URL 猜测；
 - 搜索保持辅助入口。
@@ -485,8 +678,12 @@ Maturity
 现有代码和文档中的以下规则失效：
 
 - `JCR Q1 OR JIF >= 10`；
+- `JCR Q1 AND JIF Percentile >= 87.5`；
 - 只允许 PubMed publication history 驱动公开每日论文；
 - OpenAlex 作为主要论文发现来源；
+- 只有正式期刊论文一种内容频道；
+- 对预印本和会议论文套用 JCR 规则；
+- 不保存预印本到正式发表的 Work Family 和版本关系；
 - 没有 verified official URL 仍允许进入 Catalog；
 - 医学、生物学双领域边界；
 - 实时论文和趋势分析使用同一套完成门槛；
@@ -495,10 +692,12 @@ Maturity
 新的公开真相是：
 
 ```text
-三领域 JCR 准入注册表
-+ Crossref 热发现
+三领域全部 JCR Q1 期刊注册表
++ 预印本和会议独立准入注册表
++ Crossref / DataCite / 官方首发源发现
 + URL 公开硬门槛
-+ PubMed/OpenAlex 异步补全
++ PubMed / Europe PMC / OpenAlex 异步补全
++ Work Family 与版本时间线
 + 实时公开和 analysis-ready 双状态
 + immutable micro-batch Catalog
 ```
@@ -509,7 +708,9 @@ Maturity
 
 - 使用 Crossref created/update 双水位增量；
 - 旧记录重新 indexed 不会被当作新论文；
+- bioRxiv、medRxiv、arXiv、DataCite 和 IEEE 使用各自独立 watermark；
 - 同一 DOI 重放不会产生重复 Work；
+- 同一研究的预印本和正式发表版本不会在趋势中重复计数；
 - 来源失败不会推进 watermark。
 
 ### URL
@@ -521,6 +722,7 @@ Maturity
 ### 产品
 
 - 首页首屏回答今天和最近发表了什么，不以搜索框为中心；
+- 首页分别展示正式发表、预印本、会议论文和 accepted/online-first；
 - 期刊页提供 12/24 月发表模式；
 - 趋势页提供周/月窗口和统计证据；
 - 技术页分开显示 Novelty、Momentum、Diffusion、Maturity；
@@ -530,5 +732,6 @@ Maturity
 
 - Go、Nuxt、PostgreSQL 继续独立部署；
 - 全部新增规则有单元、集成和端到端测试；
-- 从空库、授权 JCR 导入、三源同步、URL 验证到 Catalog 发布可以完整重放；
+- 从空库、授权 JCR/预印本/会议注册表导入、多来源同步、版本对账、URL 验证到
+  Catalog 发布可以完整重放；
 - 文档、Compose、CI 和生产调度与实际运行命令一致。
