@@ -1,9 +1,12 @@
 package catalog
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +16,521 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
+	t.Run("publishes exact generation-bound collections and stable payload", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		generatedAt := time.Date(
+			2026,
+			time.July,
+			17,
+			23,
+			30,
+			0,
+			0,
+			time.FixedZone("UTC-4", -4*60*60),
+		)
+		input := catalogCurationInputAt(generatedAt)
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:                "pubmed:catalog-publication-updates",
+			logicalSource:           "pubmed",
+			canonicalKey:            "doi:10.1000/catalog-publication-updates",
+			title:                   "Generation-bound publication updates",
+			paperType:               "research_article",
+			publishedAt:             time.Date(2026, time.July, 18, 1, 0, 0, 0, time.UTC),
+			sourceTime:              time.Date(2026, time.July, 18, 2, 0, 0, 0, time.UTC),
+			scopeStatus:             "included",
+			includeWorkLink:         true,
+			includeWorkID:           true,
+			includeNormalized:       true,
+			normalizedPayloadSchema: "normalized-record/v3",
+			publicationModel:        "Print-Electronic",
+			publicationStatus:       "epublish",
+			noJCRAssessment:         true,
+		})
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		insertPublisherBiomedicalProjection(t, pool, fixture)
+
+		printDate := publicationUpdateDate(2026, time.July, 18)
+		electronicDate := publicationUpdateDate(2026, time.July, 18)
+		acceptedDate := publicationUpdateDate(2026, time.July, 12)
+		aheadDate := publicationUpdateDate(2026, time.July, 15)
+		projectionAssertionID := insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printDate:         &printDate,
+				printState:        "known",
+				electronicDate:    &electronicDate,
+				electronicState:   "known",
+				aheadDate:         &aheadDate,
+				aheadState:        "known",
+				acceptedDate:      &acceptedDate,
+				acceptedState:     "known",
+				publicationModel:  stringPointer("Print-Electronic"),
+				publicationStatus: stringPointer("epublish"),
+				events: []publisherPublicationEventFixture{
+					{
+						kind:       "accepted",
+						date:       &acceptedDate,
+						precision:  "day",
+						statusRaw:  "accepted",
+						modelRaw:   stringPointer("Print-Electronic"),
+						sourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+						ordinal:    1,
+					},
+					{
+						kind:       "accepted",
+						date:       &acceptedDate,
+						precision:  "day",
+						statusRaw:  "accepted",
+						modelRaw:   stringPointer("Print-Electronic"),
+						sourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[2]",
+						ordinal:    2,
+					},
+					{
+						kind:       "ahead_of_print",
+						date:       &aheadDate,
+						precision:  "day",
+						statusRaw:  "aheadofprint",
+						modelRaw:   stringPointer("Print-Electronic"),
+						sourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[3]",
+						ordinal:    3,
+					},
+					{
+						kind:       "print_published",
+						date:       &printDate,
+						precision:  "day",
+						statusRaw:  "ppublish",
+						modelRaw:   stringPointer("Print-Electronic"),
+						sourcePath: "/PubmedArticle/MedlineCitation/Article/Journal/JournalIssue/PubDate",
+						ordinal:    4,
+					},
+					{
+						kind:       "electronic_published",
+						date:       &electronicDate,
+						precision:  "day",
+						statusRaw:  "epublish",
+						modelRaw:   stringPointer("Print-Electronic"),
+						sourcePath: "/PubmedArticle/MedlineCitation/Article/ArticleDate[1]",
+						ordinal:    5,
+					},
+				},
+			},
+		)
+
+		generation, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		)
+		if err != nil {
+			t.Fatalf("PublishCurrent() error = %v", err)
+		}
+		repository := mustRepository(t, pool)
+		home, err := repository.Home(context.Background())
+		if err != nil {
+			t.Fatalf("Home() error = %v", err)
+		}
+		if home.Generation.ID != generation.ID {
+			t.Fatalf("Home() generation = %s, want %s", home.Generation.ID, generation.ID)
+		}
+		assertNestedJSONValue(
+			t,
+			home.Payload,
+			[]string{"publication_updates", "calendar_date"},
+			"2026-07-18",
+		)
+		assertNestedJSONValue(
+			t,
+			home.Payload,
+			[]string{"publication_updates", "calendar_timezone"},
+			"UTC",
+		)
+
+		formal := publicationUpdateCollection(t, home.Payload, "formal_publications_today")
+		accepted := publicationUpdateCollection(t, home.Payload, "recent_acceptances")
+		ahead := publicationUpdateCollection(t, home.Payload, "recent_online_first")
+		assertPublicationUpdateCollectionMetadata(t, formal, 1, 2, 1)
+		assertPublicationUpdateCollectionMetadata(t, accepted, 7, 1, 1)
+		assertPublicationUpdateCollectionMetadata(t, ahead, 7, 1, 1)
+
+		formalItems := formal["items"].([]any)
+		assertPublicationUpdateEvent(
+			t,
+			formalItems[0],
+			fixture,
+			projectionAssertionID,
+			"electronic_published",
+			"2026-07-18",
+			"epublish",
+			"/PubmedArticle/MedlineCitation/Article/ArticleDate[1]",
+		)
+		assertPublicationUpdateEvent(
+			t,
+			formalItems[1],
+			fixture,
+			projectionAssertionID,
+			"print_published",
+			"2026-07-18",
+			"ppublish",
+			"/PubmedArticle/MedlineCitation/Article/Journal/JournalIssue/PubDate",
+		)
+		assertPublicationUpdateEvent(
+			t,
+			accepted["items"].([]any)[0],
+			fixture,
+			projectionAssertionID,
+			"accepted",
+			"2026-07-12",
+			"accepted",
+			"/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+		)
+		assertPublicationUpdateEvent(
+			t,
+			ahead["items"].([]any)[0],
+			fixture,
+			projectionAssertionID,
+			"ahead_of_print",
+			"2026-07-15",
+			"aheadofprint",
+			"/PubmedArticle/PubmedData/History/PubMedPubDate[3]",
+		)
+
+		paper, err := repository.Paper(context.Background(), fixture.workID)
+		if err != nil {
+			t.Fatalf("Paper() error = %v", err)
+		}
+		var frozenPaper any
+		if err := json.Unmarshal(paper.Payload, &frozenPaper); err != nil {
+			t.Fatalf("decode frozen Paper payload: %v", err)
+		}
+		for _, collection := range []map[string]any{formal, accepted, ahead} {
+			for _, rawItem := range collection["items"].([]any) {
+				item := rawItem.(map[string]any)
+				if !reflect.DeepEqual(item["paper"], frozenPaper) {
+					t.Fatalf(
+						"publication update paper = %#v, want frozen Paper summary %#v",
+						item["paper"],
+						frozenPaper,
+					)
+				}
+			}
+		}
+
+		var stored []byte
+		if err := pool.QueryRow(context.Background(), `
+			SELECT payload
+			FROM public_catalog_home
+			WHERE generation_id = $1
+		`, generation.ID).Scan(&stored); err != nil {
+			t.Fatalf("query stored Home payload: %v", err)
+		}
+		if !bytes.Equal(home.Payload, stored) {
+			t.Fatalf("Home() payload differs from stored generation payload")
+		}
+		second, err := repository.Home(context.Background())
+		if err != nil {
+			t.Fatalf("Home() second read error = %v", err)
+		}
+		if second.Generation.ID != generation.ID ||
+			!bytes.Equal(second.Payload, home.Payload) {
+			t.Fatalf("Home() payload changed within generation %s", generation.ID)
+		}
+	})
+
+	t.Run("excludes non-day non-current and ineligible events", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInputAt(
+			time.Date(2026, time.July, 18, 23, 30, 0, 0, time.UTC),
+		)
+		eligible := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"eligible-exclusions",
+			"doi:10.1000/eligible-exclusions",
+		)
+		rejectedJCR := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"rejected-jcr",
+			"doi:10.1000/rejected-jcr",
+		)
+		nonBiomedical := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"non-biomedical",
+			"doi:10.1000/non-biomedical",
+		)
+		retracted := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"retracted",
+			"doi:10.1000/retracted",
+		)
+		excluded := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"excluded",
+			"doi:10.1000/excluded",
+		)
+		if _, err := pool.Exec(context.Background(), `
+			UPDATE works SET status = 'retracted' WHERE id = $1
+		`, retracted.workID); err != nil {
+			t.Fatalf("mark retracted Work: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			UPDATE ingestion_source_states
+			SET scope_status = 'excluded'
+			WHERE work_id = $1
+		`, excluded.workID); err != nil {
+			t.Fatalf("mark excluded source state: %v", err)
+		}
+		for index, fixture := range []publisherWorkFixture{
+			rejectedJCR,
+			nonBiomedical,
+			retracted,
+			excluded,
+		} {
+			venueID := catalogWorkVenueID(t, pool, fixture.workID)
+			if _, err := pool.Exec(context.Background(), `
+				UPDATE venues
+				SET issn_l = $2
+				WHERE id = $1
+			`, venueID, deterministicCatalogISSN(1200+index)); err != nil {
+				t.Fatalf("prepare ineligible publication update Venue: %v", err)
+			}
+		}
+
+		preparePublisherAcceptedCuration(t, pool, input, eligible)
+		insertPublisherBiomedicalProjection(t, pool, eligible)
+		ineligibleProjectionIDs := make(map[uuid.UUID]uuid.UUID)
+		for index, fixture := range []publisherWorkFixture{
+			rejectedJCR,
+			nonBiomedical,
+			retracted,
+			excluded,
+		} {
+			ineligibleProjectionIDs[fixture.workID] =
+				insertPublisherAlternateProjectionAssertion(
+					t,
+					pool,
+					fixture,
+					fmt.Sprintf("projection/ineligible-publication-%d", index+1),
+				)
+		}
+
+		futureAccepted := publicationUpdateDate(2026, time.July, 19)
+		oldAhead := publicationUpdateDate(2026, time.July, 11)
+		firstConflict := publicationUpdateDate(2026, time.July, 17)
+		secondConflict := publicationUpdateDate(2026, time.July, 18)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			eligible,
+			publisherPublicationStateFixture{
+				printState:        "conflict",
+				electronicState:   "missing",
+				aheadDate:         &oldAhead,
+				aheadState:        "known",
+				acceptedDate:      &futureAccepted,
+				acceptedState:     "known",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+				events: []publisherPublicationEventFixture{
+					{
+						kind:       "print_published",
+						date:       &firstConflict,
+						precision:  "day",
+						statusRaw:  "ppublish",
+						sourcePath: "/PubmedArticle/JournalIssue/PubDate[1]",
+						ordinal:    1,
+					},
+					{
+						kind:       "print_published",
+						date:       &secondConflict,
+						precision:  "day",
+						statusRaw:  "ppublish",
+						sourcePath: "/PubmedArticle/JournalIssue/PubDate[2]",
+						ordinal:    2,
+					},
+					{
+						kind:       "electronic_published",
+						precision:  "month",
+						sourceDate: `{"year":2026,"month":7,"precision":"month"}`,
+						statusRaw:  "epublish",
+						sourcePath: "/PubmedArticle/ArticleDate[1]",
+						ordinal:    3,
+					},
+					{
+						kind:       "ahead_of_print",
+						date:       &oldAhead,
+						precision:  "day",
+						statusRaw:  "aheadofprint",
+						sourcePath: "/PubmedArticle/PubMedPubDate[1]",
+						ordinal:    4,
+					},
+					{
+						kind:       "accepted",
+						date:       &futureAccepted,
+						precision:  "day",
+						statusRaw:  "accepted",
+						sourcePath: "/PubmedArticle/PubMedPubDate[2]",
+						ordinal:    5,
+					},
+				},
+			},
+		)
+		today := publicationUpdateDate(2026, time.July, 18)
+		for _, fixture := range []publisherWorkFixture{
+			rejectedJCR,
+			nonBiomedical,
+			retracted,
+			excluded,
+		} {
+			insertPublisherPublicationState(
+				t,
+				pool,
+				fixture,
+				publisherPublicationStateFixture{
+					projectionAssertionID: ineligibleProjectionIDs[fixture.workID],
+					printDate:             &today,
+					printState:            "known",
+					electronicState:       "missing",
+					aheadState:            "missing",
+					acceptedState:         "missing",
+					events: []publisherPublicationEventFixture{{
+						kind:       "print_published",
+						date:       &today,
+						precision:  "day",
+						statusRaw:  "ppublish",
+						sourcePath: "/PubmedArticle/JournalIssue/PubDate",
+						ordinal:    1,
+					}},
+				},
+			)
+		}
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent() error = %v", err)
+		}
+		home, err := mustRepository(t, pool).Home(context.Background())
+		if err != nil {
+			t.Fatalf("Home() error = %v", err)
+		}
+		formal := publicationUpdateCollection(t, home.Payload, "formal_publications_today")
+		accepted := publicationUpdateCollection(t, home.Payload, "recent_acceptances")
+		ahead := publicationUpdateCollection(t, home.Payload, "recent_online_first")
+		assertPublicationUpdateCollectionMetadata(t, formal, 1, 0, 0)
+		assertPublicationUpdateCollectionMetadata(t, accepted, 7, 0, 1)
+		assertPublicationUpdateCollectionMetadata(t, ahead, 7, 0, 1)
+	})
+
+	t.Run("keeps old v2 work publishable with empty updates", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInput()
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:          "pubmed:catalog-old-v2-no-publication-state",
+			logicalSource:     "pubmed",
+			canonicalKey:      "doi:10.1000/catalog-old-v2-no-publication-state",
+			title:             "Old v2 publication without projected event state",
+			publishedAt:       time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:        time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:       "included",
+			includeWorkLink:   true,
+			includeWorkID:     true,
+			includeNormalized: true,
+			noJCRAssessment:   true,
+		})
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		insertPublisherBiomedicalProjection(t, pool, fixture)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent() old v2 error = %v", err)
+		}
+		home, err := mustRepository(t, pool).Home(context.Background())
+		if err != nil {
+			t.Fatalf("Home() error = %v", err)
+		}
+		for _, collectionName := range []string{
+			"formal_publications_today",
+			"recent_acceptances",
+			"recent_online_first",
+		} {
+			collection := publicationUpdateCollection(t, home.Payload, collectionName)
+			windowDays := 7
+			if collectionName == "formal_publications_today" {
+				windowDays = 1
+			}
+			assertPublicationUpdateCollectionMetadata(t, collection, windowDays, 0, 0)
+		}
+	})
+
+	t.Run("preserves missing publication metadata as null", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInput()
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:                   "pubmed:catalog-publication-metadata-missing",
+			logicalSource:              "pubmed",
+			canonicalKey:               "doi:10.1000/catalog-publication-metadata-missing",
+			title:                      "Publication metadata missing",
+			publishedAt:                time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:                 time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:                "included",
+			includeWorkLink:            true,
+			includeWorkID:              true,
+			includeNormalized:          true,
+			normalizedPayloadSchema:    "normalized-record/v3",
+			includePublicationMetadata: true,
+			noJCRAssessment:            true,
+		})
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		insertPublisherBiomedicalProjection(t, pool, fixture)
+		printDate := publicationUpdateDate(2026, time.July, 17)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printDate:       &printDate,
+				printState:      "known",
+				electronicState: "missing",
+				aheadState:      "missing",
+				acceptedState:   "missing",
+				events: []publisherPublicationEventFixture{{
+					kind:       "print_published",
+					date:       &printDate,
+					precision:  "day",
+					statusRaw:  "ppublish",
+					sourcePath: "/PubmedArticle/JournalIssue/PubDate",
+					ordinal:    1,
+				}},
+			},
+		)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent() missing publication metadata error = %v", err)
+		}
+		home, err := mustRepository(t, pool).Home(context.Background())
+		if err != nil {
+			t.Fatalf("Home() error = %v", err)
+		}
+		formal := publicationUpdateCollection(t, home.Payload, "formal_publications_today")
+		event := formal["items"].([]any)[0].(map[string]any)["event"].(map[string]any)
+		if event["publication_status"] != nil || event["publication_model"] != nil {
+			t.Fatalf("missing publication metadata event = %#v, want explicit nulls", event)
+		}
+	})
+}
 
 func TestPublisherPublishesExactBiomedicalAnalysisSnapshots(t *testing.T) {
 	pool := openCatalogTestPool(t)
@@ -176,6 +694,160 @@ func TestPublisherPublishesExactBiomedicalAnalysisSnapshots(t *testing.T) {
 			t.Fatalf("generation metadata[%q] = %#v, want %#v", key, decoded[key], want)
 		}
 	}
+}
+
+func insertPublisherPublicationUpdateWork(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	name string,
+	canonicalKey string,
+) publisherWorkFixture {
+	t.Helper()
+	return insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:                "pubmed:catalog-publication-update-" + name,
+		logicalSource:           "pubmed",
+		canonicalKey:            canonicalKey,
+		title:                   "Publication update " + name,
+		paperType:               "research_article",
+		publishedAt:             time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		sourceTime:              time.Date(2026, time.July, 18, 9, 0, 0, 0, time.UTC),
+		scopeStatus:             "included",
+		includeWorkLink:         true,
+		includeWorkID:           true,
+		includeNormalized:       true,
+		normalizedPayloadSchema: "normalized-record/v3",
+		publicationModel:        "Electronic",
+		publicationStatus:       "epublish",
+		noJCRAssessment:         true,
+	})
+}
+
+func publicationUpdateCollection(
+	t *testing.T,
+	payload json.RawMessage,
+	name string,
+) map[string]any {
+	t.Helper()
+	var document map[string]any
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatalf("decode Home payload: %v", err)
+	}
+	updates, ok := document["publication_updates"].(map[string]any)
+	if !ok {
+		t.Fatalf("publication_updates = %#v, want object", document["publication_updates"])
+	}
+	collection, ok := updates[name].(map[string]any)
+	if !ok {
+		t.Fatalf("publication_updates.%s = %#v, want object", name, updates[name])
+	}
+	if _, ok := collection["items"].([]any); !ok {
+		t.Fatalf("publication_updates.%s.items = %#v, want array", name, collection["items"])
+	}
+	return collection
+}
+
+func assertPublicationUpdateCollectionMetadata(
+	t *testing.T,
+	collection map[string]any,
+	windowDays int,
+	itemCount int,
+	knownStateCount int,
+) {
+	t.Helper()
+	analysis, ok := collection["analysis"].(map[string]any)
+	if !ok {
+		t.Fatalf("publication update analysis = %#v, want object", collection["analysis"])
+	}
+	assertDecodedCatalogValue(t, analysis["window_days"], float64(windowDays))
+	assertDecodedCatalogValue(t, analysis["sample_size"], float64(itemCount))
+	assertDecodedCatalogValue(t, analysis["coverage_ratio"], float64(knownStateCount))
+	assertDecodedCatalogValue(t, analysis["sources"], []any{"pubmed"})
+
+	items := collection["items"].([]any)
+	if len(items) != itemCount {
+		t.Fatalf("publication update item count = %d, want %d", len(items), itemCount)
+	}
+	pagination, ok := collection["pagination"].(map[string]any)
+	if !ok {
+		t.Fatalf("publication update pagination = %#v, want object", collection["pagination"])
+	}
+	for key, want := range map[string]any{
+		"has_more":    false,
+		"limit":       float64(itemCount),
+		"next_cursor": nil,
+		"total":       float64(itemCount),
+	} {
+		if !reflect.DeepEqual(pagination[key], want) {
+			t.Fatalf("publication update pagination[%q] = %#v, want %#v", key, pagination[key], want)
+		}
+	}
+}
+
+func assertDecodedCatalogValue(t *testing.T, raw any, want any) {
+	t.Helper()
+	value, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("catalog value = %#v, want object", raw)
+	}
+	if value["state"] != "known" || !reflect.DeepEqual(value["value"], want) {
+		t.Fatalf("catalog value = %#v, want known %#v", value, want)
+	}
+}
+
+func assertPublicationUpdateEvent(
+	t *testing.T,
+	raw any,
+	fixture publisherWorkFixture,
+	projectionAssertionID uuid.UUID,
+	kind string,
+	date string,
+	statusRaw string,
+	sourcePath string,
+) {
+	t.Helper()
+	item, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("publication update item = %#v, want object", raw)
+	}
+	event, ok := item["event"].(map[string]any)
+	if !ok {
+		t.Fatalf("publication update event = %#v, want object", item["event"])
+	}
+	for field, want := range map[string]any{
+		"kind":               kind,
+		"date":               date,
+		"date_precision":     "day",
+		"publication_status": "epublish",
+		"publication_model":  "Print-Electronic",
+	} {
+		if event[field] != want {
+			t.Fatalf("publication update event[%q] = %#v, want %#v", field, event[field], want)
+		}
+	}
+	provenance, ok := event["provenance"].(map[string]any)
+	if !ok {
+		t.Fatalf("publication update provenance = %#v, want object", event["provenance"])
+	}
+	for field, want := range map[string]any{
+		"source":                  "pubmed",
+		"source_record_id":        fixture.sourceRecord.String(),
+		"normalized_assertion_id": fixture.normalizedAssertionID.String(),
+		"projection_assertion_id": projectionAssertionID.String(),
+		"source_path":             sourcePath,
+		"status_raw":              statusRaw,
+	} {
+		if provenance[field] != want {
+			t.Fatalf("publication update provenance[%q] = %#v, want %#v", field, provenance[field], want)
+		}
+	}
+}
+
+func publicationUpdateDate(year int, month time.Month, day int) time.Time {
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+}
+
+func stringPointer(value string) *string {
+	return &value
 }
 
 func TestPublisherRejectsBiomedicalSnapshotOutsideValidatedCohort(t *testing.T) {

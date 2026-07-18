@@ -111,6 +111,93 @@ func TestPublisherBuildsAndAtomicallyPublishesNormalizedCurrentState(t *testing.
 	assertNestedJSONValue(t, stats.Payload, []string{"with_code_ratio", "value"}, float64(1))
 }
 
+func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
+	t.Run("publication state does not match exact work winner", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		fixture := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"winner-mismatch",
+			"doi:10.1000/publication-winner-mismatch",
+		)
+		input := catalogCurationInput()
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		insertPublisherBiomedicalProjection(t, pool, fixture)
+		alternateProjectionID := insertPublisherAlternateProjectionAssertion(
+			t,
+			pool,
+			fixture,
+			"projection/publication-decoy-v2",
+		)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				projectionAssertionID: alternateProjectionID,
+				printState:            "missing",
+				electronicState:       "missing",
+				aheadState:            "missing",
+				acceptedState:         "missing",
+			},
+		)
+
+		_, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		)
+		if !errors.Is(err, ErrCatalogNotReady) ||
+			!strings.Contains(err.Error(), "publication state") {
+			t.Fatalf(
+				"PublishCurrent(publication winner mismatch) error = %v, want ErrCatalogNotReady",
+				err,
+			)
+		}
+		assertNoCatalogWrites(t, pool)
+	})
+
+	t.Run("known state lacks exact immutable event assertion", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		fixture := insertPublisherPublicationUpdateWork(
+			t,
+			pool,
+			"event-provenance-missing",
+			"doi:10.1000/publication-event-provenance-missing",
+		)
+		input := catalogCurationInput()
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		insertPublisherBiomedicalProjection(t, pool, fixture)
+		acceptedDate := publicationUpdateDate(2026, time.July, 17)
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printState:        "missing",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedDate:      &acceptedDate,
+				acceptedState:     "known",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+			},
+		)
+
+		_, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		)
+		if !errors.Is(err, ErrCatalogNotReady) ||
+			!strings.Contains(err.Error(), "publication event") {
+			t.Fatalf(
+				"PublishCurrent(missing exact publication event) error = %v, want ErrCatalogNotReady",
+				err,
+			)
+		}
+		assertNoCatalogWrites(t, pool)
+	})
+}
+
 func TestPublisherPersistsBiomedicalCoverageMarkerBeforePublication(t *testing.T) {
 	pool := openCatalogTestPool(t)
 	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
@@ -1653,26 +1740,30 @@ func TestPublisherReusesOnlyIdenticalImmutableGeneration(t *testing.T) {
 }
 
 type publisherWorkOptions struct {
-	eventKey          string
-	logicalSource     string
-	canonicalKey      string
-	title             string
-	topicNames        []string
-	methodNames       []string
-	withCode          bool
-	withData          bool
-	withBenchmark     bool
-	paperType         string
-	jcrDecision       string
-	jcrMatchedRules   string
-	jcrEvidence       string
-	noJCRAssessment   bool
-	publishedAt       time.Time
-	sourceTime        time.Time
-	scopeStatus       string
-	includeWorkLink   bool
-	includeWorkID     bool
-	includeNormalized bool
+	eventKey                   string
+	logicalSource              string
+	canonicalKey               string
+	title                      string
+	topicNames                 []string
+	methodNames                []string
+	withCode                   bool
+	withData                   bool
+	withBenchmark              bool
+	paperType                  string
+	jcrDecision                string
+	jcrMatchedRules            string
+	jcrEvidence                string
+	noJCRAssessment            bool
+	publishedAt                time.Time
+	sourceTime                 time.Time
+	scopeStatus                string
+	includeWorkLink            bool
+	includeWorkID              bool
+	includeNormalized          bool
+	normalizedPayloadSchema    string
+	includePublicationMetadata bool
+	publicationModel           string
+	publicationStatus          string
 }
 
 type publisherWorkFixture struct {
@@ -1706,6 +1797,9 @@ func insertPublisherVisibleWork(
 	}
 	if options.scopeStatus == "" {
 		options.scopeStatus = "included"
+	}
+	if options.normalizedPayloadSchema == "" {
+		options.normalizedPayloadSchema = "normalized-record/v2"
 	}
 
 	fixture := publisherWorkFixture{
@@ -1773,20 +1867,34 @@ func insertPublisherVisibleWork(
 		t.Fatalf("insert publisher source record: %v", err)
 	}
 	if options.includeNormalized {
-		normalizedPayload := fmt.Sprintf(
-			`{"source":%q,"source_record_id":%q,"canonical_key":%q,"title":%q}`,
-			options.logicalSource,
-			options.eventKey,
-			options.canonicalKey,
-			options.title,
-		)
+		normalizedPayloadMap := map[string]any{
+			"source":           options.logicalSource,
+			"source_record_id": options.eventKey,
+			"canonical_key":    options.canonicalKey,
+			"title":            options.title,
+		}
+		if options.includePublicationMetadata || options.publicationModel != "" {
+			normalizedPayloadMap["publication_model"] = options.publicationModel
+		}
+		if options.includePublicationMetadata || options.publicationStatus != "" {
+			normalizedPayloadMap["publication_status"] = options.publicationStatus
+		}
+		normalizedPayload, err := json.Marshal(normalizedPayloadMap)
+		if err != nil {
+			t.Fatalf("encode publisher normalized payload: %v", err)
+		}
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO ingestion_normalized_records (
 				raw_event_id, source_record_uuid, normalization_policy_version,
 				payload_schema_version, normalized_payload
-			) VALUES ($1, $2, 'normalize/v1', 'normalized-record/v2', $3::jsonb)
+			) VALUES ($1, $2, 'normalize/v1', $3, $4::jsonb)
 			RETURNING id
-		`, fixture.rawEventID, fixture.sourceRecord, normalizedPayload).Scan(
+		`,
+			fixture.rawEventID,
+			fixture.sourceRecord,
+			options.normalizedPayloadSchema,
+			normalizedPayload,
+		).Scan(
 			&fixture.normalizedAssertionID,
 		); err != nil {
 			t.Fatalf("insert publisher normalized record: %v", err)
@@ -2032,6 +2140,214 @@ func insertPublisherVisibleWork(
 		t.Fatalf("commit publisher fixture: %v", err)
 	}
 	return fixture
+}
+
+type publisherPublicationEventFixture struct {
+	kind       string
+	date       *time.Time
+	precision  string
+	sourceDate string
+	statusRaw  string
+	modelRaw   *string
+	sourcePath string
+	ordinal    int
+}
+
+type publisherPublicationStateFixture struct {
+	projectionAssertionID uuid.UUID
+	printDate             *time.Time
+	printState            string
+	electronicDate        *time.Time
+	electronicState       string
+	aheadDate             *time.Time
+	aheadState            string
+	acceptedDate          *time.Time
+	acceptedState         string
+	publicationModel      *string
+	publicationStatus     *string
+	events                []publisherPublicationEventFixture
+}
+
+func insertPublisherPublicationState(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	fixture publisherWorkFixture,
+	state publisherPublicationStateFixture,
+) uuid.UUID {
+	t.Helper()
+	ctx := context.Background()
+	if state.projectionAssertionID == uuid.Nil {
+		state.projectionAssertionID = publisherProjectionAssertionID(t, pool, fixture.workID)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin publisher publication state fixture: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+
+	for _, event := range state.events {
+		sourceDate := event.sourceDate
+		if sourceDate == "" {
+			if event.date == nil {
+				t.Fatalf("publication event %s lacks source date", event.kind)
+			}
+			encoded, err := json.Marshal(map[string]any{
+				"year":      event.date.Year(),
+				"month":     int(event.date.Month()),
+				"day":       event.date.Day(),
+				"precision": event.precision,
+			})
+			if err != nil {
+				t.Fatalf("encode publication event source date: %v", err)
+			}
+			sourceDate = string(encoded)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO work_publication_event_assertions (
+				projection_assertion_id,
+				normalized_assertion_id,
+				source_record_id,
+				work_id,
+				event_kind,
+				event_date,
+				date_precision,
+				source_date,
+				status_raw,
+				publication_model_raw,
+				source_path,
+				ordinal
+			) VALUES (
+				$1, $2, $3, $4, $5, $6, $7,
+				$8::jsonb, $9, $10, $11, $12
+			)
+		`,
+			state.projectionAssertionID,
+			fixture.normalizedAssertionID,
+			fixture.sourceRecord,
+			fixture.workID,
+			event.kind,
+			event.date,
+			event.precision,
+			sourceDate,
+			event.statusRaw,
+			event.modelRaw,
+			event.sourcePath,
+			event.ordinal,
+		); err != nil {
+			t.Fatalf("insert publisher publication event %s: %v", event.kind, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO work_publication_states (
+			work_id,
+			projection_assertion_id,
+			normalized_assertion_id,
+			source_record_id,
+			print_published_on,
+			print_published_state,
+			electronic_published_on,
+			electronic_published_state,
+			ahead_of_print_on,
+			ahead_of_print_state,
+			accepted_on,
+			accepted_state,
+			publication_model_raw,
+			publication_status_raw
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7,
+			$8, $9, $10, $11, $12, $13, $14
+		)
+	`,
+		fixture.workID,
+		state.projectionAssertionID,
+		fixture.normalizedAssertionID,
+		fixture.sourceRecord,
+		state.printDate,
+		state.printState,
+		state.electronicDate,
+		state.electronicState,
+		state.aheadDate,
+		state.aheadState,
+		state.acceptedDate,
+		state.acceptedState,
+		state.publicationModel,
+		state.publicationStatus,
+	); err != nil {
+		t.Fatalf("insert publisher publication state: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit publisher publication state fixture: %v", err)
+	}
+	return state.projectionAssertionID
+}
+
+func publisherProjectionAssertionID(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	workID uuid.UUID,
+) uuid.UUID {
+	t.Helper()
+	var projectionAssertionID uuid.UUID
+	if err := pool.QueryRow(context.Background(), `
+		SELECT assertion.id
+		FROM work_projection_states AS state
+		JOIN ingestion_projection_assertions AS assertion
+		  ON assertion.work_id = state.work_id
+		 AND assertion.raw_event_id = state.raw_event_id
+		 AND assertion.normalized_assertion_id = state.normalized_assertion_id
+		 AND assertion.source_record_uuid = state.source_record_uuid
+		 AND assertion.scope_policy_version = state.scope_policy_version
+		 AND assertion.projection_policy_version = state.projection_policy_version
+		WHERE state.work_id = $1
+	`, workID).Scan(&projectionAssertionID); err != nil {
+		t.Fatalf("query publisher projection assertion: %v", err)
+	}
+	return projectionAssertionID
+}
+
+func insertPublisherAlternateProjectionAssertion(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	fixture publisherWorkFixture,
+	projectionPolicyVersion string,
+) uuid.UUID {
+	t.Helper()
+	var jobID uuid.UUID
+	if err := pool.QueryRow(context.Background(), `
+		SELECT job_id
+		FROM ingestion_raw_events
+		WHERE id = $1
+	`, fixture.rawEventID).Scan(&jobID); err != nil {
+		t.Fatalf("query alternate publication projection job: %v", err)
+	}
+	projectionAssertionID := uuid.New()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO ingestion_projection_assertions (
+			id,
+			raw_event_id,
+			normalized_assertion_id,
+			source_record_uuid,
+			work_id,
+			job_id,
+			scope_policy_version,
+			projection_policy_version,
+			record_payload
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			'scope/v1', $7, '{"fixture":"publication-decoy"}'
+		)
+	`,
+		projectionAssertionID,
+		fixture.rawEventID,
+		fixture.normalizedAssertionID,
+		fixture.sourceRecord,
+		fixture.workID,
+		jobID,
+		projectionPolicyVersion,
+	); err != nil {
+		t.Fatalf("insert alternate publication projection assertion: %v", err)
+	}
+	return projectionAssertionID
 }
 
 func mustPublisher(t *testing.T, pool *pgxpool.Pool) *Publisher {

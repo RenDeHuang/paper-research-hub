@@ -704,6 +704,10 @@ func buildHomeSnapshot(
 	if err != nil {
 		return nil, err
 	}
+	publicationUpdates, err := buildPublicationUpdates(input, papers)
+	if err != nil {
+		return nil, err
+	}
 	knownCitations := 0
 	knownMeSH := 0
 	knownPublicationTypes := 0
@@ -771,8 +775,9 @@ func buildHomeSnapshot(
 			"research_opportunity_analysis_not_published",
 			"subject_trend_analysis_not_published",
 		},
-		"generated_at":  input.GeneratedAt.UTC().Format(time.RFC3339Nano),
-		"latest_papers": latestPapers,
+		"generated_at":        input.GeneratedAt.UTC().Format(time.RFC3339Nano),
+		"latest_papers":       latestPapers,
+		"publication_updates": publicationUpdates,
 		"research_opportunities": map[string]any{
 			"analysis": unavailableAnalysis(
 				"research_opportunity_analysis_not_published",
@@ -788,6 +793,242 @@ func buildHomeSnapshot(
 			"items":    []any{},
 		},
 	})
+}
+
+type publicationUpdateItem struct {
+	paper        json.RawMessage
+	eventKind    string
+	eventDate    time.Time
+	canonicalKey string
+	event        map[string]any
+}
+
+func buildPublicationUpdates(
+	input PublishInput,
+	papers []publishedPaper,
+) (map[string]any, error) {
+	generatedAt := input.GeneratedAt.UTC()
+	calendarDate := time.Date(
+		generatedAt.Year(),
+		generatedAt.Month(),
+		generatedAt.Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	recentStart := calendarDate.AddDate(0, 0, -(biomedicalHomeWindowDays - 1))
+	formalItems := make([]publicationUpdateItem, 0)
+	acceptanceItems := make([]publicationUpdateItem, 0)
+	onlineFirstItems := make([]publicationUpdateItem, 0)
+	formalKnownPapers := 0
+	acceptanceKnownPapers := 0
+	onlineFirstKnownPapers := 0
+
+	for _, paper := range papers {
+		publication := paper.PublicationState
+		if publication == nil {
+			continue
+		}
+		if publication.PrintPublished.State == "known" ||
+			publication.ElectronicPublished.State == "known" {
+			formalKnownPapers++
+		}
+		if publication.Accepted.State == "known" {
+			acceptanceKnownPapers++
+		}
+		if publication.AheadOfPrint.State == "known" {
+			onlineFirstKnownPapers++
+		}
+
+		for _, event := range []struct {
+			kind  string
+			state publishedPublicationEventState
+		}{
+			{
+				kind:  "print_published",
+				state: publication.PrintPublished,
+			},
+			{
+				kind:  "electronic_published",
+				state: publication.ElectronicPublished,
+			},
+		} {
+			if event.state.State != "known" {
+				continue
+			}
+			if event.state.Date == nil {
+				return nil, fmt.Errorf(
+					"%w: paper %s has known %s publication state without date",
+					ErrCatalogNotReady,
+					paper.ID,
+					event.kind,
+				)
+			}
+			if event.state.Date.Equal(calendarDate) {
+				item, err := newPublicationUpdateItem(
+					paper,
+					*publication,
+					event.kind,
+					event.state,
+				)
+				if err != nil {
+					return nil, err
+				}
+				formalItems = append(formalItems, item)
+			}
+		}
+
+		for _, event := range []struct {
+			kind   string
+			state  publishedPublicationEventState
+			target *[]publicationUpdateItem
+		}{
+			{
+				kind:   "accepted",
+				state:  publication.Accepted,
+				target: &acceptanceItems,
+			},
+			{
+				kind:   "ahead_of_print",
+				state:  publication.AheadOfPrint,
+				target: &onlineFirstItems,
+			},
+		} {
+			if event.state.State != "known" {
+				continue
+			}
+			if event.state.Date == nil {
+				return nil, fmt.Errorf(
+					"%w: paper %s has known %s publication state without date",
+					ErrCatalogNotReady,
+					paper.ID,
+					event.kind,
+				)
+			}
+			if event.state.Date.Before(recentStart) ||
+				event.state.Date.After(calendarDate) {
+				continue
+			}
+			item, err := newPublicationUpdateItem(
+				paper,
+				*publication,
+				event.kind,
+				event.state,
+			)
+			if err != nil {
+				return nil, err
+			}
+			*event.target = append(*event.target, item)
+		}
+	}
+
+	sortPublicationUpdateItems(formalItems)
+	sortPublicationUpdateItems(acceptanceItems)
+	sortPublicationUpdateItems(onlineFirstItems)
+	return map[string]any{
+		"calendar_date":     calendarDate.Format("2006-01-02"),
+		"calendar_timezone": "UTC",
+		"formal_publications_today": buildPublicationUpdateCollection(
+			input,
+			1,
+			formalItems,
+			formalKnownPapers,
+			len(papers),
+		),
+		"recent_acceptances": buildPublicationUpdateCollection(
+			input,
+			biomedicalHomeWindowDays,
+			acceptanceItems,
+			acceptanceKnownPapers,
+			len(papers),
+		),
+		"recent_online_first": buildPublicationUpdateCollection(
+			input,
+			biomedicalHomeWindowDays,
+			onlineFirstItems,
+			onlineFirstKnownPapers,
+			len(papers),
+		),
+	}, nil
+}
+
+func newPublicationUpdateItem(
+	paper publishedPaper,
+	publication publishedPublicationState,
+	eventKind string,
+	eventState publishedPublicationEventState,
+) (publicationUpdateItem, error) {
+	if eventState.State != "known" ||
+		eventState.Date == nil ||
+		eventState.Provenance == nil {
+		return publicationUpdateItem{}, fmt.Errorf(
+			"%w: paper %s publication event %s is not fully known",
+			ErrCatalogNotReady,
+			paper.ID,
+			eventKind,
+		)
+	}
+	return publicationUpdateItem{
+		paper:        paper.SummaryPayload,
+		eventKind:    eventKind,
+		eventDate:    *eventState.Date,
+		canonicalKey: paper.CanonicalKey,
+		event: map[string]any{
+			"kind":               eventKind,
+			"date":               eventState.Date.Format("2006-01-02"),
+			"date_precision":     "day",
+			"publication_status": publication.PublicationStatus,
+			"publication_model":  publication.PublicationModel,
+			"provenance":         *eventState.Provenance,
+		},
+	}, nil
+}
+
+func sortPublicationUpdateItems(items []publicationUpdateItem) {
+	sort.Slice(items, func(i, j int) bool {
+		if !items[i].eventDate.Equal(items[j].eventDate) {
+			return items[i].eventDate.After(items[j].eventDate)
+		}
+		if items[i].canonicalKey != items[j].canonicalKey {
+			return items[i].canonicalKey < items[j].canonicalKey
+		}
+		return items[i].eventKind < items[j].eventKind
+	})
+}
+
+func buildPublicationUpdateCollection(
+	input PublishInput,
+	windowDays int,
+	items []publicationUpdateItem,
+	knownStatePapers int,
+	eligiblePapers int,
+) map[string]any {
+	payloadItems := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		payloadItems = append(payloadItems, map[string]any{
+			"paper": item.paper,
+			"event": item.event,
+		})
+	}
+	return map[string]any{
+		"analysis": analysisMetadata(
+			input,
+			windowDays,
+			len(payloadItems),
+			ratioCatalogValue(knownStatePapers, eligiblePapers),
+			[]string{"pubmed"},
+			[]string{},
+		),
+		"items": payloadItems,
+		"pagination": map[string]any{
+			"has_more":    false,
+			"limit":       len(payloadItems),
+			"next_cursor": nil,
+			"total":       len(payloadItems),
+		},
+	}
 }
 
 func analysisMetadata(

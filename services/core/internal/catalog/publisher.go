@@ -115,7 +115,36 @@ type publishedPaper struct {
 	SummaryPayload     json.RawMessage
 	DetailPayload      json.RawMessage
 	CitationTrend      citationTrendEvidence
+	PublicationState   *publishedPublicationState
 	biomedical         biomedicalPaperPayload
+}
+
+type publishedPublicationState struct {
+	ProjectionAssertionID uuid.UUID
+	NormalizedAssertionID uuid.UUID
+	SourceRecordID        uuid.UUID
+	Source                string
+	PrintPublished        publishedPublicationEventState
+	ElectronicPublished   publishedPublicationEventState
+	AheadOfPrint          publishedPublicationEventState
+	Accepted              publishedPublicationEventState
+	PublicationModel      *string
+	PublicationStatus     *string
+}
+
+type publishedPublicationEventState struct {
+	State      string
+	Date       *time.Time
+	Provenance *publishedPublicationEventProvenance
+}
+
+type publishedPublicationEventProvenance struct {
+	Source                string    `json:"source"`
+	SourceRecordID        uuid.UUID `json:"source_record_id"`
+	NormalizedAssertionID uuid.UUID `json:"normalized_assertion_id"`
+	ProjectionAssertionID uuid.UUID `json:"projection_assertion_id"`
+	SourcePath            string    `json:"source_path"`
+	StatusRaw             string    `json:"status_raw"`
 }
 
 type publishedBiomedicalResource struct {
@@ -1289,6 +1318,14 @@ func buildPaper(
 	}
 	paper.SummaryPayload = payload
 	paper.DetailPayload = payload
+	paper.PublicationState, err = loadCurrentPublicationState(
+		ctx,
+		tx,
+		workID,
+	)
+	if err != nil {
+		return publishedPaper{}, nil, nil, err
+	}
 
 	searchParts := []string{paper.Title, paper.CanonicalKey}
 	if abstract != "" {
@@ -1327,6 +1364,416 @@ func buildPaper(
 	searchParts = append(searchParts, paper.SourceNames...)
 	paper.SearchText = strings.Join(searchParts, " ")
 	return paper, topics, methods, nil
+}
+
+func loadCurrentPublicationState(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+) (*publishedPublicationState, error) {
+	var (
+		state                  publishedPublicationState
+		printDate              *time.Time
+		printState             string
+		electronicDate         *time.Time
+		electronicState        string
+		aheadDate              *time.Time
+		aheadState             string
+		acceptedDate           *time.Time
+		acceptedState          string
+		normalizedSchema       string
+		normalizedSource       string
+		normalizedSourceRecord string
+		normalizedModel        *string
+		normalizedStatus       *string
+		sourceRecordExternalID string
+		exactWinner            bool
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT
+			publication.projection_assertion_id,
+			publication.normalized_assertion_id,
+			publication.source_record_id,
+			source_record.source,
+			source_record.source_record_id,
+			publication.print_published_on,
+			publication.print_published_state,
+			publication.electronic_published_on,
+			publication.electronic_published_state,
+			publication.ahead_of_print_on,
+			publication.ahead_of_print_state,
+			publication.accepted_on,
+			publication.accepted_state,
+			publication.publication_model_raw,
+			publication.publication_status_raw,
+			normalized.payload_schema_version,
+			COALESCE(normalized.normalized_payload ->> 'source', ''),
+			COALESCE(normalized.normalized_payload ->> 'source_record_id', ''),
+			NULLIF(
+				normalized.normalized_payload ->> 'publication_model',
+				''
+			),
+			NULLIF(
+				normalized.normalized_payload ->> 'publication_status',
+				''
+			),
+			EXISTS (
+				SELECT 1
+				FROM work_projection_states AS winner
+				JOIN ingestion_projection_assertions AS projection
+				  ON projection.id = publication.projection_assertion_id
+				 AND projection.work_id = winner.work_id
+				 AND projection.raw_event_id = winner.raw_event_id
+				 AND projection.normalized_assertion_id =
+				     winner.normalized_assertion_id
+				 AND projection.source_record_uuid =
+				     winner.source_record_uuid
+				 AND projection.scope_policy_version =
+				     winner.scope_policy_version
+				 AND projection.projection_policy_version =
+				     winner.projection_policy_version
+				JOIN ingestion_normalized_records AS exact_normalized
+				  ON exact_normalized.id =
+				     projection.normalized_assertion_id
+				 AND exact_normalized.raw_event_id =
+				     projection.raw_event_id
+				 AND exact_normalized.source_record_uuid =
+				     projection.source_record_uuid
+				JOIN ingestion_raw_events AS raw
+				  ON raw.id = projection.raw_event_id
+				 AND raw.logical_source = source_record.source
+				 AND raw.source_record_id =
+				     source_record.source_record_id
+				JOIN ingestion_source_states AS source_state
+				  ON source_state.logical_source = raw.logical_source
+				 AND source_state.event_key = raw.event_key
+				 AND source_state.raw_event_id = winner.raw_event_id
+				 AND source_state.normalized_assertion_id =
+				     winner.normalized_assertion_id
+				 AND source_state.source_record_uuid =
+				     winner.source_record_uuid
+				 AND source_state.work_id = winner.work_id
+				 AND source_state.source_time = winner.source_time
+				 AND source_state.tie_break_key = winner.tie_break_key
+				 AND source_state.position = winner.position
+				 AND source_state.scope_policy_version =
+				     winner.scope_policy_version
+				 AND source_state.projection_policy_version =
+				     winner.projection_policy_version
+				 AND source_state.scope_status = 'included'
+				 AND NOT source_state.is_deleted
+				JOIN source_record_works AS association
+				  ON association.source_record_id =
+				     winner.source_record_uuid
+				 AND association.work_id = winner.work_id
+				WHERE winner.work_id = publication.work_id
+				  AND winner.normalized_assertion_id =
+				      publication.normalized_assertion_id
+				  AND winner.source_record_uuid =
+				      publication.source_record_id
+			)
+		FROM work_publication_states AS publication
+		JOIN ingestion_normalized_records AS normalized
+		  ON normalized.id = publication.normalized_assertion_id
+		 AND normalized.source_record_uuid =
+		     publication.source_record_id
+		JOIN source_records AS source_record
+		  ON source_record.id = publication.source_record_id
+		WHERE publication.work_id = $1
+	`, workID).Scan(
+		&state.ProjectionAssertionID,
+		&state.NormalizedAssertionID,
+		&state.SourceRecordID,
+		&state.Source,
+		&sourceRecordExternalID,
+		&printDate,
+		&printState,
+		&electronicDate,
+		&electronicState,
+		&aheadDate,
+		&aheadState,
+		&acceptedDate,
+		&acceptedState,
+		&state.PublicationModel,
+		&state.PublicationStatus,
+		&normalizedSchema,
+		&normalizedSource,
+		&normalizedSourceRecord,
+		&normalizedModel,
+		&normalizedStatus,
+		&exactWinner,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var stateExists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM work_publication_states
+				WHERE work_id = $1
+			)
+		`, workID).Scan(&stateExists); err != nil {
+			return nil, fmt.Errorf(
+				"check work %s publication state existence: %w",
+				workID,
+				err,
+			)
+		}
+		if stateExists {
+			return nil, fmt.Errorf(
+				"%w: work %s publication state has incomplete normalized provenance",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query work %s publication state: %w", workID, err)
+	}
+	if !exactWinner {
+		return nil, fmt.Errorf(
+			"%w: work %s publication state does not match the exact current work projection winner",
+			ErrCatalogNotReady,
+			workID,
+		)
+	}
+	if state.Source != "pubmed" ||
+		normalizedSchema != "normalized-record/v3" ||
+		normalizedSource != state.Source ||
+		normalizedSourceRecord != sourceRecordExternalID ||
+		!equalOptionalString(state.PublicationModel, normalizedModel) ||
+		!equalOptionalString(state.PublicationStatus, normalizedStatus) {
+		return nil, fmt.Errorf(
+			"%w: work %s publication state does not match its exact normalized PubMed assertion",
+			ErrCatalogNotReady,
+			workID,
+		)
+	}
+
+	stored := map[string]publishedPublicationEventState{
+		"print_published": {
+			State: printState,
+			Date:  normalizedPublicationDate(printDate),
+		},
+		"electronic_published": {
+			State: electronicState,
+			Date:  normalizedPublicationDate(electronicDate),
+		},
+		"ahead_of_print": {
+			State: aheadState,
+			Date:  normalizedPublicationDate(aheadDate),
+		},
+		"accepted": {
+			State: acceptedState,
+			Date:  normalizedPublicationDate(acceptedDate),
+		},
+	}
+	computed, err := loadExactPublicationEventStates(ctx, tx, workID, state)
+	if err != nil {
+		return nil, err
+	}
+	for _, eventKind := range []string{
+		"print_published",
+		"electronic_published",
+		"ahead_of_print",
+		"accepted",
+	} {
+		storedState := stored[eventKind]
+		computedState := computed[eventKind]
+		if !publicationEventStateEqual(storedState, computedState) {
+			if storedState.State == "known" {
+				return nil, fmt.Errorf(
+					"%w: work %s known publication event %s lacks matching exact immutable event provenance",
+					ErrCatalogNotReady,
+					workID,
+					eventKind,
+				)
+			}
+			return nil, fmt.Errorf(
+				"%w: work %s publication state %s does not match exact immutable event assertions",
+				ErrCatalogNotReady,
+				workID,
+				eventKind,
+			)
+		}
+	}
+	state.PrintPublished = computed["print_published"]
+	state.ElectronicPublished = computed["electronic_published"]
+	state.AheadOfPrint = computed["ahead_of_print"]
+	state.Accepted = computed["accepted"]
+	return &state, nil
+}
+
+func loadExactPublicationEventStates(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+	state publishedPublicationState,
+) (map[string]publishedPublicationEventState, error) {
+	type eventDateEvidence struct {
+		date       time.Time
+		provenance publishedPublicationEventProvenance
+	}
+	dayEvidence := map[string]map[string]eventDateEvidence{
+		"print_published":      {},
+		"electronic_published": {},
+		"ahead_of_print":       {},
+		"accepted":             {},
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT
+			normalized_assertion_id,
+			source_record_id,
+			work_id,
+			event_kind,
+			event_date,
+			date_precision,
+			status_raw,
+			source_path,
+			ordinal
+		FROM work_publication_event_assertions
+		WHERE projection_assertion_id = $1
+		ORDER BY ordinal
+	`, state.ProjectionAssertionID)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query work %s exact publication event assertions: %w",
+			workID,
+			err,
+		)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			normalizedAssertionID uuid.UUID
+			sourceRecordID        uuid.UUID
+			assertionWorkID       uuid.UUID
+			eventKind             string
+			eventDate             *time.Time
+			datePrecision         string
+			statusRaw             string
+			sourcePath            string
+			ordinal               int
+		)
+		if err := rows.Scan(
+			&normalizedAssertionID,
+			&sourceRecordID,
+			&assertionWorkID,
+			&eventKind,
+			&eventDate,
+			&datePrecision,
+			&statusRaw,
+			&sourcePath,
+			&ordinal,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan work %s exact publication event assertion: %w",
+				workID,
+				err,
+			)
+		}
+		evidenceByDate, supported := dayEvidence[eventKind]
+		if !supported ||
+			normalizedAssertionID != state.NormalizedAssertionID ||
+			sourceRecordID != state.SourceRecordID ||
+			assertionWorkID != workID ||
+			statusRaw == "" ||
+			statusRaw != strings.TrimSpace(statusRaw) ||
+			sourcePath == "" ||
+			sourcePath != strings.TrimSpace(sourcePath) ||
+			ordinal < 1 {
+			return nil, fmt.Errorf(
+				"%w: work %s publication event assertion is inconsistent with exact provenance",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		if datePrecision != "day" {
+			continue
+		}
+		if eventDate == nil {
+			return nil, fmt.Errorf(
+				"%w: work %s day-precision publication event has no date",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		date := normalizedPublicationDate(eventDate)
+		dateKey := date.Format("2006-01-02")
+		if _, duplicateDate := evidenceByDate[dateKey]; duplicateDate {
+			continue
+		}
+		evidenceByDate[dateKey] = eventDateEvidence{
+			date: *date,
+			provenance: publishedPublicationEventProvenance{
+				Source:                state.Source,
+				SourceRecordID:        state.SourceRecordID,
+				NormalizedAssertionID: state.NormalizedAssertionID,
+				ProjectionAssertionID: state.ProjectionAssertionID,
+				SourcePath:            sourcePath,
+				StatusRaw:             statusRaw,
+			},
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate work %s exact publication event assertions: %w",
+			workID,
+			err,
+		)
+	}
+
+	result := make(map[string]publishedPublicationEventState, len(dayEvidence))
+	for eventKind, evidenceByDate := range dayEvidence {
+		switch len(evidenceByDate) {
+		case 0:
+			result[eventKind] = publishedPublicationEventState{State: "missing"}
+		case 1:
+			for _, evidence := range evidenceByDate {
+				date := evidence.date
+				provenance := evidence.provenance
+				result[eventKind] = publishedPublicationEventState{
+					State:      "known",
+					Date:       &date,
+					Provenance: &provenance,
+				}
+			}
+		default:
+			result[eventKind] = publishedPublicationEventState{State: "conflict"}
+		}
+	}
+	return result, nil
+}
+
+func normalizedPublicationDate(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	normalized := time.Date(
+		value.Year(),
+		value.Month(),
+		value.Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	return &normalized
+}
+
+func publicationEventStateEqual(
+	left publishedPublicationEventState,
+	right publishedPublicationEventState,
+) bool {
+	if left.State != right.State {
+		return false
+	}
+	if left.Date == nil || right.Date == nil {
+		return left.Date == nil && right.Date == nil
+	}
+	return left.Date.Equal(*right.Date)
 }
 
 func loadBiomedicalPaperPayload(
