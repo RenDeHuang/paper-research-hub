@@ -771,6 +771,15 @@ func (repository *PostgresRepository) Exclude(
 	defer func() {
 		_ = tx.Rollback(context.Background())
 	}()
+	previousWorkID, err := lockSourceState(
+		ctx,
+		tx,
+		record.LogicalSource,
+		record.EventKey,
+	)
+	if err != nil {
+		return ProjectionResult{}, err
+	}
 	sourceRecordUUID, err := normalizedSourceRecordID(
 		ctx,
 		tx,
@@ -799,6 +808,7 @@ func (repository *PostgresRepository) Exclude(
 			NormalizedAssertionID:   record.AssertionID,
 			RawEventID:              record.RawID,
 			SourceRecordUUID:        sourceRecordUUID,
+			WorkID:                  previousWorkID,
 			SourceTime:              record.SourceTime,
 			TieBreakKey:             record.TieBreakKey,
 			Position:                record.Position,
@@ -813,6 +823,15 @@ func (repository *PostgresRepository) Exclude(
 	counter := ProjectionStatusUnchanged
 	if changed {
 		counter = ProjectionStatusExcluded
+		if previousWorkID != "" {
+			if _, err := applyWinningProjection(
+				ctx,
+				tx,
+				previousWorkID,
+			); err != nil {
+				return ProjectionResult{}, err
+			}
+		}
 	}
 	if err := incrementProjectionCounter(ctx, tx, jobID, counter); err != nil {
 		return ProjectionResult{}, err
@@ -1542,6 +1561,21 @@ func persistPublicationEventAssertions(
 		); err != nil {
 			return err
 		}
+	}
+	var persistedCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM work_publication_event_assertions
+		WHERE projection_assertion_id = $1
+	`, projectionAssertionID).Scan(&persistedCount); err != nil {
+		return fmt.Errorf("count publication event assertion set: %w", err)
+	}
+	if persistedCount != len(assertions) {
+		return fmt.Errorf(
+			"publication event assertion replay conflicts with immutable assertion set: persisted %d, expected %d",
+			persistedCount,
+			len(assertions),
+		)
 	}
 	return nil
 }
