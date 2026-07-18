@@ -105,7 +105,12 @@ func (store *PostgresAssessmentStore) LoadAssessment(
 			venue.issn,
 			venue.eissn,
 			metric.category,
+			metric.registry_version,
+			metric.edition_year,
 			metric.jif::text,
+			metric.jif_rank,
+			metric.category_journal_count,
+			metric.jif_percentile::text,
 			metric.quartile,
 			metric.metric_status,
 			metric.source_name
@@ -132,7 +137,9 @@ func (store *PostgresAssessmentStore) LoadAssessment(
 		var (
 			venueID, rawVenueType, displayTitle string
 			issnL, printISSN, electronicISSN    pgtype.Text
-			category, jif, quartile             pgtype.Text
+			category, registryVersion           pgtype.Text
+			editionYear, jifRank, categoryCount pgtype.Int4
+			jif, jifPercentile, quartile        pgtype.Text
 			rawStatus, sourceName               pgtype.Text
 		)
 		if err := rows.Scan(
@@ -143,7 +150,12 @@ func (store *PostgresAssessmentStore) LoadAssessment(
 			&printISSN,
 			&electronicISSN,
 			&category,
+			&registryVersion,
+			&editionYear,
 			&jif,
+			&jifRank,
+			&categoryCount,
+			&jifPercentile,
 			&quartile,
 			&rawStatus,
 			&sourceName,
@@ -204,15 +216,58 @@ func (store *PostgresAssessmentStore) LoadAssessment(
 			}
 			decimal = &parsed
 		}
-		snapshot, restoreErr := NewMetricSnapshot(
-			venueID,
-			metricYear,
-			category.String,
-			decimal,
-			Quartile(quartile.String),
-			MetricStatus(rawStatus.String),
-			sourceName.String,
-		)
+		var snapshot MetricSnapshot
+		var restoreErr error
+		if MetricRegistryVersion(registryVersion.String) == MetricRegistryJCRV2 {
+			var editionYearValue, jifRankValue, categoryCountValue *int
+			var percentile *Decimal
+			if editionYear.Valid {
+				value := int(editionYear.Int32)
+				editionYearValue = &value
+			}
+			if jifRank.Valid {
+				value := int(jifRank.Int32)
+				jifRankValue = &value
+			}
+			if categoryCount.Valid {
+				value := int(categoryCount.Int32)
+				categoryCountValue = &value
+			}
+			if jifPercentile.Valid {
+				parsed, parseErr := ParseDecimal(jifPercentile.String)
+				if parseErr != nil {
+					return AssessmentLoad{}, fmt.Errorf(
+						"restore Venue %q JIF percentile: %w",
+						venueID,
+						parseErr,
+					)
+				}
+				percentile = &parsed
+			}
+			snapshot, restoreErr = NewJCRRegistryV2MetricSnapshot(
+				venueID,
+				metricYear,
+				category.String,
+				editionYearValue,
+				decimal,
+				jifRankValue,
+				categoryCountValue,
+				percentile,
+				Quartile(quartile.String),
+				MetricStatus(rawStatus.String),
+				sourceName.String,
+			)
+		} else {
+			snapshot, restoreErr = NewMetricSnapshot(
+				venueID,
+				metricYear,
+				category.String,
+				decimal,
+				Quartile(quartile.String),
+				MetricStatus(rawStatus.String),
+				sourceName.String,
+			)
+		}
 		if restoreErr != nil {
 			return AssessmentLoad{}, fmt.Errorf(
 				"restore Venue %q metric category %q: %w",
@@ -243,7 +298,7 @@ func (store *PostgresAssessmentStore) PersistAssessments(
 	if store == nil || store.pool == nil {
 		return AssessmentSummary{}, errors.New("PostgresAssessmentStore is not initialized")
 	}
-	if batch.PolicyVersion != JournalJIFOrQ1PolicyVersion {
+	if batch.PolicyVersion != JournalAllQ1PolicyVersion {
 		return AssessmentSummary{}, fmt.Errorf(
 			"unsupported policy version %q",
 			batch.PolicyVersion,
@@ -329,11 +384,16 @@ func (store *PostgresAssessmentStore) PersistAssessments(
 }
 
 type postgresAssessmentCategoryEvidence struct {
-	Category   string  `json:"category"`
-	JIF        *string `json:"jif"`
-	Quartile   string  `json:"quartile,omitempty"`
-	Status     string  `json:"status"`
-	SourceName string  `json:"source_name"`
+	Category             string  `json:"category"`
+	RegistryVersion      string  `json:"registry_version"`
+	EditionYear          *int    `json:"edition_year"`
+	JIF                  *string `json:"jif"`
+	JIFRank              *int    `json:"jif_rank"`
+	CategoryJournalCount *int    `json:"category_journal_count"`
+	JIFPercentile        *string `json:"jif_percentile"`
+	Quartile             string  `json:"quartile,omitempty"`
+	Status               string  `json:"status"`
+	SourceName           string  `json:"source_name"`
 }
 
 type postgresAssessmentEvidencePayload struct {
@@ -351,14 +411,28 @@ func postgresAssessmentEvidence(
 	categories := make([]postgresAssessmentCategoryEvidence, 0)
 	for _, evidence := range assessment.Result.CategoryEvidence() {
 		category := postgresAssessmentCategoryEvidence{
-			Category:   evidence.Category(),
-			Quartile:   string(evidence.Quartile()),
-			Status:     string(evidence.Status()),
-			SourceName: evidence.Source(),
+			Category:        evidence.Category(),
+			RegistryVersion: string(evidence.RegistryVersion()),
+			Quartile:        string(evidence.Quartile()),
+			Status:          string(evidence.Status()),
+			SourceName:      evidence.Source(),
+		}
+		if value, ok := evidence.EditionYear(); ok {
+			category.EditionYear = &value
 		}
 		if evidence.HasJIF() {
 			value := evidence.JIF().String()
 			category.JIF = &value
+		}
+		if value, ok := evidence.JIFRank(); ok {
+			category.JIFRank = &value
+		}
+		if value, ok := evidence.CategoryJournalCount(); ok {
+			category.CategoryJournalCount = &value
+		}
+		if value, ok := evidence.JIFPercentile(); ok {
+			serialized := value.String()
+			category.JIFPercentile = &serialized
 		}
 		categories = append(categories, category)
 	}
@@ -386,9 +460,9 @@ func ensureJournalPolicyVersion(
 	effectiveAt time.Time,
 ) (string, error) {
 	const definition = `{
-		"logic":"OR",
-		"accept":["jcr_q1","jif_gte_10"],
-		"policy_version":"journal-jif-or-q1/v1"
+		"logic":"ANY",
+		"accept":["jcr_q1"],
+		"policy_version":"journal-all-q1/v2"
 	}`
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO venue_policy_versions (
@@ -397,8 +471,8 @@ func ensureJournalPolicyVersion(
 			definition,
 			effective_at
 		) VALUES (
-			'journal-jif-or-q1',
-			1,
+			'journal-all-q1',
+			2,
 			$1::jsonb,
 			$2
 		)
@@ -410,13 +484,13 @@ func ensureJournalPolicyVersion(
 	if err := tx.QueryRow(ctx, `
 		SELECT id::text
 		FROM venue_policy_versions
-		WHERE policy_name = 'journal-jif-or-q1'
-		  AND version_number = 1
+		WHERE policy_name = 'journal-all-q1'
+		  AND version_number = 2
 		  AND definition = $1::jsonb
 	`, definition).Scan(&policyID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", errors.New(
-				"stored journal policy version conflicts with journal-jif-or-q1/v1",
+				"stored journal policy version conflicts with journal-all-q1/v2",
 			)
 		}
 		return "", fmt.Errorf("load journal policy version: %w", err)

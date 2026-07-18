@@ -15,7 +15,8 @@ for JIF.
 Every file must contain these case-sensitive columns:
 
 ```text
-metric_year,category,quartile,jif,issn,eissn,issn_l,source,status
+edition_year,metric_year,category,quartile,jif,jif_rank,
+category_journal_count,jif_percentile,issn,eissn,issn_l,source,status
 ```
 
 `title` is optional alias evidence. It is never sent to the venue identity
@@ -23,10 +24,16 @@ repository and cannot resolve a Venue. Extra controlled-source columns may be
 carried by an authorized export, but Venue matching remains exact
 ISSN-L/print-ISSN/eISSN matching.
 
-All data rows must have the same width as the header. A `known` row requires
-both a nonnegative decimal JIF and one of `Q1` through `Q4`. An `unknown` row
-requires blank JIF and Quartile fields while retaining metric year, category,
-all three ISSN roles, source, and status.
+All data rows must have the same width as the header. A Registry v2 `known`
+row requires edition year, a nonnegative decimal JIF, positive rank and
+category journal count, rank not exceeding count, an exact JIF percentile in
+`[0, 100]`, and one of `Q1` through `Q4`. An `unknown` row leaves every metric
+evidence field blank while retaining metric year, category, all three ISSN
+roles, source, and status.
+
+Legacy fixtures without the four Registry v2 columns remain readable only for
+deterministic replay. They are stored as `legacy/v1` evidence and cannot
+satisfy the current `journal-all-q1/v2` admission policy.
 
 ## Persistence contract
 
@@ -51,18 +58,17 @@ fixture and schema make no implicit claim about production JCR licensing.
 
 ## Decimal representation
 
-JIF uses an arbitrary-precision decimal value represented as a canonical digit
-coefficient plus decimal scale. Comparisons align scales with integer
-arithmetic, so values immediately below or equal to `10` cannot be
-misclassified by binary floating-point rounding.
+JIF and JIF percentile use arbitrary-precision decimal values represented as a
+canonical digit coefficient plus decimal scale. They are retained as evidence;
+only an exact `Q1` Quartile admits a journal.
 
 ## Covered synthetic outcomes
 
 The fixture has five rows covering:
 
-- a high-JIF journal (`12.5`) that is not dependent on Q1;
+- a high-JIF Q2 category that is rejected by itself;
 - a second category for the same journal that is Q1;
-- a multi-category journal with both policy rules visible;
+- a multi-category journal admitted only by its Q1 category;
 - an explicit `unknown` metric row;
 - a known `9.999`, Q2 row that evaluates to `rejected`;
 - a checksum-valid known row with exact decimal JIF `0`.

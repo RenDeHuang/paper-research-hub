@@ -33,7 +33,7 @@ func TestPostgresAssessmentStorePersistsImmutableReceiptBackedDecisions(t *testi
 			strings.Repeat("5", 64),
 			2026,
 			[]MetricSnapshot{
-				mustMetricSnapshot(
+				mustJCRRegistryV2MetricSnapshot(
 					t,
 					fixtureVenueAlpha,
 					2025,
@@ -43,7 +43,7 @@ func TestPostgresAssessmentStorePersistsImmutableReceiptBackedDecisions(t *testi
 					MetricStatusKnown,
 					"synthetic-jcr-fixture",
 				),
-				mustMetricSnapshot(
+				mustJCRRegistryV2MetricSnapshot(
 					t,
 					fixtureVenueUnknown,
 					2025,
@@ -53,7 +53,7 @@ func TestPostgresAssessmentStorePersistsImmutableReceiptBackedDecisions(t *testi
 					MetricStatusKnown,
 					"synthetic-jcr-fixture",
 				),
-				mustMetricSnapshot(
+				mustJCRRegistryV2MetricSnapshot(
 					t,
 					fixtureVenueSubthreshold,
 					2025,
@@ -90,7 +90,7 @@ func TestPostgresAssessmentStorePersistsImmutableReceiptBackedDecisions(t *testi
 	input := AssessmentInput{
 		JCRImportReceiptID: receiptID,
 		MetricYear:         2025,
-		PolicyVersion:      JournalJIFOrQ1PolicyVersion,
+		PolicyVersion:      JournalAllQ1PolicyVersion,
 		AssessedAt:         time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
 	}
 	first, err := service.Assess(context.Background(), input)
@@ -103,8 +103,8 @@ func TestPostgresAssessmentStorePersistsImmutableReceiptBackedDecisions(t *testi
 	}
 	if first != second ||
 		first.Total != 5 ||
-		first.Accepted != 2 ||
-		first.Rejected != 1 ||
+		first.Accepted != 1 ||
+		first.Rejected != 2 ||
 		first.Unknown != 1 ||
 		first.NotApplicable != 1 {
 		t.Fatalf("assessment summaries = first %#v second %#v", first, second)
@@ -170,18 +170,18 @@ func TestPostgresAssessmentStorePersistsImmutableReceiptBackedDecisions(t *testi
 	}
 	wantDecisions := []string{
 		"accepted",
-		"accepted",
+		"rejected",
 		"rejected",
 		"unknown",
 		"not_applicable",
 	}
 	for index, item := range got {
 		if item.decision != wantDecisions[index] ||
-			item.policyName != "journal-jif-or-q1" ||
-			item.policyNumber != 1 ||
+			item.policyName != JournalAllQ1PolicyName ||
+			item.policyNumber != 2 ||
 			!item.assessedAt.Equal(input.AssessedAt) ||
 			item.evidence["jcr_import_receipt_id"] != receiptID ||
-			item.evidence["policy_version"] != JournalJIFOrQ1PolicyVersion {
+			item.evidence["policy_version"] != JournalAllQ1PolicyVersion {
 			t.Fatalf("persisted assessment %d = %#v", index, item)
 		}
 	}
@@ -203,7 +203,7 @@ func TestPostgresAssessmentStoreRejectsReceiptMetricYearMismatch(t *testing.T) {
 			strings.Repeat("6", 64),
 			2026,
 			[]MetricSnapshot{
-				mustMetricSnapshot(
+				mustJCRRegistryV2MetricSnapshot(
 					t,
 					venueID,
 					2024,
@@ -237,7 +237,7 @@ func TestPostgresAssessmentStoreRejectsReceiptMetricYearMismatch(t *testing.T) {
 	_, err = service.Assess(context.Background(), AssessmentInput{
 		JCRImportReceiptID: receiptID,
 		MetricYear:         2025,
-		PolicyVersion:      JournalJIFOrQ1PolicyVersion,
+		PolicyVersion:      JournalAllQ1PolicyVersion,
 		AssessedAt:         time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
 	})
 	if err == nil || !strings.Contains(err.Error(), "metric year") {

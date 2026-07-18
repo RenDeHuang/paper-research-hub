@@ -477,9 +477,26 @@ func insertPostgresMetric(
 	capturedAt time.Time,
 	receiptID string,
 ) (string, bool, error) {
+	registryVersion := string(snapshot.RegistryVersion())
+	var editionYear any
+	if value, ok := snapshot.EditionYear(); ok {
+		editionYear = value
+	}
 	var jif any
 	if snapshot.HasJIF() {
 		jif = snapshot.JIF().String()
+	}
+	var jifRank any
+	if value, ok := snapshot.JIFRank(); ok {
+		jifRank = value
+	}
+	var categoryJournalCount any
+	if value, ok := snapshot.CategoryJournalCount(); ok {
+		categoryJournalCount = value
+	}
+	var jifPercentile any
+	if value, ok := snapshot.JIFPercentile(); ok {
+		jifPercentile = value.String()
 	}
 	var quartile any
 	if snapshot.Quartile() != "" {
@@ -491,7 +508,12 @@ func insertPostgresMetric(
 			venue_id,
 			metric_year,
 			category,
+			registry_version,
+			edition_year,
 			jif,
+			jif_rank,
+			category_journal_count,
+			jif_percentile,
 			quartile,
 			metric_status,
 			source_name,
@@ -502,13 +524,18 @@ func insertPostgresMetric(
 			$1,
 			$2,
 			$3,
-			$4::numeric,
+			$4,
 			$5,
-			$6,
+			$6::numeric,
 			$7,
 			$8,
-			$9,
-			$10
+			$9::numeric,
+			$10,
+			$11,
+			$12,
+			$13,
+			$14,
+			$15
 		)
 		ON CONFLICT (venue_id, metric_year, category) DO NOTHING
 		RETURNING id::text
@@ -516,7 +543,12 @@ func insertPostgresMetric(
 		snapshot.VenueID(),
 		snapshot.MetricYear(),
 		snapshot.Category(),
+		registryVersion,
+		editionYear,
 		jif,
+		jifRank,
+		categoryJournalCount,
+		jifPercentile,
 		quartile,
 		snapshot.Status(),
 		snapshot.Source(),
@@ -669,6 +701,166 @@ func findPostgresMetric(
 	key MetricKey,
 	lock bool,
 ) (storedPostgresMetric, bool, error) {
+	hasRegistryV2, err := postgresMetricRegistryV2Available(ctx, querier)
+	if err != nil {
+		return storedPostgresMetric{}, false, err
+	}
+	if !hasRegistryV2 {
+		return findLegacyPostgresMetric(ctx, querier, key, lock)
+	}
+	query := `
+		SELECT
+			id::text,
+			registry_version,
+			edition_year,
+			jif::text,
+			jif_rank,
+			category_journal_count,
+			jif_percentile::text,
+			quartile,
+			metric_status,
+			source_name,
+			source_license
+		FROM venue_metric_snapshots
+		WHERE venue_id = $1
+		  AND metric_year = $2
+		  AND category = $3
+	`
+	if lock {
+		query += " FOR KEY SHARE"
+	}
+	var (
+		id                                         string
+		registryVersion                            string
+		editionYear, jifRank, categoryJournalCount pgtype.Int4
+		jif, jifPercentile, quartile               pgtype.Text
+		rawStatus, source, sourceLicense           string
+	)
+	err = querier.QueryRow(
+		ctx,
+		query,
+		key.VenueID(),
+		key.MetricYear(),
+		key.Category(),
+	).Scan(
+		&id,
+		&registryVersion,
+		&editionYear,
+		&jif,
+		&jifRank,
+		&categoryJournalCount,
+		&jifPercentile,
+		&quartile,
+		&rawStatus,
+		&source,
+		&sourceLicense,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return storedPostgresMetric{}, false, nil
+	}
+	if err != nil {
+		return storedPostgresMetric{}, false, fmt.Errorf(
+			"find JCR metric for venue %q, metric_year %d, category %q: %w",
+			key.VenueID(),
+			key.MetricYear(),
+			key.Category(),
+			err,
+		)
+	}
+
+	var decimal *Decimal
+	if jif.Valid {
+		parsed, err := ParseDecimal(jif.String)
+		if err != nil {
+			return storedPostgresMetric{}, false, fmt.Errorf("restore JCR metric JIF: %w", err)
+		}
+		decimal = &parsed
+	}
+	var snapshot MetricSnapshot
+	if MetricRegistryVersion(registryVersion) == MetricRegistryJCRV2 {
+		var editionYearValue, jifRankValue, categoryCountValue *int
+		var percentile *Decimal
+		if editionYear.Valid {
+			value := int(editionYear.Int32)
+			editionYearValue = &value
+		}
+		if jifRank.Valid {
+			value := int(jifRank.Int32)
+			jifRankValue = &value
+		}
+		if categoryJournalCount.Valid {
+			value := int(categoryJournalCount.Int32)
+			categoryCountValue = &value
+		}
+		if jifPercentile.Valid {
+			parsed, parseErr := ParseDecimal(jifPercentile.String)
+			if parseErr != nil {
+				return storedPostgresMetric{}, false, fmt.Errorf(
+					"restore JCR metric JIF percentile: %w",
+					parseErr,
+				)
+			}
+			percentile = &parsed
+		}
+		snapshot, err = NewJCRRegistryV2MetricSnapshot(
+			key.VenueID(),
+			key.MetricYear(),
+			key.Category(),
+			editionYearValue,
+			decimal,
+			jifRankValue,
+			categoryCountValue,
+			percentile,
+			Quartile(quartile.String),
+			MetricStatus(rawStatus),
+			source,
+		)
+	} else {
+		snapshot, err = NewMetricSnapshot(
+			key.VenueID(),
+			key.MetricYear(),
+			key.Category(),
+			decimal,
+			Quartile(quartile.String),
+			MetricStatus(rawStatus),
+			source,
+		)
+	}
+	if err != nil {
+		return storedPostgresMetric{}, false, fmt.Errorf("restore JCR metric: %w", err)
+	}
+	return storedPostgresMetric{
+		id:            id,
+		snapshot:      snapshot,
+		sourceLicense: sourceLicense,
+	}, true, nil
+}
+
+func postgresMetricRegistryV2Available(
+	ctx context.Context,
+	querier postgresRowQuerier,
+) (bool, error) {
+	var available bool
+	if err := querier.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public'
+			  AND table_name = 'venue_metric_snapshots'
+			  AND column_name = 'registry_version'
+		)
+	`).Scan(&available); err != nil {
+		return false, fmt.Errorf("inspect JCR Registry schema version: %w", err)
+	}
+	return available, nil
+}
+
+func findLegacyPostgresMetric(
+	ctx context.Context,
+	querier postgresRowQuerier,
+	key MetricKey,
+	lock bool,
+) (storedPostgresMetric, bool, error) {
 	query := `
 		SELECT
 			id::text,
@@ -709,19 +901,21 @@ func findPostgresMetric(
 	}
 	if err != nil {
 		return storedPostgresMetric{}, false, fmt.Errorf(
-			"find JCR metric for venue %q, metric_year %d, category %q: %w",
+			"find legacy JCR metric for venue %q, metric_year %d, category %q: %w",
 			key.VenueID(),
 			key.MetricYear(),
 			key.Category(),
 			err,
 		)
 	}
-
 	var decimal *Decimal
 	if jif.Valid {
-		parsed, err := ParseDecimal(jif.String)
-		if err != nil {
-			return storedPostgresMetric{}, false, fmt.Errorf("restore JCR metric JIF: %w", err)
+		parsed, parseErr := ParseDecimal(jif.String)
+		if parseErr != nil {
+			return storedPostgresMetric{}, false, fmt.Errorf(
+				"restore legacy JCR metric JIF: %w",
+				parseErr,
+			)
 		}
 		decimal = &parsed
 	}
@@ -735,7 +929,10 @@ func findPostgresMetric(
 		source,
 	)
 	if err != nil {
-		return storedPostgresMetric{}, false, fmt.Errorf("restore JCR metric: %w", err)
+		return storedPostgresMetric{}, false, fmt.Errorf(
+			"restore legacy JCR metric: %w",
+			err,
+		)
 	}
 	return storedPostgresMetric{
 		id:            id,

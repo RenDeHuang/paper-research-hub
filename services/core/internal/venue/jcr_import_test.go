@@ -919,7 +919,7 @@ func TestCommittedSyntheticJCRFixtureCoversPolicyOutcomes(t *testing.T) {
 	if !foundZeroJIF {
 		t.Fatal("fixture does not contain an exact zero JIF row")
 	}
-	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
+	policy, err := NewJournalPolicy(JournalAllQ1PolicyVersion)
 	if err != nil {
 		t.Fatalf("NewJournalPolicy() error = %v", err)
 	}
@@ -1186,6 +1186,51 @@ func mustMetricSnapshot(
 	)
 	if err != nil {
 		t.Fatalf("NewMetricSnapshot() error = %v", err)
+	}
+	return snapshot
+}
+
+func mustJCRRegistryV2MetricSnapshot(
+	t *testing.T,
+	venueID string,
+	year int,
+	category string,
+	jif string,
+	quartile Quartile,
+	status MetricStatus,
+	source string,
+) MetricSnapshot {
+	t.Helper()
+
+	var (
+		editionYear, jifRank, categoryJournalCount *int
+		jifValue, jifPercentile                    *Decimal
+	)
+	if status == MetricStatusKnown {
+		edition, rank, count := year+1, 1, 100
+		percentile := mustParseDecimal(t, "99")
+		editionYear, jifRank, categoryJournalCount = &edition, &rank, &count
+		jifPercentile = &percentile
+		if jif != "" {
+			parsed := mustParseDecimal(t, jif)
+			jifValue = &parsed
+		}
+	}
+	snapshot, err := NewJCRRegistryV2MetricSnapshot(
+		venueID,
+		year,
+		category,
+		editionYear,
+		jifValue,
+		jifRank,
+		categoryJournalCount,
+		jifPercentile,
+		quartile,
+		status,
+		source,
+	)
+	if err != nil {
+		t.Fatalf("NewJCRRegistryV2MetricSnapshot() error = %v", err)
 	}
 	return snapshot
 }

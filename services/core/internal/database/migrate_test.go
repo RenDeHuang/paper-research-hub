@@ -156,6 +156,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 16, name: "citation_analysis_snapshots"},
 		{version: 17, name: "biomedical_analysis_snapshots"},
 		{version: 18, name: "publication_event_assertions"},
+		{version: 19, name: "jcr_registry_v2"},
 	}
 	var migrationIndex int
 	for rows.Next() {

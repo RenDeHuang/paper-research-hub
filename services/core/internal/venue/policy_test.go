@@ -17,7 +17,7 @@ func TestAllQ1Policy(t *testing.T) {
 		"1234-5679",
 		"2049-3630",
 	)
-	policy, err := NewJournalPolicy("journal-all-q1/v2")
+	policy, err := NewJournalPolicy(JournalAllQ1PolicyVersion)
 	if err != nil {
 		t.Fatalf("NewJournalPolicy() error = %v", err)
 	}
@@ -56,7 +56,7 @@ func TestAllQ1Policy(t *testing.T) {
 				item,
 				2025,
 				[]MetricSnapshot{
-					mustMetricSnapshot(
+					mustJCRRegistryV2MetricSnapshot(
 						t,
 						item.ID(),
 						2025,
@@ -100,7 +100,7 @@ func TestAllQ1Policy(t *testing.T) {
 	}
 }
 
-func TestJournalPolicyAcceptsHighJIFOrAnyQ1WithVersionedEvidence(t *testing.T) {
+func TestJournalPolicyAcceptsOnlyQ1WithVersionedEvidence(t *testing.T) {
 	t.Parallel()
 
 	item := venueForTest(
@@ -112,37 +112,40 @@ func TestJournalPolicyAcceptsHighJIFOrAnyQ1WithVersionedEvidence(t *testing.T) {
 		"2049-3630",
 	)
 	evaluatedAt := time.Date(2026, time.July, 16, 14, 0, 0, 0, time.UTC)
-	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
+	policy, err := NewJournalPolicy(JournalAllQ1PolicyVersion)
 	if err != nil {
 		t.Fatalf("NewJournalPolicy() error = %v", err)
 	}
 
 	tests := []struct {
-		name    string
-		metrics []MetricSnapshot
-		rules   []MatchedRule
+		name     string
+		metrics  []MetricSnapshot
+		decision PolicyDecision
+		rules    []MatchedRule
 	}{
 		{
-			name: "high JIF",
+			name: "high JIF Q2 rejected",
 			metrics: []MetricSnapshot{
-				mustMetricSnapshot(t, item.ID(), 2025, "AI", "10", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "AI", "10", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
 			},
-			rules: []MatchedRule{MatchedRuleJIFAtLeast10},
+			decision: PolicyDecisionRejected,
 		},
 		{
 			name: "Q1",
 			metrics: []MetricSnapshot{
-				mustMetricSnapshot(t, item.ID(), 2025, "Robotics", "4.2", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "Robotics", "4.2", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
 			},
-			rules: []MatchedRule{MatchedRuleAnyQ1},
+			decision: PolicyDecisionAccepted,
+			rules:    []MatchedRule{MatchedRuleAnyQ1},
 		},
 		{
-			name: "both rules across categories",
+			name: "Q1 dominates high JIF Q2 across categories",
 			metrics: []MetricSnapshot{
-				mustMetricSnapshot(t, item.ID(), 2025, "AI", "10.1", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
-				mustMetricSnapshot(t, item.ID(), 2025, "Robotics", "10.1", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "AI", "10.1", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "Robotics", "1", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
 			},
-			rules: []MatchedRule{MatchedRuleJIFAtLeast10, MatchedRuleAnyQ1},
+			decision: PolicyDecisionAccepted,
+			rules:    []MatchedRule{MatchedRuleAnyQ1},
 		},
 	}
 
@@ -155,10 +158,10 @@ func TestJournalPolicyAcceptsHighJIFOrAnyQ1WithVersionedEvidence(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Evaluate() error = %v", err)
 			}
-			if result.Decision() != PolicyDecisionAccepted {
-				t.Fatalf("Decision() = %q, want accepted", result.Decision())
+			if result.Decision() != tt.decision {
+				t.Fatalf("Decision() = %q, want %q", result.Decision(), tt.decision)
 			}
-			if result.PolicyVersion() != "journal-jif-or-q1/v1" ||
+			if result.PolicyVersion() != JournalAllQ1PolicyVersion ||
 				result.MetricYear() != 2025 ||
 				!result.EvaluatedAt().Equal(evaluatedAt) {
 				t.Fatalf("versioned result metadata = %#v", result)
@@ -192,7 +195,7 @@ func TestJournalPolicyUsesThreeValuedUnknownSemantics(t *testing.T) {
 		"1234-5679",
 		"2049-3630",
 	)
-	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
+	policy, err := NewJournalPolicy(JournalAllQ1PolicyVersion)
 	if err != nil {
 		t.Fatalf("NewJournalPolicy() error = %v", err)
 	}
@@ -214,24 +217,24 @@ func TestJournalPolicyUsesThreeValuedUnknownSemantics(t *testing.T) {
 		{
 			name: "known reject plus unknown remains unknown",
 			metrics: []MetricSnapshot{
-				mustMetricSnapshot(t, item.ID(), 2025, "AI", "9.9", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
-				mustMetricSnapshot(t, item.ID(), 2025, "Robotics", "", "", MetricStatusUnknown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "AI", "9.9", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "Robotics", "", "", MetricStatusUnknown, "synthetic-jcr"),
 			},
 			decision: PolicyDecisionUnknown,
 		},
 		{
 			name: "all known and no match is rejected",
 			metrics: []MetricSnapshot{
-				mustMetricSnapshot(t, item.ID(), 2025, "AI", "9.999999999999999999", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
-				mustMetricSnapshot(t, item.ID(), 2025, "Robotics", "9.9", QuartileQ3, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "AI", "99", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "Robotics", "9.9", QuartileQ3, MetricStatusKnown, "synthetic-jcr"),
 			},
 			decision: PolicyDecisionRejected,
 		},
 		{
 			name: "known acceptance dominates unknown",
 			metrics: []MetricSnapshot{
-				mustMetricSnapshot(t, item.ID(), 2025, "AI", "10.000000000000000000", QuartileQ2, MetricStatusKnown, "synthetic-jcr"),
-				mustMetricSnapshot(t, item.ID(), 2025, "Robotics", "", "", MetricStatusUnknown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "AI", "0.1", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
+				mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2025, "Robotics", "", "", MetricStatusUnknown, "synthetic-jcr"),
 			},
 			decision: PolicyDecisionAccepted,
 		},
@@ -256,7 +259,7 @@ func TestJournalPolicyUsesThreeValuedUnknownSemantics(t *testing.T) {
 	}
 }
 
-func TestJournalPolicyJIFBoundaryUsesExactDecimalValues(t *testing.T) {
+func TestJournalPolicyIgnoresJIFForNonQ1Metrics(t *testing.T) {
 	t.Parallel()
 
 	item := venueForTest(
@@ -267,7 +270,7 @@ func TestJournalPolicyJIFBoundaryUsesExactDecimalValues(t *testing.T) {
 		"1234-5679",
 		"2049-3630",
 	)
-	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
+	policy, err := NewJournalPolicy(JournalAllQ1PolicyVersion)
 	if err != nil {
 		t.Fatalf("NewJournalPolicy() error = %v", err)
 	}
@@ -279,13 +282,13 @@ func TestJournalPolicyJIFBoundaryUsesExactDecimalValues(t *testing.T) {
 	}{
 		{jif: "0", decision: PolicyDecisionRejected},
 		{jif: "9.999", decision: PolicyDecisionRejected},
-		{jif: "10", decision: PolicyDecisionAccepted},
+		{jif: "10", decision: PolicyDecisionRejected},
 	} {
 		test := test
 		t.Run(test.jif, func(t *testing.T) {
 			t.Parallel()
 
-			metric := mustMetricSnapshot(
+			metric := mustJCRRegistryV2MetricSnapshot(
 				t,
 				item.ID(),
 				2025,
@@ -319,7 +322,7 @@ func TestJournalPolicyJIFBoundaryUsesExactDecimalValues(t *testing.T) {
 func TestJournalPolicyReturnsNotApplicableForNonJournals(t *testing.T) {
 	t.Parallel()
 
-	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
+	policy, err := NewJournalPolicy(JournalAllQ1PolicyVersion)
 	if err != nil {
 		t.Fatalf("NewJournalPolicy() error = %v", err)
 	}
@@ -345,7 +348,7 @@ func TestJournalPolicyReturnsNotApplicableForNonJournals(t *testing.T) {
 			if result.Decision() != PolicyDecisionNotApplicable {
 				t.Fatalf("Decision() = %q, want not_applicable", result.Decision())
 			}
-			if result.PolicyVersion() != "journal-jif-or-q1/v1" ||
+			if result.PolicyVersion() != JournalAllQ1PolicyVersion ||
 				result.MetricYear() != 2025 ||
 				!result.EvaluatedAt().Equal(evaluatedAt) ||
 				len(result.MatchedRules()) != 0 ||
@@ -367,15 +370,15 @@ func TestJournalPolicyRejectsMismatchedMetricEvidence(t *testing.T) {
 		"1234-5679",
 		"2049-3630",
 	)
-	policy, err := NewJournalPolicy("journal-jif-or-q1/v1")
+	policy, err := NewJournalPolicy(JournalAllQ1PolicyVersion)
 	if err != nil {
 		t.Fatalf("NewJournalPolicy() error = %v", err)
 	}
 	evaluatedAt := time.Date(2026, time.July, 16, 14, 0, 0, 0, time.UTC)
 
 	tests := []MetricSnapshot{
-		mustMetricSnapshot(t, "other-venue", 2025, "AI", "12", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
-		mustMetricSnapshot(t, item.ID(), 2024, "AI", "12", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
+		mustJCRRegistryV2MetricSnapshot(t, "other-venue", 2025, "AI", "12", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
+		mustJCRRegistryV2MetricSnapshot(t, item.ID(), 2024, "AI", "12", QuartileQ1, MetricStatusKnown, "synthetic-jcr"),
 	}
 	for _, metric := range tests {
 		if _, err := policy.Evaluate(item, 2025, []MetricSnapshot{metric}, evaluatedAt); err == nil {

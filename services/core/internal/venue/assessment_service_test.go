@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestAssessmentServiceMaterializesJCRQ1OrJIFAtLeast10ForEveryVenue(t *testing.T) {
+func TestAssessmentServiceMaterializesAllQ1PolicyForEveryVenue(t *testing.T) {
 	t.Parallel()
 
 	assessedAt := time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC)
@@ -17,7 +17,7 @@ func TestAssessmentServiceMaterializesJCRQ1OrJIFAtLeast10ForEveryVenue(t *testin
 		{
 			Venue: assessmentJournal(t, "00000000-0000-0000-0000-000000000101", "Q1 Journal"),
 			Metrics: []MetricSnapshot{
-				mustMetricSnapshot(
+				mustJCRRegistryV2MetricSnapshot(
 					t,
 					"00000000-0000-0000-0000-000000000101",
 					2025,
@@ -32,7 +32,7 @@ func TestAssessmentServiceMaterializesJCRQ1OrJIFAtLeast10ForEveryVenue(t *testin
 		{
 			Venue: assessmentJournal(t, "00000000-0000-0000-0000-000000000102", "High JIF Journal"),
 			Metrics: []MetricSnapshot{
-				mustMetricSnapshot(
+				mustJCRRegistryV2MetricSnapshot(
 					t,
 					"00000000-0000-0000-0000-000000000102",
 					2025,
@@ -47,7 +47,7 @@ func TestAssessmentServiceMaterializesJCRQ1OrJIFAtLeast10ForEveryVenue(t *testin
 		{
 			Venue: assessmentJournal(t, "00000000-0000-0000-0000-000000000103", "Rejected Journal"),
 			Metrics: []MetricSnapshot{
-				mustMetricSnapshot(
+				mustJCRRegistryV2MetricSnapshot(
 					t,
 					"00000000-0000-0000-0000-000000000103",
 					2025,
@@ -86,7 +86,7 @@ func TestAssessmentServiceMaterializesJCRQ1OrJIFAtLeast10ForEveryVenue(t *testin
 	summary, err := service.Assess(context.Background(), AssessmentInput{
 		JCRImportReceiptID: receiptID,
 		MetricYear:         2025,
-		PolicyVersion:      "journal-jif-or-q1/v1",
+		PolicyVersion:      JournalAllQ1PolicyVersion,
 		AssessedAt:         assessedAt,
 	})
 	if err != nil {
@@ -101,8 +101,8 @@ func TestAssessmentServiceMaterializesJCRQ1OrJIFAtLeast10ForEveryVenue(t *testin
 		)
 	}
 	if summary.Total != 5 ||
-		summary.Accepted != 2 ||
-		summary.Rejected != 1 ||
+		summary.Accepted != 1 ||
+		summary.Rejected != 2 ||
 		summary.Unknown != 1 ||
 		summary.NotApplicable != 1 {
 		t.Fatalf("summary = %#v", summary)
@@ -123,8 +123,8 @@ func TestAssessmentServiceMaterializesJCRQ1OrJIFAtLeast10ForEveryVenue(t *testin
 	assertAssessmentDecision(
 		t,
 		got[1],
-		PolicyDecisionAccepted,
-		[]MatchedRule{MatchedRuleJIFAtLeast10},
+		PolicyDecisionRejected,
+		nil,
 		receiptID,
 		assessedAt,
 	)
@@ -167,7 +167,7 @@ func TestAssessmentServiceRejectsPolicyVersionOrReceiptYearMismatchBeforePersist
 			name: "blank receipt",
 			input: AssessmentInput{
 				MetricYear:    2025,
-				PolicyVersion: "journal-jif-or-q1/v1",
+				PolicyVersion: JournalAllQ1PolicyVersion,
 				AssessedAt:    time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
 			},
 			want: "JCR import receipt",
@@ -177,7 +177,7 @@ func TestAssessmentServiceRejectsPolicyVersionOrReceiptYearMismatchBeforePersist
 			input: AssessmentInput{
 				JCRImportReceiptID: "00000000-0000-0000-0000-000000000501",
 				MetricYear:         2025,
-				PolicyVersion:      "journal-jif-or-q1/v2",
+				PolicyVersion:      "journal-all-q1/v1",
 				AssessedAt:         time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
 			},
 			want: "unsupported policy version",
@@ -187,7 +187,7 @@ func TestAssessmentServiceRejectsPolicyVersionOrReceiptYearMismatchBeforePersist
 			input: AssessmentInput{
 				JCRImportReceiptID: "00000000-0000-0000-0000-000000000501",
 				MetricYear:         2025,
-				PolicyVersion:      "journal-jif-or-q1/v1",
+				PolicyVersion:      JournalAllQ1PolicyVersion,
 				AssessedAt:         time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
 			},
 			load: AssessmentLoad{
@@ -299,7 +299,7 @@ func assertAssessmentDecision(
 	if assessment.Result.Decision() != decision ||
 		!slices.Equal(assessment.Result.MatchedRules(), rules) ||
 		assessment.JCRImportReceiptID != receiptID ||
-		assessment.Result.PolicyVersion() != "journal-jif-or-q1/v1" ||
+		assessment.Result.PolicyVersion() != JournalAllQ1PolicyVersion ||
 		assessment.Result.MetricYear() != 2025 ||
 		!assessment.Result.EvaluatedAt().Equal(assessedAt) {
 		t.Fatalf("assessment = %#v", assessment)
