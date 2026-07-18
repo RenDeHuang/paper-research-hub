@@ -128,17 +128,29 @@ git commit -m "ops: add local release deployment contract"
 
 **Files:**
 - Create: `services/core/migrations/000020_content_channel_registries.sql`
-- Create: `services/core/internal/registry/model.go`
-- Create: `services/core/internal/registry/model_test.go`
-- Create: `services/core/internal/registry/import.go`
-- Create: `services/core/internal/registry/import_test.go`
-- Create: `services/core/internal/registry/postgres_store.go`
-- Create: `services/core/internal/registry/postgres_store_test.go`
-- Create: `services/core/cmd/worker/registry_import_command_test.go`
-- Modify: `services/core/cmd/worker/main.go`
-- Create: `data/registries/domains.v1.csv`
-- Create: `data/registries/preprint-sources.v1.csv`
-- Create: `data/registries/conference-sources.v1.csv`
+- Create: `services/core/internal/scope/domain.go`
+- Create: `services/core/internal/scope/domain_test.go`
+- Create: `services/core/internal/scope/channel.go`
+- Create: `services/core/internal/scope/channel_test.go`
+- Create: `services/core/internal/scope/channel_projection.go`
+- Create: `services/core/internal/scope/channel_projection_test.go`
+- Create: `services/core/internal/scope/lifecycle_projection.go`
+- Create: `services/core/internal/scope/lifecycle_projection_test.go`
+- Create: `services/core/internal/scope/admission.go`
+- Create: `services/core/internal/scope/admission_test.go`
+- Create: `services/core/internal/scope/postgres_domain.go`
+- Create: `services/core/internal/scope/postgres_domain_test.go`
+- Create: `services/core/internal/scope/postgres_channel.go`
+- Create: `services/core/internal/scope/postgres_channel_test.go`
+- Modify: `services/core/internal/biomed/taxonomy.go`
+- Modify: `services/core/internal/biomed/taxonomy_test.go`
+- Modify: `services/core/internal/biomed/scope.go`
+- Modify: `services/core/internal/biomed/postgres_scope.go`
+- Modify: `services/core/cmd/worker/biomedical_eligibility_command_test.go`
+- Create: `data/subjects/research-domains-jcr-subjects.v2.csv`
+- Create: `data/sources/preprint-sources.v1.csv`
+- Create: `data/venues/conference-venues.v1.csv`
+- Modify: `data/subjects/README.md`
 - Modify: `contracts/openapi.yaml`
 
 **Step 1: Write failing Registry tests**
@@ -164,7 +176,7 @@ versioned source Registry matches and must reject JCR evidence as their eligibil
 **Step 2: Run the failing tests**
 
 ```bash
-go -C services/core test ./internal/registry ./internal/database ./cmd/worker \
+go -C services/core test ./internal/scope ./internal/biomed ./internal/database ./cmd/worker \
   -run 'TestDomainRegistry|TestChannelRegistry|TestRegistryImport' -count=1
 ```
 
@@ -188,7 +200,8 @@ must fail.
 **Step 4: Run verification**
 
 ```bash
-go -C services/core test ./internal/registry ./internal/venue ./internal/database ./cmd/worker -count=1
+go -C services/core test ./internal/scope ./internal/biomed ./internal/venue \
+  ./internal/database ./internal/catalog ./cmd/worker -count=1
 go -C services/core test ./... -count=1
 git diff --check
 ```
@@ -199,8 +212,9 @@ Expected: PASS.
 
 ```bash
 git add services/core/migrations/000020_content_channel_registries.sql \
-  services/core/internal/registry services/core/cmd/worker \
-  data/registries contracts/openapi.yaml
+  services/core/internal/scope services/core/internal/biomed \
+  services/core/cmd/worker/biomedical_eligibility_command_test.go \
+  data/subjects data/sources data/venues contracts/openapi.yaml
 git commit -m "feat(registry): add domains and content channels"
 ```
 
