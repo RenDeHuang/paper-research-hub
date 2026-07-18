@@ -6,6 +6,11 @@ DEPLOY_SCRIPT_NAME=verify-release
 export DEPLOY_SCRIPT_NAME
 . "$(dirname "$0")/lib.sh"
 
+if [ -z "${API_URL:-}" ] || [ -z "${WEB_URL:-}" ]; then
+  COMPOSE_PROJECT_NAME="$(deploy_resolve_compose_project_name)"
+  export COMPOSE_PROJECT_NAME
+fi
+
 if [ -n "${API_URL:-}" ]; then
   api_url="$(deploy_normalize_origin "${API_URL}")"
 else

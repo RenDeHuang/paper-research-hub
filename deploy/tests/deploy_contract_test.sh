@@ -392,18 +392,21 @@ done
 [ -n "${headers}" ] && [ -n "${body}" ] && [ -n "${url}" ] || exit 64
 printf '%s\n' "${url}" >>"${MOCK_CURL_LOG}"
 
+mock_api_url="${API_URL:-http://localhost:${MOCK_API_PORT:-18080}}"
+mock_web_url="${WEB_URL:-http://localhost:${MOCK_WEB_PORT:-13000}}"
+
 status=404
 content_type=application/problem+json
 payload='{"code":"route_not_found"}'
 extra_headers=
 
 case "${url}" in
-  "${API_URL%/}/health")
+  "${mock_api_url%/}/health")
     status=200
     content_type=application/json
     payload='{"status":"ok","service":"medpaperhub-api"}'
     ;;
-  "${API_URL%/}/api/v1/home")
+  "${mock_api_url%/}/api/v1/home")
     status="${MOCK_CATALOG_STATUS:-503}"
     if [ "${status}" = "200" ]; then
       content_type=application/json
@@ -416,12 +419,12 @@ case "${url}" in
       payload='{"code":"catalog_not_published"}'
     fi
     ;;
-  "${WEB_URL%/}/health")
+  "${mock_web_url%/}/health")
     status=200
     content_type=application/json
     payload='{"status":"ok","service":"medpaperhub-web"}'
     ;;
-  "${WEB_URL%/}/")
+  "${mock_web_url%/}/")
     status=200
     content_type=text/html
     payload='<!doctype html><html><body>medpaperhub</body></html>'
@@ -453,6 +456,21 @@ set -eu
   done
   printf '\n'
 } >>"${MOCK_DOCKER_LOG}"
+
+case " $* " in
+  *" exec -T api "*)
+    printf '%s' "${MOCK_API_CONTAINER_PORT:-8080}"
+    ;;
+  *" exec -T web "*)
+    printf '%s' "${MOCK_WEB_CONTAINER_PORT:-3000}"
+    ;;
+  *" port api ${MOCK_API_CONTAINER_PORT:-8080} "*)
+    printf '0.0.0.0:%s\n' "${MOCK_API_PORT:-18080}"
+    ;;
+  *" port web ${MOCK_WEB_CONTAINER_PORT:-3000} "*)
+    printf '0.0.0.0:%s\n' "${MOCK_WEB_PORT:-13000}"
+    ;;
+esac
 EOF
 chmod +x "${fake_bin}/docker"
 
@@ -588,6 +606,129 @@ default_project_name="$(
 grep -F "project=${default_project_name}" "${docker_log}" |
   grep -F '|down|--volumes|--remove-orphans' >/dev/null ||
   fail "up-empty down --volumes did not target the repo-isolated default project"
+
+assert_verify_discovers_with_project() {
+  verify_label="$1"
+  verify_script="$2"
+  expected_project="$3"
+  catalog_status="$4"
+  project_mode="$5"
+
+  : >"${docker_log}"
+  : >"${mock_log}"
+
+  case "${project_mode}" in
+    explicit)
+      if ! sh -c '
+        unset API_URL
+        unset WEB_URL
+        export COMPOSE_PROJECT_NAME="$1"
+        export LOCAL_ENV_FILE="$2"
+        export PATH="$3"
+        export MOCK_CATALOG_STATUS="$4"
+        export MOCK_CURL_LOG="$5"
+        export MOCK_DOCKER_LOG="$6"
+        sh "$7"
+      ' sh \
+        "${expected_project}" \
+        "${project_env_file}" \
+        "${fake_bin}:${PATH}" \
+        "${catalog_status}" \
+        "${mock_log}" \
+        "${docker_log}" \
+        "${verify_script}" >/dev/null; then
+        fail "${verify_label} failed with an explicit Compose project name"
+      fi
+      ;;
+    env-file)
+      if ! sh -c '
+        unset COMPOSE_PROJECT_NAME
+        unset API_URL
+        unset WEB_URL
+        export LOCAL_ENV_FILE="$1"
+        export PATH="$2"
+        export MOCK_CATALOG_STATUS="$3"
+        export MOCK_CURL_LOG="$4"
+        export MOCK_DOCKER_LOG="$5"
+        sh "$6"
+      ' sh \
+        "${project_env_file}" \
+        "${fake_bin}:${PATH}" \
+        "${catalog_status}" \
+        "${mock_log}" \
+        "${docker_log}" \
+        "${verify_script}" >/dev/null; then
+        fail "${verify_label} failed with a LOCAL_ENV_FILE Compose project name"
+      fi
+      ;;
+    default)
+      if ! sh -c '
+        unset COMPOSE_PROJECT_NAME
+        unset LOCAL_ENV_FILE
+        unset API_URL
+        unset WEB_URL
+        export PATH="$1"
+        export MOCK_CATALOG_STATUS="$2"
+        export MOCK_CURL_LOG="$3"
+        export MOCK_DOCKER_LOG="$4"
+        sh "$5"
+      ' sh \
+        "${fake_bin}:${PATH}" \
+        "${catalog_status}" \
+        "${mock_log}" \
+        "${docker_log}" \
+        "${verify_script}" >/dev/null; then
+        fail "${verify_label} failed with the default Compose project name"
+      fi
+      ;;
+    *)
+      fail "unknown verify project mode: ${project_mode}"
+      ;;
+  esac
+
+  if grep -Fv "project=${expected_project}|" "${docker_log}" >/dev/null; then
+    fail "${verify_label} used a Compose project other than ${expected_project}"
+  fi
+  for expected_call in \
+    '|exec|-T|api|' \
+    '|port|api|8080' \
+    '|exec|-T|web|' \
+    '|port|web|3000'; do
+    grep -F "project=${expected_project}" "${docker_log}" |
+      grep -F "${expected_call}" >/dev/null ||
+      fail "${verify_label} did not discover ports from ${expected_project}"
+  done
+}
+
+for verify_script in \
+  deploy/scripts/verify-empty.sh \
+  deploy/scripts/verify-release.sh; do
+  verify_name="${verify_script##*/}"
+  case "${verify_name}" in
+    verify-empty.sh) verify_catalog_status=503 ;;
+    verify-release.sh) verify_catalog_status=200 ;;
+    *) fail "unexpected verify script: ${verify_script}" ;;
+  esac
+
+  assert_verify_discovers_with_project \
+    "${verify_name} explicit project" \
+    "${verify_script}" \
+    "explicit-project" \
+    "${verify_catalog_status}" \
+    explicit
+  assert_verify_discovers_with_project \
+    "${verify_name} env-file project" \
+    "${verify_script}" \
+    "env-file-project" \
+    "${verify_catalog_status}" \
+    env-file
+  assert_verify_discovers_with_project \
+    "${verify_name} default project" \
+    "${verify_script}" \
+    "${default_project_name}" \
+    "${verify_catalog_status}" \
+    default
+done
 
 assert_fails_with \
   "release verification rejects Catalog 503" \
