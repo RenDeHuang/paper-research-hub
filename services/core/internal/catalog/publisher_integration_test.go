@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -163,6 +165,10 @@ func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 			pool,
 			"event-provenance-missing",
 			"doi:10.1000/publication-event-provenance-missing",
+			publisherPublicationHistoryEntry(
+				"accepted", 2026, time.July, 17, "day",
+				"/PubmedArticle/PubmedData/History/PubMedPubDate[1]", 1,
+			),
 		)
 		input := catalogCurationInput()
 		preparePublisherAcceptedCuration(t, pool, input, fixture)
@@ -204,6 +210,10 @@ func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 			pool,
 			"event-model-mismatch",
 			"doi:10.1000/publication-event-model-mismatch",
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 17, "day",
+				"/PubmedArticle/JournalIssue/PubDate", 1,
+			),
 		)
 		input := catalogCurationInput()
 		preparePublisherAcceptedCuration(t, pool, input, fixture)
@@ -246,6 +256,407 @@ func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 		}
 		assertNoCatalogWrites(t, pool)
 	})
+}
+
+func TestPublisherRejectsPublicationAssertionSetMismatchWithNormalizedHistory(
+	t *testing.T,
+) {
+	normalizedDate := publisherPublicationDateFixture{
+		Year:      2026,
+		Month:     int(time.July),
+		Day:       17,
+		Precision: "day",
+	}
+	persistedDate := publicationUpdateDate(2026, time.July, 17)
+	baseHistory := publisherPublicationHistoryFixture{
+		Status:     "ppublish",
+		Date:       normalizedDate,
+		SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+		Ordinal:    1,
+	}
+	baseEvent := publisherPublicationEventFixture{
+		kind:       "print_published",
+		date:       &persistedDate,
+		precision:  "day",
+		statusRaw:  "ppublish",
+		modelRaw:   stringPointer("Electronic"),
+		sourcePath: baseHistory.SourcePath,
+		ordinal:    1,
+	}
+	baseState := publisherPublicationStateFixture{
+		printDate:         &persistedDate,
+		printState:        "known",
+		electronicState:   "missing",
+		aheadState:        "missing",
+		acceptedState:     "missing",
+		publicationModel:  stringPointer("Electronic"),
+		publicationStatus: stringPointer("epublish"),
+	}
+
+	tests := []struct {
+		name              string
+		history           []publisherPublicationHistoryFixture
+		events            []publisherPublicationEventFixture
+		state             publisherPublicationStateFixture
+		publicationStatus string
+	}{
+		{
+			name:    "event kind",
+			history: []publisherPublicationHistoryFixture{baseHistory},
+			events: []publisherPublicationEventFixture{func() publisherPublicationEventFixture {
+				event := baseEvent
+				event.kind = "accepted"
+				return event
+			}()},
+			state: func() publisherPublicationStateFixture {
+				state := baseState
+				state.printDate = nil
+				state.printState = "missing"
+				state.acceptedDate = &persistedDate
+				state.acceptedState = "known"
+				return state
+			}(),
+			publicationStatus: "epublish",
+		},
+		{
+			name:    "event date",
+			history: []publisherPublicationHistoryFixture{baseHistory},
+			events: []publisherPublicationEventFixture{func() publisherPublicationEventFixture {
+				event := baseEvent
+				changed := publicationUpdateDate(2026, time.July, 18)
+				event.date = &changed
+				event.sourceDate = `{"year":2026,"month":7,"day":17,"precision":"day"}`
+				return event
+			}()},
+			state: func() publisherPublicationStateFixture {
+				state := baseState
+				changed := publicationUpdateDate(2026, time.July, 18)
+				state.printDate = &changed
+				return state
+			}(),
+			publicationStatus: "epublish",
+		},
+		{
+			name:    "date precision",
+			history: []publisherPublicationHistoryFixture{baseHistory},
+			events: []publisherPublicationEventFixture{func() publisherPublicationEventFixture {
+				event := baseEvent
+				event.date = nil
+				event.precision = "month"
+				event.sourceDate = `{"year":2026,"month":7,"day":17,"precision":"day"}`
+				return event
+			}()},
+			state: func() publisherPublicationStateFixture {
+				state := baseState
+				state.printDate = nil
+				state.printState = "missing"
+				return state
+			}(),
+			publicationStatus: "epublish",
+		},
+		{
+			name:    "source date",
+			history: []publisherPublicationHistoryFixture{baseHistory},
+			events: []publisherPublicationEventFixture{func() publisherPublicationEventFixture {
+				event := baseEvent
+				event.sourceDate = `{"year":2026,"month":7,"day":18,"precision":"day"}`
+				return event
+			}()},
+			state:             baseState,
+			publicationStatus: "epublish",
+		},
+		{
+			name:    "status",
+			history: []publisherPublicationHistoryFixture{baseHistory},
+			events: []publisherPublicationEventFixture{func() publisherPublicationEventFixture {
+				event := baseEvent
+				event.statusRaw = "accepted"
+				return event
+			}()},
+			state:             baseState,
+			publicationStatus: "epublish",
+		},
+		{
+			name:    "source path",
+			history: []publisherPublicationHistoryFixture{baseHistory},
+			events: []publisherPublicationEventFixture{func() publisherPublicationEventFixture {
+				event := baseEvent
+				event.sourcePath = "/PubmedArticle/Decoy/PubMedPubDate[1]"
+				return event
+			}()},
+			state:             baseState,
+			publicationStatus: "epublish",
+		},
+		{
+			name:    "ordinal",
+			history: []publisherPublicationHistoryFixture{baseHistory},
+			events: []publisherPublicationEventFixture{func() publisherPublicationEventFixture {
+				event := baseEvent
+				event.ordinal = 2
+				return event
+			}()},
+			state:             baseState,
+			publicationStatus: "epublish",
+		},
+		{
+			name: "missing partial assertion",
+			history: []publisherPublicationHistoryFixture{{
+				Status: "aheadofprint",
+				Date: publisherPublicationDateFixture{
+					Year:      2026,
+					Month:     int(time.July),
+					Precision: "month",
+				},
+				SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				Ordinal:    1,
+			}},
+			state: publisherPublicationStateFixture{
+				printState:        "missing",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedState:     "missing",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+			},
+			publicationStatus: "epublish",
+		},
+		{
+			name:    "extra assertion for empty history",
+			history: []publisherPublicationHistoryFixture{},
+			events: []publisherPublicationEventFixture{{
+				kind:       "print_published",
+				precision:  "month",
+				sourceDate: `{"year":2026,"month":7,"precision":"month"}`,
+				statusRaw:  "ppublish",
+				modelRaw:   stringPointer("Electronic"),
+				sourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				ordinal:    1,
+			}},
+			state: publisherPublicationStateFixture{
+				printState:        "missing",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedState:     "missing",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+			},
+			publicationStatus: "epublish",
+		},
+		{
+			name: "unknown status does not generate assertion",
+			history: []publisherPublicationHistoryFixture{{
+				Status: "received",
+				Date: publisherPublicationDateFixture{
+					Year:      2026,
+					Month:     int(time.July),
+					Precision: "month",
+				},
+				SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				Ordinal:    1,
+			}},
+			events: []publisherPublicationEventFixture{{
+				kind:       "accepted",
+				precision:  "month",
+				sourceDate: `{"year":2026,"month":7,"precision":"month"}`,
+				statusRaw:  "received",
+				modelRaw:   stringPointer("Electronic"),
+				sourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				ordinal:    1,
+			}},
+			state: publisherPublicationStateFixture{
+				printState:        "missing",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedState:     "missing",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("epublish"),
+			},
+			publicationStatus: "epublish",
+		},
+		{
+			name: "epublish requires top level epublish or ppublish",
+			history: []publisherPublicationHistoryFixture{{
+				Status: "epublish",
+				Date: publisherPublicationDateFixture{
+					Year:      2026,
+					Month:     int(time.July),
+					Precision: "month",
+				},
+				SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				Ordinal:    1,
+			}},
+			events: []publisherPublicationEventFixture{{
+				kind:       "electronic_published",
+				precision:  "month",
+				sourceDate: `{"year":2026,"month":7,"precision":"month"}`,
+				statusRaw:  "epublish",
+				modelRaw:   stringPointer("Electronic"),
+				sourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				ordinal:    1,
+			}},
+			state: publisherPublicationStateFixture{
+				printState:        "missing",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedState:     "missing",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("accepted"),
+			},
+			publicationStatus: "accepted",
+		},
+		{
+			name: "epublish is recognized for top level ppublish",
+			history: []publisherPublicationHistoryFixture{{
+				Status: "epublish",
+				Date: publisherPublicationDateFixture{
+					Year:      2026,
+					Month:     int(time.July),
+					Precision: "month",
+				},
+				SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+				Ordinal:    1,
+			}},
+			state: publisherPublicationStateFixture{
+				printState:        "missing",
+				electronicState:   "missing",
+				aheadState:        "missing",
+				acceptedState:     "missing",
+				publicationModel:  stringPointer("Electronic"),
+				publicationStatus: stringPointer("ppublish"),
+			},
+			publicationStatus: "ppublish",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool := openCatalogTestPool(t)
+			fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+				eventKey:                "pubmed:publication-history-mismatch-" + strings.ReplaceAll(test.name, " ", "-"),
+				logicalSource:           "pubmed",
+				canonicalKey:            "doi:10.1000/publication-history-mismatch-" + strings.ReplaceAll(test.name, " ", "-"),
+				title:                   "Publication history mismatch " + test.name,
+				paperType:               "research_article",
+				publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+				sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+				scopeStatus:             "included",
+				includeWorkLink:         true,
+				includeWorkID:           true,
+				includeNormalized:       true,
+				normalizedPayloadSchema: "normalized-record/v3",
+				publicationModel:        "Electronic",
+				publicationStatus:       test.publicationStatus,
+				publicationHistory:      test.history,
+				noJCRAssessment:         true,
+			})
+			input := catalogCurationInput()
+			preparePublisherAcceptedCuration(t, pool, input, fixture)
+			insertPublisherBiomedicalProjection(t, pool, fixture)
+			state := test.state
+			state.events = test.events
+			insertPublisherPublicationState(t, pool, fixture, state)
+
+			_, err := mustPublisher(t, pool).PublishCurrent(
+				context.Background(),
+				input,
+			)
+			if !errors.Is(err, ErrCatalogNotReady) ||
+				!strings.Contains(err.Error(), "publication event assertion") {
+				t.Fatalf(
+					"PublishCurrent(%s) error = %v, want publication assertion set ErrCatalogNotReady",
+					test.name,
+					err,
+				)
+			}
+			assertNoCatalogWrites(t, pool)
+		})
+	}
+}
+
+func TestPublisherPreloadsPublicationEvidenceForMultipleWorks(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	eventDate := publicationUpdateDate(2026, time.July, 17)
+	event := publisherPublicationEventFixture{
+		kind:       "print_published",
+		date:       &eventDate,
+		precision:  "day",
+		statusRaw:  "ppublish",
+		modelRaw:   stringPointer("Electronic"),
+		sourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+		ordinal:    1,
+	}
+	v3 := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:                "pubmed:catalog-bulk-publication-v3",
+		logicalSource:           "pubmed",
+		canonicalKey:            "doi:10.1000/catalog-bulk-publication-v3",
+		title:                   "Bulk publication evidence v3",
+		paperType:               "research_article",
+		publishedAt:             eventDate,
+		sourceTime:              eventDate.Add(time.Hour),
+		scopeStatus:             "included",
+		includeWorkLink:         true,
+		includeWorkID:           true,
+		includeNormalized:       true,
+		normalizedPayloadSchema: "normalized-record/v3",
+		publicationModel:        "Electronic",
+		publicationStatus:       "epublish",
+		publicationHistory: publisherPublicationHistoryFromEvents(
+			t,
+			[]publisherPublicationEventFixture{event},
+		),
+		noJCRAssessment: true,
+	})
+	v2 := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "pubmed:catalog-bulk-publication-v2",
+		logicalSource:     "pubmed",
+		canonicalKey:      "doi:10.1000/catalog-bulk-publication-v2",
+		title:             "Bulk publication evidence v2",
+		paperType:         "research_article",
+		publishedAt:       eventDate.Add(-time.Hour),
+		sourceTime:        eventDate.Add(2 * time.Hour),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+	})
+	input := catalogCurationInput()
+	preparePublisherAcceptedCuration(t, pool, input, v3, v2)
+	insertPublisherBiomedicalProjection(t, pool, v3)
+	insertPublisherBiomedicalProjection(t, pool, v2)
+	insertPublisherPublicationState(
+		t,
+		pool,
+		v3,
+		publisherPublicationStateFixture{
+			printDate:         &eventDate,
+			printState:        "known",
+			electronicState:   "missing",
+			aheadState:        "missing",
+			acceptedState:     "missing",
+			publicationModel:  stringPointer("Electronic"),
+			publicationStatus: stringPointer("epublish"),
+			events:            []publisherPublicationEventFixture{event},
+		},
+	)
+
+	counter := &publicationEvidenceQueryCounter{}
+	publisher, err := NewPublisher(publicationEvidenceCountingDatabase{
+		database: pool,
+		counter:  counter,
+	})
+	if err != nil {
+		t.Fatalf("NewPublisher() error = %v", err)
+	}
+	if _, err := publisher.PublishCurrent(context.Background(), input); err != nil {
+		t.Fatalf("PublishCurrent() error = %v", err)
+	}
+	if got := counter.count.Load(); got != 2 {
+		t.Fatalf(
+			"publication evidence SQL statements = %d, want exactly 2 bulk preload statements for two Works",
+			got,
+		)
+	}
 }
 
 func TestPublisherRejectsV3WinnerWithoutPublicationState(t *testing.T) {
@@ -1880,6 +2291,43 @@ type publisherWorkOptions struct {
 	includePublicationMetadata bool
 	publicationModel           string
 	publicationStatus          string
+	publicationHistory         []publisherPublicationHistoryFixture
+}
+
+type publisherPublicationDateFixture struct {
+	Year      int    `json:"year"`
+	Month     int    `json:"month,omitempty"`
+	Day       int    `json:"day,omitempty"`
+	Precision string `json:"precision"`
+}
+
+type publisherPublicationHistoryFixture struct {
+	Status     string                          `json:"status"`
+	Date       publisherPublicationDateFixture `json:"date"`
+	SourcePath string                          `json:"source_path"`
+	Ordinal    int                             `json:"ordinal"`
+}
+
+func publisherPublicationHistoryEntry(
+	status string,
+	year int,
+	month time.Month,
+	day int,
+	precision string,
+	sourcePath string,
+	ordinal int,
+) publisherPublicationHistoryFixture {
+	return publisherPublicationHistoryFixture{
+		Status: status,
+		Date: publisherPublicationDateFixture{
+			Year:      year,
+			Month:     int(month),
+			Day:       day,
+			Precision: precision,
+		},
+		SourcePath: sourcePath,
+		Ordinal:    ordinal,
+	}
 }
 
 type publisherWorkFixture struct {
@@ -1994,6 +2442,13 @@ func insertPublisherVisibleWork(
 		}
 		if options.includePublicationMetadata || options.publicationStatus != "" {
 			normalizedPayloadMap["publication_status"] = options.publicationStatus
+		}
+		if options.normalizedPayloadSchema == "normalized-record/v3" {
+			history := options.publicationHistory
+			if history == nil {
+				history = []publisherPublicationHistoryFixture{}
+			}
+			normalizedPayloadMap["publication_history"] = history
 		}
 		normalizedPayload, err := json.Marshal(normalizedPayloadMap)
 		if err != nil {
@@ -2323,6 +2778,46 @@ type publisherPublicationEventFixture struct {
 	ordinal    int
 }
 
+func publisherPublicationHistoryFromEvents(
+	t *testing.T,
+	events []publisherPublicationEventFixture,
+) []publisherPublicationHistoryFixture {
+	t.Helper()
+	history := make([]publisherPublicationHistoryFixture, 0, len(events))
+	for _, event := range events {
+		var date publisherPublicationDateFixture
+		if event.sourceDate != "" {
+			if err := json.Unmarshal([]byte(event.sourceDate), &date); err != nil {
+				t.Fatalf(
+					"decode publication history source date ordinal %d: %v",
+					event.ordinal,
+					err,
+				)
+			}
+		} else {
+			if event.date == nil {
+				t.Fatalf(
+					"publication history event ordinal %d lacks a source date",
+					event.ordinal,
+				)
+			}
+			date = publisherPublicationDateFixture{
+				Year:      event.date.Year(),
+				Month:     int(event.date.Month()),
+				Day:       event.date.Day(),
+				Precision: event.precision,
+			}
+		}
+		history = append(history, publisherPublicationHistoryFixture{
+			Status:     event.statusRaw,
+			Date:       date,
+			SourcePath: event.sourcePath,
+			Ordinal:    event.ordinal,
+		})
+	}
+	return history
+}
+
 type publisherPublicationStateFixture struct {
 	projectionAssertionID uuid.UUID
 	printDate             *time.Time
@@ -2336,6 +2831,59 @@ type publisherPublicationStateFixture struct {
 	publicationModel      *string
 	publicationStatus     *string
 	events                []publisherPublicationEventFixture
+}
+
+type publicationEvidenceQueryCounter struct {
+	count atomic.Int64
+}
+
+func (counter *publicationEvidenceQueryCounter) record(sql string) {
+	if strings.Contains(sql, "work_publication_states") ||
+		strings.Contains(sql, "work_publication_event_assertions") {
+		counter.count.Add(1)
+	}
+}
+
+type publicationEvidenceCountingDatabase struct {
+	database *pgxpool.Pool
+	counter  *publicationEvidenceQueryCounter
+}
+
+func (database publicationEvidenceCountingDatabase) BeginTx(
+	ctx context.Context,
+	options pgx.TxOptions,
+) (pgx.Tx, error) {
+	tx, err := database.database.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return publicationEvidenceCountingTx{
+		Tx:      tx,
+		counter: database.counter,
+	}, nil
+}
+
+type publicationEvidenceCountingTx struct {
+	pgx.Tx
+	counter *publicationEvidenceQueryCounter
+}
+
+func (tx publicationEvidenceCountingTx) Query(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) (pgx.Rows, error) {
+	tx.counter.record(sql)
+	return tx.Tx.Query(ctx, sql, args...)
+}
+
+func (tx publicationEvidenceCountingTx) QueryRow(
+	ctx context.Context,
+	sql string,
+	args ...any,
+) pgx.Row {
+	tx.counter.record(sql)
+	return tx.Tx.QueryRow(ctx, sql, args...)
 }
 
 func insertPublisherPublicationState(

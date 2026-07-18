@@ -47,7 +47,64 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 			normalizedPayloadSchema: "normalized-record/v3",
 			publicationModel:        "Print-Electronic",
 			publicationStatus:       "epublish",
-			noJCRAssessment:         true,
+			publicationHistory: []publisherPublicationHistoryFixture{
+				{
+					Status: "accepted",
+					Date: publisherPublicationDateFixture{
+						Year:      2026,
+						Month:     int(time.July),
+						Day:       12,
+						Precision: "day",
+					},
+					SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+					Ordinal:    1,
+				},
+				{
+					Status: "accepted",
+					Date: publisherPublicationDateFixture{
+						Year:      2026,
+						Month:     int(time.July),
+						Day:       12,
+						Precision: "day",
+					},
+					SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[2]",
+					Ordinal:    2,
+				},
+				{
+					Status: "aheadofprint",
+					Date: publisherPublicationDateFixture{
+						Year:      2026,
+						Month:     int(time.July),
+						Day:       15,
+						Precision: "day",
+					},
+					SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[3]",
+					Ordinal:    3,
+				},
+				{
+					Status: "ppublish",
+					Date: publisherPublicationDateFixture{
+						Year:      2026,
+						Month:     int(time.July),
+						Day:       18,
+						Precision: "day",
+					},
+					SourcePath: "/PubmedArticle/MedlineCitation/Article/Journal/JournalIssue/PubDate",
+					Ordinal:    4,
+				},
+				{
+					Status: "epublish",
+					Date: publisherPublicationDateFixture{
+						Year:      2026,
+						Month:     int(time.July),
+						Day:       18,
+						Precision: "day",
+					},
+					SourcePath: "/PubmedArticle/MedlineCitation/Article/ArticleDate[1]",
+					Ordinal:    5,
+				},
+			},
+			noJCRAssessment: true,
 		})
 		preparePublisherAcceptedCuration(t, pool, input, fixture)
 		insertPublisherBiomedicalProjection(t, pool, fixture)
@@ -245,35 +302,68 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 		input := catalogCurationInputAt(
 			time.Date(2026, time.July, 18, 23, 30, 0, 0, time.UTC),
 		)
+		eligibleHistory := []publisherPublicationHistoryFixture{
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 17, "day",
+				"/PubmedArticle/JournalIssue/PubDate[1]", 1,
+			),
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 18, "day",
+				"/PubmedArticle/JournalIssue/PubDate[2]", 2,
+			),
+			publisherPublicationHistoryEntry(
+				"epublish", 2026, time.July, 0, "month",
+				"/PubmedArticle/ArticleDate[1]", 3,
+			),
+			publisherPublicationHistoryEntry(
+				"aheadofprint", 2026, time.July, 11, "day",
+				"/PubmedArticle/PubMedPubDate[1]", 4,
+			),
+			publisherPublicationHistoryEntry(
+				"accepted", 2026, time.July, 19, "day",
+				"/PubmedArticle/PubMedPubDate[2]", 5,
+			),
+		}
+		ineligibleHistory := []publisherPublicationHistoryFixture{
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 18, "day",
+				"/PubmedArticle/JournalIssue/PubDate", 1,
+			),
+		}
 		eligible := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"eligible-exclusions",
 			"doi:10.1000/eligible-exclusions",
+			eligibleHistory...,
 		)
 		rejectedJCR := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"rejected-jcr",
 			"doi:10.1000/rejected-jcr",
+			ineligibleHistory...,
 		)
 		nonBiomedical := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"non-biomedical",
 			"doi:10.1000/non-biomedical",
+			ineligibleHistory...,
 		)
 		retracted := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"retracted",
 			"doi:10.1000/retracted",
+			ineligibleHistory...,
 		)
 		excluded := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"excluded",
 			"doi:10.1000/excluded",
+			ineligibleHistory...,
 		)
 		if _, err := pool.Exec(context.Background(), `
 			UPDATE works SET status = 'retracted' WHERE id = $1
@@ -440,23 +530,60 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 		input := catalogCurationInputAt(
 			time.Date(2026, time.July, 18, 23, 30, 0, 0, time.UTC),
 		)
+		historyA := []publisherPublicationHistoryFixture{
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 18, "day",
+				"/PubmedArticle/SortingA/Print", 1,
+			),
+			publisherPublicationHistoryEntry(
+				"epublish", 2026, time.July, 18, "day",
+				"/PubmedArticle/SortingA/Electronic", 2,
+			),
+			publisherPublicationHistoryEntry(
+				"accepted", 2026, time.July, 16, "day",
+				"/PubmedArticle/SortingA/Accepted", 3,
+			),
+		}
+		historyB := []publisherPublicationHistoryFixture{
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 18, "day",
+				"/PubmedArticle/SortingB/Print", 1,
+			),
+			publisherPublicationHistoryEntry(
+				"accepted", 2026, time.July, 16, "day",
+				"/PubmedArticle/SortingB/Accepted", 2,
+			),
+		}
+		historyC := []publisherPublicationHistoryFixture{
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 18, "day",
+				"/PubmedArticle/SortingC/Print", 1,
+			),
+			publisherPublicationHistoryEntry(
+				"accepted", 2026, time.July, 17, "day",
+				"/PubmedArticle/SortingC/Accepted", 2,
+			),
+		}
 		fixtureA := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"sorting-a",
 			"doi:10.1000/publication-sorting-a",
+			historyA...,
 		)
 		fixtureB := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"sorting-b",
 			"doi:10.1000/publication-sorting-b",
+			historyB...,
 		)
 		fixtureC := insertPublisherPublicationUpdateWork(
 			t,
 			pool,
 			"sorting-c",
 			"doi:10.1000/publication-sorting-c",
+			historyC...,
 		)
 		fixtures := []publisherWorkFixture{fixtureA, fixtureB, fixtureC}
 		preparePublisherAcceptedCuration(t, pool, input, fixtures...)
@@ -681,7 +808,13 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 			includeNormalized:          true,
 			normalizedPayloadSchema:    "normalized-record/v3",
 			includePublicationMetadata: true,
-			noJCRAssessment:            true,
+			publicationHistory: []publisherPublicationHistoryFixture{
+				publisherPublicationHistoryEntry(
+					"ppublish", 2026, time.July, 17, "day",
+					"/PubmedArticle/JournalIssue/PubDate", 1,
+				),
+			},
+			noJCRAssessment: true,
 		})
 		preparePublisherAcceptedCuration(t, pool, input, fixture)
 		insertPublisherBiomedicalProjection(t, pool, fixture)
@@ -779,6 +912,10 @@ func TestPublisherPublicationUpdatesRespectSingleEligibilityGates(t *testing.T) 
 			pool,
 			"single-gate-"+spec.name,
 			spec.canonical,
+			publisherPublicationHistoryEntry(
+				"ppublish", 2026, time.July, 18, "day",
+				"/PubmedArticle/SingleGate/JournalIssue/PubDate", 1,
+			),
 		)
 		fixtures[spec.name] = fixture
 		insertPublisherBiomedicalProjection(t, pool, fixture)
@@ -1084,6 +1221,7 @@ func insertPublisherPublicationUpdateWork(
 	pool *pgxpool.Pool,
 	name string,
 	canonicalKey string,
+	publicationHistory ...publisherPublicationHistoryFixture,
 ) publisherWorkFixture {
 	t.Helper()
 	return insertPublisherVisibleWork(t, pool, publisherWorkOptions{
@@ -1101,6 +1239,7 @@ func insertPublisherPublicationUpdateWork(
 		normalizedPayloadSchema: "normalized-record/v3",
 		publicationModel:        "Electronic",
 		publicationStatus:       "epublish",
+		publicationHistory:      publicationHistory,
 		noJCRAssessment:         true,
 	})
 }

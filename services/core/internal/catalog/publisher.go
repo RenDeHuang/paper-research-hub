@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -146,6 +147,49 @@ type publishedPublicationEventProvenance struct {
 	ProjectionAssertionID uuid.UUID `json:"projection_assertion_id"`
 	SourcePath            string    `json:"source_path"`
 	StatusRaw             string    `json:"status_raw"`
+}
+
+type normalizedPublicationDateV3 struct {
+	Year      int    `json:"year"`
+	Month     int    `json:"month,omitempty"`
+	Day       int    `json:"day,omitempty"`
+	Precision string `json:"precision"`
+}
+
+type normalizedPublicationHistoryEntryV3 struct {
+	Status     string                      `json:"status"`
+	Date       normalizedPublicationDateV3 `json:"date"`
+	SourcePath string                      `json:"source_path"`
+	Ordinal    int                         `json:"ordinal"`
+}
+
+type normalizedPublicationPayloadV3 struct {
+	Source             string                                `json:"source"`
+	SourceRecordID     string                                `json:"source_record_id"`
+	PublicationModel   string                                `json:"publication_model"`
+	PublicationStatus  string                                `json:"publication_status"`
+	PublicationHistory []normalizedPublicationHistoryEntryV3 `json:"publication_history"`
+}
+
+type publicationEventAssertionEvidence struct {
+	ProjectionAssertionID uuid.UUID
+	NormalizedAssertionID uuid.UUID
+	SourceRecordID        uuid.UUID
+	WorkID                uuid.UUID
+	EventKind             string
+	EventDate             *time.Time
+	DatePrecision         string
+	SourceDate            json.RawMessage
+	StatusRaw             string
+	PublicationModelRaw   *string
+	SourcePath            string
+	Ordinal               int
+}
+
+type publicationEvidenceSeed struct {
+	state    publishedPublicationState
+	stored   map[string]publishedPublicationEventState
+	expected []publicationEventAssertionEvidence
 }
 
 type publishedBiomedicalResource struct {
@@ -821,6 +865,14 @@ func buildCurrentSnapshot(
 		return left.EventKey < right.EventKey
 	})
 
+	publicationStatesByWork, err := loadCurrentPublicationStates(
+		ctx,
+		tx,
+		eligibleWorkIDs,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
 	topicFacts := make(map[uuid.UUID]*taxonomyFact)
 	methodFacts := make(map[uuid.UUID]*taxonomyFact)
 	papers := make([]publishedPaper, 0, len(eligibleWorkIDs))
@@ -834,6 +886,7 @@ func buildCurrentSnapshot(
 			eligibilityByWork[workID],
 			input.JCRImportReceipt,
 			analysisRun,
+			publicationStatesByWork[workID],
 		)
 		if err != nil {
 			return catalogSnapshot{}, "", err
@@ -1125,6 +1178,7 @@ func buildPaper(
 	eligibility biomedicalEligibilityRevision,
 	jcrImportReceipt uuid.UUID,
 	analysisRun citationAnalysisRun,
+	publicationState *publishedPublicationState,
 ) (publishedPaper, []taxonomyFact, []taxonomyFact, error) {
 	var paper publishedPaper
 	err := tx.QueryRow(ctx, `
@@ -1319,14 +1373,7 @@ func buildPaper(
 	}
 	paper.SummaryPayload = payload
 	paper.DetailPayload = payload
-	paper.PublicationState, err = loadCurrentPublicationState(
-		ctx,
-		tx,
-		workID,
-	)
-	if err != nil {
-		return publishedPaper{}, nil, nil, err
-	}
+	paper.PublicationState = publicationState
 
 	searchParts := []string{paper.Title, paper.CanonicalKey}
 	if abstract != "" {
@@ -1367,36 +1414,92 @@ func buildPaper(
 	return paper, topics, methods, nil
 }
 
-func loadCurrentPublicationState(
+func loadCurrentPublicationStates(
 	ctx context.Context,
 	tx pgx.Tx,
-	workID uuid.UUID,
-) (*publishedPublicationState, error) {
-	var (
-		state                  publishedPublicationState
-		printDate              *time.Time
-		printState             string
-		electronicDate         *time.Time
-		electronicState        string
-		aheadDate              *time.Time
-		aheadState             string
-		acceptedDate           *time.Time
-		acceptedState          string
-		normalizedSchema       string
-		normalizedSource       string
-		normalizedSourceRecord string
-		normalizedModel        *string
-		normalizedStatus       *string
-		sourceRecordExternalID string
-		exactWinner            bool
+	workIDs []uuid.UUID,
+) (map[uuid.UUID]*publishedPublicationState, error) {
+	statesByWork := make(
+		map[uuid.UUID]*publishedPublicationState,
+		len(workIDs),
 	)
-	err := tx.QueryRow(ctx, `
+	if len(workIDs) == 0 {
+		return statesByWork, nil
+	}
+
+	rows, err := tx.Query(ctx, `
+		WITH requested AS (
+			SELECT work_id, ordinal
+			FROM unnest($1::uuid[]) WITH ORDINALITY AS input(work_id, ordinal)
+		),
+		exact_winners AS (
+			SELECT
+				winner.work_id,
+				projection.id AS projection_assertion_id,
+				normalized.id AS normalized_assertion_id,
+				source_record.id AS source_record_id,
+				source_record.source,
+				source_record.source_record_id AS source_record_external_id,
+				normalized.payload_schema_version,
+				normalized.normalized_payload::text AS normalized_payload
+			FROM work_projection_states AS winner
+			JOIN ingestion_projection_assertions AS projection
+			  ON projection.work_id = winner.work_id
+			 AND projection.raw_event_id = winner.raw_event_id
+			 AND projection.normalized_assertion_id =
+			     winner.normalized_assertion_id
+			 AND projection.source_record_uuid = winner.source_record_uuid
+			 AND projection.scope_policy_version =
+			     winner.scope_policy_version
+			 AND projection.projection_policy_version =
+			     winner.projection_policy_version
+			JOIN ingestion_normalized_records AS normalized
+			  ON normalized.id = projection.normalized_assertion_id
+			 AND normalized.raw_event_id = projection.raw_event_id
+			 AND normalized.source_record_uuid =
+			     projection.source_record_uuid
+			JOIN source_records AS source_record
+			  ON source_record.id = winner.source_record_uuid
+			JOIN ingestion_raw_events AS raw
+			  ON raw.id = winner.raw_event_id
+			 AND raw.logical_source = source_record.source
+			 AND raw.source_record_id = source_record.source_record_id
+			JOIN ingestion_source_states AS source_state
+			  ON source_state.logical_source = raw.logical_source
+			 AND source_state.event_key = raw.event_key
+			 AND source_state.raw_event_id = winner.raw_event_id
+			 AND source_state.normalized_assertion_id =
+			     winner.normalized_assertion_id
+			 AND source_state.source_record_uuid =
+			     winner.source_record_uuid
+			 AND source_state.work_id = winner.work_id
+			 AND source_state.source_time = winner.source_time
+			 AND source_state.tie_break_key = winner.tie_break_key
+			 AND source_state.position = winner.position
+			 AND source_state.scope_policy_version =
+			     winner.scope_policy_version
+			 AND source_state.projection_policy_version =
+			     winner.projection_policy_version
+			 AND source_state.scope_status = 'included'
+			 AND NOT source_state.is_deleted
+			JOIN source_record_works AS association
+			  ON association.source_record_id = winner.source_record_uuid
+			 AND association.work_id = winner.work_id
+			WHERE winner.work_id = ANY($1::uuid[])
+		)
 		SELECT
+			requested.work_id,
+			winner.projection_assertion_id,
+			winner.normalized_assertion_id,
+			winner.source_record_id,
+			winner.source,
+			winner.source_record_external_id,
+			winner.payload_schema_version,
+			winner.normalized_payload,
+			publication.work_id IS NOT NULL,
 			publication.projection_assertion_id,
 			publication.normalized_assertion_id,
 			publication.source_record_id,
-			source_record.source,
-			source_record.source_record_id,
 			publication.print_published_on,
 			publication.print_published_state,
 			publication.electronic_published_on,
@@ -1406,182 +1509,273 @@ func loadCurrentPublicationState(
 			publication.accepted_on,
 			publication.accepted_state,
 			publication.publication_model_raw,
-			publication.publication_status_raw,
-			normalized.payload_schema_version,
-			COALESCE(normalized.normalized_payload ->> 'source', ''),
-			COALESCE(normalized.normalized_payload ->> 'source_record_id', ''),
-			NULLIF(
-				normalized.normalized_payload ->> 'publication_model',
-				''
-			),
-			NULLIF(
-				normalized.normalized_payload ->> 'publication_status',
-				''
-			),
-			EXISTS (
-				SELECT 1
-				FROM work_projection_states AS winner
-				JOIN ingestion_projection_assertions AS projection
-				  ON projection.id = publication.projection_assertion_id
-				 AND projection.work_id = winner.work_id
-				 AND projection.raw_event_id = winner.raw_event_id
-				 AND projection.normalized_assertion_id =
-				     winner.normalized_assertion_id
-				 AND projection.source_record_uuid =
-				     winner.source_record_uuid
-				 AND projection.scope_policy_version =
-				     winner.scope_policy_version
-				 AND projection.projection_policy_version =
-				     winner.projection_policy_version
-				JOIN ingestion_normalized_records AS exact_normalized
-				  ON exact_normalized.id =
-				     projection.normalized_assertion_id
-				 AND exact_normalized.raw_event_id =
-				     projection.raw_event_id
-				 AND exact_normalized.source_record_uuid =
-				     projection.source_record_uuid
-				JOIN ingestion_raw_events AS raw
-				  ON raw.id = projection.raw_event_id
-				 AND raw.logical_source = source_record.source
-				 AND raw.source_record_id =
-				     source_record.source_record_id
-				JOIN ingestion_source_states AS source_state
-				  ON source_state.logical_source = raw.logical_source
-				 AND source_state.event_key = raw.event_key
-				 AND source_state.raw_event_id = winner.raw_event_id
-				 AND source_state.normalized_assertion_id =
-				     winner.normalized_assertion_id
-				 AND source_state.source_record_uuid =
-				     winner.source_record_uuid
-				 AND source_state.work_id = winner.work_id
-				 AND source_state.source_time = winner.source_time
-				 AND source_state.tie_break_key = winner.tie_break_key
-				 AND source_state.position = winner.position
-				 AND source_state.scope_policy_version =
-				     winner.scope_policy_version
-				 AND source_state.projection_policy_version =
-				     winner.projection_policy_version
-				 AND source_state.scope_status = 'included'
-				 AND NOT source_state.is_deleted
-				JOIN source_record_works AS association
-				  ON association.source_record_id =
-				     winner.source_record_uuid
-				 AND association.work_id = winner.work_id
-				WHERE winner.work_id = publication.work_id
-				  AND winner.normalized_assertion_id =
-				      publication.normalized_assertion_id
-				  AND winner.source_record_uuid =
-				      publication.source_record_id
-			)
-		FROM work_publication_states AS publication
-		JOIN ingestion_normalized_records AS normalized
-		  ON normalized.id = publication.normalized_assertion_id
-		 AND normalized.source_record_uuid =
-		     publication.source_record_id
-		JOIN source_records AS source_record
-		  ON source_record.id = publication.source_record_id
-		WHERE publication.work_id = $1
-	`, workID).Scan(
-		&state.ProjectionAssertionID,
-		&state.NormalizedAssertionID,
-		&state.SourceRecordID,
-		&state.Source,
-		&sourceRecordExternalID,
-		&printDate,
-		&printState,
-		&electronicDate,
-		&electronicState,
-		&aheadDate,
-		&aheadState,
-		&acceptedDate,
-		&acceptedState,
-		&state.PublicationModel,
-		&state.PublicationStatus,
-		&normalizedSchema,
-		&normalizedSource,
-		&normalizedSourceRecord,
-		&normalizedModel,
-		&normalizedStatus,
-		&exactWinner,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var stateExists bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1
-				FROM work_publication_states
-				WHERE work_id = $1
-			)
-		`, workID).Scan(&stateExists); err != nil {
+			publication.publication_status_raw
+		FROM requested
+		LEFT JOIN exact_winners AS winner
+		  ON winner.work_id = requested.work_id
+		LEFT JOIN work_publication_states AS publication
+		  ON publication.work_id = requested.work_id
+		ORDER BY requested.ordinal
+	`, workIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query bulk current publication evidence: %w", err)
+	}
+	defer rows.Close()
+
+	seedsByWork := make(map[uuid.UUID]publicationEvidenceSeed, len(workIDs))
+	seen := make(map[uuid.UUID]struct{}, len(workIDs))
+	for rows.Next() {
+		var (
+			workID                 uuid.UUID
+			winnerProjectionID     pgtype.UUID
+			winnerNormalizedID     pgtype.UUID
+			winnerSourceRecordID   pgtype.UUID
+			winnerSource           pgtype.Text
+			sourceRecordExternalID pgtype.Text
+			normalizedSchema       pgtype.Text
+			normalizedPayload      pgtype.Text
+			publicationStateExists bool
+			stateProjectionID      pgtype.UUID
+			stateNormalizedID      pgtype.UUID
+			stateSourceRecordID    pgtype.UUID
+			printDate              pgtype.Date
+			printState             pgtype.Text
+			electronicDate         pgtype.Date
+			electronicState        pgtype.Text
+			aheadDate              pgtype.Date
+			aheadState             pgtype.Text
+			acceptedDate           pgtype.Date
+			acceptedState          pgtype.Text
+			publicationModel       pgtype.Text
+			publicationStatus      pgtype.Text
+		)
+		if err := rows.Scan(
+			&workID,
+			&winnerProjectionID,
+			&winnerNormalizedID,
+			&winnerSourceRecordID,
+			&winnerSource,
+			&sourceRecordExternalID,
+			&normalizedSchema,
+			&normalizedPayload,
+			&publicationStateExists,
+			&stateProjectionID,
+			&stateNormalizedID,
+			&stateSourceRecordID,
+			&printDate,
+			&printState,
+			&electronicDate,
+			&electronicState,
+			&aheadDate,
+			&aheadState,
+			&acceptedDate,
+			&acceptedState,
+			&publicationModel,
+			&publicationStatus,
+		); err != nil {
 			return nil, fmt.Errorf(
-				"check work %s publication state existence: %w",
-				workID,
+				"scan bulk current publication evidence: %w",
 				err,
 			)
 		}
-		if stateExists {
+		if _, duplicate := seen[workID]; duplicate {
+			return nil, fmt.Errorf(
+				"%w: work %s has multiple exact current normalized winners",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		seen[workID] = struct{}{}
+
+		exactWinner := winnerProjectionID.Valid &&
+			winnerNormalizedID.Valid &&
+			winnerSourceRecordID.Valid &&
+			winnerSource.Valid &&
+			sourceRecordExternalID.Valid &&
+			normalizedSchema.Valid &&
+			normalizedPayload.Valid
+		if !exactWinner {
+			if publicationStateExists {
+				return nil, fmt.Errorf(
+					"%w: work %s publication state has incomplete normalized provenance",
+					ErrCatalogNotReady,
+					workID,
+				)
+			}
+			return nil, fmt.Errorf(
+				"%w: work %s without publication state lacks exact current normalized winner provenance",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		if !publicationStateExists {
+			if normalizedSchema.String == "normalized-record/v2" {
+				statesByWork[workID] = nil
+				continue
+			}
+			return nil, fmt.Errorf(
+				"%w: work %s current normalized schema %q requires an exact publication state",
+				ErrCatalogNotReady,
+				workID,
+				normalizedSchema.String,
+			)
+		}
+		if !stateProjectionID.Valid ||
+			!stateNormalizedID.Valid ||
+			!stateSourceRecordID.Valid ||
+			!printState.Valid ||
+			!electronicState.Valid ||
+			!aheadState.Valid ||
+			!acceptedState.Valid {
 			return nil, fmt.Errorf(
 				"%w: work %s publication state has incomplete normalized provenance",
 				ErrCatalogNotReady,
 				workID,
 			)
 		}
-		return loadLegacyPublicationStateAbsence(ctx, tx, workID)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("query work %s publication state: %w", workID, err)
-	}
-	if !exactWinner {
-		return nil, fmt.Errorf(
-			"%w: work %s publication state does not match the exact current work projection winner",
-			ErrCatalogNotReady,
+
+		state := publishedPublicationState{
+			ProjectionAssertionID: pgUUIDValue(stateProjectionID),
+			NormalizedAssertionID: pgUUIDValue(stateNormalizedID),
+			SourceRecordID:        pgUUIDValue(stateSourceRecordID),
+			Source:                winnerSource.String,
+			PublicationModel:      optionalPGText(publicationModel),
+			PublicationStatus:     optionalPGText(publicationStatus),
+		}
+		if state.ProjectionAssertionID != pgUUIDValue(winnerProjectionID) ||
+			state.NormalizedAssertionID != pgUUIDValue(winnerNormalizedID) ||
+			state.SourceRecordID != pgUUIDValue(winnerSourceRecordID) {
+			return nil, fmt.Errorf(
+				"%w: work %s publication state does not match the exact current work projection winner",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+
+		var payload normalizedPublicationPayloadV3
+		if err := json.Unmarshal(
+			[]byte(normalizedPayload.String),
+			&payload,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"%w: work %s has invalid normalized publication payload: %v",
+				ErrCatalogNotReady,
+				workID,
+				err,
+			)
+		}
+		normalizedModel, err := normalizedPublicationRaw(
+			payload.PublicationModel,
+			"publication model",
+		)
+		if err != nil {
+			return nil, catalogPublicationEvidenceError(workID, err)
+		}
+		normalizedStatus, err := normalizedPublicationRaw(
+			payload.PublicationStatus,
+			"publication status",
+		)
+		if err != nil {
+			return nil, catalogPublicationEvidenceError(workID, err)
+		}
+		if state.Source != "pubmed" ||
+			normalizedSchema.String != "normalized-record/v3" ||
+			payload.Source != state.Source ||
+			payload.SourceRecordID != sourceRecordExternalID.String ||
+			!equalOptionalString(state.PublicationModel, normalizedModel) ||
+			!equalOptionalString(state.PublicationStatus, normalizedStatus) {
+			return nil, fmt.Errorf(
+				"%w: work %s publication state does not match its exact normalized PubMed assertion",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		expected, err := expectedPublicationEventAssertions(
 			workID,
+			state,
+			payload,
+		)
+		if err != nil {
+			return nil, err
+		}
+		seedsByWork[workID] = publicationEvidenceSeed{
+			state: state,
+			stored: map[string]publishedPublicationEventState{
+				"print_published": {
+					State: printState.String,
+					Date:  pgDatePointer(printDate),
+				},
+				"electronic_published": {
+					State: electronicState.String,
+					Date:  pgDatePointer(electronicDate),
+				},
+				"ahead_of_print": {
+					State: aheadState.String,
+					Date:  pgDatePointer(aheadDate),
+				},
+				"accepted": {
+					State: acceptedState.String,
+					Date:  pgDatePointer(acceptedDate),
+				},
+			},
+			expected: expected,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate bulk current publication evidence: %w",
+			err,
 		)
 	}
-	if state.Source != "pubmed" ||
-		normalizedSchema != "normalized-record/v3" ||
-		normalizedSource != state.Source ||
-		normalizedSourceRecord != sourceRecordExternalID ||
-		!equalOptionalString(state.PublicationModel, normalizedModel) ||
-		!equalOptionalString(state.PublicationStatus, normalizedStatus) {
+	if len(seen) != len(workIDs) {
 		return nil, fmt.Errorf(
-			"%w: work %s publication state does not match its exact normalized PubMed assertion",
+			"%w: bulk publication evidence returned %d Works, expected %d",
 			ErrCatalogNotReady,
-			workID,
+			len(seen),
+			len(workIDs),
 		)
 	}
 
-	stored := map[string]publishedPublicationEventState{
-		"print_published": {
-			State: printState,
-			Date:  normalizedPublicationDate(printDate),
-		},
-		"electronic_published": {
-			State: electronicState,
-			Date:  normalizedPublicationDate(electronicDate),
-		},
-		"ahead_of_print": {
-			State: aheadState,
-			Date:  normalizedPublicationDate(aheadDate),
-		},
-		"accepted": {
-			State: acceptedState,
-			Date:  normalizedPublicationDate(acceptedDate),
-		},
-	}
-	computed, err := loadExactPublicationEventStates(ctx, tx, workID, state)
+	assertionsByProjection, err := loadPublicationEventAssertionSets(
+		ctx,
+		tx,
+		workIDs,
+	)
 	if err != nil {
 		return nil, err
 	}
-	for _, eventKind := range []string{
-		"print_published",
-		"electronic_published",
-		"ahead_of_print",
-		"accepted",
-	} {
-		storedState := stored[eventKind]
-		computedState := computed[eventKind]
-		if !publicationEventStateEqual(storedState, computedState) {
+	for _, workID := range workIDs {
+		seed, found := seedsByWork[workID]
+		if !found {
+			continue
+		}
+		key := publicationAssertionSetKey{
+			workID:                workID,
+			projectionAssertionID: seed.state.ProjectionAssertionID,
+		}
+		assertions := assertionsByProjection[key]
+		if err := validatePublicationEventAssertionSet(
+			workID,
+			seed.state,
+			seed.expected,
+			assertions,
+		); err != nil {
+			return nil, err
+		}
+		computed, err := publicationEventStatesFromAssertions(
+			workID,
+			seed.state,
+			assertions,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for _, eventKind := range publicationEventKinds() {
+			storedState := seed.stored[eventKind]
+			computedState := computed[eventKind]
+			if publicationEventStateEqual(storedState, computedState) {
+				continue
+			}
 			if storedState.State == "known" {
 				return nil, fmt.Errorf(
 					"%w: work %s known publication event %s lacks matching exact immutable event provenance",
@@ -1597,99 +1791,273 @@ func loadCurrentPublicationState(
 				eventKind,
 			)
 		}
+		seed.state.PrintPublished = computed["print_published"]
+		seed.state.ElectronicPublished = computed["electronic_published"]
+		seed.state.AheadOfPrint = computed["ahead_of_print"]
+		seed.state.Accepted = computed["accepted"]
+		state := seed.state
+		statesByWork[workID] = &state
 	}
-	state.PrintPublished = computed["print_published"]
-	state.ElectronicPublished = computed["electronic_published"]
-	state.AheadOfPrint = computed["ahead_of_print"]
-	state.Accepted = computed["accepted"]
-	return &state, nil
+	return statesByWork, nil
 }
 
-func loadLegacyPublicationStateAbsence(
+type publicationAssertionSetKey struct {
+	workID                uuid.UUID
+	projectionAssertionID uuid.UUID
+}
+
+func loadPublicationEventAssertionSets(
 	ctx context.Context,
 	tx pgx.Tx,
-	workID uuid.UUID,
-) (*publishedPublicationState, error) {
-	var normalizedSchema string
-	err := tx.QueryRow(ctx, `
-		SELECT normalized.payload_schema_version
-		FROM work_projection_states AS winner
-		JOIN ingestion_projection_assertions AS projection
-		  ON projection.work_id = winner.work_id
-		 AND projection.raw_event_id = winner.raw_event_id
-		 AND projection.normalized_assertion_id =
-		     winner.normalized_assertion_id
-		 AND projection.source_record_uuid = winner.source_record_uuid
-		 AND projection.scope_policy_version =
-		     winner.scope_policy_version
-		 AND projection.projection_policy_version =
-		     winner.projection_policy_version
-		JOIN ingestion_normalized_records AS normalized
-		  ON normalized.id = projection.normalized_assertion_id
-		 AND normalized.raw_event_id = projection.raw_event_id
-		 AND normalized.source_record_uuid =
-		     projection.source_record_uuid
-		JOIN source_records AS source_record
-		  ON source_record.id = winner.source_record_uuid
-		JOIN ingestion_raw_events AS raw
-		  ON raw.id = winner.raw_event_id
-		 AND raw.logical_source = source_record.source
-		 AND raw.source_record_id = source_record.source_record_id
-		JOIN ingestion_source_states AS source_state
-		  ON source_state.logical_source = raw.logical_source
-		 AND source_state.event_key = raw.event_key
-		 AND source_state.raw_event_id = winner.raw_event_id
-		 AND source_state.normalized_assertion_id =
-		     winner.normalized_assertion_id
-		 AND source_state.source_record_uuid =
-		     winner.source_record_uuid
-		 AND source_state.work_id = winner.work_id
-		 AND source_state.source_time = winner.source_time
-		 AND source_state.tie_break_key = winner.tie_break_key
-		 AND source_state.position = winner.position
-		 AND source_state.scope_policy_version =
-		     winner.scope_policy_version
-		 AND source_state.projection_policy_version =
-		     winner.projection_policy_version
-		 AND source_state.scope_status = 'included'
-		 AND NOT source_state.is_deleted
-		JOIN source_record_works AS association
-		  ON association.source_record_id = winner.source_record_uuid
-		 AND association.work_id = winner.work_id
-		WHERE winner.work_id = $1
-	`, workID).Scan(&normalizedSchema)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf(
-			"%w: work %s without publication state lacks exact current normalized winner provenance",
-			ErrCatalogNotReady,
-			workID,
-		)
-	}
+	workIDs []uuid.UUID,
+) (map[publicationAssertionSetKey][]publicationEventAssertionEvidence, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT
+			projection_assertion_id,
+			normalized_assertion_id,
+			source_record_id,
+			work_id,
+			event_kind,
+			event_date,
+			date_precision,
+			source_date,
+			status_raw,
+			publication_model_raw,
+			source_path,
+			ordinal
+		FROM work_publication_event_assertions
+		WHERE work_id = ANY($1::uuid[])
+		ORDER BY work_id, projection_assertion_id, ordinal
+	`, workIDs)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"query work %s normalized schema without publication state: %w",
-			workID,
+			"query bulk publication event assertion sets: %w",
 			err,
 		)
 	}
-	switch normalizedSchema {
-	case "normalized-record/v2":
-		return nil, nil
-	default:
-		return nil, fmt.Errorf(
-			"%w: work %s current normalized schema %q requires an exact publication state",
-			ErrCatalogNotReady,
-			workID,
-			normalizedSchema,
+	defer rows.Close()
+
+	assertionsByProjection := make(
+		map[publicationAssertionSetKey][]publicationEventAssertionEvidence,
+	)
+	for rows.Next() {
+		var assertion publicationEventAssertionEvidence
+		if err := rows.Scan(
+			&assertion.ProjectionAssertionID,
+			&assertion.NormalizedAssertionID,
+			&assertion.SourceRecordID,
+			&assertion.WorkID,
+			&assertion.EventKind,
+			&assertion.EventDate,
+			&assertion.DatePrecision,
+			&assertion.SourceDate,
+			&assertion.StatusRaw,
+			&assertion.PublicationModelRaw,
+			&assertion.SourcePath,
+			&assertion.Ordinal,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan bulk publication event assertion set: %w",
+				err,
+			)
+		}
+		key := publicationAssertionSetKey{
+			workID:                assertion.WorkID,
+			projectionAssertionID: assertion.ProjectionAssertionID,
+		}
+		assertionsByProjection[key] = append(
+			assertionsByProjection[key],
+			assertion,
 		)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate bulk publication event assertion sets: %w",
+			err,
+		)
+	}
+	return assertionsByProjection, nil
 }
 
-func loadExactPublicationEventStates(
-	ctx context.Context,
-	tx pgx.Tx,
+func expectedPublicationEventAssertions(
 	workID uuid.UUID,
 	state publishedPublicationState,
+	payload normalizedPublicationPayloadV3,
+) ([]publicationEventAssertionEvidence, error) {
+	expected := make(
+		[]publicationEventAssertionEvidence,
+		0,
+		len(payload.PublicationHistory),
+	)
+	seenOrdinals := make(map[int]struct{}, len(payload.PublicationHistory))
+	for _, entry := range payload.PublicationHistory {
+		if entry.Status == "" || entry.Status != strings.TrimSpace(entry.Status) {
+			return nil, catalogPublicationEvidenceError(
+				workID,
+				fmt.Errorf(
+					"publication history ordinal %d status must be non-empty and trimmed",
+					entry.Ordinal,
+				),
+			)
+		}
+		if entry.Ordinal < 1 {
+			return nil, catalogPublicationEvidenceError(
+				workID,
+				fmt.Errorf(
+					"publication history ordinal must be positive, got %d",
+					entry.Ordinal,
+				),
+			)
+		}
+		if entry.SourcePath == "" ||
+			entry.SourcePath != strings.TrimSpace(entry.SourcePath) {
+			return nil, catalogPublicationEvidenceError(
+				workID,
+				fmt.Errorf(
+					"publication history ordinal %d source path must be non-empty and trimmed",
+					entry.Ordinal,
+				),
+			)
+		}
+		eventDate, err := normalizedPublicationEventDate(entry.Date)
+		if err != nil {
+			return nil, catalogPublicationEvidenceError(
+				workID,
+				fmt.Errorf("publication history ordinal %d: %w", entry.Ordinal, err),
+			)
+		}
+		sourceDate, err := json.Marshal(entry.Date)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"encode work %s normalized publication history ordinal %d source date: %w",
+				workID,
+				entry.Ordinal,
+				err,
+			)
+		}
+		eventKind := ""
+		switch entry.Status {
+		case "accepted":
+			eventKind = "accepted"
+		case "aheadofprint":
+			eventKind = "ahead_of_print"
+		case "ppublish":
+			eventKind = "print_published"
+		case "epublish":
+			if state.PublicationStatus == nil {
+				continue
+			}
+			switch *state.PublicationStatus {
+			case "epublish", "ppublish":
+				eventKind = "electronic_published"
+			default:
+				continue
+			}
+		default:
+			continue
+		}
+		if _, duplicate := seenOrdinals[entry.Ordinal]; duplicate {
+			return nil, catalogPublicationEvidenceError(
+				workID,
+				fmt.Errorf(
+					"publication event assertion set has duplicate expected ordinal %d",
+					entry.Ordinal,
+				),
+			)
+		}
+		seenOrdinals[entry.Ordinal] = struct{}{}
+		expected = append(expected, publicationEventAssertionEvidence{
+			ProjectionAssertionID: state.ProjectionAssertionID,
+			NormalizedAssertionID: state.NormalizedAssertionID,
+			SourceRecordID:        state.SourceRecordID,
+			WorkID:                workID,
+			EventKind:             eventKind,
+			EventDate:             eventDate,
+			DatePrecision:         entry.Date.Precision,
+			SourceDate:            sourceDate,
+			StatusRaw:             entry.Status,
+			PublicationModelRaw:   copyOptionalString(state.PublicationModel),
+			SourcePath:            entry.SourcePath,
+			Ordinal:               entry.Ordinal,
+		})
+	}
+	return expected, nil
+}
+
+func validatePublicationEventAssertionSet(
+	workID uuid.UUID,
+	state publishedPublicationState,
+	expected []publicationEventAssertionEvidence,
+	persisted []publicationEventAssertionEvidence,
+) error {
+	expectedByOrdinal := make(
+		map[int]publicationEventAssertionEvidence,
+		len(expected),
+	)
+	for _, assertion := range expected {
+		expectedByOrdinal[assertion.Ordinal] = assertion
+	}
+	for _, assertion := range persisted {
+		expectedAssertion, found := expectedByOrdinal[assertion.Ordinal]
+		if !found {
+			return catalogPublicationAssertionSetError(
+				workID,
+				fmt.Sprintf("unexpected ordinal %d", assertion.Ordinal),
+			)
+		}
+		sourceDateMatches, err := publicationSourceDatesEqual(
+			assertion.SourceDate,
+			expectedAssertion.SourceDate,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"compare work %s publication event assertion ordinal %d source date: %w",
+				workID,
+				assertion.Ordinal,
+				err,
+			)
+		}
+		if assertion.ProjectionAssertionID != state.ProjectionAssertionID ||
+			assertion.NormalizedAssertionID != state.NormalizedAssertionID ||
+			assertion.SourceRecordID != state.SourceRecordID ||
+			assertion.WorkID != workID ||
+			assertion.EventKind != expectedAssertion.EventKind ||
+			!publicationEventDatesEqual(
+				assertion.EventDate,
+				expectedAssertion.EventDate,
+			) ||
+			assertion.DatePrecision != expectedAssertion.DatePrecision ||
+			!sourceDateMatches ||
+			assertion.StatusRaw != expectedAssertion.StatusRaw ||
+			!equalOptionalString(
+				assertion.PublicationModelRaw,
+				expectedAssertion.PublicationModelRaw,
+			) ||
+			assertion.SourcePath != expectedAssertion.SourcePath {
+			return catalogPublicationAssertionSetError(
+				workID,
+				fmt.Sprintf("ordinal %d fields differ", assertion.Ordinal),
+			)
+		}
+		delete(expectedByOrdinal, assertion.Ordinal)
+	}
+	if len(persisted) != len(expected) || len(expectedByOrdinal) != 0 {
+		return catalogPublicationAssertionSetError(
+			workID,
+			fmt.Sprintf(
+				"persisted %d assertions, expected %d",
+				len(persisted),
+				len(expected),
+			),
+		)
+	}
+	return nil
+}
+
+func publicationEventStatesFromAssertions(
+	workID uuid.UUID,
+	state publishedPublicationState,
+	assertions []publicationEventAssertionEvidence,
 ) (map[string]publishedPublicationEventState, error) {
 	type eventDateEvidence struct {
 		date             time.Time
@@ -1702,113 +2070,42 @@ func loadExactPublicationEventStates(
 		"ahead_of_print":       {},
 		"accepted":             {},
 	}
-	rows, err := tx.Query(ctx, `
-		SELECT
-			normalized_assertion_id,
-			source_record_id,
-			work_id,
-			event_kind,
-			event_date,
-			date_precision,
-			status_raw,
-			publication_model_raw,
-			source_path,
-			ordinal
-		FROM work_publication_event_assertions
-		WHERE projection_assertion_id = $1
-		ORDER BY ordinal
-	`, state.ProjectionAssertionID)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"query work %s exact publication event assertions: %w",
-			workID,
-			err,
-		)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			normalizedAssertionID uuid.UUID
-			sourceRecordID        uuid.UUID
-			assertionWorkID       uuid.UUID
-			eventKind             string
-			eventDate             *time.Time
-			datePrecision         string
-			statusRaw             string
-			publicationModelRaw   *string
-			sourcePath            string
-			ordinal               int
-		)
-		if err := rows.Scan(
-			&normalizedAssertionID,
-			&sourceRecordID,
-			&assertionWorkID,
-			&eventKind,
-			&eventDate,
-			&datePrecision,
-			&statusRaw,
-			&publicationModelRaw,
-			&sourcePath,
-			&ordinal,
-		); err != nil {
-			return nil, fmt.Errorf(
-				"scan work %s exact publication event assertion: %w",
-				workID,
-				err,
-			)
-		}
-		evidenceByDate, supported := dayEvidence[eventKind]
-		if !supported ||
-			normalizedAssertionID != state.NormalizedAssertionID ||
-			sourceRecordID != state.SourceRecordID ||
-			assertionWorkID != workID ||
-			statusRaw == "" ||
-			statusRaw != strings.TrimSpace(statusRaw) ||
-			!equalOptionalString(publicationModelRaw, state.PublicationModel) ||
-			sourcePath == "" ||
-			sourcePath != strings.TrimSpace(sourcePath) ||
-			ordinal < 1 {
+	for _, assertion := range assertions {
+		evidenceByDate, supported := dayEvidence[assertion.EventKind]
+		if !supported {
 			return nil, fmt.Errorf(
 				"%w: work %s publication event assertion is inconsistent with exact provenance",
 				ErrCatalogNotReady,
 				workID,
 			)
 		}
-		if datePrecision != "day" {
+		if assertion.DatePrecision != "day" {
 			continue
 		}
-		if eventDate == nil {
+		if assertion.EventDate == nil {
 			return nil, fmt.Errorf(
 				"%w: work %s day-precision publication event has no date",
 				ErrCatalogNotReady,
 				workID,
 			)
 		}
-		date := normalizedPublicationDate(eventDate)
+		date := normalizedPublicationDate(assertion.EventDate)
 		dateKey := date.Format("2006-01-02")
 		if _, duplicateDate := evidenceByDate[dateKey]; duplicateDate {
 			continue
 		}
 		evidenceByDate[dateKey] = eventDateEvidence{
 			date:             *date,
-			publicationModel: copyOptionalString(publicationModelRaw),
+			publicationModel: copyOptionalString(assertion.PublicationModelRaw),
 			provenance: publishedPublicationEventProvenance{
 				Source:                state.Source,
 				SourceRecordID:        state.SourceRecordID,
 				NormalizedAssertionID: state.NormalizedAssertionID,
 				ProjectionAssertionID: state.ProjectionAssertionID,
-				SourcePath:            sourcePath,
-				StatusRaw:             statusRaw,
+				SourcePath:            assertion.SourcePath,
+				StatusRaw:             assertion.StatusRaw,
 			},
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf(
-			"iterate work %s exact publication event assertions: %w",
-			workID,
-			err,
-		)
 	}
 
 	result := make(map[string]publishedPublicationEventState, len(dayEvidence))
@@ -1832,6 +2129,141 @@ func loadExactPublicationEventStates(
 		}
 	}
 	return result, nil
+}
+
+func normalizedPublicationEventDate(
+	value normalizedPublicationDateV3,
+) (*time.Time, error) {
+	if value.Year <= 0 {
+		return nil, fmt.Errorf("publication date year %d is invalid", value.Year)
+	}
+	switch value.Precision {
+	case "year":
+		return nil, nil
+	case "month":
+		if value.Month < int(time.January) || value.Month > int(time.December) {
+			return nil, fmt.Errorf(
+				"publication date month %d is invalid",
+				value.Month,
+			)
+		}
+		return nil, nil
+	case "day":
+		if value.Month < int(time.January) || value.Month > int(time.December) {
+			return nil, fmt.Errorf(
+				"publication date month %d is invalid",
+				value.Month,
+			)
+		}
+		date := time.Date(
+			value.Year,
+			time.Month(value.Month),
+			value.Day,
+			0,
+			0,
+			0,
+			0,
+			time.UTC,
+		)
+		if date.Year() != value.Year ||
+			int(date.Month()) != value.Month ||
+			date.Day() != value.Day {
+			return nil, fmt.Errorf(
+				"publication date %04d-%02d-%02d is invalid",
+				value.Year,
+				value.Month,
+				value.Day,
+			)
+		}
+		return &date, nil
+	default:
+		return nil, fmt.Errorf(
+			"publication date precision %q is unsupported",
+			value.Precision,
+		)
+	}
+}
+
+func normalizedPublicationRaw(value string, field string) (*string, error) {
+	if value == "" {
+		return nil, nil
+	}
+	if value != strings.TrimSpace(value) {
+		return nil, fmt.Errorf("%s must be trimmed", field)
+	}
+	return stringPointerCopy(value), nil
+}
+
+func publicationSourceDatesEqual(
+	left json.RawMessage,
+	right json.RawMessage,
+) (bool, error) {
+	var leftValue any
+	if err := json.Unmarshal(left, &leftValue); err != nil {
+		return false, err
+	}
+	var rightValue any
+	if err := json.Unmarshal(right, &rightValue); err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(leftValue, rightValue), nil
+}
+
+func publicationEventDatesEqual(left *time.Time, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return normalizedPublicationDate(left).Equal(*normalizedPublicationDate(right))
+}
+
+func publicationEventKinds() []string {
+	return []string{
+		"print_published",
+		"electronic_published",
+		"ahead_of_print",
+		"accepted",
+	}
+}
+
+func catalogPublicationEvidenceError(workID uuid.UUID, err error) error {
+	return fmt.Errorf(
+		"%w: work %s normalized publication evidence is invalid: %v",
+		ErrCatalogNotReady,
+		workID,
+		err,
+	)
+}
+
+func catalogPublicationAssertionSetError(workID uuid.UUID, detail string) error {
+	return fmt.Errorf(
+		"%w: work %s publication event assertion set conflicts with exact normalized history: %s",
+		ErrCatalogNotReady,
+		workID,
+		detail,
+	)
+}
+
+func pgUUIDValue(value pgtype.UUID) uuid.UUID {
+	return uuid.UUID(value.Bytes)
+}
+
+func pgDatePointer(value pgtype.Date) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	return normalizedPublicationDate(&value.Time)
+}
+
+func optionalPGText(value pgtype.Text) *string {
+	if !value.Valid {
+		return nil
+	}
+	return stringPointerCopy(value.String)
+}
+
+func stringPointerCopy(value string) *string {
+	copied := value
+	return &copied
 }
 
 func normalizedPublicationDate(value *time.Time) *time.Time {
