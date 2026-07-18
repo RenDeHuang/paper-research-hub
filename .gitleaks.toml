@@ -1,0 +1,11 @@
+title = "paper-research-hub secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Explicit local development and test placeholders"
+regexes = [
+  '''^development-only-[A-Za-z0-9][A-Za-z0-9._-]*$''',
+  '''^test-[A-Za-z0-9][A-Za-z0-9._-]*$''',
+]

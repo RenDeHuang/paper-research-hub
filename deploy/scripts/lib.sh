@@ -8,14 +8,97 @@ deploy_fail() {
   exit 1
 }
 
+deploy_validate_local_env_file() {
+  case "${LOCAL_ENV_FILE}" in
+    /*) ;;
+    *) deploy_fail "LOCAL_ENV_FILE must be an absolute path" ;;
+  esac
+  [ -f "${LOCAL_ENV_FILE}" ] ||
+    deploy_fail "LOCAL_ENV_FILE does not exist: ${LOCAL_ENV_FILE}"
+}
+
+deploy_validate_compose_project_name() {
+  project_name="$1"
+  case "${project_name}" in
+    [a-z0-9]*) ;;
+    *) deploy_fail "invalid COMPOSE_PROJECT_NAME: ${project_name:-empty}" ;;
+  esac
+  case "${project_name}" in
+    *[!a-z0-9_-]*)
+      deploy_fail "invalid COMPOSE_PROJECT_NAME: ${project_name}"
+      ;;
+  esac
+  printf '%s' "${project_name}"
+}
+
+deploy_default_compose_project_name() {
+  project_repo_path="$1"
+  case "${project_repo_path}" in
+    /*) ;;
+    *) deploy_fail "repo path must be absolute: ${project_repo_path}" ;;
+  esac
+  project_repo_checksum="$(
+    printf '%s' "${project_repo_path}" | cksum | awk '{print $1}'
+  )" || deploy_fail "cannot calculate repo path cksum"
+  [ -n "${project_repo_checksum}" ] ||
+    deploy_fail "cannot calculate repo path cksum"
+  printf 'paper-research-hub-empty-%s' "${project_repo_checksum}"
+}
+
+deploy_local_env_project_name() {
+  deploy_validate_local_env_file
+  local_env_project_name=
+  local_env_project_status=0
+  local_env_project_name="$(
+    awk '
+      /^[[:space:]]*($|#)/ {
+        next
+      }
+      /^COMPOSE_PROJECT_NAME=/ {
+        count++
+        if (count > 1) {
+          exit 2
+        }
+        print substr($0, length("COMPOSE_PROJECT_NAME=") + 1)
+        next
+      }
+      /^[[:space:]]*COMPOSE_PROJECT_NAME/ {
+        exit 3
+      }
+    ' "${LOCAL_ENV_FILE}"
+  )" || local_env_project_status="$?"
+  case "${local_env_project_status}" in
+    0) ;;
+    2)
+      deploy_fail "LOCAL_ENV_FILE COMPOSE_PROJECT_NAME must be defined at most once"
+      ;;
+    *)
+      deploy_fail "LOCAL_ENV_FILE contains an invalid COMPOSE_PROJECT_NAME assignment"
+      ;;
+  esac
+  printf '%s' "${local_env_project_name}"
+}
+
+deploy_resolve_compose_project_name() {
+  if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+    deploy_validate_compose_project_name "${COMPOSE_PROJECT_NAME}"
+    return
+  fi
+
+  if [ -n "${LOCAL_ENV_FILE:-}" ]; then
+    env_project_name="$(deploy_local_env_project_name)"
+    if [ -n "${env_project_name}" ]; then
+      deploy_validate_compose_project_name "${env_project_name}"
+      return
+    fi
+  fi
+
+  deploy_default_compose_project_name "${deploy_repo_root}"
+}
+
 deploy_compose() {
   if [ -n "${LOCAL_ENV_FILE:-}" ]; then
-    case "${LOCAL_ENV_FILE}" in
-      /*) ;;
-      *) deploy_fail "LOCAL_ENV_FILE must be an absolute path" ;;
-    esac
-    [ -f "${LOCAL_ENV_FILE}" ] ||
-      deploy_fail "LOCAL_ENV_FILE does not exist: ${LOCAL_ENV_FILE}"
+    deploy_validate_local_env_file
     docker compose \
       --project-directory "${deploy_repo_root}" \
       --env-file "${LOCAL_ENV_FILE}" \
@@ -128,14 +211,22 @@ deploy_header_value() {
 
 deploy_assert_content_type() {
   headers="$1"
-  expected_prefix="$2"
+  expected_media_type="$2"
   actual="$(deploy_header_value "${headers}" "Content-Type")"
-  case "${actual}" in
-    "${expected_prefix}"*) ;;
-    *)
-      deploy_fail "expected Content-Type ${expected_prefix}*, got ${actual:-missing}"
-      ;;
-  esac
+  actual_media_type="${actual%%;*}"
+  actual_media_type="$(
+    printf '%s' "${actual_media_type}" |
+      sed \
+        -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//' |
+      LC_ALL=C tr '[:upper:]' '[:lower:]'
+  )"
+  expected_media_type="$(
+    printf '%s' "${expected_media_type}" |
+      LC_ALL=C tr '[:upper:]' '[:lower:]'
+  )"
+  [ "${actual_media_type}" = "${expected_media_type}" ] ||
+    deploy_fail "expected Content-Type ${expected_media_type}, got ${actual:-missing}"
 }
 
 deploy_assert_health_boundaries() {

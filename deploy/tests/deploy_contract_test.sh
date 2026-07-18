@@ -10,46 +10,6 @@ fail() {
   exit 1
 }
 
-secret_pattern='(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|(AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_(live|test)_[A-Za-z0-9]{16,}|(Bearer[[:space:]]+)?eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})'
-assignment_pattern="^[[:space:]]*(#[[:space:]]*)?(export[[:space:]]+)?[\"']?[A-Z][A-Z0-9_]*_(API_KEY|TOKEN|SECRET)[\"']?[[:space:]]*[:=]"
-
-deploy_contract_secret_value_is_forbidden() {
-  printf '%s\n' "$1" |
-    grep -E "${secret_pattern}" >/dev/null 2>&1
-}
-
-deploy_contract_secret_assignment_is_allowed() {
-  assignment_value="$1"
-  assignment_path="$2"
-
-  case "${assignment_value}" in
-    "")
-      return 0
-      ;;
-    replace-* | optional-* | development-only-*)
-      [ -n "${assignment_value#*-}" ]
-      return
-      ;;
-  esac
-
-  if printf '%s\n' "${assignment_value}" |
-    grep -E '^<[^<>]+>$|^\$\{[A-Za-z_][A-Za-z0-9_]*\}$|^\$\{\{[[:space:]]*(secrets|env)\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\}\}$|^\$\{[A-Za-z_][A-Za-z0-9_]*:-((replace|optional|development-only)-[^}]+)?\}$' >/dev/null 2>&1; then
-    return 0
-  fi
-
-  case "${assignment_path}" in
-    */test/* | */tests/* | */e2e/* | */fixture/* | */fixtures/* | \
-      *_test.* | *.test.* | *.spec.* | docker-compose.test.yml)
-      [ "${#assignment_value}" -le 32 ] || return 1
-      printf '%s\n' "${assignment_value}" |
-        grep -E '^[A-Za-z0-9._-]+$' >/dev/null 2>&1
-      return
-      ;;
-  esac
-
-  return 1
-}
-
 assert_fails_with() {
   label="$1"
   expected="$2"
@@ -66,6 +26,7 @@ assert_fails_with() {
 
 required_files='
 Makefile
+.gitleaks.toml
 .github/workflows/container.yml
 deploy/README.md
 deploy/compose/compose.local.yml
@@ -90,10 +51,64 @@ test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/medpaperhub-deploy-contract.XXXXXX")"
 trap 'find "${test_tmp}" -type f -delete 2>/dev/null; find "${test_tmp}" -depth -type d -exec rmdir {} \; 2>/dev/null' 0 1 2 3 15
 failure_index=0
 
+grep -Eq '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true[[:space:]]*$' \
+  .gitleaks.toml ||
+  fail ".gitleaks.toml must extend the Gitleaks default rules"
+grep -F 'development-only-' .gitleaks.toml >/dev/null ||
+  fail ".gitleaks.toml must allow the explicit development-only placeholder prefix"
+grep -F 'test-' .gitleaks.toml >/dev/null ||
+  fail ".gitleaks.toml must allow the explicit test placeholder prefix"
+if grep -Eq '^[[:space:]]*paths[[:space:]]*=' .gitleaks.toml; then
+  fail ".gitleaks.toml must not bypass scanning with a file allowlist"
+fi
+grep -F 'uses: gitleaks/gitleaks-action@v3' \
+  .github/workflows/container.yml >/dev/null ||
+  fail "container workflow must run the official Gitleaks v3 action"
+grep -F 'GITLEAKS_CONFIG: .gitleaks.toml' \
+  .github/workflows/container.yml >/dev/null ||
+  fail "container workflow must load the repository Gitleaks configuration"
+legacy_secret_scanner='deploy_contract_secret_''value_is_forbidden'
+if grep -F "${legacy_secret_scanner}" deploy/tests/deploy_contract_test.sh >/dev/null; then
+  fail "deploy contract must delegate repository secret scanning to Gitleaks"
+fi
+
 for shell_file in deploy/scripts/*.sh deploy/tests/*.sh; do
   sh -n "${shell_file}" ||
     fail "invalid POSIX shell syntax: ${shell_file}"
 done
+
+project_path_a="${test_tmp}/repo-a"
+project_path_b="${test_tmp}/repo-b"
+if ! project_name_a="$(
+  sh -c \
+    '. "$1"; deploy_default_compose_project_name "$2"' \
+    "${repo_root}/deploy/scripts/project-name-probe" \
+    "${repo_root}/deploy/scripts/lib.sh" \
+    "${project_path_a}"
+)"; then
+  fail "deploy library must derive a default Compose project name from a repo path"
+fi
+project_name_a_again="$(
+  sh -c \
+    '. "$1"; deploy_default_compose_project_name "$2"' \
+    "${repo_root}/deploy/scripts/project-name-probe" \
+    "${repo_root}/deploy/scripts/lib.sh" \
+    "${project_path_a}"
+)"
+project_name_b="$(
+  sh -c \
+    '. "$1"; deploy_default_compose_project_name "$2"' \
+    "${repo_root}/deploy/scripts/project-name-probe" \
+    "${repo_root}/deploy/scripts/lib.sh" \
+    "${project_path_b}"
+)"
+[ "${project_name_a}" = "${project_name_a_again}" ] ||
+  fail "default Compose project name must be stable for the same repo path"
+[ "${project_name_a}" != "${project_name_b}" ] ||
+  fail "different repo paths must not share the default Compose project name"
+project_checksum_a="$(printf '%s' "${project_path_a}" | cksum | awk '{print $1}')"
+[ "${project_name_a}" = "paper-research-hub-empty-${project_checksum_a}" ] ||
+  fail "default Compose project name must include the repo path cksum"
 
 if grep -n '^[[:space:]]*command:' deploy/compose/compose.local.yml >/dev/null; then
   fail "compose.local.yml must not duplicate canonical service commands"
@@ -125,116 +140,54 @@ grep -F 'path: ./deploy/env/.env.pipeline' \
   deploy/compose/compose.local.yml >/dev/null ||
   fail "local Compose overlay must read the ignored pipeline environment file"
 
-if ! command -v deploy_contract_secret_value_is_forbidden >/dev/null 2>&1; then
-  fail "secret scanner does not validate common real key and token shapes"
-fi
-
-openai_key_candidate='sk-''abcdefghijklmnopqrstuvwxyz012345'
-github_token_candidate='ghp_''abcdefghijklmnopqrstuvwxyz0123456789'
-aws_key_candidate='AKIA''ABCDEFGHIJKLMNOP'
-google_key_candidate='AIza''abcdefghijklmnopqrstuvwxyz0123456789'
-slack_token_candidate='xoxb-''123456789012-abcdefghijklmnopqrstuvwxyz'
-jwt_candidate='Bearer eyJ''hbGciOiJIUzI1NiJ9.eyJ''zdWIiOiIxMjM0NTY3ODkwIn0.signaturevalue'
-
-for forbidden_secret in \
-  "${openai_key_candidate}" \
-  "${github_token_candidate}" \
-  "${aws_key_candidate}" \
-  "${google_key_candidate}" \
-  "${slack_token_candidate}" \
-  "${jwt_candidate}"; do
-  deploy_contract_secret_value_is_forbidden "${forbidden_secret}" ||
-    fail "secret scanner accepted a common real key or token shape"
-done
-
-if deploy_contract_secret_value_is_forbidden '<replace-with-api-key>'; then
-  fail "secret scanner rejected an explicit placeholder"
-fi
-
-for allowed_assignment in \
-  "" \
-  '<replace-with-api-key>' \
-  'replace-with-api-key' \
-  'optional-authorized-key' \
-  'development-only-local-secret' \
-  '${OPENAI_API_KEY}' \
-  '${{ secrets.GITHUB_TOKEN }}'; do
-  deploy_contract_secret_assignment_is_allowed \
-    "${allowed_assignment}" \
-    "config/example.env" ||
-    fail "secret assignment scanner rejected an allowed placeholder form"
-done
-deploy_contract_secret_assignment_is_allowed \
-  "short-test-secret" \
-  "services/example/config_test.go" ||
-  fail "secret assignment scanner rejected a short test fixture"
-if deploy_contract_secret_assignment_is_allowed \
-  "production-catalog-cursor-secret-value" \
-  ".env.example"; then
-  fail "secret assignment scanner accepted an obvious non-placeholder value"
-fi
-
-if git grep -I -n -E "${secret_pattern}" -- \
-  >"${test_tmp}/secret-shape-matches"; then
-  fail "Git tracked worktree contains a common real key or token shape"
-else
-  grep_status="$?"
-  [ "${grep_status}" -eq 1 ] ||
-    fail "git grep failed while scanning tracked files for secret shapes"
-fi
-
-if git grep -I -n -E "${assignment_pattern}" -- \
-  >"${test_tmp}/sensitive-assignments"; then
-  :
-else
-  grep_status="$?"
-  [ "${grep_status}" -eq 1 ] ||
-    fail "git grep failed while scanning tracked sensitive assignments"
-fi
-
-while IFS=: read -r assignment_path assignment_line assignment_text; do
-  [ -n "${assignment_path}" ] || continue
-  normalized_assignment="$(
-    printf '%s\n' "${assignment_text}" |
-      sed \
-        -e 's/^[[:space:]]*//' \
-        -e 's/^#[[:space:]]*//' \
-        -e 's/^export[[:space:]][[:space:]]*//' \
-        -e 's/^"//' \
-        -e "s/^'//"
-  )"
-  assignment_key="$(
-    printf '%s\n' "${normalized_assignment}" |
-      sed \
-        -e 's/[[:space:]]*[:=].*$//' \
-        -e 's/"$//' \
-        -e "s/'$//"
-  )"
-  assignment_value="$(
-    printf '%s\n' "${normalized_assignment}" |
-      sed \
-        -e 's/^[^:=]*[[:space:]]*[:=][[:space:]]*//' \
-        -e 's/[[:space:]]*,[[:space:]]*$//' \
-        -e 's/[[:space:]]*$//'
-  )"
-  case "${assignment_value}" in
-    \"*\")
-      assignment_value="${assignment_value#\"}"
-      assignment_value="${assignment_value%\"}"
-      ;;
-    \'*\')
-      assignment_value="${assignment_value#\'}"
-      assignment_value="${assignment_value%\'}"
-      ;;
-  esac
-  deploy_contract_secret_assignment_is_allowed \
-    "${assignment_value}" \
-    "${assignment_path}" ||
-    fail "tracked sensitive assignment must use a placeholder: ${assignment_path}:${assignment_line}:${assignment_key}"
-done <"${test_tmp}/sensitive-assignments"
-
 grep -F 'count(paper.paper_id)' deploy/sql/verify-release.sql >/dev/null ||
   fail "release SQL must count the public_catalog_papers primary-key column"
+
+json_with_charset_headers="${test_tmp}/json-with-charset.headers"
+printf 'Content-Type: Application/JSON; Charset=UTF-8\r\n' \
+  >"${json_with_charset_headers}"
+sh -c \
+  '. "$1"; deploy_assert_content_type "$2" "$3"' \
+  "${repo_root}/deploy/scripts/content-type-probe" \
+  "${repo_root}/deploy/scripts/lib.sh" \
+  "${json_with_charset_headers}" \
+  "application/json" ||
+  fail "Content-Type comparison must be case-insensitive and allow parameters"
+
+html_with_charset_headers="${test_tmp}/html-with-charset.headers"
+printf 'Content-Type: Text/HTML; charset=utf-8\r\n' \
+  >"${html_with_charset_headers}"
+sh -c \
+  '. "$1"; deploy_assert_content_type "$2" "$3"' \
+  "${repo_root}/deploy/scripts/content-type-probe" \
+  "${repo_root}/deploy/scripts/lib.sh" \
+  "${html_with_charset_headers}" \
+  "text/html" ||
+  fail "HTML Content-Type comparison must be case-insensitive and allow parameters"
+
+jsonp_headers="${test_tmp}/jsonp.headers"
+printf 'Content-Type: application/jsonp\r\n' >"${jsonp_headers}"
+assert_fails_with \
+  "Content-Type rejects application/jsonp" \
+  "expected Content-Type application/json" \
+  sh -c \
+    '. "$1"; deploy_assert_content_type "$2" "$3"' \
+    "${repo_root}/deploy/scripts/content-type-probe" \
+    "${repo_root}/deploy/scripts/lib.sh" \
+    "${jsonp_headers}" \
+    "application/json"
+
+htmlx_headers="${test_tmp}/htmlx.headers"
+printf 'Content-Type: text/htmlx\r\n' >"${htmlx_headers}"
+assert_fails_with \
+  "Content-Type rejects text/htmlx" \
+  "expected Content-Type text/html" \
+  sh -c \
+    '. "$1"; deploy_assert_content_type "$2" "$3"' \
+    "${repo_root}/deploy/scripts/content-type-probe" \
+    "${repo_root}/deploy/scripts/lib.sh" \
+    "${htmlx_headers}" \
+    "text/html"
 
 assert_fails_with \
   "missing manifest" \
@@ -302,6 +255,85 @@ assert_fails_with \
   "restricted KEY: value format" \
   env MANIFEST="${complex_manifest}" sh deploy/scripts/local-release.sh
 
+duplicate_key_manifest="${test_tmp}/duplicate-key.yaml"
+cat >"${duplicate_key_manifest}" <<EOF
+MANIFEST_VERSION: 1
+JCR_IMPORT_PATH: ${jcr_input}
+JCR_IMPORT_PATH: ${jcr_input}
+REPLAY_INPUT_PATH: ${replay_input}
+EOF
+assert_fails_with \
+  "manifest duplicate key" \
+  "restricted KEY: value format" \
+  env MANIFEST="${duplicate_key_manifest}" sh deploy/scripts/local-release.sh
+
+unknown_key_manifest="${test_tmp}/unknown-key.yaml"
+cat >"${unknown_key_manifest}" <<EOF
+MANIFEST_VERSION: 1
+JCR_IMPORT_PATH: ${jcr_input}
+REPLAY_INPUT_PATH: ${replay_input}
+UNEXPECTED_INPUT_PATH: ${replay_input}
+EOF
+assert_fails_with \
+  "manifest unknown key" \
+  "restricted KEY: value format" \
+  env MANIFEST="${unknown_key_manifest}" sh deploy/scripts/local-release.sh
+
+wrong_version_manifest="${test_tmp}/wrong-version.yaml"
+cat >"${wrong_version_manifest}" <<EOF
+MANIFEST_VERSION: 2
+JCR_IMPORT_PATH: ${jcr_input}
+REPLAY_INPUT_PATH: ${replay_input}
+EOF
+assert_fails_with \
+  "manifest wrong version" \
+  "MANIFEST_VERSION must be 1" \
+  env MANIFEST="${wrong_version_manifest}" sh deploy/scripts/local-release.sh
+
+quoted_value_manifest="${test_tmp}/quoted-value.yaml"
+cat >"${quoted_value_manifest}" <<EOF
+MANIFEST_VERSION: 1
+JCR_IMPORT_PATH: "${jcr_input}"
+REPLAY_INPUT_PATH: ${replay_input}
+EOF
+assert_fails_with \
+  "manifest quoted value" \
+  "restricted KEY: value format" \
+  env MANIFEST="${quoted_value_manifest}" sh deploy/scripts/local-release.sh
+
+inline_comment_manifest="${test_tmp}/inline-comment.yaml"
+cat >"${inline_comment_manifest}" <<EOF
+MANIFEST_VERSION: 1
+JCR_IMPORT_PATH: ${jcr_input}
+REPLAY_INPUT_PATH: ${replay_input} # fixed replay
+EOF
+assert_fails_with \
+  "manifest inline comment" \
+  "restricted KEY: value format" \
+  env MANIFEST="${inline_comment_manifest}" sh deploy/scripts/local-release.sh
+
+indented_manifest="${test_tmp}/indented.yaml"
+cat >"${indented_manifest}" <<EOF
+MANIFEST_VERSION: 1
+ JCR_IMPORT_PATH: ${jcr_input}
+REPLAY_INPUT_PATH: ${replay_input}
+EOF
+assert_fails_with \
+  "manifest indentation" \
+  "restricted KEY: value format" \
+  env MANIFEST="${indented_manifest}" sh deploy/scripts/local-release.sh
+
+trailing_whitespace_manifest="${test_tmp}/trailing-whitespace.yaml"
+{
+  printf '%s\n' 'MANIFEST_VERSION: 1'
+  printf 'JCR_IMPORT_PATH: %s \n' "${jcr_input}"
+  printf 'REPLAY_INPUT_PATH: %s\n' "${replay_input}"
+} >"${trailing_whitespace_manifest}"
+assert_fails_with \
+  "manifest trailing whitespace" \
+  "restricted KEY: value format" \
+  env MANIFEST="${trailing_whitespace_manifest}" sh deploy/scripts/local-release.sh
+
 valid_manifest="${test_tmp}/valid.yaml"
 cat >"${valid_manifest}" <<EOF
 MANIFEST_VERSION: 1
@@ -312,6 +344,14 @@ assert_fails_with \
   "unimplemented release stage" \
   "pipeline stage not implemented" \
   env MANIFEST="${valid_manifest}" sh deploy/scripts/local-release.sh
+
+positional_manifest="${test_tmp}/positional.yaml"
+cp "${valid_manifest}" "${positional_manifest}"
+assert_fails_with \
+  "manifest environment and positional conflict" \
+  "MANIFEST and the positional manifest path disagree" \
+  env MANIFEST="${valid_manifest}" \
+  sh deploy/scripts/local-release.sh "${positional_manifest}"
 
 fake_bin="${test_tmp}/bin"
 mkdir -p "${fake_bin}"
@@ -401,10 +441,153 @@ printf '%s' "${status}"
 EOF
 chmod +x "${fake_bin}/curl"
 
+cat >"${fake_bin}/docker" <<'EOF'
+#!/bin/sh
+
+set -eu
+
+{
+  printf 'project=%s' "${COMPOSE_PROJECT_NAME:-}"
+  for argument in "$@"; do
+    printf '|%s' "${argument}"
+  done
+  printf '\n'
+} >>"${MOCK_DOCKER_LOG}"
+EOF
+chmod +x "${fake_bin}/docker"
+
 mock_log="${test_tmp}/curl.log"
 : >"${mock_log}"
 api_url='http://api.test.invalid'
 web_url='http://web.test.invalid'
+
+project_env_file="${test_tmp}/local-project.env"
+printf '%s\n' 'COMPOSE_PROJECT_NAME=env-file-project' >"${project_env_file}"
+docker_log="${test_tmp}/docker.log"
+: >"${docker_log}"
+if ! sh -c '
+  unset COMPOSE_PROJECT_NAME
+  export LOCAL_ENV_FILE="$1"
+  export PATH="$2"
+  export API_URL="$3"
+  export WEB_URL="$4"
+  export MOCK_CATALOG_STATUS=503
+  export MOCK_CURL_LOG="$5"
+  export MOCK_DOCKER_LOG="$6"
+  export LOCAL_WAIT_TIMEOUT=1
+  sh deploy/scripts/up-empty.sh
+' sh \
+  "${project_env_file}" \
+  "${fake_bin}:${PATH}" \
+  "${api_url}" \
+  "${web_url}" \
+  "${mock_log}" \
+  "${docker_log}" >/dev/null; then
+  fail "up-empty rejected a valid LOCAL_ENV_FILE Compose project name"
+fi
+grep -F 'project=env-file-project' "${docker_log}" |
+  grep -F '|down|--volumes|--remove-orphans' >/dev/null ||
+  fail "up-empty down --volumes targeted the wrong LOCAL_ENV_FILE project"
+
+invalid_project_env_file="${test_tmp}/invalid-local-project.env"
+printf '%s\n' 'COMPOSE_PROJECT_NAME=<replace-project-name>' \
+  >"${invalid_project_env_file}"
+assert_fails_with \
+  "invalid LOCAL_ENV_FILE Compose project name" \
+  "invalid COMPOSE_PROJECT_NAME" \
+  sh -c '
+    unset COMPOSE_PROJECT_NAME
+    export LOCAL_ENV_FILE="$1"
+    export PATH="$2"
+    export API_URL="$3"
+    export WEB_URL="$4"
+    export MOCK_CATALOG_STATUS=503
+    export MOCK_CURL_LOG="$5"
+    export MOCK_DOCKER_LOG="$6"
+    export LOCAL_WAIT_TIMEOUT=1
+    sh deploy/scripts/up-empty.sh
+  ' sh \
+    "${invalid_project_env_file}" \
+    "${fake_bin}:${PATH}" \
+    "${api_url}" \
+    "${web_url}" \
+    "${mock_log}" \
+    "${docker_log}"
+
+duplicate_project_env_file="${test_tmp}/duplicate-local-project.env"
+printf '%s\n' \
+  'COMPOSE_PROJECT_NAME=first-project' \
+  'COMPOSE_PROJECT_NAME=second-project' \
+  >"${duplicate_project_env_file}"
+assert_fails_with \
+  "duplicate LOCAL_ENV_FILE Compose project name" \
+  "COMPOSE_PROJECT_NAME must be defined at most once" \
+  sh -c '
+    unset COMPOSE_PROJECT_NAME
+    export LOCAL_ENV_FILE="$1"
+    export PATH="$2"
+    export API_URL="$3"
+    export WEB_URL="$4"
+    export MOCK_CATALOG_STATUS=503
+    export MOCK_CURL_LOG="$5"
+    export MOCK_DOCKER_LOG="$6"
+    export LOCAL_WAIT_TIMEOUT=1
+    sh deploy/scripts/up-empty.sh
+  ' sh \
+    "${duplicate_project_env_file}" \
+    "${fake_bin}:${PATH}" \
+    "${api_url}" \
+    "${web_url}" \
+    "${mock_log}" \
+    "${docker_log}"
+
+: >"${docker_log}"
+env \
+  COMPOSE_PROJECT_NAME=explicit-project \
+  LOCAL_ENV_FILE="${project_env_file}" \
+  PATH="${fake_bin}:${PATH}" \
+  API_URL="${api_url}" \
+  WEB_URL="${web_url}" \
+  MOCK_CATALOG_STATUS=503 \
+  MOCK_CURL_LOG="${mock_log}" \
+  MOCK_DOCKER_LOG="${docker_log}" \
+  LOCAL_WAIT_TIMEOUT=1 \
+  sh deploy/scripts/up-empty.sh >/dev/null ||
+  fail "up-empty rejected an explicit Compose project name"
+grep -F 'project=explicit-project' "${docker_log}" |
+  grep -F '|down|--volumes|--remove-orphans' >/dev/null ||
+  fail "explicit COMPOSE_PROJECT_NAME must override LOCAL_ENV_FILE"
+
+: >"${docker_log}"
+if ! sh -c '
+  unset COMPOSE_PROJECT_NAME
+  unset LOCAL_ENV_FILE
+  export PATH="$1"
+  export API_URL="$2"
+  export WEB_URL="$3"
+  export MOCK_CATALOG_STATUS=503
+  export MOCK_CURL_LOG="$4"
+  export MOCK_DOCKER_LOG="$5"
+  export LOCAL_WAIT_TIMEOUT=1
+  sh deploy/scripts/up-empty.sh
+' sh \
+  "${fake_bin}:${PATH}" \
+  "${api_url}" \
+  "${web_url}" \
+  "${mock_log}" \
+  "${docker_log}" >/dev/null; then
+  fail "up-empty rejected its stable isolated default project"
+fi
+default_project_name="$(
+  sh -c \
+    '. "$1"; deploy_default_compose_project_name "$2"' \
+    "${repo_root}/deploy/scripts/project-name-probe" \
+    "${repo_root}/deploy/scripts/lib.sh" \
+    "${repo_root}"
+)"
+grep -F "project=${default_project_name}" "${docker_log}" |
+  grep -F '|down|--volumes|--remove-orphans' >/dev/null ||
+  fail "up-empty down --volumes did not target the repo-isolated default project"
 
 assert_fails_with \
   "release verification rejects Catalog 503" \

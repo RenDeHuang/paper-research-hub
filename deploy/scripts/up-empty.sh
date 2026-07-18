@@ -6,10 +6,8 @@ DEPLOY_SCRIPT_NAME=up-empty
 export DEPLOY_SCRIPT_NAME
 . "$(dirname "$0")/lib.sh"
 
-if [ -z "${COMPOSE_PROJECT_NAME:-}" ]; then
-  COMPOSE_PROJECT_NAME=paper-research-hub-empty
-  export COMPOSE_PROJECT_NAME
-fi
+COMPOSE_PROJECT_NAME="$(deploy_resolve_compose_project_name)"
+export COMPOSE_PROJECT_NAME
 
 wait_timeout="${LOCAL_WAIT_TIMEOUT:-240}"
 case "${wait_timeout}" in
