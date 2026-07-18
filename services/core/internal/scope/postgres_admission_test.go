@@ -2,6 +2,7 @@ package scope
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -183,5 +184,91 @@ func TestAdmissionSchemaRejectsInvalidMissingChannelShapes(t *testing.T) {
 				"work_channel_admission_decisions_channel_shape_check",
 			)
 		})
+	}
+}
+
+func TestPostgresAdmissionStoreNormalizesDecisionTimestampsToMicroseconds(
+	t *testing.T,
+) {
+	pool := openScopeTestPool(t)
+	fixture := insertScopeProjectionFixture(t, pool, "admission-timestamp")
+	originalTime := time.Date(
+		2026,
+		time.July,
+		18,
+		13,
+		30,
+		0,
+		123456789,
+		time.FixedZone("UTC+08", 8*60*60),
+	)
+	normalizedTime := originalTime.UTC().Truncate(time.Microsecond)
+	decision, err := EvaluateAdmission(
+		AdmissionInput{
+			WorkID: fixture.workID,
+			ChannelDecision: ChannelDecision{
+				WorkID:        fixture.workID,
+				Status:        ChannelDecisionMissing,
+				PolicyVersion: "channel-projection/v1",
+				DecidedAt:     originalTime,
+			},
+			AdmissionPolicyVersion: ChannelAdmissionPolicyVersion,
+			DomainRegistryVersion:  ResearchDomainRegistryVersion,
+			DecidedAt:              originalTime,
+		},
+		PreprintRegistry{},
+		ConferenceRegistry{},
+	)
+	if err != nil {
+		t.Fatalf("EvaluateAdmission(nanosecond timestamp) error = %v", err)
+	}
+
+	store, err := NewPostgresAdmissionStore(pool)
+	if err != nil {
+		t.Fatalf("NewPostgresAdmissionStore() error = %v", err)
+	}
+	originalDecision := decision
+	originalDecision.DecidedAt = originalTime
+	record := AdmissionRecord{
+		Decision:       originalDecision,
+		SourceRecordID: fixture.sourceRecordID,
+		SourcePath:     "$.channel",
+	}
+	first, err := store.Persist(context.Background(), record)
+	if err != nil {
+		t.Fatalf("Persist(first nanosecond timestamp) error = %v", err)
+	}
+	if first.Decision.DecidedAt != normalizedTime {
+		t.Fatalf(
+			"Persist(first) decided_at = %s, want %s",
+			first.Decision.DecidedAt,
+			normalizedTime,
+		)
+	}
+	second, err := store.Persist(context.Background(), record)
+	if err != nil {
+		t.Fatalf("Persist(idempotent original timestamp) error = %v", err)
+	}
+	if second.ID != first.ID || second.Decision.DecidedAt != normalizedTime {
+		t.Fatalf("idempotent timestamp records = %#v / %#v", first, second)
+	}
+	loaded, found, err := store.Find(
+		scopeTestContext(t),
+		first.ID,
+	)
+	if err != nil {
+		t.Fatalf("Find(normalized timestamp) error = %v", err)
+	}
+	if !found || !reflect.DeepEqual(loaded, first) {
+		t.Fatalf("Find(normalized timestamp) = %#v, %t, want %#v", loaded, found, first)
+	}
+
+	conflicting := record
+	conflicting.Decision.DecidedAt = originalTime.Add(time.Microsecond)
+	if _, err := store.Persist(
+		context.Background(),
+		conflicting,
+	); !errors.Is(err, ErrConflictingAdmissionDecision) {
+		t.Fatalf("Persist(different microsecond) error = %v", err)
 	}
 }

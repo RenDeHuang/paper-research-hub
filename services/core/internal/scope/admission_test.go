@@ -528,6 +528,49 @@ func TestAdmissionAllChannelsRequireExplicitDomainRegistryVersion(t *testing.T) 
 	}
 }
 
+func TestAdmissionDecisionTimestampUsesPostgresMicrosecondPrecision(t *testing.T) {
+	t.Parallel()
+
+	originalTime := time.Date(
+		2026,
+		time.July,
+		18,
+		13,
+		30,
+		0,
+		123456789,
+		time.FixedZone("UTC+08", 8*60*60),
+	)
+	workID := "00000000-0000-0000-0000-000000001301"
+	decision, err := EvaluateAdmission(
+		AdmissionInput{
+			WorkID: workID,
+			ChannelDecision: ChannelDecision{
+				WorkID:        workID,
+				Status:        ChannelDecisionMissing,
+				PolicyVersion: "channel-projection/v1",
+				DecidedAt:     originalTime,
+			},
+			AdmissionPolicyVersion: ChannelAdmissionPolicyVersion,
+			DomainRegistryVersion:  ResearchDomainRegistryVersion,
+			DecidedAt:              originalTime,
+		},
+		PreprintRegistry{},
+		ConferenceRegistry{},
+	)
+	if err != nil {
+		t.Fatalf("EvaluateAdmission(nanosecond timestamp) error = %v", err)
+	}
+	want := originalTime.UTC().Truncate(time.Microsecond)
+	if decision.DecidedAt != want {
+		t.Fatalf(
+			"AdmissionDecision decided_at = %s, want PostgreSQL precision %s",
+			decision.DecidedAt,
+			want,
+		)
+	}
+}
+
 func resolvedChannelDecision(
 	workID string,
 	channel ContentChannel,

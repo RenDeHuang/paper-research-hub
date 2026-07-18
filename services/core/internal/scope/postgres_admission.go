@@ -63,6 +63,9 @@ func (store *PostgresAdmissionStore) Persist(
 			"new admission record cannot provide a persisted ID",
 		)
 	}
+	record.Decision.DecidedAt = normalizeAdmissionDecisionTimestamp(
+		record.Decision.DecidedAt,
+	)
 	if err := validateAdmissionRecord(record); err != nil {
 		return AdmissionRecord{}, err
 	}
@@ -109,7 +112,7 @@ func (store *PostgresAdmissionStore) Persist(
 		nullableAdmissionString(record.Decision.JournalPolicyVersion),
 		nullableAdmissionString(record.Decision.ChannelRegistryVersion),
 		rawEvidence,
-		record.Decision.DecidedAt.UTC(),
+		record.Decision.DecidedAt,
 	).Scan(&record.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, found, findErr := store.findByIdentity(
@@ -275,7 +278,9 @@ func scanAdmissionRecord(
 		)
 	}
 	record.Decision.SourcePaths = slices.Clone(evidence.SourcePaths)
-	record.Decision.DecidedAt = record.Decision.DecidedAt.UTC()
+	record.Decision.DecidedAt = normalizeAdmissionDecisionTimestamp(
+		record.Decision.DecidedAt,
+	)
 	if err := validateAdmissionRecord(record); err != nil {
 		return AdmissionRecord{}, false, fmt.Errorf(
 			"restore admission decision: %w",

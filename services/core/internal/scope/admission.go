@@ -136,6 +136,11 @@ func (decision AdmissionDecision) Validate() error {
 	if decision.DecidedAt.IsZero() {
 		return errors.New("admission decision decided_at is required")
 	}
+	if decision.DecidedAt != normalizeAdmissionDecisionTimestamp(decision.DecidedAt) {
+		return errors.New(
+			"admission decision decided_at requires UTC PostgreSQL microsecond precision",
+		)
+	}
 	for index, sourcePath := range decision.SourcePaths {
 		if sourcePath == "" || sourcePath != strings.TrimSpace(sourcePath) {
 			return fmt.Errorf(
@@ -257,7 +262,9 @@ func EvaluateAdmission(
 		WorkID:                 input.WorkID,
 		AdmissionPolicyVersion: input.AdmissionPolicyVersion,
 		DomainRegistryVersion:  input.DomainRegistryVersion,
-		DecidedAt:              input.DecidedAt.UTC(),
+		DecidedAt: normalizeAdmissionDecisionTimestamp(
+			input.DecidedAt,
+		),
 	}
 	if input.ChannelDecision.Status != ChannelDecisionResolved {
 		decision.Decision = AdmissionMissing
@@ -413,6 +420,10 @@ func EvaluateAdmission(
 		"unsupported admission channel %q",
 		decision.Channel,
 	)
+}
+
+func normalizeAdmissionDecisionTimestamp(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
 }
 
 func evaluateJournalAdmission(
