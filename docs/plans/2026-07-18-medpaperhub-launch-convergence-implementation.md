@@ -127,7 +127,7 @@ git commit -m "ops: add local release deployment contract"
 **Business task:** Task 1 completion.
 
 **Files:**
-- Create: `services/core/migrations/000020_content_channel_registries.sql`
+- Create: `services/core/migrations/000020_scope_and_channel_registries.sql`
 - Create: `services/core/internal/scope/domain.go`
 - Create: `services/core/internal/scope/domain_test.go`
 - Create: `services/core/internal/scope/channel.go`
@@ -211,7 +211,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add services/core/migrations/000020_content_channel_registries.sql \
+git add services/core/migrations/000020_scope_and_channel_registries.sql \
   services/core/internal/scope services/core/internal/biomed \
   services/core/cmd/worker/biomedical_eligibility_command_test.go \
   data/subjects data/sources data/venues contracts/openapi.yaml
