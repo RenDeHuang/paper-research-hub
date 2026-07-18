@@ -224,7 +224,7 @@ git commit -m "feat(registry): add domains and content channels"
 **Business task:** Task 2, first slice.
 
 **Files:**
-- Create: `services/core/migrations/000021_connector_runs.sql`
+- Create: `services/core/migrations/000023_connector_runs.sql`
 - Modify: `services/core/internal/ingestion/envelope.go`
 - Modify: `services/core/internal/ingestion/envelope_test.go`
 - Create: `services/core/internal/ingestion/connector_run.go`
@@ -297,7 +297,7 @@ Expected: PASS.
 **Step 6: Commit**
 
 ```bash
-git add services/core/migrations/000021_connector_runs.sql \
+git add services/core/migrations/000023_connector_runs.sql \
   services/core/internal/ingestion services/core/internal/source/crossref \
   services/core/cmd/worker
 git commit -m "feat(ingestion): add durable Crossref discovery"
@@ -398,9 +398,9 @@ git commit -m "feat(source): add preprint and conference discovery"
 **Business tasks:** Task 3 and Task 4.
 
 **Files:**
-- Create: `services/core/migrations/000022_work_families.sql`
-- Create: `services/core/migrations/000023_official_urls.sql`
-- Create: `services/core/migrations/000024_visibility_states.sql`
+- Create: `services/core/migrations/000024_work_families.sql`
+- Create: `services/core/migrations/000025_official_urls.sql`
+- Create: `services/core/migrations/000026_visibility_states.sql`
 - Create: `services/core/internal/workfamily/model.go`
 - Create: `services/core/internal/workfamily/model_test.go`
 - Create: `services/core/internal/workfamily/postgres_store.go`
@@ -479,9 +479,9 @@ Expected: PASS.
 **Step 6: Commit**
 
 ```bash
-git add services/core/migrations/000022_work_families.sql \
-  services/core/migrations/000023_official_urls.sql \
-  services/core/migrations/000024_visibility_states.sql \
+git add services/core/migrations/000024_work_families.sql \
+  services/core/migrations/000025_official_urls.sql \
+  services/core/migrations/000026_visibility_states.sql \
   services/core/internal/workfamily services/core/internal/urlverify \
   services/core/internal/catalog services/core/internal/httpapi \
   contracts/openapi.yaml apps/web
@@ -505,7 +505,7 @@ From a clean test database and fixed multi-source fixtures:
 **Business task:** Task 5.
 
 **Files:**
-- Create: `services/core/migrations/000025_abstract_route_analysis.sql`
+- Create: `services/core/migrations/000027_abstract_route_analysis.sql`
 - Create: `services/core/internal/abstractanalysis/schema.go`
 - Create: `services/core/internal/abstractanalysis/schema_test.go`
 - Create: `services/core/internal/abstractanalysis/evidence.go`
@@ -633,7 +633,7 @@ Expected: PASS.
 **Step 8: Commit**
 
 ```bash
-git add services/core/migrations/000025_abstract_route_analysis.sql \
+git add services/core/migrations/000027_abstract_route_analysis.sql \
   services/core/internal/abstractanalysis services/core/internal/openairesponses \
   services/core/internal/config services/core/cmd/worker .env.example
 git commit -m "feat(analysis): extract evidence-bound abstract routes"
@@ -646,8 +646,8 @@ git commit -m "feat(analysis): extract evidence-bound abstract routes"
 **Business tasks:** Task 5 enrichment and Task 6 readiness.
 
 **Files:**
-- Create: `services/core/migrations/000026_enrichment_outbox.sql`
-- Create: `services/core/migrations/000027_analysis_readiness.sql`
+- Create: `services/core/migrations/000028_enrichment_outbox.sql`
+- Create: `services/core/migrations/000029_analysis_readiness.sql`
 - Modify: `services/core/internal/source/pubmed/bulk.go`
 - Modify: `services/core/internal/source/pubmed/bulk_test.go`
 - Modify: `services/core/internal/source/openalex/client.go`
@@ -708,8 +708,8 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add services/core/migrations/000026_enrichment_outbox.sql \
-  services/core/migrations/000027_analysis_readiness.sql \
+git add services/core/migrations/000028_enrichment_outbox.sql \
+  services/core/migrations/000029_analysis_readiness.sql \
   services/core/internal/enrichment services/core/internal/readiness \
   services/core/internal/source/pubmed services/core/internal/source/openalex \
   services/core/cmd/worker
@@ -723,7 +723,7 @@ git commit -m "feat(enrichment): add evidence readiness pipeline"
 **Business task:** Task 6.
 
 **Files:**
-- Create: `services/core/migrations/000028_research_intelligence.sql`
+- Create: `services/core/migrations/000030_research_intelligence.sql`
 - Modify: `services/core/internal/analysis/trends.go`
 - Modify: `services/core/internal/analysis/trends_test.go`
 - Modify: `services/core/internal/analysis/journals.go`
@@ -789,7 +789,7 @@ Expected: PASS.
 **Step 6: Commit**
 
 ```bash
-git add services/core/migrations/000028_research_intelligence.sql \
+git add services/core/migrations/000030_research_intelligence.sql \
   services/core/internal/analysis services/core/internal/catalog \
   services/core/cmd/worker contracts/openapi.yaml \
   apps/web/app/types/openapi.generated.ts
@@ -811,7 +811,7 @@ git commit -m "feat(intelligence): add trends and journal profiles"
 **Business task:** Task 7.
 
 **Files:**
-- Create: `services/core/migrations/000029_journal_fit.sql`
+- Create: `services/core/migrations/000031_journal_fit.sql`
 - Create: `services/core/internal/journalfit/model.go`
 - Create: `services/core/internal/journalfit/model_test.go`
 - Create: `services/core/internal/journalfit/service.go`
@@ -882,7 +882,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add services/core/migrations/000029_journal_fit.sql \
+git add services/core/migrations/000031_journal_fit.sql \
   services/core/internal/journalfit services/core/internal/abstractanalysis \
   services/core/internal/httpapi contracts/openapi.yaml \
   apps/web/app/types/openapi.generated.ts
