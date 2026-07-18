@@ -243,6 +243,7 @@ func cloneSourceRecord(record source.Record) source.Record {
 	cloned.RejectedIdentifiers = slices.Clone(record.RejectedIdentifiers)
 	cloned.Evidence = slices.Clone(record.Evidence)
 	cloned.AbstractSections = slices.Clone(record.AbstractSections)
+	cloned.PublicationHistory = slices.Clone(record.PublicationHistory)
 	cloned.PublishedAt = clonePointer(record.PublishedAt)
 	cloned.PublishedDate = clonePointer(record.PublishedDate)
 	cloned.ElectronicPublishedAt = clonePointer(record.ElectronicPublishedAt)

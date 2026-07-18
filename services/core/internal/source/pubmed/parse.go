@@ -36,6 +36,7 @@ type medlineCitationXML struct {
 }
 
 type articleXML struct {
+	PublicationModel    string              `xml:"PubModel,attr"`
 	Journal             journalXML          `xml:"Journal"`
 	Title               mixedText           `xml:"ArticleTitle"`
 	Abstract            abstractXML         `xml:"Abstract"`
@@ -189,8 +190,15 @@ func (identifier *identifierTextXML) UnmarshalXML(
 }
 
 type pubmedDataXML struct {
-	ArticleIDs []identifierTextXML `xml:"ArticleIdList>ArticleId"`
-	Licenses   []licenseXML        `xml:"License"`
+	ArticleIDs         []identifierTextXML `xml:"ArticleIdList>ArticleId"`
+	Licenses           []licenseXML        `xml:"License"`
+	PublicationStatus  string              `xml:"PublicationStatus"`
+	PublicationHistory []pubMedPubDateXML  `xml:"History>PubMedPubDate"`
+}
+
+type pubMedPubDateXML struct {
+	Status string `xml:"PubStatus,attr"`
+	dateXML
 }
 
 type licenseXML struct {
@@ -346,6 +354,10 @@ func ParseRecord(raw []byte) (source.Record, error) {
 	if err != nil {
 		return source.Record{}, fmt.Errorf("parse PubMed revision date: %w", err)
 	}
+	publicationHistory, err := parsePublicationHistory(article.PubmedData.PublicationHistory)
+	if err != nil {
+		return source.Record{}, err
+	}
 	licenses := parseLicenses(article.PubmedData.Licenses)
 
 	scope, err := source.NewScopeDecision(
@@ -367,6 +379,9 @@ func ParseRecord(raw []byte) (source.Record, error) {
 		Abstract:                  strings.Join(abstractParts, "\n\n"),
 		AbstractSections:          abstractSections,
 		CopyrightInformation:      normalizeText(string(article.MedlineCitation.Article.Abstract.CopyrightInformation)),
+		PublicationModel:          strings.TrimSpace(article.MedlineCitation.Article.PublicationModel),
+		PublicationStatus:         strings.TrimSpace(article.PubmedData.PublicationStatus),
+		PublicationHistory:        publicationHistory,
 		PublishedAt:               publishedAt,
 		PublishedDate:             publishedDate,
 		ElectronicPublishedAt:     electronicPublishedAt,
@@ -662,6 +677,39 @@ func parseElectronicDate(
 	return nil, nil, nil
 }
 
+func parsePublicationHistory(
+	values []pubMedPubDateXML,
+) ([]source.PublicationHistoryEntry, error) {
+	history := make([]source.PublicationHistoryEntry, 0, len(values))
+	for index, value := range values {
+		ordinal := index + 1
+		date, _, err := parseDate(value.dateXML)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"parse PubMed publication history PubMedPubDate[%d]: %w",
+				ordinal,
+				err,
+			)
+		}
+		if date == nil {
+			return nil, fmt.Errorf(
+				"parse PubMed publication history PubMedPubDate[%d]: requires a date",
+				ordinal,
+			)
+		}
+		history = append(history, source.PublicationHistoryEntry{
+			Status: strings.TrimSpace(value.Status),
+			Date:   *date,
+			SourcePath: fmt.Sprintf(
+				"/PubmedArticle/PubmedData/History/PubMedPubDate[%d]",
+				ordinal,
+			),
+			Ordinal: ordinal,
+		})
+	}
+	return history, nil
+}
+
 func parseDate(value dateXML) (*source.SourceDate, *time.Time, error) {
 	yearText := strings.TrimSpace(value.Year)
 	monthText := strings.TrimSpace(value.Month)
@@ -774,6 +822,9 @@ func buildEvidence(record source.Record) []source.FieldEvidence {
 	appendField("authors_truncated", "/PubmedArticle/MedlineCitation/Article/AuthorList/@CompleteYN", record.AuthorsTruncated != nil)
 	appendField("mesh_headings", "/PubmedArticle/MedlineCitation/MeshHeadingList", len(record.MeSHHeadings) > 0)
 	appendField("publication_types", "/PubmedArticle/MedlineCitation/Article/PublicationTypeList", len(record.PublicationTypes) > 0)
+	appendField("publication_model", "/PubmedArticle/MedlineCitation/Article/@PubModel", record.PublicationModel != "")
+	appendField("publication_status", "/PubmedArticle/PubmedData/PublicationStatus", record.PublicationStatus != "")
+	appendField("publication_history", "/PubmedArticle/PubmedData/History/PubMedPubDate", len(record.PublicationHistory) > 0)
 	appendField("relations", "/PubmedArticle/MedlineCitation/CommentsCorrectionsList", len(record.Relations) > 0)
 	appendField("published_at", "/PubmedArticle/MedlineCitation/Article/Journal/JournalIssue/PubDate", record.PublishedAt != nil)
 	appendField("electronic_published_at", "/PubmedArticle/MedlineCitation/Article/ArticleDate", record.ElectronicPublishedAt != nil)

@@ -192,6 +192,13 @@ type SourceDate struct {
 	Precision DatePrecision
 }
 
+type PublicationHistoryEntry struct {
+	Status     string
+	Date       SourceDate
+	SourcePath string
+	Ordinal    int
+}
+
 const IdentifierRejectionSourceInvalid = "source_marked_invalid"
 
 type RejectedIdentifierAssertion struct {
@@ -214,6 +221,9 @@ type Record struct {
 	Publisher                 string
 	AbstractSections          []AbstractSection
 	CopyrightInformation      string
+	PublicationModel          string
+	PublicationStatus         string
+	PublicationHistory        []PublicationHistoryEntry
 	PublishedAt               *time.Time
 	PublishedDate             *SourceDate
 	ElectronicPublishedAt     *time.Time

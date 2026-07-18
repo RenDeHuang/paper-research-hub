@@ -373,6 +373,173 @@ func TestParsePreservesPartialAndMedlinePublicationDatesWithoutInventingDay(t *t
 	}
 }
 
+func TestParsePublicationHistoryPreservesExplicitOrderedEvidence(t *testing.T) {
+	t.Parallel()
+
+	record, err := pubmed.ParseRecord([]byte(`<PubmedArticle>
+  <MedlineCitation>
+    <PMID>123</PMID>
+    <Article PubModel=" Print-Electronic ">
+      <ArticleTitle>Explicit publication history</ArticleTitle>
+    </Article>
+  </MedlineCitation>
+  <PubmedData>
+    <History>
+      <PubMedPubDate PubStatus=" accepted ">
+        <Year>2026</Year><Month>7</Month><Day>1</Day>
+      </PubMedPubDate>
+      <PubMedPubDate PubStatus=" aheadofprint ">
+        <Year>2026</Year><Month>Jul</Month>
+      </PubMedPubDate>
+      <PubMedPubDate PubStatus=" epublish ">
+        <Year>2026</Year>
+      </PubMedPubDate>
+      <PubMedPubDate PubStatus=" ppublish ">
+        <Year>2026</Year><Month>July</Month><Day>15</Day>
+      </PubMedPubDate>
+      <PubMedPubDate PubStatus=" FutureStatus ">
+        <Year>2027</Year><Month>2</Month><Day>3</Day>
+      </PubMedPubDate>
+    </History>
+    <PublicationStatus> ppublish </PublicationStatus>
+  </PubmedData>
+</PubmedArticle>`))
+	if err != nil {
+		t.Fatalf("ParseRecord() error = %v", err)
+	}
+
+	if record.PublicationModel != "Print-Electronic" {
+		t.Fatalf("PublicationModel = %q, want trimmed raw value", record.PublicationModel)
+	}
+	if record.PublicationStatus != "ppublish" {
+		t.Fatalf("PublicationStatus = %q, want trimmed raw value", record.PublicationStatus)
+	}
+	wantHistory := []source.PublicationHistoryEntry{
+		{
+			Status: "accepted",
+			Date: source.SourceDate{
+				Year:      2026,
+				Month:     time.July,
+				Day:       1,
+				Precision: source.DatePrecisionDay,
+			},
+			SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+			Ordinal:    1,
+		},
+		{
+			Status: "aheadofprint",
+			Date: source.SourceDate{
+				Year:      2026,
+				Month:     time.July,
+				Precision: source.DatePrecisionMonth,
+			},
+			SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[2]",
+			Ordinal:    2,
+		},
+		{
+			Status: "epublish",
+			Date: source.SourceDate{
+				Year:      2026,
+				Precision: source.DatePrecisionYear,
+			},
+			SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[3]",
+			Ordinal:    3,
+		},
+		{
+			Status: "ppublish",
+			Date: source.SourceDate{
+				Year:      2026,
+				Month:     time.July,
+				Day:       15,
+				Precision: source.DatePrecisionDay,
+			},
+			SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[4]",
+			Ordinal:    4,
+		},
+		{
+			Status: "FutureStatus",
+			Date: source.SourceDate{
+				Year:      2027,
+				Month:     time.February,
+				Day:       3,
+				Precision: source.DatePrecisionDay,
+			},
+			SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[5]",
+			Ordinal:    5,
+		},
+	}
+	if !slices.Equal(record.PublicationHistory, wantHistory) {
+		t.Fatalf("PublicationHistory = %#v, want %#v", record.PublicationHistory, wantHistory)
+	}
+
+	wantEvidence := []source.FieldEvidence{
+		{
+			Field:      "publication_model",
+			SourcePath: "/PubmedArticle/MedlineCitation/Article/@PubModel",
+		},
+		{
+			Field:      "publication_status",
+			SourcePath: "/PubmedArticle/PubmedData/PublicationStatus",
+		},
+		{
+			Field:      "publication_history",
+			SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate",
+		},
+	}
+	for _, evidence := range wantEvidence {
+		if !slices.Contains(record.Evidence, evidence) {
+			t.Errorf("Evidence = %#v, missing %#v", record.Evidence, evidence)
+		}
+	}
+}
+
+func TestParsePublicationHistoryRejectsEntryWithoutDate(t *testing.T) {
+	t.Parallel()
+
+	_, err := pubmed.ParseRecord([]byte(`<PubmedArticle>
+  <MedlineCitation><PMID>123</PMID><Article/></MedlineCitation>
+  <PubmedData>
+    <History>
+      <PubMedPubDate PubStatus="accepted"/>
+    </History>
+  </PubmedData>
+</PubmedArticle>`))
+	if err == nil {
+		t.Fatal("ParseRecord() accepted publication history evidence without a date")
+	}
+	if !strings.Contains(err.Error(), "publication history") ||
+		!strings.Contains(err.Error(), "PubMedPubDate[1]") ||
+		!strings.Contains(err.Error(), "requires a date") {
+		t.Fatalf("ParseRecord() error = %v, want explicit missing history date error", err)
+	}
+}
+
+func TestParsePublicationHistoryDoesNotInferAheadOfPrintFromElectronicArticleDate(t *testing.T) {
+	t.Parallel()
+
+	record, err := pubmed.ParseRecord([]byte(`<PubmedArticle>
+  <MedlineCitation>
+    <PMID>123</PMID>
+    <Article PubModel="Electronic">
+      <ArticleTitle>Ahead of print wording is not evidence</ArticleTitle>
+      <ArticleDate DateType="Electronic">
+        <Year>2026</Year><Month>7</Month><Day>8</Day>
+      </ArticleDate>
+    </Article>
+  </MedlineCitation>
+  <PubmedData/>
+</PubmedArticle>`))
+	if err != nil {
+		t.Fatalf("ParseRecord() error = %v", err)
+	}
+	if record.ElectronicPublicationDate == nil {
+		t.Fatal("ElectronicPublicationDate = nil, want explicit ArticleDate evidence retained")
+	}
+	if len(record.PublicationHistory) != 0 {
+		t.Fatalf("PublicationHistory = %#v, must not synthesize aheadofprint", record.PublicationHistory)
+	}
+}
+
 func assertTime(t *testing.T, got *time.Time, want time.Time) {
 	t.Helper()
 	if got == nil || !got.Equal(want) {

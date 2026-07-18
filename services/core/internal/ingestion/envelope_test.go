@@ -369,6 +369,53 @@ func TestNewEnvelopeDeepCopiesNestedRecordAndRawPayload(t *testing.T) {
 	}
 }
 
+func TestEnvelopeAndCloneDeepCopyPublicationHistory(t *testing.T) {
+	t.Parallel()
+
+	raw := mustRawRecord(t, `{"pmid":"123"}`)
+	record := source.Record{
+		Source:         source.PubMed,
+		SourceRecordID: "123",
+		Raw:            raw,
+		PublicationHistory: []source.PublicationHistoryEntry{{
+			Status: "accepted",
+			Date: source.SourceDate{
+				Year:      2026,
+				Month:     time.July,
+				Day:       1,
+				Precision: source.DatePrecisionDay,
+			},
+			SourcePath: "/PubmedArticle/PubmedData/History/PubMedPubDate[1]",
+			Ordinal:    1,
+		}},
+	}
+	envelope, err := NewEnvelope(
+		source.PubMed,
+		"pubmed:123",
+		time.Date(2026, time.July, 16, 9, 30, 0, 0, time.UTC),
+		"1",
+		1,
+		record,
+		raw,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope() error = %v", err)
+	}
+	cloned := envelope.Clone()
+
+	record.PublicationHistory[0].Status = "changed-original"
+	record.PublicationHistory[0].Date.Year = 1999
+	if got := envelope.Record.PublicationHistory[0]; got.Status != "accepted" || got.Date.Year != 2026 {
+		t.Fatalf("Envelope PublicationHistory = %#v, retained original Record alias", got)
+	}
+
+	envelope.Record.PublicationHistory[0].Status = "changed-envelope"
+	envelope.Record.PublicationHistory[0].Date.Month = time.December
+	if got := cloned.Record.PublicationHistory[0]; got.Status != "accepted" || got.Date.Month != time.July {
+		t.Fatalf("Clone PublicationHistory = %#v, retained Envelope alias", got)
+	}
+}
+
 func TestNewDeletionEnvelopeDeepCopiesRawPayload(t *testing.T) {
 	t.Parallel()
 
