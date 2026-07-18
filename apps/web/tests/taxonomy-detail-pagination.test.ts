@@ -29,6 +29,7 @@ const emptyPaperPage = {
     has_more: false,
     limit: 20,
     next_cursor: null,
+    total: 0,
   },
 }
 

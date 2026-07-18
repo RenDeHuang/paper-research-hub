@@ -13,12 +13,11 @@ const props = defineProps<{
 }>()
 
 const navigation = [
-  { label: "首页", to: "/" },
+  { label: "今日", to: "/" },
+  { label: "论文", to: "/papers" },
   { label: "学科", to: "/subjects" },
   { label: "期刊", to: "/journals" },
-  { label: "论文", to: "/papers" },
   { label: "趋势", to: "/trends" },
-  { label: "研究机会", to: "/opportunities" },
 ] as const
 
 const currentRouteLabel = computed(() => {
@@ -113,22 +112,14 @@ onBeforeUnmount(() => {
       </nav>
 
       <div class="app-header__utilities">
-        <a
+        <NuxtLink
           class="app-header__utility-link"
-          href="/#sync-status"
-          aria-label="数据状态与更新时间"
-          @click="closeMenu()"
-        >
-          数据状态
-        </a>
-        <a
-          class="app-header__utility-link"
-          href="/#global-search"
-          aria-label="搜索"
+          to="/papers#papers-q"
+          aria-label="搜索论文"
           @click="closeMenu()"
         >
           搜索
-        </a>
+        </NuxtLink>
       </div>
 
       <button

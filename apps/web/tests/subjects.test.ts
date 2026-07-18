@@ -97,6 +97,7 @@ const subject = {
       has_more: true,
       limit: 20,
       next_cursor: "subject-next",
+      total: 1,
     },
   },
   slug: "oncology",
@@ -131,6 +132,7 @@ const subjectListResponse = {
     has_more: false,
     limit: 20,
     next_cursor: null,
+    total: 1,
   },
   taxonomy_version: "jcr-biomedical-2025-v1",
 }

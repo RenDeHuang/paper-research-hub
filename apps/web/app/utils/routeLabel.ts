@@ -4,7 +4,7 @@ interface RouteLabelSource {
 }
 
 const fixedRouteLabels: Record<string, string> = {
-  "/": "首页",
+  "/": "今日",
   "/journals": "期刊",
   "/methods": "Method",
   "/opportunities": "研究机会",

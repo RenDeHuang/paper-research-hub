@@ -15,7 +15,6 @@ func TestSubjectsUseStableGenerationBoundPaperCountCursor(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-subject-list",
-			homeMarker:     "subject-list",
 		},
 	)
 	repository := mustRepository(t, pool)
@@ -60,7 +59,6 @@ func TestSubjectsUseStableGenerationBoundPaperCountCursor(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-subject-list-next-generation",
-			homeMarker:     "subject-list-next-generation",
 		},
 	)
 	if _, err := repository.Subjects(ctx, PageQuery{
@@ -78,7 +76,6 @@ func TestSubjectDetailPaginatesOnlyStoredRecentPapers(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-subject-detail",
-			homeMarker:     "subject-detail",
 		},
 	)
 	repository := mustRepository(t, pool)
@@ -159,7 +156,6 @@ func TestSubjectRejectsInvalidSnapshotRowsAndHidesRejectedOrUnknownSlugs(t *test
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-subject-visibility",
-			homeMarker:     "subject-visibility",
 		},
 	)
 	repository := mustRepository(t, pool)

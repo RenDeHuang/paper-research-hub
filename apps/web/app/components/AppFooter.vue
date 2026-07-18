@@ -5,11 +5,8 @@
         medpaperhub
       </p>
       <p>
-        医学与生物学论文、期刊趋势和研究机会均以可追溯来源、明确覆盖和独立缺失状态呈现。
+        医学与生物学 · JCR Q1 或 JIF ≥ 10
       </p>
-      <a href="/#global-search">
-        返回搜索
-      </a>
     </div>
   </footer>
 </template>
@@ -21,36 +18,23 @@
 }
 
 .app-footer__inner {
-  display: grid;
-  gap: var(--space-3);
-  padding-top: var(--space-8);
-  padding-bottom: var(--space-8);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  align-items: center;
+  justify-content: space-between;
+  padding-top: var(--space-6);
+  padding-bottom: var(--space-6);
   color: var(--color-text-muted);
   font-size: var(--text-sm-size);
-  line-height: var(--text-sm-line);
 }
 
 .app-footer p {
-  max-width: 68ch;
   margin: 0;
 }
 
 .app-footer__brand {
   color: var(--color-text-strong);
   font-weight: 800;
-}
-
-.app-footer a {
-  width: fit-content;
-  min-height: 44px;
-  align-content: center;
-  color: var(--color-link);
-}
-
-@media (min-width: 768px) {
-  .app-footer__inner {
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: start;
-  }
 }
 </style>

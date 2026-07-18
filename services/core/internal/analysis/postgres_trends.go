@@ -61,6 +61,54 @@ type trendCandidate struct {
 	TeamIDs         map[uuid.UUID]struct{}
 }
 
+type PublicationTrendWindowBoundaries struct {
+	RecentStart   time.Time
+	RecentEnd     time.Time
+	BaselineStart time.Time
+	BaselineEnd   time.Time
+}
+
+func PublicationTrendCalendarWindowBoundaries(
+	asOf time.Time,
+	recentWindowDays int,
+	baselineWindowDays int,
+) (PublicationTrendWindowBoundaries, error) {
+	if asOf.IsZero() {
+		return PublicationTrendWindowBoundaries{}, errors.New(
+			"publication trend window as_of is required",
+		)
+	}
+	if recentWindowDays < 1 || baselineWindowDays <= recentWindowDays {
+		return PublicationTrendWindowBoundaries{}, &InvalidInputError{
+			Field:  "window_days",
+			Reason: "baseline window must exceed recent window and both must be positive",
+		}
+	}
+	asOf = asOf.UTC()
+	calendarDate := time.Date(
+		asOf.Year(),
+		asOf.Month(),
+		asOf.Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	recentStart := calendarDate.AddDate(0, 0, -(recentWindowDays - 1))
+	baselineEnd := recentStart
+	return PublicationTrendWindowBoundaries{
+		RecentStart: recentStart,
+		RecentEnd:   asOf,
+		BaselineStart: baselineEnd.AddDate(
+			0,
+			0,
+			-(baselineWindowDays - recentWindowDays),
+		),
+		BaselineEnd: baselineEnd,
+	}, nil
+}
+
 func (input TrendAnalysisInput) validate() error {
 	if input.AsOf.IsZero() {
 		return errors.New("publication trends as_of is required")
@@ -206,10 +254,18 @@ func (service *PostgresAnalysisService) AnalyzePublicationTrends(
 		return AnalysisRunSummary{}, err
 	}
 
-	recentStart := input.AsOf.Add(-time.Duration(input.RecentWindowDays) * 24 * time.Hour)
-	baselineStart := input.AsOf.Add(-time.Duration(input.BaselineWindowDays) * 24 * time.Hour)
-	recentEnd := input.AsOf
-	baselineEnd := recentStart
+	windows, err := PublicationTrendCalendarWindowBoundaries(
+		input.AsOf,
+		input.RecentWindowDays,
+		input.BaselineWindowDays,
+	)
+	if err != nil {
+		return AnalysisRunSummary{}, err
+	}
+	recentStart := windows.RecentStart
+	recentEnd := windows.RecentEnd
+	baselineStart := windows.BaselineStart
+	baselineEnd := windows.BaselineEnd
 
 	candidates := make(map[string]*trendCandidate)
 	addCandidate := func(entityType, entityID string, workID uuid.UUID, venueID uuid.UUID, inRecent, inBaseline bool, institutionIDs []uuid.UUID) {
@@ -332,7 +388,17 @@ func (service *PostgresAnalysisService) AnalyzePublicationTrends(
 		if !exists {
 			return AnalysisRunSummary{}, fmt.Errorf("publication trends missing result for %s", inputID)
 		}
-		if err := service.insertTrendSnapshot(ctx, tx, runID, input, candidate, result, cohortRevision, startedAt); err != nil {
+		if err := service.insertTrendSnapshot(
+			ctx,
+			tx,
+			runID,
+			input,
+			windows,
+			candidate,
+			result,
+			cohortRevision,
+			startedAt,
+		); err != nil {
 			return AnalysisRunSummary{}, err
 		}
 	}
@@ -350,19 +416,48 @@ func (service *PostgresAnalysisService) insertTrendSnapshot(
 	tx pgx.Tx,
 	runID uuid.UUID,
 	input TrendAnalysisInput,
+	windows PublicationTrendWindowBoundaries,
 	candidate *trendCandidate,
 	result PublicationTrend,
 	cohortRevision string,
 	generatedAt time.Time,
 ) error {
+	for _, boundary := range []struct {
+		name string
+		got  time.Time
+		want time.Time
+	}{
+		{name: "recent_window_start", got: result.Recent.Start, want: windows.RecentStart},
+		{name: "recent_window_end", got: result.Recent.End, want: windows.RecentEnd},
+		{name: "baseline_window_start", got: result.Baseline.Start, want: windows.BaselineStart},
+		{name: "baseline_window_end", got: result.Baseline.End, want: windows.BaselineEnd},
+	} {
+		if !boundary.got.Equal(boundary.want) {
+			return fmt.Errorf(
+				"publication trend result %s %s = %s, want declared window boundary %s",
+				result.ID,
+				boundary.name,
+				boundary.got.UTC().Format(time.RFC3339Nano),
+				boundary.want.UTC().Format(time.RFC3339Nano),
+			)
+		}
+	}
 	evidence := map[string]any{
-		"cohort_revision":      cohortRevision,
-		"entity_type":          candidate.EntityType,
-		"entity_id":            candidate.EntityID,
-		"recent_work_count":    len(candidate.RecentWorkIDs),
-		"baseline_work_count":  len(candidate.BaselineWorkIDs),
-		"independent_journals": len(candidate.JournalIDs),
-		"independent_teams":    len(candidate.TeamIDs),
+		"analysis_run_id":       runID,
+		"as_of":                 input.AsOf.UTC().Format(time.RFC3339Nano),
+		"recent_window_days":    input.RecentWindowDays,
+		"baseline_window_days":  input.BaselineWindowDays,
+		"recent_window_start":   result.Recent.Start.UTC().Format(time.RFC3339Nano),
+		"recent_window_end":     result.Recent.End.UTC().Format(time.RFC3339Nano),
+		"baseline_window_start": result.Baseline.Start.UTC().Format(time.RFC3339Nano),
+		"baseline_window_end":   result.Baseline.End.UTC().Format(time.RFC3339Nano),
+		"cohort_revision":       cohortRevision,
+		"entity_type":           candidate.EntityType,
+		"entity_id":             candidate.EntityID,
+		"recent_work_count":     len(candidate.RecentWorkIDs),
+		"baseline_work_count":   len(candidate.BaselineWorkIDs),
+		"independent_journals":  len(candidate.JournalIDs),
+		"independent_teams":     len(candidate.TeamIDs),
 	}
 	payload := map[string]any{
 		"cohort_revision": cohortRevision,

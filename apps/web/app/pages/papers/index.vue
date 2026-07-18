@@ -176,7 +176,7 @@ async function applyFilters() {
             查询结果
           </p>
           <h2 id="results-heading">
-            {{ readyData.pagination.total ?? readyData.items.length }} 篇论文
+            {{ readyData.pagination.total }} 篇论文
           </h2>
         </div>
       </div>

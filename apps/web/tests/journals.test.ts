@@ -114,6 +114,7 @@ const journal = {
       has_more: true,
       limit: 20,
       next_cursor: "journal-next",
+      total: 1,
     },
   },
   slug: "journal-of-clinical-oncology",
@@ -129,6 +130,7 @@ const journalListResponse = {
     has_more: false,
     limit: 20,
     next_cursor: null,
+    total: 1,
   },
   taxonomy_version: "jcr-biomedical-2025-v1",
 }

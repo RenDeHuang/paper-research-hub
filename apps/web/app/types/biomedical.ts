@@ -26,7 +26,15 @@ export type BiomedicalEntityType =
 export type EntityMomentumItem =
   components["schemas"]["EntityMomentumItem"]
 export type HomeCoverage = components["schemas"]["HomeCoverage"]
+export type HomePublicationUpdates =
+  components["schemas"]["HomePublicationUpdates"]
 export type HomeResponse = components["schemas"]["HomeResponse"]
+export type PublicationUpdateCollection =
+  components["schemas"]["PublicationUpdateCollection"]
+export type PublicationUpdateEvent =
+  components["schemas"]["PublicationUpdateEvent"]
+export type PublicationUpdateItem =
+  components["schemas"]["PublicationUpdateItem"]
 export type DistributionBucket =
   components["schemas"]["DistributionBucket"]
 export type SubjectSummary = components["schemas"]["SubjectSummary"]

@@ -9,9 +9,12 @@ import {
 } from "~/utils/catalogPresentation"
 import { presentDataValue } from "~/utils/dataValue"
 
-defineProps<{
+withDefaults(defineProps<{
   activity: AnalysisCollection<JournalActivityItem>
-}>()
+  compact?: boolean
+}>(), {
+  compact: false,
+})
 </script>
 
 <template>
@@ -23,10 +26,10 @@ defineProps<{
     <div class="section-heading">
       <div>
         <p class="section-kicker">
-          发表节奏
+          {{ compact ? "重点期刊" : "发表节奏" }}
         </p>
         <h2 id="journal-activity-heading">
-          活跃期刊
+          {{ compact ? "期刊动态" : "活跃期刊" }}
         </h2>
       </div>
       <NuxtLink class="button button--secondary" to="/journals">
@@ -34,10 +37,19 @@ defineProps<{
       </NuxtLink>
     </div>
 
-    <IntelligenceModuleMeta :analysis="activity.analysis" />
+    <IntelligenceModuleMeta
+      v-if="!compact"
+      :analysis="activity.analysis"
+    />
 
+    <p
+      v-if="compact && activity.items.length === 0"
+      class="journal-activity__empty"
+    >
+      暂无期刊动态
+    </p>
     <DataState
-      v-if="activity.items.length === 0"
+      v-else-if="activity.items.length === 0"
       state="empty"
       title="当前窗口没有活跃期刊"
       message="API 已成功返回空集合；页面不会把未知发表节奏显示为零。"
@@ -145,6 +157,12 @@ dd {
   color: var(--color-text-muted);
   font-family: var(--font-ui);
   font-style: italic;
+}
+
+.journal-activity__empty {
+  margin: 0;
+  padding: var(--space-5) 0;
+  color: var(--color-text-muted);
 }
 
 @media (min-width: 768px) {

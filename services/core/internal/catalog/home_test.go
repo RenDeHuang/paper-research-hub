@@ -108,7 +108,6 @@ func TestHomeReadsStoredPayloadFromCurrentPublishedGeneration(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-home-generation-1",
-			homeMarker:     "first-generation",
 		},
 	)
 	second := insertBiomedicalCatalogFixture(
@@ -116,7 +115,6 @@ func TestHomeReadsStoredPayloadFromCurrentPublishedGeneration(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-home-generation-2",
-			homeMarker:     "current-generation",
 		},
 	)
 	repository := mustRepository(t, pool)
@@ -133,7 +131,12 @@ func TestHomeReadsStoredPayloadFromCurrentPublishedGeneration(t *testing.T) {
 			first.generationID,
 		)
 	}
-	assertJSONField(t, document.Payload, "fixture_marker", "current-generation")
+	assertJSONField(
+		t,
+		document.Payload,
+		"catalog_generation",
+		second.generationID.String(),
+	)
 }
 
 func TestHomeRequiresPublishedBiomedicalSnapshot(t *testing.T) {
@@ -146,6 +149,262 @@ func TestHomeRequiresPublishedBiomedicalSnapshot(t *testing.T) {
 	}
 }
 
+func TestHomeRejectsIncompatibleSnapshotSchema(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		options biomedicalFixtureOptions
+	}{
+		{
+			name: "missing schema",
+			options: biomedicalFixtureOptions{
+				sourceRevision:         "biomedical-home-schema-missing",
+				omitHomeSnapshotSchema: true,
+			},
+		},
+		{
+			name: "unsupported schema",
+			options: biomedicalFixtureOptions{
+				sourceRevision:     "biomedical-home-schema-unsupported",
+				homeSnapshotSchema: "home-snapshot/v1",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool := openCatalogTestPool(t)
+			insertBiomedicalCatalogFixture(t, pool, test.options)
+
+			_, err := mustRepository(t, pool).Home(context.Background())
+			if !errors.Is(err, ErrCatalogNotPublished) {
+				t.Fatalf(
+					"Home() error = %v, want ErrCatalogNotPublished",
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestHomeSnapshotContractRejectsMissingOrUnknownTopLevelFields(t *testing.T) {
+	generationID := uuid.New()
+	validPayload := biomedicalHomeFixturePayload(
+		generationID,
+		homeSnapshotSchemaVersion,
+		false,
+	)
+	if err := validateHomeSnapshotPayload(validPayload); err != nil {
+		t.Fatalf("validate valid Home snapshot payload: %v", err)
+	}
+
+	var valid map[string]json.RawMessage
+	if err := json.Unmarshal(validPayload, &valid); err != nil {
+		t.Fatalf("decode valid Home snapshot fixture: %v", err)
+	}
+	requiredFields := []string{
+		"active_journals",
+		"catalog_generation",
+		"citation_momentum",
+		"coverage",
+		"entity_momentum",
+		"evidence_gaps",
+		"generated_at",
+		"latest_papers",
+		"publication_updates",
+		"research_opportunities",
+		"snapshot_schema",
+		"scope",
+		"subject_momentum",
+	}
+	for _, field := range requiredFields {
+		t.Run("missing "+field, func(t *testing.T) {
+			candidate := make(map[string]json.RawMessage, len(valid)-1)
+			for name, value := range valid {
+				if name != field {
+					candidate[name] = value
+				}
+			}
+			payload, err := json.Marshal(candidate)
+			if err != nil {
+				t.Fatalf("encode Home snapshot without %s: %v", field, err)
+			}
+			if err := validateHomeSnapshotPayload(payload); err == nil {
+				t.Fatalf(
+					"validateHomeSnapshotPayload() accepted missing required field %q",
+					field,
+				)
+			}
+		})
+	}
+
+	t.Run("unknown fixture_marker", func(t *testing.T) {
+		candidate := make(map[string]json.RawMessage, len(valid)+1)
+		for name, value := range valid {
+			candidate[name] = value
+		}
+		candidate["fixture_marker"] = json.RawMessage(`"must-be-rejected"`)
+		payload, err := json.Marshal(candidate)
+		if err != nil {
+			t.Fatalf("encode Home snapshot with unknown field: %v", err)
+		}
+		if err := validateHomeSnapshotPayload(payload); err == nil {
+			t.Fatalf("validateHomeSnapshotPayload() accepted unknown fixture_marker")
+		}
+	})
+}
+
+func TestHomeSnapshotUsesApprovedAnalysisWindows(t *testing.T) {
+	generatedAt := time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC)
+	journalID := uuid.New()
+	recentAt := time.Date(2026, time.July, 12, 0, 0, 0, 0, time.UTC)
+	excludedFromSevenDayWindowAt := time.Date(
+		2026,
+		time.July,
+		11,
+		23,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	staleAt := generatedAt.AddDate(0, 0, -31)
+	coveragePaper := homeWindowPaper(
+		uuid.New(),
+		journalID,
+		"Coverage paper",
+		excludedFromSevenDayWindowAt,
+	)
+	coveragePaper.CitationCountState = "known"
+	coveragePaper.biomedical.MeSHHeadings = catalogValue{
+		State: "known",
+		Value: []string{"D000001"},
+	}
+	coveragePaper.biomedical.PublicationTypesState = catalogValue{
+		State: "known",
+		Value: []string{"Journal Article"},
+	}
+	papers := []publishedPaper{
+		homeWindowPaper(uuid.New(), journalID, "Recent paper", recentAt),
+		coveragePaper,
+		homeWindowPaper(uuid.New(), journalID, "Stale paper", staleAt),
+	}
+	input := PublishInput{
+		FormulaVersion: "public-catalog/biomedical-v1",
+		GeneratedAt:    generatedAt,
+		JCRMetricYear:  2025,
+		SubjectVersion: "biomedical-jcr-subjects/v1",
+	}
+	home, err := buildHomeSnapshot(
+		input,
+		papers,
+		map[uuid.UUID]journalSnapshotProfile{
+			journalID: {
+				summary: map[string]any{
+					"id":              journalID,
+					"slug":            "journal-window-test",
+					"title":           "Journal Window Test",
+					"jcr_metric_year": 2025,
+					"jif": catalogValue{
+						State: "known",
+						Value: 10.0,
+					},
+				},
+			},
+		},
+		[]string{"test-fixture"},
+		map[string]any{
+			"analysis": analysisMetadata(
+				input,
+				biomedicalDetailWindowDays,
+				0,
+				catalogValue{State: "missing"},
+				[]string{"test-fixture"},
+				[]string{"citation_momentum_not_published"},
+			),
+			"items": []any{},
+		},
+	)
+	if err != nil {
+		t.Fatalf("buildHomeSnapshot() error = %v", err)
+	}
+	home, err = bindCatalogGeneration(home, uuid.New())
+	if err != nil {
+		t.Fatalf("bindCatalogGeneration() error = %v", err)
+	}
+
+	for section, windowDays := range map[string]int{
+		"active_journals":  biomedicalHomeWindowDays,
+		"coverage":         biomedicalDetailWindowDays,
+		"entity_momentum":  biomedicalHomeWindowDays,
+		"subject_momentum": biomedicalHomeWindowDays,
+	} {
+		assertNestedJSONValue(
+			t,
+			home,
+			[]string{section, "analysis", "window_days", "state"},
+			"known",
+		)
+		assertNestedJSONValue(
+			t,
+			home,
+			[]string{section, "analysis", "window_days", "value"},
+			float64(windowDays),
+		)
+	}
+	assertNestedJSONValue(
+		t,
+		home,
+		[]string{"research_opportunities", "analysis", "window_days", "state"},
+		"missing",
+	)
+	assertNestedJSONValue(
+		t,
+		home,
+		[]string{"research_opportunities", "analysis", "sample_size", "value"},
+		float64(0),
+	)
+	assertNestedJSONValue(
+		t,
+		home,
+		[]string{"active_journals", "analysis", "sample_size", "value"},
+		float64(1),
+	)
+	assertNestedJSONValue(
+		t,
+		home,
+		[]string{"active_journals", "items", "0", "paper_count", "value"},
+		float64(1),
+	)
+	assertNestedJSONValue(
+		t,
+		home,
+		[]string{"latest_papers", "pagination", "total"},
+		float64(1),
+	)
+	assertNestedJSONValue(
+		t,
+		home,
+		[]string{"coverage", "analysis", "sample_size", "value"},
+		float64(2),
+	)
+	for _, metric := range []string{
+		"citation_coverage_ratio",
+		"mesh_coverage_ratio",
+		"publication_type_coverage_ratio",
+	} {
+		assertNestedJSONValue(
+			t,
+			home,
+			[]string{"coverage", metric, "state"},
+			"known",
+		)
+		assertNestedJSONValue(
+			t,
+			home,
+			[]string{"coverage", metric, "value"},
+			float64(0.5),
+		)
+	}
+}
+
 func TestPublishedBiomedicalSnapshotsAreImmutable(t *testing.T) {
 	pool := openCatalogTestPool(t)
 	fixture := insertBiomedicalCatalogFixture(
@@ -153,7 +412,6 @@ func TestPublishedBiomedicalSnapshotsAreImmutable(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-immutable",
-			homeMarker:     "immutable",
 		},
 	)
 	ctx := context.Background()
@@ -207,8 +465,9 @@ func TestPublishedBiomedicalSnapshotsAreImmutable(t *testing.T) {
 }
 
 type biomedicalFixtureOptions struct {
-	sourceRevision string
-	homeMarker     string
+	sourceRevision         string
+	homeSnapshotSchema     string
+	omitHomeSnapshotSchema bool
 }
 
 type biomedicalCatalogFixture struct {
@@ -242,29 +501,10 @@ func insertBiomedicalCatalogFixture(
 	}
 	defer tx.Rollback(context.Background())
 
-	homePayload := fmt.Sprintf(`{
-		"active_journals":{"analysis":%s,"items":[]},
-		"catalog_generation":%q,
-		"citation_momentum":{"analysis":%s,"items":[]},
-		"coverage":{"analysis":%s,"citation_coverage_ratio":{"state":"known","value":1},"jcr_metric_year":2025,"mesh_coverage_ratio":{"state":"known","value":1},"publication_type_coverage_ratio":{"state":"known","value":1},"taxonomy_version":"biomedical-jcr-subjects/v1"},
-		"entity_momentum":{"analysis":%s,"items":[]},
-		"evidence_gaps":[],
-		"fixture_marker":%q,
-		"generated_at":"2026-07-17T08:30:00Z",
-		"latest_papers":{"analysis":%s,"items":[]},
-		"research_opportunities":{"analysis":%s,"items":[]},
-		"scope":{"jcr_metric_year":2025,"taxonomy_version":"biomedical-jcr-subjects/v1"},
-		"subject_momentum":{"analysis":%s,"items":[]}
-	}`,
-		biomedicalAnalysisJSON(0),
+	homePayload := biomedicalHomeFixturePayload(
 		generationID,
-		biomedicalAnalysisJSON(0),
-		biomedicalAnalysisJSON(0),
-		biomedicalAnalysisJSON(0),
-		options.homeMarker,
-		biomedicalAnalysisJSON(0),
-		biomedicalAnalysisJSON(0),
-		biomedicalAnalysisJSON(0),
+		options.homeSnapshotSchema,
+		options.omitHomeSnapshotSchema,
 	)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO public_catalog_home (generation_id, payload)
@@ -435,14 +675,140 @@ func insertBiomedicalGenerationBase(
 }
 
 func biomedicalAnalysisJSON(sampleSize int) string {
+	return biomedicalAnalysisJSONForWindow(
+		sampleSize,
+		biomedicalDetailWindowDays,
+	)
+}
+
+func biomedicalAnalysisJSONForWindow(sampleSize, windowDays int) string {
 	return fmt.Sprintf(`{
 		"coverage_ratio":{"state":"known","value":1},
 		"generated_at":{"state":"known","value":"2026-07-17T08:30:00Z"},
 		"missing_signals":[],
 		"sample_size":{"state":"known","value":%d},
 		"sources":{"state":"known","value":["test-fixture"]},
-		"window_days":{"state":"known","value":30}
+		"window_days":{"state":"known","value":%d}
+	}`, sampleSize, windowDays)
+}
+
+func biomedicalAnalysisJSONWithoutWindow(sampleSize int) string {
+	return fmt.Sprintf(`{
+		"coverage_ratio":{"state":"known","value":1},
+		"generated_at":{"state":"known","value":"2026-07-17T08:30:00Z"},
+		"missing_signals":[],
+		"sample_size":{"state":"known","value":%d},
+		"sources":{"state":"known","value":["test-fixture"]},
+		"window_days":{"state":"missing"}
 	}`, sampleSize)
+}
+
+func biomedicalHomeFixturePayload(
+	generationID uuid.UUID,
+	snapshotSchema string,
+	omitSnapshotSchema bool,
+) json.RawMessage {
+	if snapshotSchema == "" {
+		snapshotSchema = homeSnapshotSchemaVersion
+	}
+	snapshotSchemaField := fmt.Sprintf(
+		`"snapshot_schema":%q,`,
+		snapshotSchema,
+	)
+	if omitSnapshotSchema {
+		snapshotSchemaField = ""
+	}
+	emptySnapshotPagination := `{
+		"has_more":false,
+		"limit":0,
+		"next_cursor":null,
+		"total":0
+	}`
+	emptyPaperCollection := func(windowDays int) string {
+		return fmt.Sprintf(
+			`{"analysis":%s,"items":[],"pagination":%s}`,
+			biomedicalAnalysisJSONForWindow(0, windowDays),
+			emptySnapshotPagination,
+		)
+	}
+	publicationUpdates := fmt.Sprintf(`{
+		"calendar_date":"2026-07-17",
+		"calendar_timezone":"UTC",
+		"formal_publications_today":%s,
+		"recent_acceptances":%s,
+		"recent_online_first":%s
+	}`,
+		emptyPaperCollection(1),
+		emptyPaperCollection(biomedicalHomeWindowDays),
+		emptyPaperCollection(biomedicalHomeWindowDays),
+	)
+	return json.RawMessage(fmt.Sprintf(`{
+		%s
+		"active_journals":{"analysis":%s,"items":[]},
+		"catalog_generation":%q,
+		"citation_momentum":{"analysis":%s,"items":[]},
+		"coverage":{"analysis":%s,"citation_coverage_ratio":{"state":"known","value":1},"jcr_metric_year":2025,"mesh_coverage_ratio":{"state":"known","value":1},"publication_type_coverage_ratio":{"state":"known","value":1},"taxonomy_version":"biomedical-jcr-subjects/v1"},
+		"entity_momentum":{"analysis":%s,"items":[]},
+		"evidence_gaps":[],
+		"generated_at":"2026-07-17T08:30:00Z",
+		"latest_papers":%s,
+		"publication_updates":%s,
+		"research_opportunities":{"analysis":%s,"items":[]},
+		"scope":{"jcr_metric_year":2025,"taxonomy_version":"biomedical-jcr-subjects/v1"},
+		"subject_momentum":{"analysis":%s,"items":[]}
+	}`,
+		snapshotSchemaField,
+		biomedicalAnalysisJSONForWindow(0, biomedicalHomeWindowDays),
+		generationID,
+		biomedicalAnalysisJSON(0),
+		biomedicalAnalysisJSON(0),
+		biomedicalAnalysisJSONForWindow(0, biomedicalHomeWindowDays),
+		emptyPaperCollection(biomedicalHomeWindowDays),
+		publicationUpdates,
+		biomedicalAnalysisJSONWithoutWindow(0),
+		biomedicalAnalysisJSONForWindow(0, biomedicalHomeWindowDays),
+	))
+}
+
+func homeWindowPaper(
+	id uuid.UUID,
+	journalID uuid.UUID,
+	title string,
+	publishedAt time.Time,
+) publishedPaper {
+	summary := strictHomeContractPaper()
+	summary["id"] = id.String()
+	summary["canonical_key"] = "doi:10.1000/" + id.String()
+	summary["title"] = title
+	summary["published_at"] = strictKnown(
+		publishedAt.UTC().Format(time.RFC3339Nano),
+	)
+	summary["journal"] = map[string]any{
+		"id":    journalID.String(),
+		"slug":  "journal-window-test",
+		"title": "Journal Window Test",
+	}
+	summaryPayload, err := json.Marshal(summary)
+	if err != nil {
+		panic(fmt.Sprintf("encode Home window paper fixture: %v", err))
+	}
+	return publishedPaper{
+		ID:               id,
+		CanonicalKey:     "doi:10.1000/" + id.String(),
+		Title:            title,
+		PublishedAtState: "known",
+		PublishedAt:      &publishedAt,
+		SummaryPayload:   summaryPayload,
+		biomedical: biomedicalPaperPayload{
+			Journal: journalReference{
+				ID:    journalID,
+				Slug:  "journal-window-test",
+				Title: "Journal Window Test",
+			},
+			MeSHHeadings:          catalogValue{State: "missing"},
+			PublicationTypesState: catalogValue{State: "missing"},
+		},
+	}
 }
 
 func biomedicalSubjectDetailJSON(subjectID uuid.UUID) string {

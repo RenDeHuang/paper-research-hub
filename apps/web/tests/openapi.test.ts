@@ -745,6 +745,237 @@ describe("OpenAPI contract", () => {
       },
     })
   })
+
+  it("describes generation-bound Home publication updates", () => {
+    expect(
+      getRecord(document, "components", "schemas", "HomeResponse"),
+    ).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: expect.arrayContaining([
+        "publication_updates",
+        "snapshot_schema",
+      ]),
+      properties: {
+        publication_updates: {
+          $ref: "#/components/schemas/HomePublicationUpdates",
+        },
+        snapshot_schema: {
+          type: "string",
+          const: "home-snapshot/v2",
+        },
+      },
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "HomePublicationUpdates"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "calendar_date",
+        "calendar_timezone",
+        "formal_publications_today",
+        "recent_acceptances",
+        "recent_online_first",
+      ],
+      properties: {
+        calendar_date: {
+          type: "string",
+          format: "date",
+        },
+        calendar_timezone: {
+          type: "string",
+          const: "UTC",
+        },
+        formal_publications_today: {
+          $ref: "#/components/schemas/PublicationUpdateCollection",
+        },
+        recent_acceptances: {
+          $ref: "#/components/schemas/PublicationUpdateCollection",
+        },
+        recent_online_first: {
+          $ref: "#/components/schemas/PublicationUpdateCollection",
+        },
+      },
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "PublicationEventKind"),
+    ).toEqual({
+      type: "string",
+      enum: [
+        "print_published",
+        "electronic_published",
+        "ahead_of_print",
+        "accepted",
+      ],
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "PublicationUpdateEvent"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "kind",
+        "date",
+        "date_precision",
+        "publication_status",
+        "publication_model",
+        "provenance",
+      ],
+      properties: {
+        date: {
+          type: "string",
+          format: "date",
+        },
+        date_precision: {
+          type: "string",
+          const: "day",
+        },
+        kind: {
+          $ref: "#/components/schemas/PublicationEventKind",
+        },
+        publication_status: {
+          type: "string",
+          minLength: 1,
+        },
+        publication_model: {
+          type: ["string", "null"],
+          minLength: 1,
+        },
+        provenance: {
+          $ref: "#/components/schemas/PublicationEventProvenance",
+        },
+      },
+    })
+
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "PublicationEventProvenance",
+      ),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "source",
+        "source_record_id",
+        "normalized_assertion_id",
+        "projection_assertion_id",
+        "source_path",
+        "status_raw",
+      ],
+      properties: {
+        source: {
+          type: "string",
+          const: "pubmed",
+        },
+        source_record_id: {
+          type: "string",
+          format: "uuid",
+        },
+        normalized_assertion_id: {
+          type: "string",
+          format: "uuid",
+        },
+        projection_assertion_id: {
+          type: "string",
+          format: "uuid",
+        },
+        source_path: {
+          type: "string",
+          minLength: 1,
+        },
+        status_raw: {
+          type: "string",
+          minLength: 1,
+        },
+      },
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "PublicationUpdateItem"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: ["paper", "event"],
+      properties: {
+        paper: {
+          $ref: "#/components/schemas/PaperSummary",
+        },
+        event: {
+          $ref: "#/components/schemas/PublicationUpdateEvent",
+        },
+      },
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "PublicationUpdateCollection"),
+    ).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["analysis", "items", "pagination"],
+      properties: {
+        analysis: {
+          $ref: "#/components/schemas/AnalysisMetadata",
+        },
+        items: {
+          type: "array",
+          items: {
+            $ref: "#/components/schemas/PublicationUpdateItem",
+          },
+        },
+        pagination: {
+          $ref: "#/components/schemas/SnapshotPagination",
+        },
+      },
+    })
+  })
+
+  it("requires snapshot pagination on paper analysis collections", () => {
+    expect(
+      getRecord(document, "components", "schemas", "PaperAnalysisCollection"),
+    ).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["analysis", "items", "pagination"],
+      properties: {
+        pagination: {
+          $ref: "#/components/schemas/SnapshotPagination",
+        },
+      },
+    })
+
+    expect(
+      getRecord(document, "components", "schemas", "SnapshotPagination"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: ["limit", "total", "next_cursor", "has_more"],
+      properties: {
+        limit: {
+          type: "integer",
+          minimum: 0,
+        },
+        total: {
+          type: "integer",
+          minimum: 0,
+        },
+        next_cursor: {
+          type: "null",
+          const: null,
+        },
+        has_more: {
+          type: "boolean",
+          const: false,
+        },
+      },
+    })
+  })
 })
 
 describe("generated OpenAPI TypeScript types", () => {

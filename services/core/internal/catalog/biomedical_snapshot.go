@@ -695,6 +695,14 @@ func buildHomeSnapshot(
 	recentPapers, _, err := papersInWindow(
 		input,
 		papers,
+		biomedicalHomeWindowDays,
+	)
+	if err != nil {
+		return nil, err
+	}
+	coveragePapers, _, err := papersInWindow(
+		input,
+		papers,
 		biomedicalDetailWindowDays,
 	)
 	if err != nil {
@@ -711,7 +719,7 @@ func buildHomeSnapshot(
 	knownCitations := 0
 	knownMeSH := 0
 	knownPublicationTypes := 0
-	for _, paper := range papers {
+	for _, paper := range coveragePapers {
 		if paper.CitationCountState == "known" {
 			knownCitations++
 		}
@@ -725,29 +733,33 @@ func buildHomeSnapshot(
 	coverageAnalysis := analysisMetadata(
 		input,
 		biomedicalDetailWindowDays,
-		len(papers),
-		catalogValue{State: "known", Value: float64(1)},
+		len(coveragePapers),
+		dateCoverageValue(papers),
 		sources,
 		[]string{
 			"citation_snapshots_not_published",
 			"open_fulltext_not_published",
 		},
 	)
-	unavailableAnalysis := func(signal string) map[string]any {
+	unavailableAnalysis := func(
+		windowDays int,
+		sampleSize int,
+		signal string,
+	) map[string]any {
 		return analysisMetadata(
 			input,
-			biomedicalDetailWindowDays,
-			len(papers),
+			windowDays,
+			sampleSize,
 			catalogValue{State: "missing"},
 			sources,
 			[]string{signal},
 		)
 	}
-	return marshalCatalogPayload(map[string]any{
+	payload, err := marshalCatalogPayload(map[string]any{
 		"active_journals": map[string]any{
 			"analysis": analysisMetadata(
 				input,
-				biomedicalDetailWindowDays,
+				biomedicalHomeWindowDays,
 				len(recentPapers),
 				dateCoverageValue(papers),
 				sources,
@@ -757,16 +769,29 @@ func buildHomeSnapshot(
 		},
 		"citation_momentum": citationMomentum,
 		"coverage": map[string]any{
-			"analysis":                        coverageAnalysis,
-			"citation_coverage_ratio":         ratioCatalogValue(knownCitations, len(papers)),
-			"jcr_metric_year":                 input.JCRMetricYear,
-			"mesh_coverage_ratio":             ratioCatalogValue(knownMeSH, len(papers)),
-			"publication_type_coverage_ratio": ratioCatalogValue(knownPublicationTypes, len(papers)),
-			"taxonomy_version":                input.SubjectVersion,
+			"analysis": coverageAnalysis,
+			"citation_coverage_ratio": ratioCatalogValue(
+				knownCitations,
+				len(coveragePapers),
+			),
+			"jcr_metric_year": input.JCRMetricYear,
+			"mesh_coverage_ratio": ratioCatalogValue(
+				knownMeSH,
+				len(coveragePapers),
+			),
+			"publication_type_coverage_ratio": ratioCatalogValue(
+				knownPublicationTypes,
+				len(coveragePapers),
+			),
+			"taxonomy_version": input.SubjectVersion,
 		},
 		"entity_momentum": map[string]any{
-			"analysis": unavailableAnalysis("entity_trend_analysis_not_published"),
-			"items":    []any{},
+			"analysis": unavailableAnalysis(
+				biomedicalHomeWindowDays,
+				len(recentPapers),
+				"entity_trend_analysis_not_published",
+			),
+			"items": []any{},
 		},
 		"evidence_gaps": []string{
 			"entity_trend_analysis_not_published",
@@ -778,8 +803,11 @@ func buildHomeSnapshot(
 		"generated_at":        input.GeneratedAt.UTC().Format(time.RFC3339Nano),
 		"latest_papers":       latestPapers,
 		"publication_updates": publicationUpdates,
+		"snapshot_schema":     homeSnapshotSchemaVersion,
 		"research_opportunities": map[string]any{
 			"analysis": unavailableAnalysis(
+				0,
+				0,
 				"research_opportunity_analysis_not_published",
 			),
 			"items": []any{},
@@ -789,10 +817,18 @@ func buildHomeSnapshot(
 			"taxonomy_version": input.SubjectVersion,
 		},
 		"subject_momentum": map[string]any{
-			"analysis": unavailableAnalysis("subject_trend_analysis_not_published"),
-			"items":    []any{},
+			"analysis": unavailableAnalysis(
+				biomedicalHomeWindowDays,
+				len(recentPapers),
+				"subject_trend_analysis_not_published",
+			),
+			"items": []any{},
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 type publicationUpdateItem struct {
@@ -1036,7 +1072,7 @@ func analysisMetadata(
 	sources []string,
 	missingSignals []string,
 ) map[string]any {
-	return map[string]any{
+	metadata := map[string]any{
 		"coverage_ratio": coverage,
 		"formula_version": catalogValue{
 			State: "known",
@@ -1055,11 +1091,15 @@ func analysisMetadata(
 			State: "known",
 			Value: sources,
 		},
-		"window_days": catalogValue{
+		"window_days": catalogValue{State: "missing"},
+	}
+	if windowDays > 0 {
+		metadata["window_days"] = catalogValue{
 			State: "known",
 			Value: windowDays,
-		},
+		}
 	}
+	return metadata
 }
 
 func recentPaperCollection(
@@ -1107,7 +1147,18 @@ func papersInWindow(
 			ErrCatalogNotReady,
 		)
 	}
-	cutoff := input.GeneratedAt.UTC().AddDate(0, 0, -windowDays)
+	asOf := input.GeneratedAt.UTC()
+	calendarDate := time.Date(
+		asOf.Year(),
+		asOf.Month(),
+		asOf.Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	windowStart := calendarDate.AddDate(0, 0, -(windowDays - 1))
 	recent := make([]publishedPaper, 0, len(papers))
 	knownDates := 0
 	for _, paper := range papers {
@@ -1122,8 +1173,8 @@ func papersInWindow(
 			)
 		}
 		knownDates++
-		if paper.PublishedAt.Before(cutoff) ||
-			paper.PublishedAt.After(input.GeneratedAt.UTC()) {
+		if paper.PublishedAt.Before(windowStart) ||
+			paper.PublishedAt.After(asOf) {
 			continue
 		}
 		recent = append(recent, paper)
@@ -1381,5 +1432,17 @@ func bindCatalogGeneration(
 		return nil, fmt.Errorf("decode biomedical Home snapshot: %w", err)
 	}
 	document["catalog_generation"] = generationID.String()
-	return marshalCatalogPayload(document)
+	bound, err := marshalCatalogPayload(document)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateHomeSnapshotPayload(bound); err != nil {
+		return nil, fmt.Errorf(
+			"%w: generated Home snapshot violates %s: %v",
+			ErrCatalogNotReady,
+			homeSnapshotSchemaVersion,
+			err,
+		)
+	}
+	return bound, nil
 }

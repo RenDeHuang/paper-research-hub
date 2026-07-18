@@ -9,42 +9,44 @@ import DiscoveryRail from "../app/components/DiscoveryRail.vue"
 import EvidenceBar from "../app/components/EvidenceBar.vue"
 import OpportunityMatrix from "../app/components/OpportunityMatrix.vue"
 import PaperCard from "../app/components/PaperCard.vue"
+import PublicationEventCard from "../app/components/PublicationEventCard.vue"
+import PublicationUpdateList from "../app/components/PublicationUpdateList.vue"
 import SearchCommand from "../app/components/SearchCommand.vue"
 import SyncStatus from "../app/components/SyncStatus.vue"
 import TrendSparkline from "../app/components/TrendSparkline.vue"
 
 describe("AppHeader", () => {
-  it("renders the fixed primary navigation and an accessible search entry", async () => {
+  it("renders the daily intelligence navigation and one search utility", async () => {
     const wrapper = await mountSuspended(AppHeader, { route: "/" })
     const links = wrapper.findAll('nav[aria-label="一级导航"] a')
 
     expect(links.map((link) => link.text())).toEqual([
-      "首页",
+      "今日",
+      "论文",
       "学科",
       "期刊",
-      "论文",
       "趋势",
-      "研究机会",
     ])
     expect(links.map((link) => link.attributes("href"))).toEqual([
       "/",
+      "/papers",
       "/subjects",
       "/journals",
-      "/papers",
       "/trends",
-      "/opportunities",
     ])
     expect(wrapper.get(".app-header__brand").text()).toBe("medpaperhub")
     expect(wrapper.text()).not.toContain("Paper Research Hub")
     expect(links[0]?.attributes("aria-current")).toBe("page")
-    expect(wrapper.get(".app-header__route-name").text()).toBe("首页")
-    const searchLink = wrapper.get('a[href="/#global-search"]')
-    const dataStatusLink = wrapper.get('a[href="/#sync-status"]')
+    expect(wrapper.get(".app-header__route-name").text()).toBe("今日")
+    const utilityLinks = wrapper.findAll(".app-header__utility-link")
+    const searchLink = wrapper.get('a[href="/papers#papers-q"]')
 
+    expect(utilityLinks).toHaveLength(1)
     expect(searchLink.text()).toContain("搜索")
+    expect(searchLink.attributes("aria-label")).toBe("搜索论文")
     expect(searchLink.attributes("aria-current")).toBeUndefined()
-    expect(dataStatusLink.text()).toBe("数据状态")
-    expect(dataStatusLink.attributes("aria-label")).toContain("更新时间")
+    expect(wrapper.text()).not.toContain("数据状态")
+    expect(wrapper.text()).not.toContain("研究机会")
     expect(wrapper.get("button.app-header__menu-button").attributes()).toMatchObject({
       "aria-controls": "primary-navigation",
       "aria-expanded": "false",
@@ -179,44 +181,178 @@ describe("DiscoveryRail", () => {
 })
 
 describe("SyncStatus", () => {
-  it("renders updated time, data range, and coverage from explicit data states", async () => {
+  it("renders one compact publication scope status row", async () => {
     const wrapper = await mountSuspended(SyncStatus, {
       props: {
-        coverage: { label: "等待首次同步", state: "unknown" },
-        dataRange: { label: "等待首次同步", state: "missing" },
-        updatedAt: { label: "尚未生成", state: "missing" },
+        calendarDate: "2026-07-17",
+        calendarTimezone: "UTC",
+        generatedAt: "2026-07-17T08:30:00Z",
+        jcrMetricYear: 2025,
       },
     })
     const values = wrapper.findAll("dd")
 
     expect(wrapper.attributes("id")).toBe("sync-status")
     expect(wrapper.findAll("dt").map((item) => item.text())).toEqual([
-      "更新时间",
-      "数据范围",
-      "覆盖率",
+      "日报日期",
+      "更新",
+      "时区",
+      "收录范围",
     ])
     expect(values.map((item) => item.text())).toEqual([
-      "尚未生成",
-      "等待首次同步",
-      "等待首次同步",
-    ])
-    expect(values.map((item) => item.attributes("data-value-state"))).toEqual([
-      "missing",
-      "missing",
-      "unknown",
+      "2026-07-17",
+      "2026-07-17 08:30 UTC",
+      "UTC",
+      "JCR 2025 · Q1 / JIF ≥ 10",
     ])
   })
 })
 
+const publicationPaper = {
+  citation_count: { state: "known" as const, value: 27 },
+  id: "00000000-0000-4000-8000-000000000101",
+  journal: {
+    id: "00000000-0000-4000-8000-000000000201",
+    slug: "nature-medicine",
+    title: "Nature Medicine",
+  },
+  publication_types: ["Journal Article"],
+  title: "Single-cell atlas of treatment response",
+}
+
+const publicationEvent = {
+  date: "2026-07-18",
+  date_precision: "day" as const,
+  kind: "electronic_published" as const,
+  provenance: {
+    normalized_assertion_id: "00000000-0000-4000-8000-000000000301",
+    projection_assertion_id: "00000000-0000-4000-8000-000000000302",
+    source: "pubmed" as const,
+    source_path: "/PubmedArticle/PubmedData/History/PubMedPubDate[2]",
+    source_record_id: "00000000-0000-4000-8000-000000000303",
+    status_raw: "epublish",
+  },
+  publication_model: "Electronic",
+  publication_status: "epublish",
+}
+
+describe("PublicationEventCard", () => {
+  it("shows the publication event without exposing internal provenance IDs", async () => {
+    const wrapper = await mountSuspended(PublicationEventCard, {
+      props: {
+        item: {
+          event: publicationEvent,
+          paper: publicationPaper,
+        },
+      },
+    })
+
+    expect(wrapper.attributes("data-event-kind")).toBe("electronic_published")
+    expect(wrapper.get("h3").text()).toBe(publicationPaper.title)
+    expect(wrapper.get(`a[href="/papers/${publicationPaper.id}"]`).exists()).toBe(true)
+    expect(wrapper.get('a[href="/journals/nature-medicine"]').text()).toBe(
+      "Nature Medicine",
+    )
+    expect(wrapper.get("time").attributes("datetime")).toBe("2026-07-18")
+    expect(wrapper.text()).toContain("电子正式发表")
+    expect(wrapper.text()).toContain("Journal Article")
+    expect(wrapper.text()).toContain("引用 27")
+    expect(wrapper.text()).not.toContain(
+      publicationEvent.provenance.normalized_assertion_id,
+    )
+    expect(wrapper.text()).not.toContain(
+      publicationEvent.provenance.projection_assertion_id,
+    )
+  })
+})
+
+describe("PublicationUpdateList", () => {
+  it("preserves API order and keeps same-paper events distinct", async () => {
+    const wrapper = await mountSuspended(PublicationUpdateList, {
+      props: {
+        collection: {
+          analysis: {},
+          items: [
+            {
+              event: publicationEvent,
+              paper: publicationPaper,
+            },
+            {
+              event: {
+                ...publicationEvent,
+                kind: "print_published",
+                publication_status: "ppublish",
+                provenance: {
+                  ...publicationEvent.provenance,
+                  status_raw: "ppublish",
+                },
+              },
+              paper: publicationPaper,
+            },
+          ],
+          pagination: {
+            has_more: false,
+            limit: 2,
+            next_cursor: null,
+            total: 2,
+          },
+        },
+        emptyTitle: "暂无正式发表",
+        headingId: "publication-test-heading",
+        kicker: "今日",
+        title: "正式发表",
+      },
+    })
+
+    expect(wrapper.get("h2").attributes("id")).toBe("publication-test-heading")
+    expect(
+      wrapper.findAll("[data-event-kind]").map((item) =>
+        item.attributes("data-event-kind"),
+      ),
+    ).toEqual(["electronic_published", "print_published"])
+    expect(wrapper.findAll("h3").map((heading) => heading.text())).toEqual([
+      publicationPaper.title,
+      publicationPaper.title,
+    ])
+  })
+
+  it("renders a short real empty state without example papers", async () => {
+    const wrapper = await mountSuspended(PublicationUpdateList, {
+      props: {
+        collection: {
+          analysis: {},
+          items: [],
+          pagination: {
+            has_more: false,
+            limit: 0,
+            next_cursor: null,
+            total: 0,
+          },
+        },
+        emptyTitle: "暂无在线优先文章",
+        headingId: "publication-empty-heading",
+        title: "在线优先",
+      },
+    })
+
+    expect(wrapper.get("[data-publication-empty]").text()).toBe(
+      "暂无在线优先文章",
+    )
+    expect(wrapper.find("[data-event-kind]").exists()).toBe(false)
+    expect(wrapper.text()).not.toContain("示例")
+  })
+})
+
 describe("AppFooter", () => {
-  it("links back to search without announcing the fragment as the current page", async () => {
+  it("keeps the footer focused on the publication scope", async () => {
     const wrapper = await mountSuspended(AppFooter, { route: "/" })
-    const searchLink = wrapper.get('a[href="/#global-search"]')
 
     expect(wrapper.get(".app-footer__brand").text()).toBe("medpaperhub")
     expect(wrapper.text()).not.toContain("Paper Research Hub")
-    expect(searchLink.text()).toBe("返回搜索")
-    expect(searchLink.attributes("aria-current")).toBeUndefined()
+    expect(wrapper.text()).toContain("医学与生物学")
+    expect(wrapper.text()).toContain("JCR Q1 或 JIF ≥ 10")
+    expect(wrapper.find("a").exists()).toBe(false)
+    expect(wrapper.text()).not.toContain("研究机会")
   })
 })
 

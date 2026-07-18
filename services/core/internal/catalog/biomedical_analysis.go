@@ -245,10 +245,18 @@ func validateTrendAnalysisRun(
 	raw rawBiomedicalAnalysisRun,
 	payload trendAnalysisRunInput,
 ) (persistedBiomedicalAnalysisRun, error) {
+	if payload.RecentWindowDays != biomedicalHomeWindowDays {
+		return persistedBiomedicalAnalysisRun{}, fmt.Errorf(
+			"%w: publication trend analysis run %s recent window = %d days, want %d",
+			ErrCatalogNotReady,
+			raw.ID,
+			payload.RecentWindowDays,
+			biomedicalHomeWindowDays,
+		)
+	}
 	if raw.AnalysisType != "publication_trends" ||
 		raw.PromptVersion != analysis.PublicationTrendFormulaVersion ||
 		payload.FormulaVersion != analysis.PublicationTrendFormulaVersion ||
-		payload.RecentWindowDays < 1 ||
 		payload.BaselineWindowDays <= payload.RecentWindowDays ||
 		payload.BaselineWindowDays > 3650 ||
 		payload.MinimumPaperCount < 1 ||
@@ -293,6 +301,35 @@ func validateTrendAnalysisRun(
 	)
 	if err != nil {
 		return persistedBiomedicalAnalysisRun{}, err
+	}
+	runAsOfDate := time.Date(
+		run.AsOf.UTC().Year(),
+		run.AsOf.UTC().Month(),
+		run.AsOf.UTC().Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	homeDate := time.Date(
+		input.GeneratedAt.UTC().Year(),
+		input.GeneratedAt.UTC().Month(),
+		input.GeneratedAt.UTC().Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	if !runAsOfDate.Equal(homeDate) {
+		return persistedBiomedicalAnalysisRun{}, fmt.Errorf(
+			"%w: publication trend analysis run %s as_of UTC calendar date %s does not match Home date %s",
+			ErrCatalogNotReady,
+			raw.ID,
+			runAsOfDate.Format("2006-01-02"),
+			homeDate.Format("2006-01-02"),
+		)
 	}
 	run.RecentWindowDays = payload.RecentWindowDays
 	run.BaselineWindowDays = payload.BaselineWindowDays

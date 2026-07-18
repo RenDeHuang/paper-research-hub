@@ -29,6 +29,7 @@ const emptyPaperPage = {
     has_more: false,
     limit: 20,
     next_cursor: null,
+    total: 0,
   },
 }
 
@@ -79,5 +80,7 @@ describe("biomedical paper catalog", () => {
     ]) {
       expect(wrapper.find(`[name="${removed}"]`).exists()).toBe(false)
     }
+    expect(wrapper.get("#results-heading").text()).toBe("0 篇论文")
+    expect(wrapper.get(".catalog-pagination").text()).toContain("共 0 条")
   })
 })

@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -48,6 +49,23 @@ type analysisTrendStateCounts struct {
 	snapshots int
 }
 
+type analysisTrendWindowDeclaration struct {
+	AsOf               string `json:"as_of"`
+	RecentWindowDays   int    `json:"recent_window_days"`
+	BaselineWindowDays int    `json:"baseline_window_days"`
+}
+
+type analysisTrendWindowEvidence struct {
+	AnalysisRunID       string `json:"analysis_run_id"`
+	AsOf                string `json:"as_of"`
+	RecentWindowDays    int    `json:"recent_window_days"`
+	BaselineWindowDays  int    `json:"baseline_window_days"`
+	RecentWindowStart   string `json:"recent_window_start"`
+	RecentWindowEnd     string `json:"recent_window_end"`
+	BaselineWindowStart string `json:"baseline_window_start"`
+	BaselineWindowEnd   string `json:"baseline_window_end"`
+}
+
 func TestPostgresAnalysisServicePersistsAcceptedTrendCohortAtomically(
 	t *testing.T,
 ) {
@@ -82,6 +100,7 @@ func TestPostgresAnalysisServicePersistsAcceptedTrendCohortAtomically(
 	}
 	assertPersistedTrendRun(t, fixture, summary)
 	assertTrendAcceptedCohort(t, fixture, summary.RunID)
+	assertTrendWindowEvidenceBoundToRun(t, fixture, summary.RunID)
 	assertFailedTrendTransactionLeavesNoPartialState(
 		t,
 		fixture,
@@ -377,6 +396,11 @@ func insertAnalysisTrendWorks(
 		},
 		{
 			venueID:     venueIDs[0],
+			methodID:    caseControlMethodID,
+			publishedAt: fixture.asOf.Add(-7 * 24 * time.Hour),
+		},
+		{
+			venueID:     venueIDs[0],
 			methodID:    cohortMethodID,
 			publishedAt: fixture.asOf.Add(-8 * 24 * time.Hour),
 		},
@@ -602,22 +626,71 @@ func assertTrendAcceptedCohort(
 		)
 	}
 
-	var recentCount, baselineCount int
+	var (
+		recentCount         int
+		baselineCount       int
+		recentWindowStart   time.Time
+		recentWindowEnd     time.Time
+		baselineWindowStart time.Time
+		baselineWindowEnd   time.Time
+	)
 	if err := fixture.pool.QueryRow(t.Context(), `
-		SELECT recent_paper_count, baseline_paper_count
+		SELECT
+			recent_paper_count,
+			baseline_paper_count,
+			recent_window_start,
+			recent_window_end,
+			baseline_window_start,
+			baseline_window_end
 		FROM publication_trend_snapshots
 		WHERE analysis_run_id = $1
 		  AND entity_type = 'subject'
 		  AND entity_id = 'oncology'
-	`, runID).Scan(&recentCount, &baselineCount); err != nil {
+	`, runID).Scan(
+		&recentCount,
+		&baselineCount,
+		&recentWindowStart,
+		&recentWindowEnd,
+		&baselineWindowStart,
+		&baselineWindowEnd,
+	); err != nil {
 		t.Fatalf("query Subject trend snapshot: %v", err)
 	}
-	if recentCount != 3 || baselineCount != 3 {
+	if recentCount != 3 || baselineCount != 4 {
 		t.Fatalf(
-			"Subject trend counts = recent %d baseline %d, want 3/3",
+			"Subject trend counts = recent %d baseline %d, want 3/4; D-7 must be baseline, not recent",
 			recentCount,
 			baselineCount,
 		)
+	}
+	calendarDate := time.Date(
+		fixture.asOf.UTC().Year(),
+		fixture.asOf.UTC().Month(),
+		fixture.asOf.UTC().Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	wantRecentStart := calendarDate.AddDate(0, 0, -6)
+	wantRecentEnd := fixture.asOf.UTC()
+	wantBaselineEnd := wantRecentStart
+	wantBaselineStart := wantBaselineEnd.AddDate(0, 0, -7)
+	for field, gotAndWant := range map[string][2]time.Time{
+		"recent_window_start":   {recentWindowStart, wantRecentStart},
+		"recent_window_end":     {recentWindowEnd, wantRecentEnd},
+		"baseline_window_start": {baselineWindowStart, wantBaselineStart},
+		"baseline_window_end":   {baselineWindowEnd, wantBaselineEnd},
+	} {
+		if !gotAndWant[0].Equal(gotAndWant[1]) {
+			t.Fatalf(
+				"%s = %s, want %s",
+				field,
+				gotAndWant[0].Format(time.RFC3339Nano),
+				gotAndWant[1].Format(time.RFC3339Nano),
+			)
+		}
 	}
 	if err := fixture.pool.QueryRow(t.Context(), `
 		SELECT recent_paper_count, baseline_paper_count
@@ -633,6 +706,100 @@ func assertTrendAcceptedCohort(
 			"Method trend counts = recent %d baseline %d, want 2/1; unassessed Work leaked into accepted cohort",
 			recentCount,
 			baselineCount,
+		)
+	}
+}
+
+func assertTrendWindowEvidenceBoundToRun(
+	t *testing.T,
+	fixture analysisTrendFixture,
+	runID uuid.UUID,
+) {
+	t.Helper()
+	var (
+		rawDeclaration      []byte
+		rawEvidence         []byte
+		recentWindowStart   time.Time
+		recentWindowEnd     time.Time
+		baselineWindowStart time.Time
+		baselineWindowEnd   time.Time
+	)
+	if err := fixture.pool.QueryRow(t.Context(), `
+		SELECT
+			r.input_payload,
+			s.evidence,
+			s.recent_window_start,
+			s.recent_window_end,
+			s.baseline_window_start,
+			s.baseline_window_end
+		FROM analysis_runs AS r
+		JOIN publication_trend_snapshots AS s
+		  ON s.analysis_run_id = r.id
+		WHERE r.id = $1
+		  AND s.entity_type = 'subject'
+		  AND s.entity_id = 'oncology'
+	`, runID).Scan(
+		&rawDeclaration,
+		&rawEvidence,
+		&recentWindowStart,
+		&recentWindowEnd,
+		&baselineWindowStart,
+		&baselineWindowEnd,
+	); err != nil {
+		t.Fatalf("query persisted trend window evidence: %v", err)
+	}
+
+	var declaration analysisTrendWindowDeclaration
+	if err := json.Unmarshal(rawDeclaration, &declaration); err != nil {
+		t.Fatalf("decode persisted trend window declaration: %v", err)
+	}
+	var evidence analysisTrendWindowEvidence
+	if err := json.Unmarshal(rawEvidence, &evidence); err != nil {
+		t.Fatalf("decode persisted trend window evidence: %v", err)
+	}
+
+	wantAsOf := fixture.asOf.UTC().Format(time.RFC3339Nano)
+	if declaration.AsOf != wantAsOf ||
+		declaration.RecentWindowDays != 7 ||
+		declaration.BaselineWindowDays != 14 {
+		t.Fatalf(
+			"trend run window declaration = %#v, want as_of %q and 7/14-day windows",
+			declaration,
+			wantAsOf,
+		)
+	}
+	for field, gotAndWant := range map[string][2]string{
+		"analysis_run_id":       {evidence.AnalysisRunID, runID.String()},
+		"as_of":                 {evidence.AsOf, declaration.AsOf},
+		"recent_window_start":   {evidence.RecentWindowStart, recentWindowStart.UTC().Format(time.RFC3339Nano)},
+		"recent_window_end":     {evidence.RecentWindowEnd, recentWindowEnd.UTC().Format(time.RFC3339Nano)},
+		"baseline_window_start": {evidence.BaselineWindowStart, baselineWindowStart.UTC().Format(time.RFC3339Nano)},
+		"baseline_window_end":   {evidence.BaselineWindowEnd, baselineWindowEnd.UTC().Format(time.RFC3339Nano)},
+	} {
+		if gotAndWant[0] != gotAndWant[1] {
+			t.Fatalf(
+				"trend evidence %s = %q, want %q",
+				field,
+				gotAndWant[0],
+				gotAndWant[1],
+			)
+		}
+	}
+	if evidence.RecentWindowDays != declaration.RecentWindowDays ||
+		evidence.BaselineWindowDays != declaration.BaselineWindowDays {
+		t.Fatalf(
+			"trend evidence window days = %d/%d, want run declaration %d/%d",
+			evidence.RecentWindowDays,
+			evidence.BaselineWindowDays,
+			declaration.RecentWindowDays,
+			declaration.BaselineWindowDays,
+		)
+	}
+	if evidence.RecentWindowEnd != evidence.AsOf {
+		t.Fatalf(
+			"trend evidence recent_window_end = %q, want as_of %q",
+			evidence.RecentWindowEnd,
+			evidence.AsOf,
 		)
 	}
 }

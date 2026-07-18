@@ -667,6 +667,15 @@ export interface components {
             publication_type_coverage_ratio: components["schemas"]["RatioCatalogValue"];
             taxonomy_version: string;
         };
+        HomePublicationUpdates: {
+            /** Format: date */
+            calendar_date: string;
+            /** @constant */
+            calendar_timezone: "UTC";
+            formal_publications_today: components["schemas"]["PublicationUpdateCollection"];
+            recent_acceptances: components["schemas"]["PublicationUpdateCollection"];
+            recent_online_first: components["schemas"]["PublicationUpdateCollection"];
+        };
         HomeResponse: {
             active_journals: components["schemas"]["JournalActivityCollection"];
             catalog_generation: string;
@@ -677,11 +686,14 @@ export interface components {
             /** Format: date-time */
             generated_at: string;
             latest_papers: components["schemas"]["PaperAnalysisCollection"];
+            publication_updates: components["schemas"]["HomePublicationUpdates"];
             research_opportunities: components["schemas"]["ResearchOpportunityAnalysisCollection"];
             scope: {
                 jcr_metric_year: number;
                 taxonomy_version: string;
             };
+            /** @constant */
+            snapshot_schema: "home-snapshot/v2";
             subject_momentum: components["schemas"]["SubjectTrendCollection"];
         };
         InsufficientEvidenceCatalogValue: {
@@ -819,6 +831,7 @@ export interface components {
         PaperAnalysisCollection: {
             analysis: components["schemas"]["AnalysisMetadata"];
             items: components["schemas"]["PaperSummary"][];
+            pagination: components["schemas"]["SnapshotPagination"];
         };
         PaperDetail: {
             abstract?: components["schemas"]["StringCatalogValue"];
@@ -914,11 +927,44 @@ export interface components {
             /** Format: uri-reference */
             type: string;
         };
+        /** @enum {string} */
+        PublicationEventKind: "print_published" | "electronic_published" | "ahead_of_print" | "accepted";
+        PublicationEventProvenance: {
+            /** Format: uuid */
+            normalized_assertion_id: string;
+            /** Format: uuid */
+            projection_assertion_id: string;
+            /** @constant */
+            source: "pubmed";
+            source_path: string;
+            /** Format: uuid */
+            source_record_id: string;
+            status_raw: string;
+        };
         PublicationTypesCatalogValue: {
             /** @constant */
             state: "known";
             value: string[];
         } | components["schemas"]["MissingCatalogValue"];
+        PublicationUpdateCollection: {
+            analysis: components["schemas"]["AnalysisMetadata"];
+            items: components["schemas"]["PublicationUpdateItem"][];
+            pagination: components["schemas"]["SnapshotPagination"];
+        };
+        PublicationUpdateEvent: {
+            /** Format: date */
+            date: string;
+            /** @constant */
+            date_precision: "day";
+            kind: components["schemas"]["PublicationEventKind"];
+            provenance: components["schemas"]["PublicationEventProvenance"];
+            publication_model: string | null;
+            publication_status: string;
+        };
+        PublicationUpdateItem: {
+            event: components["schemas"]["PublicationUpdateEvent"];
+            paper: components["schemas"]["PaperSummary"];
+        };
         RankingMetadata: {
             confidence?: components["schemas"]["RatioCatalogValue"];
             coverage?: components["schemas"]["RatioCatalogValue"];
@@ -979,6 +1025,14 @@ export interface components {
         ResearchOpportunityTriggerRule: {
             code: string;
             version: string;
+        };
+        SnapshotPagination: {
+            /** @constant */
+            has_more: false;
+            limit: number;
+            /** @constant */
+            next_cursor: null;
+            total: number;
         };
         /** @enum {string} */
         SourceName: "crossref" | "arxiv" | "openreview" | "s2" | "pubmed" | "pmc" | "openalex" | "springer_nature" | "elsevier" | "manual";

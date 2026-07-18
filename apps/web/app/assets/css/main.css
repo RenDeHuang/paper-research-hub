@@ -112,7 +112,6 @@
 
   --shell-max: 1360px;
   --shell-gutter: 16px;
-  --discovery-rail-width: 216px;
 
   color: var(--color-text);
   background: var(--color-bg);
@@ -202,10 +201,6 @@ svg {
   min-width: 0;
   padding-top: var(--space-10);
   padding-bottom: var(--space-16);
-}
-
-.app-shell__content > .discovery-rail {
-  display: none;
 }
 
 .shell-container {
@@ -582,20 +577,16 @@ td {
     --shell-gutter: 28px;
   }
 
-  .app-shell__content {
-    display: grid;
-    grid-template-columns: var(--discovery-rail-width) minmax(0, 1fr);
-    gap: var(--space-6);
-    align-items: start;
+  .publication-dashboard {
+    grid-template-columns: repeat(12, minmax(0, 1fr));
   }
 
-  .app-shell__content > .discovery-rail {
-    position: sticky;
-    top: 96px;
-    display: grid;
-    width: var(--discovery-rail-width);
-    max-height: none;
-    overflow: visible;
+  .publication-dashboard__formal {
+    grid-column: span 8;
+  }
+
+  .publication-dashboard__side {
+    grid-column: span 4;
   }
 
   .filter-panel {
@@ -610,7 +601,6 @@ td {
 @media (min-width: 1440px) {
   :root {
     --shell-gutter: 32px;
-    --discovery-rail-width: 232px;
   }
 }
 

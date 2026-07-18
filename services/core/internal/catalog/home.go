@@ -27,6 +27,13 @@ func (repository *Repository) Home(ctx context.Context) (Document, error) {
 			}
 			return Document{}, fmt.Errorf("query public Catalog Home snapshot: %w", err)
 		}
+		if err := validateHomeSnapshotPayload(payload); err != nil {
+			return Document{}, fmt.Errorf(
+				"%w: current Home snapshot is incompatible: %v",
+				ErrCatalogNotPublished,
+				err,
+			)
+		}
 		return Document{
 			Generation: generation,
 			Payload:    json.RawMessage(payload),

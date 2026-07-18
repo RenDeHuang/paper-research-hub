@@ -1,27 +1,126 @@
 import { expect, test, type Page } from "@playwright/test"
 
+const homeServerURLs = {
+  default: "http://127.0.0.1:3100",
+  catalogNotPublished: "http://127.0.0.1:3101",
+  upstreamError: "http://127.0.0.1:3102",
+} as const
+
 async function waitForNuxtHydration(page: Page) {
   await expect(page.locator(".app-header__menu-button")).toBeEnabled()
 }
 
-for (const width of [375, 768, 1024, 1440]) {
-  test(`keeps the shell accessible and overflow-free at ${width}px`, async ({
+async function gotoSSRHome(page: Page, baseURL: string) {
+  const response = await page.goto(baseURL)
+
+  if (response === null) {
+    throw new Error(`Expected an HTML document from ${baseURL}`)
+  }
+  expect(response.request().resourceType()).toBe("document")
+  expect(response.status()).toBe(200)
+
+  return response.text()
+}
+
+test.describe("first Home SSR states without client JavaScript", () => {
+  test.use({ javaScriptEnabled: false })
+
+  test("renders catalog_not_published as empty state in the first document HTML", async ({
     page,
   }) => {
-    await page.setViewportSize({ height: 900, width })
+    const html = await gotoSSRHome(
+      page,
+      homeServerURLs.catalogNotPublished,
+    )
+
+    expect(html).toContain('data-state="empty"')
+    expect(html).toContain("等待首次同步")
+    expect(html).toContain("公开目录尚未发布")
+    expect(html).not.toContain('data-home-section="formal-publications"')
+  })
+
+  test("renders an upstream Home API error in the first document HTML", async ({
+    page,
+  }) => {
+    const html = await gotoSSRHome(page, homeServerURLs.upstreamError)
+
+    expect(html).toContain('data-state="error"')
+    expect(html).toContain("暂时无法加载")
+    expect(html).toContain("重试")
+    expect(html).toContain("00000000-0000-4000-8000-000000000901")
+    expect(html).not.toContain('data-home-section="formal-publications"')
+  })
+})
+
+for (const viewport of [
+  { height: 844, width: 390 },
+  { height: 1024, width: 768 },
+  { height: 1000, width: 1440 },
+]) {
+  test(`keeps the daily shell accessible and overflow-free at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = []
+    const failedResponses: string[] = []
+    const pageErrors: string[] = []
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        consoleErrors.push(message.text())
+      }
+    })
+    page.on("pageerror", (error) => {
+      pageErrors.push(error.message)
+    })
+    page.on("response", (response) => {
+      if (response.status() >= 400) {
+        failedResponses.push(`${response.status()} ${response.url()}`)
+      }
+    })
+    await page.setViewportSize(viewport)
     await page.goto("/")
 
-    await expect(
-      page.getByRole("heading", {
-        level: 1,
-        name: "医学生物学研究情报，从新论文到可验证趋势",
-      }),
-    ).toBeVisible()
+    await expect(page.locator("h1")).toHaveText("medpaperhub 今日论文情报")
     await expect(page.locator('nav[aria-label="一级导航"]')).toBeAttached()
+    const search = page.getByRole("link", { exact: true, name: "搜索论文" })
+    await expect(search).toBeVisible()
+    await expect(search).toHaveAttribute("href", "/papers#papers-q")
+    await expect(page.locator(".app-header__route-name")).toHaveText("今日")
+    await expect(page.locator(".discovery-rail")).toHaveCount(0)
+    await expect(page.locator('form[role="search"]')).toHaveCount(0)
+    await expect(page.locator("body")).not.toContainText(
+      "医学生物学研究情报，从新论文到可验证趋势",
+    )
     await expect(
-      page.getByRole("link", { exact: true, name: "搜索" }),
+      page.getByRole("heading", { level: 2, name: "今日正式发表" }),
     ).toBeVisible()
-    await expect(page.locator(".app-header__route-name")).toHaveText("首页")
+    await expect(
+      page.getByRole("heading", { level: 2, name: "近期接收" }),
+    ).toBeVisible()
+    await expect(
+      page.getByRole("heading", { level: 2, name: "在线优先" }),
+    ).toBeVisible()
+    await expect(page.locator("[data-home-section]").first()).toHaveAttribute(
+      "data-home-section",
+      "formal-publications",
+    )
+    await expect(page.locator("[data-home-section]")).toHaveCount(6)
+    expect(
+      await page
+        .locator("[data-home-section]")
+        .evaluateAll((sections) =>
+          sections.map((section) => section.getAttribute("data-home-section")),
+        ),
+    ).toEqual([
+      "formal-publications",
+      "recent-acceptances",
+      "recent-online-first",
+      "trends",
+      "journals",
+      "subjects",
+    ])
+    await expect(page.locator("body")).toContainText(
+      "Prospective oncology cohort with external validation",
+    )
 
     const dimensions = await page.evaluate(() => ({
       clientWidth: document.documentElement.clientWidth,
@@ -54,30 +153,16 @@ for (const width of [375, 768, 1024, 1440]) {
 
     expect(undersizedTargets).toEqual([])
 
-    const rail = page.locator(".discovery-rail")
-    if (width < 1024) {
-      await expect(rail).toBeHidden()
-    } else {
-      await expect(rail).toBeVisible()
-      const railLayout = await rail.evaluate((element) => {
-        const style = getComputedStyle(element)
-        return {
-          overflowY: style.overflowY,
-          width: element.getBoundingClientRect().width,
-        }
-      })
-
-      expect(railLayout.width).toBe(width >= 1440 ? 232 : 216)
-      expect(["auto", "scroll"]).not.toContain(railLayout.overflowY)
-    }
-
     const shellOverflow = await page
       .locator(".app-shell__content, .app-shell__main")
       .evaluateAll((elements) =>
         elements.map((element) => getComputedStyle(element).overflowY),
-      )
+    )
     expect(shellOverflow).not.toContain("auto")
     expect(shellOverflow).not.toContain("scroll")
+    expect(consoleErrors).toEqual([])
+    expect(failedResponses).toEqual([])
+    expect(pageErrors).toEqual([])
   })
 }
 
@@ -126,7 +211,7 @@ test("reduces transition and animation durations when motion is reduced", async 
   await page.goto("/")
 
   const durations = await page
-    .getByRole("button", { name: "搜索" })
+    .getByRole("link", { name: "搜索论文" })
     .evaluate((element) => {
       const style = getComputedStyle(element)
       const toMilliseconds = (duration: string) => {
@@ -146,46 +231,6 @@ test("reduces transition and animation durations when motion is reduced", async 
 
   expect(Math.max(...durations.animation)).toBeLessThanOrEqual(0.01)
   expect(Math.max(...durations.transition)).toBeLessThanOrEqual(0.01)
-})
-
-test("loads a shareable search query and submits the trimmed default URL", async ({
-  page,
-}) => {
-  await page.goto("/?q=shared%20query")
-  await waitForNuxtHydration(page)
-  const search = page.getByRole("combobox", {
-    name: "搜索医学生物学论文",
-  })
-
-  await expect(search).toHaveValue("shared query")
-  await search.fill("  agent systems  ")
-  await page.getByRole("button", { name: "搜索" }).click()
-
-  await expect(page).toHaveURL(/\/papers\?q=agent(\+|%20)systems$/)
-})
-
-test("restores the homepage search query through browser history", async ({
-  page,
-}) => {
-  const search = page.getByRole("combobox", {
-    name: "搜索医学生物学论文",
-  })
-
-  await page.goto("/?q=first")
-  await waitForNuxtHydration(page)
-  await expect(search).toHaveValue("first")
-
-  await page.goto("/?q=second")
-  await waitForNuxtHydration(page)
-  await expect(search).toHaveValue("second")
-
-  await page.goBack()
-  await expect(page).toHaveURL(/\/\?q=first$/)
-  await expect(search).toHaveValue("first")
-
-  await page.goForward()
-  await expect(page).toHaveURL(/\/\?q=second$/)
-  await expect(search).toHaveValue("second")
 })
 
 for (const route of [

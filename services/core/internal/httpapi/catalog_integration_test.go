@@ -66,6 +66,107 @@ func TestPublicCatalogGETRoutesReadPublishedGeneration(t *testing.T) {
 	}
 }
 
+func TestCatalogHomeReturnsPublicationUpdatesContract(t *testing.T) {
+	pool := openHTTPAPITestPool(t)
+	insertHTTPAPICatalogFixture(t, pool)
+	handler := newCatalogTestHandler(t, pool)
+
+	response := serveWithHandler(handler, http.MethodGet, "/api/v1/home")
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"GET /api/v1/home status = %d, want 200; body=%s",
+			response.Code,
+			response.Body,
+		)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode Home response: %v", err)
+	}
+	updates, ok := body["publication_updates"].(map[string]any)
+	if !ok {
+		t.Fatalf(
+			"publication_updates = %#v, want object; body=%s",
+			body["publication_updates"],
+			response.Body,
+		)
+	}
+	if got := updates["calendar_date"]; got != "2026-07-16" {
+		t.Fatalf("publication_updates.calendar_date = %#v, want 2026-07-16", got)
+	}
+	if got := updates["calendar_timezone"]; got != "UTC" {
+		t.Fatalf("publication_updates.calendar_timezone = %#v, want UTC", got)
+	}
+	for _, name := range []string{
+		"formal_publications_today",
+		"recent_acceptances",
+		"recent_online_first",
+	} {
+		collection, ok := updates[name].(map[string]any)
+		if !ok {
+			t.Fatalf("publication_updates.%s = %#v, want object", name, updates[name])
+		}
+		for _, field := range []string{"analysis", "items", "pagination"} {
+			if _, exists := collection[field]; !exists {
+				t.Fatalf("publication_updates.%s is missing %s", name, field)
+			}
+		}
+	}
+}
+
+func TestCatalogHomeReturnsPaperAnalysisPagination(t *testing.T) {
+	pool := openHTTPAPITestPool(t)
+	insertHTTPAPICatalogFixture(t, pool)
+	handler := newCatalogTestHandler(t, pool)
+
+	response := serveWithHandler(handler, http.MethodGet, "/api/v1/home")
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"GET /api/v1/home status = %d, want 200; body=%s",
+			response.Code,
+			response.Body,
+		)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode Home response: %v", err)
+	}
+	latestPapers, ok := body["latest_papers"].(map[string]any)
+	if !ok {
+		t.Fatalf("latest_papers = %#v, want object", body["latest_papers"])
+	}
+	pagination, ok := latestPapers["pagination"].(map[string]any)
+	if !ok {
+		t.Fatalf("latest_papers.pagination = %#v, want object", latestPapers["pagination"])
+	}
+	if pagination["limit"] != float64(0) ||
+		pagination["total"] != float64(0) ||
+		pagination["next_cursor"] != nil ||
+		pagination["has_more"] != false {
+		t.Fatalf("latest_papers.pagination = %#v, want empty snapshot pagination", pagination)
+	}
+}
+
+func TestCatalogHomeRejectsIncompatibleSnapshotSchema(t *testing.T) {
+	pool := openHTTPAPITestPool(t)
+	insertHTTPAPICatalogFixtureWithSnapshotSchema(
+		t,
+		pool,
+		"home-snapshot/v1",
+	)
+	handler := newCatalogTestHandler(t, pool)
+
+	response := serveWithHandler(handler, http.MethodGet, "/api/v1/home")
+	assertProblem(
+		t,
+		response,
+		http.StatusServiceUnavailable,
+		"catalog_not_published",
+	)
+}
+
 func TestResearchOpportunityResponseUsesAnalysisMetadataFromCatalog(
 	t *testing.T,
 ) {
@@ -278,8 +379,19 @@ func TestPaperListMapsCursorValidationAndContextConflicts(t *testing.T) {
 	)
 	assertProblem(t, mismatch, http.StatusConflict, "cursor_context_mismatch")
 
-	cursor := *page.Pagination.NextCursor
-	tampered := cursor[:len(cursor)-1] + "A"
+	cursorParts := strings.Split(*page.Pagination.NextCursor, ".")
+	if len(cursorParts) != 2 || cursorParts[1] == "" {
+		t.Fatalf(
+			"cursor = %q, want payload.signature",
+			*page.Pagination.NextCursor,
+		)
+	}
+	replacement := byte('A')
+	if cursorParts[1][0] == replacement {
+		replacement = 'B'
+	}
+	cursorParts[1] = string(replacement) + cursorParts[1][1:]
+	tampered := strings.Join(cursorParts, ".")
 	invalid := serveWithHandler(
 		handler,
 		http.MethodGet,
@@ -334,6 +446,19 @@ func insertHTTPAPICatalogFixture(
 	pool *pgxpool.Pool,
 ) httpAPICatalogFixture {
 	t.Helper()
+	return insertHTTPAPICatalogFixtureWithSnapshotSchema(
+		t,
+		pool,
+		"home-snapshot/v2",
+	)
+}
+
+func insertHTTPAPICatalogFixtureWithSnapshotSchema(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	homeSnapshotSchema string,
+) httpAPICatalogFixture {
+	t.Helper()
 
 	fixture := httpAPICatalogFixture{
 		generationID:  uuid.New(),
@@ -384,14 +509,49 @@ func insertHTTPAPICatalogFixture(
 		t.Fatalf("insert HTTP API stats: %v", err)
 	}
 
-	analysisPayload := `{
+	analysisPayloadForWindow := func(sampleSize, windowDays int) string {
+		return fmt.Sprintf(`{
+			"coverage_ratio":{"state":"known","value":1},
+			"generated_at":{"state":"known","value":"2026-07-16T05:00:00Z"},
+			"missing_signals":[],
+			"sample_size":{"state":"known","value":%d},
+			"sources":{"state":"known","value":["test-fixture"]},
+			"window_days":{"state":"known","value":%d}
+		}`, sampleSize, windowDays)
+	}
+	analysisPayload := analysisPayloadForWindow(2, 30)
+	analysisPayloadWithoutWindow := `{
 		"coverage_ratio":{"state":"known","value":1},
 		"generated_at":{"state":"known","value":"2026-07-16T05:00:00Z"},
 		"missing_signals":[],
-		"sample_size":{"state":"known","value":2},
+		"sample_size":{"state":"known","value":0},
 		"sources":{"state":"known","value":["test-fixture"]},
-		"window_days":{"state":"known","value":30}
+		"window_days":{"state":"missing"}
 	}`
+	snapshotPagination := `{
+		"has_more":false,
+		"limit":0,
+		"next_cursor":null,
+		"total":0
+	}`
+	emptyPaperCollection := func(windowDays int) string {
+		return fmt.Sprintf(
+			`{"analysis":%s,"items":[],"pagination":%s}`,
+			analysisPayloadForWindow(0, windowDays),
+			snapshotPagination,
+		)
+	}
+	publicationUpdatesPayload := fmt.Sprintf(`{
+		"calendar_date":"2026-07-16",
+		"calendar_timezone":"UTC",
+		"formal_publications_today":%s,
+		"recent_acceptances":%s,
+		"recent_online_first":%s
+	}`,
+		emptyPaperCollection(1),
+		emptyPaperCollection(7),
+		emptyPaperCollection(7),
+	)
 	homePayload := fmt.Sprintf(`{
 		"active_journals":{"analysis":%s,"items":[]},
 		"catalog_generation":%q,
@@ -400,19 +560,23 @@ func insertHTTPAPICatalogFixture(
 		"entity_momentum":{"analysis":%s,"items":[]},
 		"evidence_gaps":[],
 		"generated_at":"2026-07-16T05:00:00Z",
-		"latest_papers":{"analysis":%s,"items":[]},
+		"latest_papers":%s,
+		"publication_updates":%s,
 		"research_opportunities":{"analysis":%s,"items":[]},
+		"snapshot_schema":%q,
 		"scope":{"jcr_metric_year":2025,"taxonomy_version":"biomedical-jcr-subjects/v1"},
 		"subject_momentum":{"analysis":%s,"items":[]}
 	}`,
-		analysisPayload,
+		analysisPayloadForWindow(2, 7),
 		fixture.generationID,
 		analysisPayload,
 		analysisPayload,
-		analysisPayload,
-		analysisPayload,
-		analysisPayload,
-		analysisPayload,
+		analysisPayloadForWindow(2, 7),
+		emptyPaperCollection(7),
+		publicationUpdatesPayload,
+		analysisPayloadWithoutWindow,
+		homeSnapshotSchema,
+		analysisPayloadForWindow(2, 7),
 	)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO public_catalog_home (generation_id, payload)

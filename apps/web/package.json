@@ -9,7 +9,7 @@
     "generate:api-types": "node scripts/generate-openapi-types.mjs",
     "check:api-types": "node scripts/generate-openapi-types.mjs --check",
     "lint": "eslint .",
-    "typecheck": "nuxt typecheck",
+    "typecheck": "nuxt typecheck && tsc --noEmit -p tsconfig.e2e.json",
     "test": "vitest run --config vitest.config.ts && vitest run --config vitest.e2e.config.ts",
     "test:e2e": "playwright test",
     "postinstall": "nuxt prepare"
@@ -23,6 +23,7 @@
     "@nuxt/eslint-config": "1.16.0",
     "@nuxt/test-utils": "3.23.0",
     "@playwright/test": "1.61.1",
+    "@types/node": "26.1.1",
     "@vue/test-utils": "2.4.11",
     "eslint": "10.7.0",
     "happy-dom": "20.10.6",

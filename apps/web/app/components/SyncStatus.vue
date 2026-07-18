@@ -1,33 +1,48 @@
 <script setup lang="ts">
-import {
-  presentDataValue,
-  type DataValue,
-} from "~/utils/dataValue"
-
 const props = defineProps<{
-  coverage: DataValue<number | string>
-  dataRange: DataValue<string>
-  updatedAt: DataValue<string>
+  calendarDate: string
+  calendarTimezone: "UTC"
+  generatedAt: string
+  jcrMetricYear: number
 }>()
 
+const updatedAt = computed(() => {
+  const value = new Date(props.generatedAt)
+  if (!Number.isFinite(value.valueOf())) {
+    throw new Error(`API 返回了无效时间: ${props.generatedAt}`)
+  }
+  const date = new Intl.DateTimeFormat("zh-CN", {
+    day: "2-digit",
+    month: "2-digit",
+    timeZone: "UTC",
+    year: "numeric",
+  }).format(value).replaceAll("/", "-")
+  const time = new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    hour12: false,
+    minute: "2-digit",
+    timeZone: "UTC",
+  }).format(value)
+  return `${date} ${time} UTC`
+})
+
 const items = computed(() => [
-  { label: "更新时间", value: presentDataValue(props.updatedAt) },
-  { label: "数据范围", value: presentDataValue(props.dataRange) },
-  { label: "覆盖率", value: presentDataValue(props.coverage) },
+  { label: "日报日期", value: props.calendarDate },
+  { label: "更新", value: updatedAt.value },
+  { label: "时区", value: props.calendarTimezone },
+  {
+    label: "收录范围",
+    value: `JCR ${props.jcrMetricYear} · Q1 / JIF ≥ 10`,
+  },
 ])
 </script>
 
 <template>
-  <section id="sync-status" class="sync-status" aria-label="数据状态">
+  <section id="sync-status" class="sync-status" aria-label="日报状态">
     <dl>
       <div v-for="item in items" :key="item.label">
         <dt>{{ item.label }}</dt>
-        <dd
-          :data-value-state="item.value.state"
-          :data-value-kind="item.value.kind"
-        >
-          {{ item.value.text }}
-        </dd>
+        <dd>{{ item.value }}</dd>
       </div>
     </dl>
   </section>
@@ -36,28 +51,29 @@ const items = computed(() => [
 <style scoped>
 .sync-status {
   min-width: 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-subtle);
 }
 
 dl {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(144px, 1fr));
-  gap: var(--space-2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  align-items: center;
   margin: 0;
 }
 
 dl > div {
-  display: grid;
-  gap: var(--space-1);
-  padding: var(--space-3);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
 }
 
 dt {
   color: var(--color-text-muted);
   font-size: var(--text-xs-size);
-  line-height: var(--text-xs-line);
 }
 
 dd {
@@ -65,15 +81,6 @@ dd {
   color: var(--color-text-strong);
   font-size: var(--text-sm-size);
   font-variant-numeric: tabular-nums;
-  font-weight: 700;
-  line-height: var(--text-sm-line);
-}
-
-[data-value-state="missing"],
-[data-value-state="unknown"] {
-  color: var(--color-text-muted);
-  font-family: var(--font-ui);
-  font-style: italic;
-  font-weight: 600;
+  font-weight: 750;
 }
 </style>

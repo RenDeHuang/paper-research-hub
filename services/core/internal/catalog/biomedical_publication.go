@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/analysis"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -23,7 +24,11 @@ type persistedPublicationTrendSnapshot struct {
 	EntityID                string
 	State                   string
 	Model                   string
+	RecentWindowStart       time.Time
+	RecentWindowEnd         time.Time
 	RecentPaperCount        int64
+	BaselineWindowStart     time.Time
+	BaselineWindowEnd       time.Time
 	BaselinePaperCount      int64
 	IndependentJournalCount int
 	IndependentTeamCount    int
@@ -146,7 +151,11 @@ func loadPersistedPublicationTrends(
 			entity_id,
 			state,
 			model,
+			recent_window_start,
+			recent_window_end,
 			recent_paper_count,
+			baseline_window_start,
+			baseline_window_end,
 			baseline_paper_count,
 			independent_journal_count,
 			independent_team_count,
@@ -179,7 +188,11 @@ func loadPersistedPublicationTrends(
 			&snapshot.EntityID,
 			&snapshot.State,
 			&snapshot.Model,
+			&snapshot.RecentWindowStart,
+			&snapshot.RecentWindowEnd,
 			&snapshot.RecentPaperCount,
+			&snapshot.BaselineWindowStart,
+			&snapshot.BaselineWindowEnd,
 			&snapshot.BaselinePaperCount,
 			&snapshot.IndependentJournalCount,
 			&snapshot.IndependentTeamCount,
@@ -204,6 +217,12 @@ func loadPersistedPublicationTrends(
 			snapshot.CohortRevision,
 			snapshot.FormulaVersion,
 			snapshot.GeneratedAt,
+		); err != nil {
+			return nil, err
+		}
+		if err := validatePersistedPublicationTrendWindows(
+			run,
+			snapshot,
 		); err != nil {
 			return nil, err
 		}
@@ -536,6 +555,65 @@ func validatePersistedSnapshotBinding(
 			kind,
 			run.ID,
 		)
+	}
+	return nil
+}
+
+func validatePersistedPublicationTrendWindows(
+	run persistedBiomedicalAnalysisRun,
+	snapshot persistedPublicationTrendSnapshot,
+) error {
+	windows, err := analysis.PublicationTrendCalendarWindowBoundaries(
+		run.AsOf,
+		run.RecentWindowDays,
+		run.BaselineWindowDays,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%w: publication trend analysis run %s has invalid window declarations: %v",
+			ErrCatalogNotReady,
+			run.ID,
+			err,
+		)
+	}
+	for _, boundary := range []struct {
+		name string
+		got  time.Time
+		want time.Time
+	}{
+		{
+			name: "recent_window_start",
+			got:  snapshot.RecentWindowStart,
+			want: windows.RecentStart,
+		},
+		{
+			name: "recent_window_end",
+			got:  snapshot.RecentWindowEnd,
+			want: windows.RecentEnd,
+		},
+		{
+			name: "baseline_window_start",
+			got:  snapshot.BaselineWindowStart,
+			want: windows.BaselineStart,
+		},
+		{
+			name: "baseline_window_end",
+			got:  snapshot.BaselineWindowEnd,
+			want: windows.BaselineEnd,
+		},
+	} {
+		if !boundary.got.Equal(boundary.want) {
+			return fmt.Errorf(
+				"%w: publication trend snapshot %s:%s %s = %s, want %s from analysis run %s",
+				ErrCatalogNotReady,
+				snapshot.EntityType,
+				snapshot.EntityID,
+				boundary.name,
+				boundary.got.UTC().Format(time.RFC3339Nano),
+				boundary.want.UTC().Format(time.RFC3339Nano),
+				run.ID,
+			)
+		}
 	}
 	return nil
 }
@@ -1054,8 +1132,7 @@ func persistedRunAnalysisMetadata(
 		}
 	} else {
 		metadata["window_days"] = catalogValue{
-			State:  "missing",
-			Reason: "analysis does not use a publication window",
+			State: "missing",
 		}
 	}
 	if run.RecentWindowDays > 0 {

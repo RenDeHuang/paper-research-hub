@@ -6,9 +6,12 @@ import type {
 import { catalogDataValue } from "~/utils/catalogPresentation"
 import { presentDataValue } from "~/utils/dataValue"
 
-defineProps<{
+withDefaults(defineProps<{
+  compact?: boolean
   momentum: AnalysisCollection<SubjectTrendEstimate>
-}>()
+}>(), {
+  compact: false,
+})
 
 const numberFormatter = new Intl.NumberFormat("zh-CN", {
   maximumFractionDigits: 3,
@@ -36,10 +39,10 @@ function intervalText(interval: SubjectTrendEstimate["confidence_interval"]) {
     <div class="section-heading">
       <div>
         <p class="section-kicker">
-          发表率变化
+          {{ compact ? "医学生物学" : "发表率变化" }}
         </p>
         <h2 id="subject-momentum-heading">
-          学科趋势
+          {{ compact ? "学科动态" : "学科趋势" }}
         </h2>
       </div>
       <NuxtLink class="button button--secondary" to="/subjects">
@@ -47,10 +50,19 @@ function intervalText(interval: SubjectTrendEstimate["confidence_interval"]) {
       </NuxtLink>
     </div>
 
-    <IntelligenceModuleMeta :analysis="momentum.analysis" />
+    <IntelligenceModuleMeta
+      v-if="!compact"
+      :analysis="momentum.analysis"
+    />
 
+    <p
+      v-if="compact && momentum.items.length === 0"
+      class="subject-momentum__empty"
+    >
+      暂无学科动态
+    </p>
     <DataState
-      v-if="momentum.items.length === 0"
+      v-else-if="momentum.items.length === 0"
       state="empty"
       title="当前窗口没有学科趋势"
       message="API 已成功返回空集合；没有基线时不会显示 0% 增长。"
@@ -150,6 +162,12 @@ function intervalText(interval: SubjectTrendEstimate["confidence_interval"]) {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   background: var(--color-surface);
+}
+
+.subject-momentum__empty {
+  margin: 0;
+  padding: var(--space-5) 0;
+  color: var(--color-text-muted);
 }
 
 .metric-card > *,

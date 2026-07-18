@@ -1,8 +1,12 @@
 # medpaperhub
 
-medpaperhub 是一个面向论文发现、证据追踪与研究机会分析的公开门户。后端采用 Go 模块化单体，前端采用 Nuxt 4，PostgreSQL 是唯一规范数据存储。仓库不注入演示论文或 mock 数据；首次启动完成迁移后，界面会如实显示空数据状态，Catalog API 在首次显式发布 generation 前返回 `503 catalog_not_published`。
+medpaperhub 是一个面向医学与生物学科研人员的每日论文情报门户。首页优先回答：今天正式发表了什么、最近接收了什么、哪些文章处于 Online First，以及最近 7 天的主题、方法、期刊和学科趋势。论文检索保留为独立工具，不再主导首页。
 
-![medpaperhub 空目录 Demo](docs/screenshots/home-empty-catalog.png)
+后端采用 Go 模块化单体，前端采用 Nuxt 4，PostgreSQL 是唯一规范数据存储。仓库不注入演示论文或 mock 数据；首次启动完成迁移后，界面会如实显示空数据状态，Catalog API 在首次显式发布 generation 前返回 `503 catalog_not_published`。
+
+![medpaperhub 每日发表情报首页](docs/screenshots/home-daily-publication-dashboard.png)
+
+> 截图使用确定性 E2E Catalog 响应做视觉验收；生产 API、Worker 和 Nuxt 运行时不会加载该测试数据。
 
 ## 架构
 
@@ -46,6 +50,36 @@ make compose-up
 - PostgreSQL：`localhost:5432`
 
 API 与 Web 保持独立部署：`GET http://localhost:8080/` 只返回稳定的 API discovery JSON，不重定向也不托管 Nuxt 页面。API health 的公开 service identity 是 `medpaperhub-api`，Web health 的公开 service identity 是 `medpaperhub-web`；内部 Go module、二进制、镜像、Compose project 和数据库名称保持不变。
+
+## 每日发表情报
+
+`GET /api/v1/home` 返回一个 generation-bound 的 `home-snapshot/v2`。Nuxt 首页只消费这一份不可变快照，并按固定顺序展示：
+
+1. 今日正式发表；
+2. 最近 7 天接收；
+3. 最近 7 天 Online First；
+4. 最近 7 天主题、方法与研究设计趋势；
+5. 期刊动态；
+6. 学科动态。
+
+发表状态只来自当前 PubMed 投影中可追溯的显式 publication history：
+
+- `ppublish` → `print_published`；
+- 满足正式发表语义的 `epublish` → `electronic_published`；
+- `accepted` → `accepted`；
+- `aheadofprint` → `ahead_of_print`。
+
+系统不会从论文标题、`works.published_at`、抓取时间或跨来源日期拼接推断发表状态。日精度缺失、同一事件日期冲突、provenance 不匹配、JCR 未准入、非 biomedical、撤稿、撤回或 scope excluded 的 Work 不进入首页发表集合。
+
+日报日期由 Catalog 发布参数 `--generated-at` 的 UTC 自然日确定，不在快照生成过程中调用当前系统时间。最近 7 天窗口是包含日报当天的 `[D-6, D]`。每个发表事件都绑定同一个 Work revision 的：
+
+- source record；
+- normalized assertion；
+- projection assertion；
+- PubMed XML source path；
+- raw publication status。
+
+集合中的 `pagination.total`、`limit` 与实际不可变 item 数量严格一致，`has_more=false`、`next_cursor=null`。当前 Home 是完整快照，不会通过前端兜底补数量或生成示例文章。
 
 `make compose-up` 会在启动后自动执行严格的部署边界验证。也可以对已经运行的服务单独执行：
 

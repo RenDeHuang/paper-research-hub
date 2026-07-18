@@ -28,9 +28,7 @@ const nextPageTo = computed(() => {
 <template>
   <nav class="catalog-pagination" aria-label="目录分页">
     <p>
-      <template v-if="pagination.total !== undefined">
-        共 {{ pagination.total }} 条；
-      </template>
+      共 {{ pagination.total }} 条；
       本页最多 {{ pagination.limit }} 条
     </p>
     <div>

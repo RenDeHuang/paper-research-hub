@@ -1052,7 +1052,7 @@ func TestPublisherPublicationUpdatesRespectSingleEligibilityGates(t *testing.T) 
 	}
 }
 
-func TestPublisherPublishesExactBiomedicalAnalysisSnapshots(t *testing.T) {
+func TestPublisherPublishesBiomedicalAnalysisRuns(t *testing.T) {
 	pool := openCatalogTestPool(t)
 	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
 		eventKey:          "pubmed:catalog-biomedical-analysis-publication",
@@ -1101,6 +1101,31 @@ func TestPublisherPublishesExactBiomedicalAnalysisSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Home() error = %v", err)
 	}
+	for section, windowDays := range map[string]int{
+		"active_journals":  biomedicalHomeWindowDays,
+		"coverage":         biomedicalDetailWindowDays,
+		"entity_momentum":  biomedicalHomeWindowDays,
+		"subject_momentum": biomedicalHomeWindowDays,
+	} {
+		assertNestedJSONValue(
+			t,
+			home.Payload,
+			[]string{section, "analysis", "window_days", "state"},
+			"known",
+		)
+		assertNestedJSONValue(
+			t,
+			home.Payload,
+			[]string{section, "analysis", "window_days", "value"},
+			float64(windowDays),
+		)
+	}
+	assertNestedJSONValue(
+		t,
+		home.Payload,
+		[]string{"research_opportunities", "analysis", "window_days", "state"},
+		"missing",
+	)
 	assertNestedJSONValue(
 		t,
 		home.Payload,
@@ -1122,6 +1147,18 @@ func TestPublisherPublishesExactBiomedicalAnalysisSnapshots(t *testing.T) {
 	assertNestedJSONValue(
 		t,
 		home.Payload,
+		[]string{"subject_momentum", "items", "0", "recent_count", "value"},
+		float64(24),
+	)
+	assertNestedJSONValue(
+		t,
+		home.Payload,
+		[]string{"subject_momentum", "items", "0", "baseline_count", "value"},
+		float64(40),
+	)
+	assertNestedJSONValue(
+		t,
+		home.Payload,
 		[]string{"entity_momentum", "items", "0", "label"},
 		"Causal Inference",
 	)
@@ -1134,15 +1171,41 @@ func TestPublisherPublishesExactBiomedicalAnalysisSnapshots(t *testing.T) {
 	assertNestedJSONValue(
 		t,
 		home.Payload,
-		[]string{"research_opportunities", "analysis", "window_days", "state"},
-		"missing",
-	)
-	assertNestedJSONValue(
-		t,
-		home.Payload,
 		[]string{"research_opportunities", "items", "0", "estimates", "0", "value"},
 		float64(0.81),
 	)
+
+	subject, err := mustRepository(t, pool).Subject(
+		context.Background(),
+		"oncology",
+		PageQuery{Limit: 20},
+	)
+	if err != nil {
+		t.Fatalf("Subject() error = %v", err)
+	}
+	for _, assertion := range []struct {
+		path []string
+		want any
+	}{
+		{
+			path: []string{"trend_estimates", "analysis", "analysis_run_id"},
+			want: input.TrendAnalysisRunID.String(),
+		},
+		{
+			path: []string{"trend_estimates", "items", "0", "estimate", "value"},
+			want: float64(7.25),
+		},
+		{
+			path: []string{"trend_estimates", "items", "0", "recent_count", "value"},
+			want: float64(24),
+		},
+		{
+			path: []string{"trend_estimates", "items", "0", "baseline_count", "value"},
+			want: float64(40),
+		},
+	} {
+		assertNestedJSONValue(t, subject.Payload, assertion.path, assertion.want)
+	}
 
 	venueID := catalogWorkVenueID(t, pool, fixture.workID)
 	journal, err := mustRepository(t, pool).Journal(
@@ -1505,6 +1568,85 @@ func TestPublisherRejectsBiomedicalSnapshotOutsideValidatedCohort(t *testing.T) 
 	assertNoCatalogWrites(t, pool)
 }
 
+func TestLoadPersistedPublicationTrendsRejectsWindowBoundaryDrift(t *testing.T) {
+	for _, test := range []struct {
+		column string
+		offset time.Duration
+	}{
+		{column: "recent_window_start", offset: time.Hour},
+		{column: "recent_window_end", offset: -time.Hour},
+		{column: "baseline_window_start", offset: time.Hour},
+		{column: "baseline_window_end", offset: -time.Hour},
+	} {
+		test := test
+		t.Run(test.column, func(t *testing.T) {
+			pool := openCatalogTestPool(t)
+			fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+				eventKey:          "pubmed:catalog-trend-window-" + test.column,
+				logicalSource:     "pubmed",
+				canonicalKey:      "doi:10.1000/catalog-trend-window-" + test.column,
+				title:             "Catalog trend window " + test.column,
+				publishedAt:       time.Date(2026, time.July, 16, 8, 0, 0, 0, time.UTC),
+				sourceTime:        time.Date(2026, time.July, 17, 7, 0, 0, 0, time.UTC),
+				scopeStatus:       "included",
+				includeWorkLink:   true,
+				includeWorkID:     true,
+				includeNormalized: true,
+				noJCRAssessment:   true,
+			})
+			input := catalogCurationInputAt(
+				time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC),
+			)
+			cohortRevision := preparePublisherAcceptedCurationWithoutBiomedicalRuns(
+				t,
+				pool,
+				input,
+				fixture,
+			)
+			insertCatalogBiomedicalPublicationFixturesWithOptions(
+				t,
+				pool,
+				input,
+				cohortRevision,
+				cohortRevision,
+				input.TrendAnalysisRunID,
+				fixture,
+				catalogBiomedicalPublicationFixtureOptions{
+					trendWindowOffsetField: test.column,
+					trendWindowOffset:      test.offset,
+				},
+			)
+
+			ctx := context.Background()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin publication trend window validation: %v", err)
+			}
+			defer tx.Rollback(context.Background())
+			runs, err := validateBiomedicalAnalysisRuns(
+				ctx,
+				tx,
+				input,
+				cohortRevision,
+			)
+			if err != nil {
+				t.Fatalf("validateBiomedicalAnalysisRuns() error = %v", err)
+			}
+			if _, err := loadPersistedPublicationTrends(
+				ctx,
+				tx,
+				runs.Trend,
+			); err == nil || !strings.Contains(err.Error(), test.column) {
+				t.Fatalf(
+					"loadPersistedPublicationTrends(%s drift) error = %v",
+					test.column,
+					err,
+				)
+			}
+		})
+	}
+}
+
 func TestSnapshotRevisionIncludesOpportunityRows(t *testing.T) {
 	input := catalogCurationInput()
 	firstOpportunityID := uuid.MustParse(
@@ -1590,6 +1732,34 @@ func insertCatalogBiomedicalPublicationFixtures(
 	fixture publisherWorkFixture,
 ) {
 	t.Helper()
+	insertCatalogBiomedicalPublicationFixturesWithOptions(
+		t,
+		pool,
+		input,
+		runCohortRevision,
+		snapshotCohortRevision,
+		opportunityTrendRunID,
+		fixture,
+		catalogBiomedicalPublicationFixtureOptions{},
+	)
+}
+
+type catalogBiomedicalPublicationFixtureOptions struct {
+	trendWindowOffsetField string
+	trendWindowOffset      time.Duration
+}
+
+func insertCatalogBiomedicalPublicationFixturesWithOptions(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	input PublishInput,
+	runCohortRevision string,
+	snapshotCohortRevision string,
+	opportunityTrendRunID uuid.UUID,
+	fixture publisherWorkFixture,
+	options catalogBiomedicalPublicationFixtureOptions,
+) {
+	t.Helper()
 	ctx := context.Background()
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -1653,7 +1823,7 @@ func insertCatalogBiomedicalPublicationFixtures(
 			analysisType:   "publication_trends",
 			formulaVersion: analysis.PublicationTrendFormulaVersion,
 			additionalInput: map[string]any{
-				"recent_window_days":                56,
+				"recent_window_days":                biomedicalHomeWindowDays,
 				"baseline_window_days":              364,
 				"minimum_paper_count":               20,
 				"minimum_independent_journal_count": 3,
@@ -1722,8 +1892,44 @@ func insertCatalogBiomedicalPublicationFixtures(
 		}
 	}
 
-	baselineStart := asOf.Add(-364 * 24 * time.Hour)
-	recentStart := asOf.Add(-56 * 24 * time.Hour)
+	calendarDate := time.Date(
+		asOf.Year(),
+		asOf.Month(),
+		asOf.Day(),
+		0,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	recentStart := calendarDate.AddDate(
+		0,
+		0,
+		-(biomedicalHomeWindowDays - 1),
+	)
+	recentEnd := asOf
+	baselineEnd := recentStart
+	baselineStart := baselineEnd.AddDate(
+		0,
+		0,
+		-(364 - biomedicalHomeWindowDays),
+	)
+	switch options.trendWindowOffsetField {
+	case "":
+	case "recent_window_start":
+		recentStart = recentStart.Add(options.trendWindowOffset)
+	case "recent_window_end":
+		recentEnd = recentEnd.Add(options.trendWindowOffset)
+	case "baseline_window_start":
+		baselineStart = baselineStart.Add(options.trendWindowOffset)
+	case "baseline_window_end":
+		baselineEnd = baselineEnd.Add(options.trendWindowOffset)
+	default:
+		t.Fatalf(
+			"unsupported trend window offset field %q",
+			options.trendWindowOffsetField,
+		)
+	}
 	trendFixtures := []struct {
 		entityType string
 		entityID   string
@@ -1789,19 +1995,20 @@ func insertCatalogBiomedicalPublicationFixtures(
 			) VALUES (
 				$1, $2, $3, 'sufficient_evidence', 'poisson',
 				'fixed_poisson', 0, 0, $4, $5, 24, 0.5,
-				$6, $4, 40, 0.13, 3, 4, $7::numeric, 0.95,
-				1.2, 8.5, 0.01, 0.02, $8, $9,
+				$6, $7, 40, 0.13, 3, 4, $8::numeric, 0.95,
+				1.2, 8.5, 0.01, 0.02, $9, $10,
 				'{"fixture":"persisted_trend"}',
 				'{"fixture":"persisted_trend_evidence"}',
-				$10
+				$11
 			)
 		`,
 			input.TrendAnalysisRunID,
 			trend.entityType,
 			trend.entityID,
 			recentStart,
-			asOf,
+			recentEnd,
 			baselineStart,
+			baselineEnd,
 			trend.rateRatio,
 			snapshotCohortRevision,
 			analysis.PublicationTrendFormulaVersion,

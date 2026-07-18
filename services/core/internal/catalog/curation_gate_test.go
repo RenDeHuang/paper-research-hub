@@ -505,6 +505,50 @@ func TestValidateBiomedicalAnalysisRunsRequiresExactCohortAndUpstreams(
 			err,
 		)
 	}
+
+	rawTrend, err := loadRawBiomedicalAnalysisRun(
+		context.Background(),
+		tx,
+		input.TrendAnalysisRunID,
+	)
+	if err != nil {
+		t.Fatalf("load trend run for Home window validation: %v", err)
+	}
+	var trendInput trendAnalysisRunInput
+	if err := decodeStrictJSONObject(
+		rawTrend.InputPayload,
+		&trendInput,
+	); err != nil {
+		t.Fatalf("decode trend run for Home window validation: %v", err)
+	}
+	trendInput.RecentWindowDays = 56
+	if _, err := validateTrendAnalysisRun(
+		input,
+		cohortRevision,
+		rawTrend,
+		trendInput,
+	); err == nil || !strings.Contains(err.Error(), "recent window") {
+		t.Fatalf(
+			"validateTrendAnalysisRun(incompatible Home trend window) error = %v",
+			err,
+		)
+	}
+
+	trendInput.RecentWindowDays = biomedicalHomeWindowDays
+	trendInput.AsOf = input.GeneratedAt.UTC().
+		AddDate(0, 0, -1).
+		Format(time.RFC3339Nano)
+	if _, err := validateTrendAnalysisRun(
+		input,
+		cohortRevision,
+		rawTrend,
+		trendInput,
+	); err == nil || !strings.Contains(err.Error(), "UTC calendar date") {
+		t.Fatalf(
+			"validateTrendAnalysisRun(stale UTC calendar date) error = %v",
+			err,
+		)
+	}
 }
 
 func TestPublisherReturnsEmptyDomainWhenNoWorkPassesCurationGate(t *testing.T) {

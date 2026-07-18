@@ -6,9 +6,12 @@ import type {
 import { catalogDataValue } from "~/utils/catalogPresentation"
 import { presentDataValue } from "~/utils/dataValue"
 
-defineProps<{
+withDefaults(defineProps<{
+  compact?: boolean
   momentum: AnalysisCollection<EntityMomentumItem>
-}>()
+}>(), {
+  compact: false,
+})
 
 const entityTypeLabels = {
   disease: "疾病",
@@ -44,18 +47,27 @@ function intervalText(interval: EntityMomentumItem["confidence_interval"]) {
     <div class="section-heading">
       <div>
         <p class="section-kicker">
-          医学语义与研究方法
+          {{ compact ? "主题 / 方法 / 研究设计" : "医学语义与研究方法" }}
         </p>
         <h2 id="entity-momentum-heading">
-          热门疾病/靶点/方法
+          {{ compact ? "最近 7 天趋势" : "热门疾病/靶点/方法" }}
         </h2>
       </div>
     </div>
 
-    <IntelligenceModuleMeta :analysis="momentum.analysis" />
+    <IntelligenceModuleMeta
+      v-if="!compact"
+      :analysis="momentum.analysis"
+    />
 
+    <p
+      v-if="compact && momentum.items.length === 0"
+      class="entity-momentum__empty"
+    >
+      暂无趋势数据
+    </p>
     <DataState
-      v-if="momentum.items.length === 0"
+      v-else-if="momentum.items.length === 0"
       state="empty"
       title="当前窗口没有实体趋势"
       message="API 已成功返回空集合；页面不会从论文标题推断疾病、靶点或方法。"
@@ -149,6 +161,10 @@ h3 {
 p {
   color: var(--color-text-muted);
   font-size: var(--text-sm-size);
+}
+
+.entity-momentum__empty {
+  padding: var(--space-5) 0;
 }
 
 .metric-card__model {

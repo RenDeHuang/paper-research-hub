@@ -13,7 +13,6 @@ func TestJournalsUseStablePaperCountThenSlugCursor(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-journal-list",
-			homeMarker:     "journal-list",
 		},
 	)
 	repository := mustRepository(t, pool)
@@ -53,7 +52,6 @@ func TestJournalDetailUsesStoredPayloadAndGenerationBoundRecentPaperCursor(t *te
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-journal-detail",
-			homeMarker:     "journal-detail",
 		},
 	)
 	repository := mustRepository(t, pool)
@@ -131,7 +129,6 @@ func TestJournalSnapshotConstraintsAndAcceptedOnlyVisibility(t *testing.T) {
 		pool,
 		biomedicalFixtureOptions{
 			sourceRevision: "biomedical-journal-visibility",
-			homeMarker:     "journal-visibility",
 		},
 	)
 	repository := mustRepository(t, pool)

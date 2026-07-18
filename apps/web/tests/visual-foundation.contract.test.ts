@@ -12,9 +12,11 @@ const requiredFiles = [
   "app/layouts/default.vue",
   "app/components/AppHeader.vue",
   "app/components/AppFooter.vue",
+  "app/components/CatalogPagination.vue",
   "app/components/SearchCommand.vue",
-  "app/components/DiscoveryRail.vue",
   "app/components/SyncStatus.vue",
+  "app/components/PublicationUpdateList.vue",
+  "app/components/PublicationEventCard.vue",
   "app/components/PaperCard.vue",
   "app/components/TrendSparkline.vue",
   "app/components/EvidenceBar.vue",
@@ -107,9 +109,9 @@ describe("Nuxt visual foundation contract", () => {
     expect(globalUtilities).not.toMatch(rawPaletteToken)
   })
 
-  it("keeps discovery rail visibility under the shell breakpoint contract", () => {
-    const componentSource = readFileSync(
-      `${webRoot}/app/components/DiscoveryRail.vue`,
+  it("uses a content-wide shell without the legacy discovery rail", () => {
+    const layout = readFileSync(
+      `${webRoot}/app/layouts/default.vue`,
       "utf8",
     )
     const stylesheet = readFileSync(
@@ -117,15 +119,15 @@ describe("Nuxt visual foundation contract", () => {
       "utf8",
     )
 
-    expect(componentSource).not.toMatch(
-      /\.discovery-rail\s*\{[^}]*display:\s*grid/s,
-    )
-    expect(stylesheet).toContain(
-      ".app-shell__content > .discovery-rail {\n  display: none;",
-    )
-    expect(stylesheet).toMatch(
-      /@media \(min-width: 1024px\)[\s\S]*\.app-shell__content > \.discovery-rail\s*\{[\s\S]*display:\s*grid;/,
-    )
+    expect(layout).not.toContain("<DiscoveryRail")
+    expect(layout).not.toContain("quickFilters")
+    expect(stylesheet).not.toContain("--discovery-rail-width")
+    expect(stylesheet).not.toContain(".app-shell__content > .discovery-rail")
+    expect(stylesheet).toContain("grid-template-columns: repeat(12, minmax(0, 1fr))")
+    expect(stylesheet).toContain(".publication-dashboard__formal")
+    expect(stylesheet).toContain("grid-column: span 8")
+    expect(stylesheet).toContain(".publication-dashboard__side")
+    expect(stylesheet).toContain("grid-column: span 4")
   })
 
   it("uses NuxtLink for every primary navigation destination", () => {
@@ -155,14 +157,41 @@ describe("Nuxt visual foundation contract", () => {
     expect(header).not.toContain("Paper Research Hub")
     expect(footer).not.toContain("Paper Research Hub")
     for (const destination of [
-      'label: "首页"',
+      'label: "今日"',
+      'label: "论文"',
       'label: "学科"',
       'label: "期刊"',
-      'label: "论文"',
       'label: "趋势"',
-      'label: "研究机会"',
     ]) {
       expect(header).toContain(destination)
     }
+    expect(header).not.toContain('label: "研究机会"')
+    expect(header).toContain('to="/papers#papers-q"')
+  })
+
+  it("renders required pagination totals without fallback branches", () => {
+    const pagination = readFileSync(
+      `${webRoot}/app/components/CatalogPagination.vue`,
+      "utf8",
+    )
+    const papers = readFileSync(
+      `${webRoot}/app/pages/papers/index.vue`,
+      "utf8",
+    )
+
+    expect(pagination).toContain("共 {{ pagination.total }} 条")
+    expect(pagination).not.toContain("pagination.total !== undefined")
+    expect(papers).toContain("{{ readyData.pagination.total }} 篇论文")
+    expect(papers).not.toContain("?? readyData.items.length")
+  })
+
+  it("keeps publication title and journal links at the minimum target size", () => {
+    const source = readFileSync(
+      `${webRoot}/app/components/PublicationEventCard.vue`,
+      "utf8",
+    )
+
+    expect(source.match(/min-width: 44px/g)).toHaveLength(2)
+    expect(source.match(/min-height: 44px/g)).toHaveLength(2)
   })
 })

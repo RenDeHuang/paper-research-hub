@@ -1804,6 +1804,7 @@ components:
       required:
         - analysis
         - items
+        - pagination
       properties:
         analysis:
           $ref: "#/components/schemas/AnalysisMetadata"
@@ -1811,6 +1812,143 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PaperSummary"
+        pagination:
+          $ref: "#/components/schemas/SnapshotPagination"
+    SnapshotPagination:
+      type: object
+      additionalProperties: false
+      required:
+        - limit
+        - total
+        - next_cursor
+        - has_more
+      properties:
+        limit:
+          type: integer
+          minimum: 0
+        total:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: "null"
+          const: null
+        has_more:
+          type: boolean
+          const: false
+    PublicationEventKind:
+      type: string
+      enum:
+        - print_published
+        - electronic_published
+        - ahead_of_print
+        - accepted
+    PublicationEventProvenance:
+      type: object
+      additionalProperties: false
+      required:
+        - source
+        - source_record_id
+        - normalized_assertion_id
+        - projection_assertion_id
+        - source_path
+        - status_raw
+      properties:
+        source:
+          type: string
+          const: pubmed
+        source_record_id:
+          type: string
+          format: uuid
+        normalized_assertion_id:
+          type: string
+          format: uuid
+        projection_assertion_id:
+          type: string
+          format: uuid
+        source_path:
+          type: string
+          minLength: 1
+        status_raw:
+          type: string
+          minLength: 1
+    PublicationUpdateEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - date
+        - date_precision
+        - publication_status
+        - publication_model
+        - provenance
+      properties:
+        kind:
+          $ref: "#/components/schemas/PublicationEventKind"
+        date:
+          type: string
+          format: date
+        date_precision:
+          type: string
+          const: day
+        publication_status:
+          type: string
+          minLength: 1
+        publication_model:
+          type:
+            - string
+            - "null"
+          minLength: 1
+        provenance:
+          $ref: "#/components/schemas/PublicationEventProvenance"
+    PublicationUpdateItem:
+      type: object
+      additionalProperties: false
+      required:
+        - paper
+        - event
+      properties:
+        paper:
+          $ref: "#/components/schemas/PaperSummary"
+        event:
+          $ref: "#/components/schemas/PublicationUpdateEvent"
+    PublicationUpdateCollection:
+      type: object
+      additionalProperties: false
+      required:
+        - analysis
+        - items
+        - pagination
+      properties:
+        analysis:
+          $ref: "#/components/schemas/AnalysisMetadata"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicationUpdateItem"
+        pagination:
+          $ref: "#/components/schemas/SnapshotPagination"
+    HomePublicationUpdates:
+      type: object
+      additionalProperties: false
+      required:
+        - calendar_date
+        - calendar_timezone
+        - formal_publications_today
+        - recent_acceptances
+        - recent_online_first
+      properties:
+        calendar_date:
+          type: string
+          format: date
+        calendar_timezone:
+          type: string
+          const: UTC
+        formal_publications_today:
+          $ref: "#/components/schemas/PublicationUpdateCollection"
+        recent_acceptances:
+          $ref: "#/components/schemas/PublicationUpdateCollection"
+        recent_online_first:
+          $ref: "#/components/schemas/PublicationUpdateCollection"
     ResearchOpportunityAnalysisCollection:
       type: object
       additionalProperties: false
@@ -1862,7 +2000,9 @@ components:
         - evidence_gaps
         - generated_at
         - latest_papers
+        - publication_updates
         - research_opportunities
+        - snapshot_schema
         - scope
         - subject_momentum
       properties:
@@ -1887,8 +2027,13 @@ components:
           format: date-time
         latest_papers:
           $ref: "#/components/schemas/PaperAnalysisCollection"
+        publication_updates:
+          $ref: "#/components/schemas/HomePublicationUpdates"
         research_opportunities:
           $ref: "#/components/schemas/ResearchOpportunityAnalysisCollection"
+        snapshot_schema:
+          type: string
+          const: home-snapshot/v2
         scope:
           type: object
           additionalProperties: false

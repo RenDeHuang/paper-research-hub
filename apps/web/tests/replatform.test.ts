@@ -16,56 +16,8 @@ describe("default application shell", () => {
     expect(wrapper.get('a[href="#main-content"]').text()).toBe("跳到主要内容")
     expect(wrapper.get("header").exists()).toBe(true)
     expect(wrapper.get('nav[aria-label="一级导航"]').exists()).toBe(true)
-    expect(wrapper.get('aside[aria-label="发现导航"]').exists()).toBe(true)
-    expect(
-      wrapper.get('a[href="/#sync-status"]').attributes("aria-label"),
-    ).toContain("更新时间")
-    expect(
-      wrapper
-        .findAll(
-          'aside[aria-label="发现导航"] [data-discovery-group]',
-        )
-        .map((group) => group.attributes("data-discovery-group")),
-    ).toEqual([
-      "quick-filters",
-      "trending-subjects",
-      "active-journals",
-      "saved-views",
-    ])
-    expect(
-      wrapper
-        .findAll(
-          'aside[aria-label="发现导航"] [data-discovery-group]',
-        )
-        .map((group) => group.attributes("data-discovery-state")),
-    ).toEqual(["known", "unknown", "unknown", "empty"])
-    expect(
-      wrapper
-        .findAll('aside[aria-label="发现导航"] a')
-        .map((link) => link.text()),
-    ).toEqual(["最新精选", "引用优先", "趋势优先", "研究机会"])
-    expect(
-      wrapper
-        .findAll('aside[aria-label="发现导航"] a')
-        .map((link) => link.attributes("href")),
-    ).toEqual([
-      "/papers?sort=published_at_desc",
-      "/papers?sort=citations_desc",
-      "/papers?sort=trend_desc",
-      "/opportunities",
-    ])
-    expect(wrapper.get('aside[aria-label="发现导航"]').text()).not.toContain(
-      "浏览论文",
-    )
-    expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
-      "等待学科趋势生成",
-    )
-    expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
-      "等待期刊活跃度生成",
-    )
-    expect(wrapper.get('aside[aria-label="发现导航"]').text()).toContain(
-      "暂无保存视图",
-    )
+    expect(wrapper.find('aside[aria-label="发现导航"]').exists()).toBe(false)
+    expect(wrapper.get('a[href="/papers#papers-q"]').text()).toBe("搜索")
     expect(wrapper.get("main#main-content").attributes("tabindex")).toBe("-1")
     expect(wrapper.get("footer").exists()).toBe(true)
   })
@@ -89,6 +41,7 @@ describe("default application shell", () => {
     expect(wrapper.get(".app-header__route-name").text()).toBe("自定义研究视图")
 
     for (const [path, expected] of [
+      ["/", "今日"],
       ["/papers/paper-1", "论文详情"],
       ["/subjects/oncology", "学科"],
       ["/journals/nature-medicine", "期刊"],
