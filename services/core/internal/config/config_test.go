@@ -191,6 +191,236 @@ func TestLoadForCitationAnalysisRequiresOnlyDatabase(t *testing.T) {
 	}
 }
 
+func TestLoadForAbstractAnalysisRequiresStrictOpenAIConfiguration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "missing base URL",
+			env: map[string]string{
+				"OPENAI_API_MODE": "responses",
+				"OPENAI_API_KEY":  "openai-secret",
+				"OPENAI_MODEL":    "gpt-5.4-mini",
+			},
+			want: "OPENAI_BASE_URL is required",
+		},
+		{
+			name: "missing API key",
+			env: map[string]string{
+				"OPENAI_BASE_URL": "https://api.openai.example/v1",
+				"OPENAI_API_MODE": "responses",
+				"OPENAI_MODEL":    "gpt-5.4-mini",
+			},
+			want: "OPENAI_API_KEY is required",
+		},
+		{
+			name: "missing model",
+			env: map[string]string{
+				"OPENAI_BASE_URL": "https://api.openai.example/v1",
+				"OPENAI_API_MODE": "responses",
+				"OPENAI_API_KEY":  "openai-secret",
+			},
+			want: "OPENAI_MODEL is required",
+		},
+		{
+			name: "missing API mode",
+			env: map[string]string{
+				"OPENAI_BASE_URL": "https://api.openai.example/v1",
+				"OPENAI_API_KEY":  "openai-secret",
+				"OPENAI_MODEL":    "gpt-5.4-mini",
+			},
+			want: "OPENAI_API_MODE is required",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			values := map[string]string{"DATABASE_URL": testDatabaseURL}
+			for key, value := range test.env {
+				values[key] = value
+			}
+			_, err := LoadFrom(RoleAbstractAnalysis, mapLookup(values))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"LoadFrom(RoleAbstractAnalysis) error = %v, want containing %q",
+					err,
+					test.want,
+				)
+			}
+			if strings.Contains(fmt.Sprint(err), "openai-secret") {
+				t.Fatalf("configuration error leaked OPENAI_API_KEY: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadForAbstractAnalysisPreservesBaseURLModelAndRedactsAPIKey(t *testing.T) {
+	t.Parallel()
+
+	const secret = "openai-secret-that-must-not-leak"
+	cfg, err := LoadFrom(RoleAbstractAnalysis, mapLookup(map[string]string{
+		"DATABASE_URL":    testDatabaseURL,
+		"OPENAI_BASE_URL": "https://gateway.example.test/openai/v1",
+		"OPENAI_API_MODE": "chat_completions",
+		"OPENAI_API_KEY":  secret,
+		"OPENAI_MODEL":    "gpt-5.4-mini-2026-06-01",
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom(RoleAbstractAnalysis) error = %v", err)
+	}
+	if cfg.OpenAI.BaseURL != "https://gateway.example.test/openai/v1" {
+		t.Fatalf("OpenAI.BaseURL = %q", cfg.OpenAI.BaseURL)
+	}
+	if cfg.OpenAI.APIMode != "chat_completions" {
+		t.Fatalf("OpenAI.APIMode = %q", cfg.OpenAI.APIMode)
+	}
+	if cfg.OpenAI.APIKey != secret {
+		t.Fatal("OpenAI.APIKey did not preserve the configured credential")
+	}
+	if cfg.OpenAI.Model != "gpt-5.4-mini-2026-06-01" {
+		t.Fatalf("OpenAI.Model = %q", cfg.OpenAI.Model)
+	}
+
+	for _, output := range []string{
+		cfg.String(),
+		fmt.Sprintf("%+v", cfg),
+		string(mustMarshalJSON(t, cfg)),
+	} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("formatted configuration leaked OPENAI_API_KEY: %s", output)
+		}
+		if !strings.Contains(output, `"api_key":"[REDACTED]"`) {
+			t.Fatalf("formatted configuration omitted configured-key state: %s", output)
+		}
+	}
+}
+
+func TestLoadForAbstractAnalysisRejectsUnsafeOrUntrimmedOpenAIValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		baseURL string
+		apiKey  string
+		model   string
+		apiMode string
+		want    string
+	}{
+		{
+			name:    "unsupported API mode",
+			baseURL: "https://gateway.example.test/v1",
+			apiKey:  "openai-secret",
+			model:   "gpt-5.4-mini",
+			apiMode: "auto",
+			want:    "OPENAI_API_MODE",
+		},
+		{
+			name:    "remote plaintext base URL",
+			baseURL: "http://gateway.example.test/v1",
+			apiKey:  "openai-secret",
+			model:   "gpt-5.4-mini",
+			want:    "HTTPS",
+		},
+		{
+			name:    "base URL credentials",
+			baseURL: "https://user:secret@gateway.example.test/v1",
+			apiKey:  "openai-secret",
+			model:   "gpt-5.4-mini",
+			want:    "OPENAI_BASE_URL",
+		},
+		{
+			name:    "base URL query",
+			baseURL: "https://gateway.example.test/v1?api_key=secret",
+			apiKey:  "openai-secret",
+			model:   "gpt-5.4-mini",
+			want:    "OPENAI_BASE_URL",
+		},
+		{
+			name:    "base URL fragment",
+			baseURL: "https://gateway.example.test/v1#responses",
+			apiKey:  "openai-secret",
+			model:   "gpt-5.4-mini",
+			want:    "OPENAI_BASE_URL",
+		},
+		{
+			name:    "base URL whitespace",
+			baseURL: " https://gateway.example.test/v1",
+			apiKey:  "openai-secret",
+			model:   "gpt-5.4-mini",
+			want:    "OPENAI_BASE_URL",
+		},
+		{
+			name:    "API key whitespace",
+			baseURL: "https://gateway.example.test/v1",
+			apiKey:  " openai-secret",
+			model:   "gpt-5.4-mini",
+			want:    "OPENAI_API_KEY",
+		},
+		{
+			name:    "model whitespace",
+			baseURL: "https://gateway.example.test/v1",
+			apiKey:  "openai-secret",
+			model:   " gpt-5.4-mini",
+			want:    "OPENAI_MODEL",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			apiMode := test.apiMode
+			if apiMode == "" {
+				apiMode = "responses"
+			}
+			_, err := LoadFrom(RoleAbstractAnalysis, mapLookup(map[string]string{
+				"DATABASE_URL":    testDatabaseURL,
+				"OPENAI_BASE_URL": test.baseURL,
+				"OPENAI_API_MODE": apiMode,
+				"OPENAI_API_KEY":  test.apiKey,
+				"OPENAI_MODEL":    test.model,
+			}))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"LoadFrom(RoleAbstractAnalysis) error = %v, want containing %q",
+					err,
+					test.want,
+				)
+			}
+			if strings.Contains(err.Error(), "openai-secret") ||
+				strings.Contains(err.Error(), "api_key=secret") ||
+				strings.Contains(err.Error(), "user:secret") {
+				t.Fatalf("configuration error leaked OpenAI secret material: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadForUnrelatedRoleIgnoresInvalidOpenAIConfiguration(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadFrom(RoleMigrate, mapLookup(map[string]string{
+		"DATABASE_URL":    testDatabaseURL,
+		"OPENAI_BASE_URL": "not-an-http-url",
+		"OPENAI_API_KEY":  "unrelated-openai-secret",
+		"OPENAI_MODEL":    "unrelated-model",
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom(RoleMigrate) error = %v", err)
+	}
+	if cfg.OpenAI.BaseURL != "not-an-http-url" {
+		t.Fatalf("OpenAI.BaseURL = %q", cfg.OpenAI.BaseURL)
+	}
+}
+
 func TestLoadRequiresPostgreSQLDatabaseURLWithoutLeakingIt(t *testing.T) {
 	tests := []struct {
 		name string
@@ -575,4 +805,14 @@ func mapLookup(values map[string]string) LookupEnv {
 		value, ok := values[key]
 		return value, ok
 	}
+}
+
+func mustMarshalJSON(t *testing.T, value any) []byte {
+	t.Helper()
+
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return encoded
 }

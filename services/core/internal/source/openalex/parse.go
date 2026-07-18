@@ -14,6 +14,8 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
+const ParserVersion = "openalex/works-v1"
+
 var (
 	pmidPattern      = regexp.MustCompile(`^[1-9][0-9]*$`)
 	pmcidPattern     = regexp.MustCompile(`^PMC[1-9][0-9]*$`)
@@ -252,6 +254,7 @@ func Parse(raw json.RawMessage) (source.Record, error) {
 	record := source.Record{
 		Source:           source.OpenAlex,
 		SourceRecordID:   requiredOpenAlexID,
+		ParserVersion:    ParserVersion,
 		Identity:         identity,
 		Identifiers:      identifiers,
 		Raw:              rawRecord,

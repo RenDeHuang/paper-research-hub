@@ -29,6 +29,7 @@ type workPayload struct {
 	Published           *partialDatePayload `json:"published"`
 	PublishedOnline     *partialDatePayload `json:"published-online"`
 	Created             *timestampPayload   `json:"created"`
+	Deposited           *timestampPayload   `json:"deposited"`
 	Indexed             *timestampPayload   `json:"indexed"`
 	Abstract            string              `json:"abstract"`
 	Licenses            []licensePayload    `json:"license"`
@@ -71,6 +72,7 @@ type updateToPayload struct {
 }
 
 const (
+	ParserVersion    = "crossref/works-v2"
 	MaxJATSDepth     = 64
 	MaxJATSElements  = 10_000
 	MaxJATSTextBytes = 1 << 20
@@ -149,7 +151,11 @@ func Parse(raw json.RawMessage) (source.Record, error) {
 	if err != nil {
 		return source.Record{}, err
 	}
-	updatedAt, err := parseTimestamp(work.Indexed, "$.indexed")
+	depositedAt, err := parseTimestamp(work.Deposited, "$.deposited")
+	if err != nil {
+		return source.Record{}, err
+	}
+	indexedAt, err := parseTimestamp(work.Indexed, "$.indexed")
 	if err != nil {
 		return source.Record{}, err
 	}
@@ -174,6 +180,7 @@ func Parse(raw json.RawMessage) (source.Record, error) {
 	record := source.Record{
 		Source:         source.Crossref,
 		SourceRecordID: identity.Value(),
+		ParserVersion:  ParserVersion,
 		Identity:       identity,
 		Identifiers: []source.Identifier{{
 			Scheme: source.IdentifierDOI,
@@ -188,14 +195,14 @@ func Parse(raw json.RawMessage) (source.Record, error) {
 		ElectronicPublishedAt:     electronicAt,
 		ElectronicPublicationDate: electronicDate,
 		CreatedAt:                 createdAt,
-		UpdatedAt:                 updatedAt,
+		UpdatedAt:                 depositedAt,
 		Authors:                   authors,
 		Relations:                 relations,
 		Venue:                     venue,
 		Licenses:                  licenses,
 		Scope:                     scope,
 	}
-	record.Evidence = buildEvidence(record, venueEvidence)
+	record.Evidence = buildEvidence(record, venueEvidence, indexedAt != nil)
 	return record, nil
 }
 
@@ -700,6 +707,7 @@ func parseRelations(values []updateToPayload) ([]source.Relation, error) {
 func buildEvidence(
 	record source.Record,
 	venue venueEvidenceFlags,
+	hasIndexedAt bool,
 ) []source.FieldEvidence {
 	evidence := []source.FieldEvidence{{
 		Field:      "identifiers",
@@ -736,7 +744,8 @@ func buildEvidence(
 		record.ElectronicPublishedAt != nil,
 	)
 	add("created_at", "$.created.date-time", record.CreatedAt != nil)
-	add("updated_at", "$.indexed.date-time", record.UpdatedAt != nil)
+	add("updated_at", "$.deposited.date-time", record.UpdatedAt != nil)
+	add("crossref_indexed_at", "$.indexed.date-time", hasIndexedAt)
 	for _, license := range record.Licenses {
 		add("licenses", license.SourcePath, true)
 	}

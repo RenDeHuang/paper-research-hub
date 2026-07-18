@@ -211,6 +211,7 @@ type RejectedIdentifierAssertion struct {
 type Record struct {
 	Source                    string
 	SourceRecordID            string
+	ParserVersion             string
 	Identity                  paper.Identifier
 	Identifiers               []Identifier
 	RejectedIdentifiers       []RejectedIdentifierAssertion

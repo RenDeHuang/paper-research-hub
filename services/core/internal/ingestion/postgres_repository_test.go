@@ -789,18 +789,18 @@ func TestPostgresRepositoryReplaysPublicationSchemaV3(t *testing.T) {
 
 	first, err := repository.Normalize(ctx, job.ID, raw, "normalization/pubmed-v1")
 	if err != nil {
-		t.Fatalf("Normalize(v3 first) error = %v", err)
+		t.Fatalf("Normalize(v4 first) error = %v", err)
 	}
 	second, err := repository.Normalize(ctx, job.ID, raw, "normalization/pubmed-v1")
 	if err != nil {
-		t.Fatalf("Normalize(v3 replay) error = %v", err)
+		t.Fatalf("Normalize(v4 replay) error = %v", err)
 	}
-	if first.PayloadSchemaVersion != "normalized-record/v3" ||
-		second.PayloadSchemaVersion != "normalized-record/v3" ||
+	if first.PayloadSchemaVersion != "normalized-record/v4" ||
+		second.PayloadSchemaVersion != "normalized-record/v4" ||
 		first.AssertionID == legacyV2AssertionID ||
 		second.AssertionID != first.AssertionID {
 		t.Fatalf(
-			"v3 normalization = first %q/%q second %q/%q legacy %q",
+			"v4 normalization = first %q/%q second %q/%q legacy %q",
 			first.AssertionID,
 			first.PayloadSchemaVersion,
 			second.AssertionID,
@@ -886,7 +886,7 @@ func TestPostgresRepositoryReplaysPublicationSchemaV3(t *testing.T) {
 		"scope/pubmed-v1",
 		"projection/pubmed-v1",
 	); err != nil {
-		t.Fatalf("Project(v3) error = %v", err)
+		t.Fatalf("Project(v4) error = %v", err)
 	}
 	var projectionNormalizedID, projectionSchemaVersion string
 	if err := pool.QueryRow(ctx, `
@@ -901,12 +901,12 @@ func TestPostgresRepositoryReplaysPublicationSchemaV3(t *testing.T) {
 		&projectionNormalizedID,
 		&projectionSchemaVersion,
 	); err != nil {
-		t.Fatalf("query v3 projection binding: %v", err)
+		t.Fatalf("query v4 projection binding: %v", err)
 	}
 	if projectionNormalizedID != first.AssertionID ||
-		projectionSchemaVersion != "normalized-record/v3" {
+		projectionSchemaVersion != "normalized-record/v4" {
 		t.Fatalf(
-			"projection binding = %q/%q, want %q/normalized-record/v3",
+			"projection binding = %q/%q, want %q/normalized-record/v4",
 			projectionNormalizedID,
 			projectionSchemaVersion,
 			first.AssertionID,

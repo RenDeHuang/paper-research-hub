@@ -15,6 +15,25 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/openalex"
 )
 
+func TestOpenAlexParserVersionIsExplicitAndAttachedToRecords(t *testing.T) {
+	t.Parallel()
+
+	if openalex.ParserVersion != "openalex/works-v1" {
+		t.Fatalf("ParserVersion = %q", openalex.ParserVersion)
+	}
+	record, err := openalex.Parse(fixtureWork(t))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if record.ParserVersion != openalex.ParserVersion {
+		t.Fatalf(
+			"record.ParserVersion = %q, want %q",
+			record.ParserVersion,
+			openalex.ParserVersion,
+		)
+	}
+}
+
 func TestParseMapsOpenAlexRecordWithoutInventingValues(t *testing.T) {
 	t.Parallel()
 

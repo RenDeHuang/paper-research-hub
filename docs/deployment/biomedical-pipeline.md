@@ -295,7 +295,58 @@ docker compose run --rm \
 
 发布前必须至少有一个 `accepted`，否则 Catalog publisher 会因空公开域拒绝发布。
 
-### 8. 生成不可变引用分析 run
+### 8. 生成严格摘要研究路线 run
+
+远程 OpenAI-compatible base URL 必须使用 HTTPS。将
+`OPENAI_BASE_URL`、`OPENAI_API_MODE`、`OPENAI_API_KEY`、`OPENAI_MODEL`
+写入被 Git 忽略的 `deploy/env/.env.pipeline`；根 Compose 不显式覆盖这些
+变量，Worker overlay 按文件提供给一次性任务。`OPENAI_API_MODE` 只能是
+`responses` 或 `chat_completions`，必须根据已验证的网关能力显式冻结；
+系统不会自动探测、降级或切换接口。
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f deploy/compose/compose.local.yml \
+  --profile jobs run --rm \
+  worker /app/paper-hub-worker analyze abstract-routes \
+  --prompt-version abstract-route-prompt/v1 \
+  --schema-version abstract-route/v1 \
+  --analysis-cutoff "${ABSTRACT_ANALYSIS_CUTOFF}" \
+  --limit "${ABSTRACT_ANALYSIS_LIMIT}"
+```
+
+命令只选择 `analysis-cutoff` 之前、具有 `normalized-record/v4` 标题和摘要的精确
+Work revision。每个 run 保存：
+
+- `api_mode`，即本次使用的显式 OpenAI-compatible 接口模式；
+- `requested_model` 与 provider 响应中的 `actual_model`；
+- 输入标题、输入摘要及各自 SHA-256；
+-完整 prompt、Schema JSON、版本及 SHA-256；
+- 响应 ID、token usage、状态和稳定 failure code；
+- 通过 `abstract-route/v1` 的结构化输出与每个字段的摘要证据。
+
+证据必须在规范化输入摘要中出现；缺失、伪造、拒答、截断或 Schema 不匹配都会使该
+run 失败，不会转成自由文本或调用第二供应商。Worker 崩溃留下的 `running` run 使用
+固定 lease 回收为失败记录，后续命令可以重新分析同一 revision。
+
+```sql
+SELECT
+    api_mode,
+    requested_model,
+    actual_model,
+    prompt_version,
+    schema_version,
+    input_sha256,
+    schema_sha256,
+    response_id,
+    status
+FROM abstract_route_analysis_runs
+ORDER BY started_at DESC, id DESC
+LIMIT 20;
+```
+
+### 9. 生成不可变引用分析 run
 
 引用来源必须显式选择，不能把 OpenAlex、Crossref 或其他来源的计数混在同一个速度与百分位结果中：
 
@@ -328,7 +379,7 @@ printf 'CITATION_ANALYSIS_RUN_ID=%s\n' "${CITATION_ANALYSIS_RUN_ID}"
 
 该 run 必须与后续 Catalog 的 citation source、JCR receipt/year、Subject version、eligibility policy 和 Venue policy 完全匹配，并且在 `GENERATED_AT` 之前成功完成。缺少同源边界快照时，velocity 会持久化为 `insufficient_evidence`，不会填 `0`。
 
-### 9. 生成不可变 publication trend analysis run
+### 10. 生成不可变 publication trend analysis run
 
 ```bash
 docker compose run --rm \
@@ -363,7 +414,7 @@ test -n "${TREND_ANALYSIS_RUN_ID}"
 printf 'TREND_ANALYSIS_RUN_ID=%s\n' "${TREND_ANALYSIS_RUN_ID}"
 ```
 
-### 10. 生成不可变 journal editorial-pattern analysis run
+### 11. 生成不可变 journal editorial-pattern analysis run
 
 ```bash
 docker compose run --rm \
@@ -394,7 +445,7 @@ test -n "${JOURNAL_ANALYSIS_RUN_ID}"
 printf 'JOURNAL_ANALYSIS_RUN_ID=%s\n' "${JOURNAL_ANALYSIS_RUN_ID}"
 ```
 
-### 11. 生成不可变 research opportunity analysis run
+### 12. 生成不可变 research opportunity analysis run
 
 Opportunity 必须显式绑定本批次的 citation、trend 和 journal 三个 succeeded run：
 
@@ -428,7 +479,7 @@ test -n "${OPPORTUNITY_ANALYSIS_RUN_ID}"
 printf 'OPPORTUNITY_ANALYSIS_RUN_ID=%s\n' "${OPPORTUNITY_ANALYSIS_RUN_ID}"
 ```
 
-### 12. 发布 immutable Catalog generation
+### 13. 发布 immutable Catalog generation
 
 ```bash
 docker compose run --rm \
@@ -655,11 +706,13 @@ paper-hub-worker <sync|import|assess|analyze|publish> <source> [flags]
 | --- | --- | --- |
 | `sync openalex` | `--query string`、`--filter string`、`--max-results int` | query/filter 至少一个；max-results 1..1000 |
 | `sync pubmed` | `--query string`、`--from-date YYYY-MM-DD`、`--to-date YYYY-MM-DD`、repeatable `--issn string`、`--max-results int` | 日期两者都必填且 from <= to；query/ISSN 至少一个；max-results 1..1000 |
-| `sync crossref` | `--from-date YYYY-MM-DD`、`--to-date YYYY-MM-DD`、repeatable `--issn string`、`--max-results int` | date pair 可省略，但 date window/ISSN 至少一个；max-results 1..1000 |
+| `sync crossref-created` | `--from-date YYYY-MM-DD`、`--to-date YYYY-MM-DD`、repeatable `--issn string`、`--max-results int` | date pair 必填；使用 Crossref `created` 流做首次发现；max-results 1..1000 |
+| `sync crossref-updated` | `--from-date YYYY-MM-DD`、`--to-date YYYY-MM-DD`、repeatable `--issn string`、`--max-results int` | date pair 必填；使用 Crossref `update/deposited` 流做修订同步；`indexed` 不推进发现时间；max-results 1..1000 |
 | `import subjects` | `--file path.csv` | 必填；trim 后非空；显式 `.csv`；不能含 `?`/`#` |
 | `import jcr` | `--file path.csv` | 同上；运行时还要求与 `JCR_IMPORT_PATH` 完全一致，并要求 `JCR_SOURCE_LICENSE` |
 | `assess venues` | `--metric-year int`、`--policy-version string`、`--assessed-at RFC3339Nano`、`--jcr-receipt UUID` | year 1900..3000；完整 policy version/label 必须为 `journal-all-q1/v2`；时间非零；receipt 必填 |
 | `assess biomedical-eligibility` | `--metric-year int`、`--subject-version string`、`--policy-version string`、`--assessed-at RFC3339Nano` | year 1900..3000；Subject version 必填；policy 必须为 `biomedical-public-eligibility/v1`；时间非零 |
+| `analyze abstract-routes` | `--prompt-version string`、`--schema-version string`、`--analysis-cutoff RFC3339Nano`、`--limit int` | 全部必填；prompt 固定为 `abstract-route-prompt/v1`；Schema 固定为 `abstract-route/v1`；limit 1..1000；运行角色还必须提供 `OPENAI_BASE_URL`、显式 `OPENAI_API_MODE=responses\|chat_completions`、`OPENAI_API_KEY`、`OPENAI_MODEL` |
 | `analyze citations` | `--as-of RFC3339Nano`、`--source string`、`--velocity-window-days int`、`--minimum-cohort-size int`、`--formula-version string`、`--subject-version string`、`--eligibility-policy-version string`、`--jcr-metric-year int`、`--jcr-import-receipt UUID` | 全部必填；窗口 1..3650；cohort 2..1000000；formula 固定为 `citation-intelligence/v1`；不混合 citation source |
 | `analyze trends` | `--recent-window-days int`、`--baseline-window-days int`、`--minimum-paper-count int`、`--minimum-independent-journal-count int`、`--minimum-independent-team-count int`、`--model-selection string`、`--dispersion-threshold float`、`--formula-version string`，以及 `--as-of`、Subject/eligibility/JCR/Venue policy scope flags | 全部必填；baseline 必须大于 recent；formula 固定为 `biomedical-trends/v1`；用于 Catalog publish 的 recent window 必须为 7；Venue policy name=`journal-all-q1`，revision=`2` |
 | `analyze journals` | `--window-days int`、`--minimum-support-count int`、`--minimum-field-baseline-count int`、`--formula-version string`，以及 `--as-of`、Subject/eligibility/JCR/Venue policy scope flags | 全部必填；field baseline 不小于 support；formula 固定为 `biomedical-journal-patterns/v1`；Venue policy name=`journal-all-q1`，revision=`2` |

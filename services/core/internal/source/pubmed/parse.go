@@ -15,6 +15,8 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
+const ParserVersion = "pubmed/pubmed-article-v1"
+
 var (
 	pmidPattern  = regexp.MustCompile(`^[1-9][0-9]*$`)
 	pmcidPattern = regexp.MustCompile(`^PMC[1-9][0-9]*$`)
@@ -371,6 +373,7 @@ func ParseRecord(raw []byte) (source.Record, error) {
 	record := source.Record{
 		Source:                    source.PubMed,
 		SourceRecordID:            pmid,
+		ParserVersion:             ParserVersion,
 		Identity:                  identity,
 		Identifiers:               identifiers,
 		RejectedIdentifiers:       rejectedIdentifiers,

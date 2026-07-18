@@ -140,6 +140,25 @@ grep -F 'path: ./deploy/env/.env.pipeline' \
   deploy/compose/compose.local.yml >/dev/null ||
   fail "local Compose overlay must read the ignored pipeline environment file"
 
+for openai_key in \
+  OPENAI_BASE_URL \
+  OPENAI_API_MODE \
+  OPENAI_API_KEY \
+  OPENAI_MODEL
+do
+  grep -F "${openai_key}=<" deploy/env/pipeline.env.example >/dev/null ||
+    fail "pipeline environment example must declare ${openai_key}"
+  if grep -F "${openai_key}: \${${openai_key}:-}" docker-compose.yml >/dev/null; then
+    fail "root Compose environment must not override pipeline env_file value ${openai_key}"
+  fi
+done
+grep -F 'path: ./deploy/env/.env.pipeline' deploy/compose/compose.local.yml >/dev/null ||
+  fail "local Worker overlay must load the pipeline environment file"
+grep -F 'analyze abstract-routes' README.md >/dev/null ||
+  fail "root README must document the strict abstract analysis command"
+grep -F '`analyze abstract-routes`' docs/deployment/biomedical-pipeline.md >/dev/null ||
+  fail "pipeline command table must document strict abstract analysis"
+
 grep -F 'count(paper.paper_id)' deploy/sql/verify-release.sql >/dev/null ||
   fail "release SQL must count the public_catalog_papers primary-key column"
 

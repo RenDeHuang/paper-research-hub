@@ -2,6 +2,8 @@ package crossref_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,203 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/crossref"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/httpclient"
 )
+
+func TestFetchWithPageReceiptsRecordsValidatedPagesBeforeYield(t *testing.T) {
+	t.Parallel()
+
+	firstPayload := envelopePayload(
+		t,
+		cursorValue("page 2"),
+		item("10.1000/one"),
+		item("10.1000/two"),
+	)
+	secondPayload := envelopePayload(t, noCursor())
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Query().Get("cursor") {
+		case "*":
+			_, _ = writer.Write(firstPayload)
+		case "page 2":
+			_, _ = writer.Write(secondPayload)
+		default:
+			t.Errorf("unexpected cursor %q", request.URL.Query().Get("cursor"))
+		}
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(config *crossref.Config) {
+		config.BatchSize = 2
+	}, httpclient.Dependencies{})
+	var (
+		receipts       []crossref.PageReceipt
+		recordsAtWrite []int
+		records        []source.Record
+		errs           []error
+	)
+	sequence := client.FetchWithPageReceipts(
+		context.Background(),
+		boundedQuery(10),
+		func(_ context.Context, receipt crossref.PageReceipt) error {
+			receipts = append(receipts, receipt)
+			recordsAtWrite = append(recordsAtWrite, len(records))
+			return nil
+		},
+	)
+	for record, err := range sequence {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		records = append(records, record)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("FetchWithPageReceipts() errors = %v", errs)
+	}
+	if got := recordDOIs(records); !slices.Equal(got, []string{
+		"10.1000/one",
+		"10.1000/two",
+	}) {
+		t.Fatalf("record DOIs = %v", got)
+	}
+	if !slices.Equal(recordsAtWrite, []int{0, 2}) {
+		t.Fatalf(
+			"records visible when receipts persisted = %v, want receipt before each page yield",
+			recordsAtWrite,
+		)
+	}
+	if len(receipts) != 2 {
+		t.Fatalf("receipts = %d, want 2 including terminal empty page", len(receipts))
+	}
+	assertPageReceipt(
+		t,
+		receipts[0],
+		1,
+		"*",
+		"page 2",
+		firstPayload,
+		2,
+	)
+	assertPageReceipt(
+		t,
+		receipts[1],
+		2,
+		"page 2",
+		"",
+		secondPayload,
+		0,
+	)
+}
+
+func TestFetchWithPageReceiptsRejectsInvalidPageBeforeReceiptOrYield(t *testing.T) {
+	t.Parallel()
+
+	payload := envelopePayload(
+		t,
+		noCursor(),
+		item("10.1000/one"),
+		json.RawMessage(`{"title":["missing DOI"]}`),
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(config *crossref.Config) {
+		config.BatchSize = 2
+	}, httpclient.Dependencies{})
+	receipts := 0
+	records, errs := collect(client.FetchWithPageReceipts(
+		context.Background(),
+		boundedQuery(10),
+		func(context.Context, crossref.PageReceipt) error {
+			receipts++
+			return nil
+		},
+	))
+	if len(records) != 0 || len(errs) != 1 {
+		t.Fatalf(
+			"FetchWithPageReceipts() = %d records, %d errors; want atomic page rejection",
+			len(records),
+			len(errs),
+		)
+	}
+	if receipts != 0 {
+		t.Fatalf("receipts = %d, malformed page must not be acknowledged", receipts)
+	}
+	if !strings.Contains(strings.ToLower(errs[0].Error()), "item 2") {
+		t.Fatalf("error = %v, want exact global item ordinal", errs[0])
+	}
+}
+
+func TestFetchWithPageReceiptsStopsBeforeYieldWhenReceiptPersistenceFails(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		requests.Add(1)
+		writeEnvelope(
+			t,
+			writer,
+			cursorValue("page 2"),
+			item("10.1000/one"),
+		)
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(config *crossref.Config) {
+		config.BatchSize = 1
+	}, httpclient.Dependencies{})
+	persistErr := errors.New("page receipt unavailable")
+	records, errs := collect(client.FetchWithPageReceipts(
+		context.Background(),
+		boundedQuery(2),
+		func(context.Context, crossref.PageReceipt) error {
+			return persistErr
+		},
+	))
+	if len(records) != 0 || len(errs) != 1 ||
+		!errors.Is(errs[0], persistErr) {
+		t.Fatalf(
+			"FetchWithPageReceipts() = %d records, errors %v; want persistence failure",
+			len(records),
+			errs,
+		)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want stop after failed first receipt", requests.Load())
+	}
+}
+
+func assertPageReceipt(
+	t *testing.T,
+	receipt crossref.PageReceipt,
+	ordinal int,
+	cursorIn string,
+	cursorOut string,
+	payload []byte,
+	recordCount int,
+) {
+	t.Helper()
+
+	hash := sha256.Sum256(payload)
+	if receipt.Ordinal != ordinal ||
+		receipt.CursorIn != cursorIn ||
+		receipt.CursorOut != cursorOut ||
+		receipt.ContentSHA256 != hex.EncodeToString(hash[:]) ||
+		receipt.RecordCount != recordCount {
+		t.Fatalf("receipt = %#v", receipt)
+	}
+}
 
 func TestNewClientRequiresExplicitValidatedConfiguration(t *testing.T) {
 	t.Parallel()
@@ -67,7 +266,7 @@ func TestNewClientRequiresExplicitValidatedConfiguration(t *testing.T) {
 	}
 }
 
-func TestFetchBuildsDeterministicValidatedFilterAndEncodesCursor(t *testing.T) {
+func TestCrossrefCreatedUpdatedStreamsCreatedFilterAndPagination(t *testing.T) {
 	t.Parallel()
 
 	const specialCursor = "next cursor/+?=&%"
@@ -104,9 +303,10 @@ func TestFetchBuildsDeterministicValidatedFilterAndEncodesCursor(t *testing.T) {
 		config.BatchSize = 2
 	}, httpclient.Dependencies{})
 	records, errs := collect(client.Fetch(context.Background(), crossref.Query{
-		DOIs:  []string{" DOI:10.1000/TWO ", "https://doi.org/10.1000/one", "10.1000/two"},
-		ISSNs: []string{"2049-3630", "0028-0836", "2049-3630"},
-		IndexedDateWindow: crossref.DateWindow{
+		Stream: crossref.StreamCreated,
+		DOIs:   []string{" DOI:10.1000/TWO ", "https://doi.org/10.1000/one", "10.1000/two"},
+		ISSNs:  []string{"2049-3630", "0028-0836", "2049-3630"},
+		DateWindow: crossref.DateWindow{
 			From: time.Date(2026, time.July, 1, 18, 0, 0, 0, time.FixedZone("west", -7*60*60)),
 			To:   time.Date(2026, time.July, 16, 23, 59, 0, 0, time.FixedZone("east", 8*60*60)),
 		},
@@ -128,7 +328,7 @@ func TestFetchBuildsDeterministicValidatedFilterAndEncodesCursor(t *testing.T) {
 	if len(requests) != 2 {
 		t.Fatalf("requests = %d, want 2", len(requests))
 	}
-	const wantFilter = "doi:10.1000/one,doi:10.1000/two,issn:0028-0836,issn:2049-3630,from-index-date:2026-07-01,until-index-date:2026-07-16"
+	const wantFilter = "doi:10.1000/one,doi:10.1000/two,issn:0028-0836,issn:2049-3630,from-created-date:2026-07-01,until-created-date:2026-07-16"
 	for index, values := range requests {
 		if got := values.Get("filter"); got != wantFilter {
 			t.Errorf("request %d filter = %q, want %q", index+1, got, wantFilter)
@@ -150,6 +350,44 @@ func TestFetchBuildsDeterministicValidatedFilterAndEncodesCursor(t *testing.T) {
 	}
 }
 
+func TestCrossrefCreatedUpdatedStreamsUpdatedFilter(t *testing.T) {
+	t.Parallel()
+
+	var captured url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		captured = request.URL.Query()
+		writeEnvelope(t, writer, noCursor())
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+	records, errs := collect(client.Fetch(context.Background(), crossref.Query{
+		Stream: crossref.StreamUpdated,
+		DateWindow: crossref.DateWindow{
+			From: time.Date(2026, time.July, 17, 23, 59, 0, 0, time.FixedZone("west", -7*60*60)),
+			To:   time.Date(2026, time.July, 18, 0, 1, 0, 0, time.FixedZone("east", 8*60*60)),
+		},
+		ISSNs:      []string{"0028-0836"},
+		MaxResults: 25,
+	}))
+	if len(records) != 0 || len(errs) != 0 {
+		t.Fatalf("Fetch() = %d records, errors %v", len(records), errs)
+	}
+	const wantFilter = "issn:0028-0836,from-update-date:2026-07-17,until-update-date:2026-07-18"
+	if got := captured.Get("filter"); got != wantFilter {
+		t.Fatalf("filter = %q, want explicit updated stream %q", got, wantFilter)
+	}
+	if got := captured.Get("cursor"); got != "*" {
+		t.Fatalf("cursor = %q, want initial cursor", got)
+	}
+	if got := captured.Get("rows"); got != "25" {
+		t.Fatalf("rows = %q, want remaining max results", got)
+	}
+	if got := captured.Get("mailto"); got != "research@example.test" {
+		t.Fatalf("mailto = %q", got)
+	}
+}
+
 func TestFetchRejectsDOIFilterDelimiterInjectionButAllowsDOIPunctuation(t *testing.T) {
 	t.Parallel()
 
@@ -168,6 +406,7 @@ func TestFetchRejectsDOIFilterDelimiterInjectionButAllowsDOIPunctuation(t *testi
 
 	client := newClient(t, server, nil, httpclient.Dependencies{})
 	records, errs := collect(client.Fetch(context.Background(), crossref.Query{
+		Stream:     crossref.StreamCreated,
 		DOIs:       []string{"10.1000/A:B%2CC/D"},
 		MaxResults: 1,
 	}))
@@ -185,6 +424,7 @@ func TestFetchRejectsDOIFilterDelimiterInjectionButAllowsDOIPunctuation(t *testi
 	}
 
 	records, errs = collect(client.Fetch(context.Background(), crossref.Query{
+		Stream:     crossref.StreamCreated,
 		DOIs:       []string{"10.1000/safe,issn:0028-0836"},
 		MaxResults: 1,
 	}))
@@ -212,9 +452,10 @@ func TestFetchSnapshotsQueryBeforeReturningLazySequence(t *testing.T) {
 
 	client := newClient(t, server, nil, httpclient.Dependencies{})
 	query := crossref.Query{
-		DOIs:  []string{"10.1000/original"},
-		ISSNs: []string{"0028-0836"},
-		IndexedDateWindow: crossref.DateWindow{
+		Stream: crossref.StreamCreated,
+		DOIs:   []string{"10.1000/original"},
+		ISSNs:  []string{"0028-0836"},
+		DateWindow: crossref.DateWindow{
 			From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
 			To:   time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),
 		},
@@ -228,7 +469,7 @@ func TestFetchSnapshotsQueryBeforeReturningLazySequence(t *testing.T) {
 	if len(records) != 0 || len(errs) != 0 {
 		t.Fatalf("Fetch() = %d records, errors %v", len(records), errs)
 	}
-	const want = "doi:10.1000/original,issn:0028-0836,from-index-date:2026-07-01,until-index-date:2026-07-02"
+	const want = "doi:10.1000/original,issn:0028-0836,from-created-date:2026-07-01,until-created-date:2026-07-02"
 	if got := captured.Get("filter"); got != want {
 		t.Fatalf("filter = %q, want immutable Fetch snapshot %q", got, want)
 	}
@@ -244,6 +485,7 @@ func TestFetchSnapshotHasNoRaceWithCallerMutation(t *testing.T) {
 
 	client := newClient(t, server, nil, httpclient.Dependencies{})
 	query := crossref.Query{
+		Stream:     crossref.StreamCreated,
 		DOIs:       []string{"10.1000/original"},
 		ISSNs:      []string{"0028-0836"},
 		MaxResults: 1,
@@ -289,35 +531,74 @@ func TestFetchRejectsUnboundedOrMalformedQueryBeforeNetwork(t *testing.T) {
 		query crossref.Query
 		want  string
 	}{
-		{name: "nonpositive max", query: crossref.Query{DOIs: []string{"10.1000/a"}}, want: "max results"},
-		{name: "unbounded", query: crossref.Query{MaxResults: 1}, want: "bounded"},
+		{
+			name:  "missing stream",
+			query: crossref.Query{DOIs: []string{"10.1000/a"}, MaxResults: 1},
+			want:  "stream",
+		},
+		{
+			name: "unknown stream",
+			query: crossref.Query{
+				Stream:     crossref.Stream("indexed"),
+				DOIs:       []string{"10.1000/a"},
+				MaxResults: 1,
+			},
+			want: "stream",
+		},
+		{
+			name: "nonpositive max",
+			query: crossref.Query{
+				Stream: crossref.StreamCreated,
+				DOIs:   []string{"10.1000/a"},
+			},
+			want: "max results",
+		},
+		{
+			name: "unbounded",
+			query: crossref.Query{
+				Stream:     crossref.StreamCreated,
+				MaxResults: 1,
+			},
+			want: "bounded",
+		},
 		{name: "partial from window", query: crossref.Query{
-			IndexedDateWindow: crossref.DateWindow{From: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)},
-			MaxResults:        1,
+			Stream:     crossref.StreamCreated,
+			DateWindow: crossref.DateWindow{From: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)},
+			MaxResults: 1,
 		}, want: "both"},
 		{name: "partial to window", query: crossref.Query{
-			IndexedDateWindow: crossref.DateWindow{To: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)},
-			MaxResults:        1,
+			Stream:     crossref.StreamUpdated,
+			DateWindow: crossref.DateWindow{To: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)},
+			MaxResults: 1,
 		}, want: "both"},
 		{name: "reversed window", query: crossref.Query{
-			IndexedDateWindow: crossref.DateWindow{
+			Stream: crossref.StreamUpdated,
+			DateWindow: crossref.DateWindow{
 				From: time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC),
 				To:   time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC),
 			},
 			MaxResults: 1,
 		}, want: "must not follow"},
-		{name: "invalid DOI", query: crossref.Query{DOIs: []string{"not-a-doi"}, MaxResults: 1}, want: "DOI"},
-		{name: "invalid ISSN format", query: crossref.Query{ISSNs: []string{"Nature"}, MaxResults: 1}, want: "ISSN"},
-		{name: "invalid ISSN checksum", query: crossref.Query{ISSNs: []string{"0028-0837"}, MaxResults: 1}, want: "ISSN"},
-		{name: "indexed year zero", query: crossref.Query{
-			IndexedDateWindow: crossref.DateWindow{
+		{name: "invalid DOI", query: crossref.Query{
+			Stream: crossref.StreamCreated, DOIs: []string{"not-a-doi"}, MaxResults: 1,
+		}, want: "DOI"},
+		{name: "invalid ISSN format", query: crossref.Query{
+			Stream: crossref.StreamCreated, ISSNs: []string{"Nature"}, MaxResults: 1,
+		}, want: "ISSN"},
+		{name: "invalid ISSN checksum", query: crossref.Query{
+			Stream: crossref.StreamUpdated, ISSNs: []string{"0028-0837"}, MaxResults: 1,
+		}, want: "ISSN"},
+		{name: "date year zero", query: crossref.Query{
+			Stream: crossref.StreamCreated,
+			DateWindow: crossref.DateWindow{
 				From: time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC),
 				To:   time.Date(1, time.January, 2, 0, 0, 0, 0, time.UTC),
 			},
 			MaxResults: 1,
 		}, want: "year"},
-		{name: "indexed year above four digits", query: crossref.Query{
-			IndexedDateWindow: crossref.DateWindow{
+		{name: "date year above four digits", query: crossref.Query{
+			Stream: crossref.StreamUpdated,
+			DateWindow: crossref.DateWindow{
 				From: time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC),
 				To:   time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
 			},
@@ -344,7 +625,7 @@ func TestFetchRejectsUnboundedOrMalformedQueryBeforeNetwork(t *testing.T) {
 	}
 }
 
-func TestFetchAcceptsIndexedDateYearBoundaries(t *testing.T) {
+func TestFetchAcceptsCreatedAndUpdatedDateYearBoundaries(t *testing.T) {
 	t.Parallel()
 
 	var (
@@ -360,30 +641,40 @@ func TestFetchAcceptsIndexedDateYearBoundaries(t *testing.T) {
 	defer server.Close()
 
 	client := newClient(t, server, nil, httpclient.Dependencies{})
-	for _, window := range []crossref.DateWindow{
+	for _, test := range []struct {
+		stream crossref.Stream
+		window crossref.DateWindow
+	}{
 		{
-			From: time.Date(1, time.January, 2, 0, 0, 0, 0, time.UTC),
-			To:   time.Date(1, time.December, 31, 0, 0, 0, 0, time.UTC),
+			stream: crossref.StreamCreated,
+			window: crossref.DateWindow{
+				From: time.Date(1, time.January, 2, 0, 0, 0, 0, time.UTC),
+				To:   time.Date(1, time.December, 31, 0, 0, 0, 0, time.UTC),
+			},
 		},
 		{
-			From: time.Date(9999, time.January, 1, 0, 0, 0, 0, time.UTC),
-			To:   time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC),
+			stream: crossref.StreamUpdated,
+			window: crossref.DateWindow{
+				From: time.Date(9999, time.January, 1, 0, 0, 0, 0, time.UTC),
+				To:   time.Date(9999, time.December, 31, 0, 0, 0, 0, time.UTC),
+			},
 		},
 	} {
 		records, errs := collect(client.Fetch(context.Background(), crossref.Query{
-			IndexedDateWindow: window,
-			MaxResults:        1,
+			Stream:     test.stream,
+			DateWindow: test.window,
+			MaxResults: 1,
 		}))
 		if len(records) != 0 || len(errs) != 0 {
-			t.Fatalf("Fetch(%v) = %d records, errors %v", window, len(records), errs)
+			t.Fatalf("Fetch(%s, %v) = %d records, errors %v", test.stream, test.window, len(records), errs)
 		}
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	want := []string{
-		"from-index-date:0001-01-02,until-index-date:0001-12-31",
-		"from-index-date:9999-01-01,until-index-date:9999-12-31",
+		"from-created-date:0001-01-02,until-created-date:0001-12-31",
+		"from-update-date:9999-01-01,until-update-date:9999-12-31",
 	}
 	if !slices.Equal(filters, want) {
 		t.Fatalf("filters = %v, want exact supported year boundaries %v", filters, want)
@@ -426,13 +717,13 @@ func TestFetchStopsNormallyOnShortOrEmptyPageWithoutCursor(t *testing.T) {
 	}
 }
 
-func TestFetchStopsAtMaxResultsWithoutAnotherRequestOrCursorValidation(t *testing.T) {
+func TestFetchFailsAtMaxResultsWhenCursorIsNotExhausted(t *testing.T) {
 	t.Parallel()
 
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
-		writeEnvelope(t, writer, cursorValue("*"), item("10.1000/one"))
+		writeEnvelope(t, writer, cursorValue("page 2"), item("10.1000/one"))
 	}))
 	defer server.Close()
 
@@ -440,11 +731,60 @@ func TestFetchStopsAtMaxResultsWithoutAnotherRequestOrCursorValidation(t *testin
 		config.BatchSize = 1
 	}, httpclient.Dependencies{})
 	records, errs := collect(client.Fetch(context.Background(), boundedQuery(1)))
-	if len(records) != 1 || len(errs) != 0 {
-		t.Fatalf("Fetch() = %d records, %d errors; want max-results success", len(records), len(errs))
+	if len(records) != 1 || len(errs) != 1 ||
+		!errors.Is(errs[0], crossref.ErrResultLimitReached) {
+		t.Fatalf(
+			"Fetch() = %d records, errors %v; want explicit incomplete-window error",
+			len(records),
+			errs,
+		)
 	}
 	if requests.Load() != 1 {
 		t.Fatalf("requests = %d, want exactly 1", requests.Load())
+	}
+}
+
+func TestFetchWithPageReceiptsPreservesNextCursorBeforeResultLimitFailure(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		writeEnvelope(
+			t,
+			writer,
+			cursorValue("opaque next cursor \t"),
+			item("10.1000/one"),
+		)
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(config *crossref.Config) {
+		config.BatchSize = 1
+	}, httpclient.Dependencies{})
+	var receipts []crossref.PageReceipt
+	records, errs := collect(client.FetchWithPageReceipts(
+		context.Background(),
+		boundedQuery(1),
+		func(_ context.Context, receipt crossref.PageReceipt) error {
+			receipts = append(receipts, receipt)
+			return nil
+		},
+	))
+	if len(records) != 1 || len(errs) != 1 ||
+		!errors.Is(errs[0], crossref.ErrResultLimitReached) {
+		t.Fatalf(
+			"FetchWithPageReceipts() = %d records, errors %v",
+			len(records),
+			errs,
+		)
+	}
+	if len(receipts) != 1 ||
+		receipts[0].CursorOut != "opaque next cursor \t" {
+		t.Fatalf("receipts = %#v, want exact opaque continuation cursor", receipts)
 	}
 }
 
@@ -872,7 +1212,7 @@ func TestFetchClosesResponseBodyOnEveryExitPath(t *testing.T) {
 		t.Parallel()
 
 		client, closes := newTrackingBodyClient(t, successPayload, nil)
-		records, errs := collect(client.Fetch(context.Background(), boundedQuery(1)))
+		records, errs := collect(client.Fetch(context.Background(), boundedQuery(2)))
 		if len(records) != 1 || len(errs) != 0 {
 			t.Fatalf("Fetch() = %d records, errors %v", len(records), errs)
 		}
@@ -1019,6 +1359,7 @@ func validConfig(baseURL string) crossref.Config {
 
 func boundedQuery(maxResults int) crossref.Query {
 	return crossref.Query{
+		Stream:     crossref.StreamCreated,
 		DOIs:       []string{"10.1000/bound"},
 		MaxResults: maxResults,
 	}

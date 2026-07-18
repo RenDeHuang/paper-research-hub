@@ -3,6 +3,7 @@ package crossref
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,10 @@ import (
 )
 
 const maxBatchSize = 1000
+
+var ErrResultLimitReached = errors.New(
+	"Crossref result limit reached before cursor exhaustion",
+)
 
 type Config struct {
 	BaseURL          string
@@ -41,11 +46,19 @@ type DateWindow struct {
 	To   time.Time
 }
 
+type Stream string
+
+const (
+	StreamCreated Stream = "created"
+	StreamUpdated Stream = "updated"
+)
+
 type Query struct {
-	DOIs              []string
-	ISSNs             []string
-	IndexedDateWindow DateWindow
-	MaxResults        int
+	Stream     Stream
+	DateWindow DateWindow
+	DOIs       []string
+	ISSNs      []string
+	MaxResults int
 }
 
 type Client struct {
@@ -54,6 +67,16 @@ type Client struct {
 	batchSize    int
 	httpClient   *httpclient.Client
 }
+
+type PageReceipt struct {
+	Ordinal       int
+	CursorIn      string
+	CursorOut     string
+	ContentSHA256 string
+	RecordCount   int
+}
+
+type PageReceiptRecorder func(context.Context, PageReceipt) error
 
 func NewClient(
 	base *http.Client,
@@ -185,9 +208,6 @@ func (client *Client) Fetch(ctx context.Context, query Query) source.ClientSeque
 					return
 				}
 			}
-			if emitted >= query.MaxResults {
-				return
-			}
 			if len(page.items) < rows {
 				return
 			}
@@ -204,8 +224,165 @@ func (client *Client) Fetch(ctx context.Context, query Query) source.ClientSeque
 				)
 				return
 			}
+			if emitted >= query.MaxResults {
+				yield(source.Record{}, ErrResultLimitReached)
+				return
+			}
 			seenCursors[nextCursor] = struct{}{}
 			cursor = nextCursor
+		}
+	}
+}
+
+func (client *Client) FetchWithPageReceipts(
+	ctx context.Context,
+	query Query,
+	recordPage PageReceiptRecorder,
+) source.ClientSequence {
+	query = query.clone()
+	return func(yield func(source.Record, error) bool) {
+		if client == nil {
+			yield(source.Record{}, errors.New("Crossref client is nil"))
+			return
+		}
+		if ctx == nil {
+			yield(source.Record{}, errors.New("Crossref fetch context is required"))
+			return
+		}
+		if recordPage == nil {
+			yield(source.Record{}, errors.New("Crossref page receipt recorder is required"))
+			return
+		}
+
+		filter, err := query.filter()
+		if err != nil {
+			yield(source.Record{}, err)
+			return
+		}
+
+		cursor := "*"
+		seenCursors := map[string]struct{}{cursor: {}}
+		emitted := 0
+		pageOrdinal := 0
+
+		for emitted < query.MaxResults {
+			if err := ctx.Err(); err != nil {
+				yield(source.Record{}, err)
+				return
+			}
+
+			rows := min(client.batchSize, query.MaxResults-emitted)
+			request, err := http.NewRequestWithContext(
+				ctx,
+				http.MethodGet,
+				client.worksURL(filter, cursor, rows),
+				nil,
+			)
+			if err != nil {
+				yield(source.Record{}, fmt.Errorf("create Crossref works request: %w", err))
+				return
+			}
+			response, err := client.httpClient.Do(request)
+			if err != nil {
+				yield(source.Record{}, fmt.Errorf("fetch Crossref works page: %w", err))
+				return
+			}
+			payload, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if readErr != nil {
+				yield(source.Record{}, fmt.Errorf("read Crossref works response: %w", readErr))
+				return
+			}
+			if closeErr != nil {
+				yield(source.Record{}, fmt.Errorf("close Crossref works response: %w", closeErr))
+				return
+			}
+
+			page, err := decodePage(payload)
+			if err != nil {
+				yield(source.Record{}, err)
+				return
+			}
+			if len(page.items) > rows {
+				yield(
+					source.Record{},
+					fmt.Errorf(
+						"Crossref protocol error: page returned %d items for requested rows=%d",
+						len(page.items),
+						rows,
+					),
+				)
+				return
+			}
+
+			pageStart := emitted
+			records := make([]source.Record, len(page.items))
+			for index, raw := range page.items {
+				record, err := Parse(raw)
+				if err != nil {
+					yield(
+						source.Record{},
+						fmt.Errorf("parse Crossref item %d: %w", pageStart+index+1, err),
+					)
+					return
+				}
+				records[index] = record
+			}
+
+			cursorOut := ""
+			fullPage := len(page.items) == rows
+			if fullPage {
+				cursorOut, err = page.requiredNextCursor()
+				if err != nil {
+					yield(source.Record{}, err)
+					return
+				}
+				if _, exists := seenCursors[cursorOut]; exists {
+					yield(
+						source.Record{},
+						fmt.Errorf(
+							"Crossref protocol error: duplicate next-cursor %q",
+							cursorOut,
+						),
+					)
+					return
+				}
+			}
+
+			pageOrdinal++
+			contentHash := sha256.Sum256(payload)
+			if err := recordPage(ctx, PageReceipt{
+				Ordinal:       pageOrdinal,
+				CursorIn:      cursor,
+				CursorOut:     cursorOut,
+				ContentSHA256: fmt.Sprintf("%x", contentHash),
+				RecordCount:   len(records),
+			}); err != nil {
+				yield(
+					source.Record{},
+					fmt.Errorf("record Crossref page receipt %d: %w", pageOrdinal, err),
+				)
+				return
+			}
+
+			for _, record := range records {
+				emitted++
+				if !yield(record, nil) {
+					return
+				}
+			}
+			if emitted >= query.MaxResults {
+				if fullPage {
+					yield(source.Record{}, ErrResultLimitReached)
+				}
+				return
+			}
+			if !fullPage {
+				return
+			}
+
+			seenCursors[cursorOut] = struct{}{}
+			cursor = cursorOut
 		}
 	}
 }
@@ -223,6 +400,23 @@ func (client *Client) worksURL(filter, cursor string, rows int) string {
 }
 
 func (query Query) filter() (string, error) {
+	var fromFilter, untilFilter string
+	switch query.Stream {
+	case StreamCreated:
+		fromFilter = "from-created-date"
+		untilFilter = "until-created-date"
+	case StreamUpdated:
+		fromFilter = "from-update-date"
+		untilFilter = "until-update-date"
+	default:
+		return "", fmt.Errorf(
+			"Crossref stream must be %q or %q, got %q",
+			StreamCreated,
+			StreamUpdated,
+			query.Stream,
+		)
+	}
+
 	if query.MaxResults <= 0 {
 		return "", errors.New("Crossref max results must be positive")
 	}
@@ -236,10 +430,13 @@ func (query Query) filter() (string, error) {
 		return "", err
 	}
 
-	hasFrom := !query.IndexedDateWindow.From.IsZero()
-	hasTo := !query.IndexedDateWindow.To.IsZero()
+	hasFrom := !query.DateWindow.From.IsZero()
+	hasTo := !query.DateWindow.To.IsZero()
 	if hasFrom != hasTo {
-		return "", errors.New("Crossref indexed date window requires both from and to dates")
+		return "", fmt.Errorf(
+			"Crossref %s stream date window requires both from and to dates",
+			query.Stream,
+		)
 	}
 
 	tokens := make([]string, 0, len(dois)+len(issns)+2)
@@ -250,23 +447,32 @@ func (query Query) filter() (string, error) {
 		tokens = append(tokens, "issn:"+issn)
 	}
 	if hasFrom {
-		from := dateOnly(query.IndexedDateWindow.From)
-		to := dateOnly(query.IndexedDateWindow.To)
+		from := dateOnly(query.DateWindow.From)
+		to := dateOnly(query.DateWindow.To)
 		if from.Year() < 1 || from.Year() > 9999 ||
 			to.Year() < 1 || to.Year() > 9999 {
-			return "", errors.New("Crossref indexed date window year must be between 1 and 9999")
+			return "", fmt.Errorf(
+				"Crossref %s stream date window year must be between 1 and 9999",
+				query.Stream,
+			)
 		}
 		if from.After(to) {
-			return "", errors.New("Crossref indexed date window from date must not follow to date")
+			return "", fmt.Errorf(
+				"Crossref %s stream date window from date must not follow to date",
+				query.Stream,
+			)
 		}
 		tokens = append(
 			tokens,
-			"from-index-date:"+from.Format(time.DateOnly),
-			"until-index-date:"+to.Format(time.DateOnly),
+			fromFilter+":"+from.Format(time.DateOnly),
+			untilFilter+":"+to.Format(time.DateOnly),
 		)
 	}
 	if len(tokens) == 0 {
-		return "", errors.New("Crossref query must be bounded by DOI, ISSN, or a complete indexed date window")
+		return "", fmt.Errorf(
+			"Crossref %s stream query must be bounded by DOI, ISSN, or a complete date window",
+			query.Stream,
+		)
 	}
 	return strings.Join(tokens, ","), nil
 }

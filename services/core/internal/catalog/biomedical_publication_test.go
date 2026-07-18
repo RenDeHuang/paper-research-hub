@@ -44,7 +44,7 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 			includeWorkLink:         true,
 			includeWorkID:           true,
 			includeNormalized:       true,
-			normalizedPayloadSchema: "normalized-record/v3",
+			normalizedPayloadSchema: "normalized-record/v4",
 			publicationModel:        "Print-Electronic",
 			publicationStatus:       "epublish",
 			publicationHistory: []publisherPublicationHistoryFixture{
@@ -806,7 +806,7 @@ func TestPublisherPublishesDailyPublicationUpdates(t *testing.T) {
 			includeWorkLink:            true,
 			includeWorkID:              true,
 			includeNormalized:          true,
-			normalizedPayloadSchema:    "normalized-record/v3",
+			normalizedPayloadSchema:    "normalized-record/v4",
 			includePublicationMetadata: true,
 			publicationHistory: []publisherPublicationHistoryFixture{
 				publisherPublicationHistoryEntry(
@@ -1299,7 +1299,7 @@ func insertPublisherPublicationUpdateWork(
 		includeWorkLink:         true,
 		includeWorkID:           true,
 		includeNormalized:       true,
-		normalizedPayloadSchema: "normalized-record/v3",
+		normalizedPayloadSchema: "normalized-record/v4",
 		publicationModel:        "Electronic",
 		publicationStatus:       "epublish",
 		publicationHistory:      publicationHistory,

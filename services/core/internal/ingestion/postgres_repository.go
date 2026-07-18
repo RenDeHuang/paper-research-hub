@@ -25,7 +25,7 @@ type PostgresRepository struct {
 
 const (
 	postgresJobIdempotencyAdvisorySeed int64 = 0x49444D50
-	normalizedPayloadSchemaVersion           = "normalized-record/v3"
+	normalizedPayloadSchemaVersion           = "normalized-record/v4"
 )
 
 func NewPostgresRepository(pool *pgxpool.Pool) (*PostgresRepository, error) {
@@ -503,6 +503,8 @@ type persistedPublicationDateV3 struct {
 	Year      int                  `json:"year"`
 	Month     int                  `json:"month,omitempty"`
 	Day       int                  `json:"day,omitempty"`
+	Season    string               `json:"season,omitempty"`
+	Raw       string               `json:"raw,omitempty"`
 	Precision source.DatePrecision `json:"precision"`
 }
 
@@ -513,30 +515,59 @@ type persistedPublicationHistoryEntryV3 struct {
 	Ordinal    int                        `json:"ordinal"`
 }
 
+type persistedOpenAccessV4 struct {
+	IsOA                     *bool  `json:"is_oa,omitempty"`
+	Status                   string `json:"status,omitempty"`
+	URL                      string `json:"url,omitempty"`
+	AnyRepositoryHasFulltext *bool  `json:"any_repository_has_fulltext,omitempty"`
+}
+
+type persistedLicenseV4 struct {
+	Name       string `json:"name,omitempty"`
+	ID         string `json:"id,omitempty"`
+	URL        string `json:"url,omitempty"`
+	SourcePath string `json:"source_path"`
+}
+
 type persistedRecordPayloadV3 struct {
-	Source             string                               `json:"source"`
-	SourceRecordID     string                               `json:"source_record_id"`
-	CanonicalKey       string                               `json:"canonical_key,omitempty"`
-	Identifiers        []source.Identifier                  `json:"identifiers"`
-	Title              string                               `json:"title"`
-	Abstract           string                               `json:"abstract,omitempty"`
-	AbstractSections   []source.AbstractSection             `json:"abstract_sections"`
-	PublicationModel   string                               `json:"publication_model"`
-	PublicationStatus  string                               `json:"publication_status"`
-	PublicationHistory []persistedPublicationHistoryEntryV3 `json:"publication_history"`
-	PublishedAt        *time.Time                           `json:"published_at,omitempty"`
-	Authors            []source.Author                      `json:"authors"`
-	MeSHHeadings       []source.MeSHHeading                 `json:"mesh_headings"`
-	PublicationTypes   []source.PublicationType             `json:"publication_types"`
-	Relations          []source.Relation                    `json:"relations"`
-	Topics             []source.Topic                       `json:"topics"`
-	Keywords           []source.Keyword                     `json:"keywords"`
-	CitedByCount       *int                                 `json:"cited_by_count,omitempty"`
-	Venue              *source.Venue                        `json:"venue,omitempty"`
-	Retracted          *bool                                `json:"retracted,omitempty"`
-	CodeURLs           []string                             `json:"code_urls"`
-	Evidence           []source.FieldEvidence               `json:"evidence"`
-	AuthorsTruncated   *bool                                `json:"authors_truncated,omitempty"`
+	Source                    string                               `json:"source"`
+	SourceRecordID            string                               `json:"source_record_id"`
+	ParserVersion             string                               `json:"parser_version,omitempty"`
+	CanonicalKey              string                               `json:"canonical_key,omitempty"`
+	Identifiers               []source.Identifier                  `json:"identifiers"`
+	RejectedIdentifiers       []source.RejectedIdentifierAssertion `json:"rejected_identifiers,omitempty"`
+	Title                     string                               `json:"title"`
+	Abstract                  string                               `json:"abstract,omitempty"`
+	Publisher                 string                               `json:"publisher,omitempty"`
+	AbstractSections          []source.AbstractSection             `json:"abstract_sections"`
+	CopyrightInformation      string                               `json:"copyright_information,omitempty"`
+	PublicationModel          string                               `json:"publication_model"`
+	PublicationStatus         string                               `json:"publication_status"`
+	PublicationHistory        []persistedPublicationHistoryEntryV3 `json:"publication_history"`
+	PublishedAt               *time.Time                           `json:"published_at,omitempty"`
+	PublishedDate             *persistedPublicationDateV3          `json:"published_date,omitempty"`
+	ElectronicPublishedAt     *time.Time                           `json:"electronic_published_at,omitempty"`
+	ElectronicPublicationDate *persistedPublicationDateV3          `json:"electronic_publication_date,omitempty"`
+	CreatedAt                 *time.Time                           `json:"created_at,omitempty"`
+	CompletedAt               *time.Time                           `json:"completed_at,omitempty"`
+	CompletedDate             *persistedPublicationDateV3          `json:"completed_date,omitempty"`
+	UpdatedAt                 *time.Time                           `json:"updated_at,omitempty"`
+	RevisedAt                 *time.Time                           `json:"revised_at,omitempty"`
+	RevisionDate              *persistedPublicationDateV3          `json:"revision_date,omitempty"`
+	Authors                   []source.Author                      `json:"authors"`
+	MeSHHeadings              []source.MeSHHeading                 `json:"mesh_headings"`
+	PublicationTypes          []source.PublicationType             `json:"publication_types"`
+	Relations                 []source.Relation                    `json:"relations"`
+	Topics                    []source.Topic                       `json:"topics"`
+	Keywords                  []source.Keyword                     `json:"keywords"`
+	CitedByCount              *int                                 `json:"cited_by_count,omitempty"`
+	Venue                     *source.Venue                        `json:"venue,omitempty"`
+	OpenAccess                *persistedOpenAccessV4               `json:"open_access,omitempty"`
+	Licenses                  []persistedLicenseV4                 `json:"licenses,omitempty"`
+	Retracted                 *bool                                `json:"retracted,omitempty"`
+	CodeURLs                  []string                             `json:"code_urls"`
+	Evidence                  []source.FieldEvidence               `json:"evidence"`
+	AuthorsTruncated          *bool                                `json:"authors_truncated,omitempty"`
 }
 
 func recordPayload(record source.Record) persistedRecordPayloadV3 {
@@ -557,29 +588,46 @@ func recordPayload(record source.Record) persistedRecordPayloadV3 {
 		}
 	}
 	return persistedRecordPayloadV3{
-		Source:             record.Source,
-		SourceRecordID:     record.SourceRecordID,
-		CanonicalKey:       canonicalKey,
-		Identifiers:        slices.Clone(record.Identifiers),
-		Title:              record.Title,
-		Abstract:           record.Abstract,
-		AbstractSections:   slices.Clone(record.AbstractSections),
-		PublicationModel:   record.PublicationModel,
-		PublicationStatus:  record.PublicationStatus,
-		PublicationHistory: publicationHistory,
-		PublishedAt:        cloneRepositoryTime(record.PublishedAt),
-		Authors:            cloneAuthors(record.Authors),
-		MeSHHeadings:       cloneMeSHHeadings(record.MeSHHeadings),
-		PublicationTypes:   slices.Clone(record.PublicationTypes),
-		Relations:          slices.Clone(record.Relations),
-		Topics:             cloneTopics(record.Topics),
-		Keywords:           cloneKeywords(record.Keywords),
-		CitedByCount:       cloneRepositoryInt(record.CitedByCount),
-		Venue:              cloneRepositoryVenue(record.Venue),
-		Retracted:          cloneRepositoryBool(record.Retracted),
-		CodeURLs:           slices.Clone(record.CodeURLs),
-		Evidence:           slices.Clone(record.Evidence),
-		AuthorsTruncated:   cloneRepositoryBool(record.AuthorsTruncated),
+		Source:                record.Source,
+		SourceRecordID:        record.SourceRecordID,
+		ParserVersion:         record.ParserVersion,
+		CanonicalKey:          canonicalKey,
+		Identifiers:           slices.Clone(record.Identifiers),
+		RejectedIdentifiers:   slices.Clone(record.RejectedIdentifiers),
+		Title:                 record.Title,
+		Abstract:              record.Abstract,
+		Publisher:             record.Publisher,
+		AbstractSections:      slices.Clone(record.AbstractSections),
+		CopyrightInformation:  record.CopyrightInformation,
+		PublicationModel:      record.PublicationModel,
+		PublicationStatus:     record.PublicationStatus,
+		PublicationHistory:    publicationHistory,
+		PublishedAt:           cloneRepositoryTime(record.PublishedAt),
+		PublishedDate:         persistedPublicationDatePointerV3(record.PublishedDate),
+		ElectronicPublishedAt: cloneRepositoryTime(record.ElectronicPublishedAt),
+		ElectronicPublicationDate: persistedPublicationDatePointerV3(
+			record.ElectronicPublicationDate,
+		),
+		CreatedAt:        cloneRepositoryTime(record.CreatedAt),
+		CompletedAt:      cloneRepositoryTime(record.CompletedAt),
+		CompletedDate:    persistedPublicationDatePointerV3(record.CompletedDate),
+		UpdatedAt:        cloneRepositoryTime(record.UpdatedAt),
+		RevisedAt:        cloneRepositoryTime(record.RevisedAt),
+		RevisionDate:     persistedPublicationDatePointerV3(record.RevisionDate),
+		Authors:          cloneAuthors(record.Authors),
+		MeSHHeadings:     cloneMeSHHeadings(record.MeSHHeadings),
+		PublicationTypes: slices.Clone(record.PublicationTypes),
+		Relations:        slices.Clone(record.Relations),
+		Topics:           cloneTopics(record.Topics),
+		Keywords:         cloneKeywords(record.Keywords),
+		CitedByCount:     cloneRepositoryInt(record.CitedByCount),
+		Venue:            cloneRepositoryVenue(record.Venue),
+		OpenAccess:       persistedOpenAccessPayloadV4(record.OpenAccess),
+		Licenses:         persistedLicensePayloadsV4(record.Licenses),
+		Retracted:        cloneRepositoryBool(record.Retracted),
+		CodeURLs:         slices.Clone(record.CodeURLs),
+		Evidence:         slices.Clone(record.Evidence),
+		AuthorsTruncated: cloneRepositoryBool(record.AuthorsTruncated),
 	}
 }
 
@@ -596,8 +644,23 @@ func persistedPublicationDatePayloadV3(
 	case source.DatePrecisionDay:
 		persisted.Month = int(value.Month)
 		persisted.Day = value.Day
+	case source.DatePrecisionSeason:
+		persisted.Season = value.Season
+		persisted.Raw = value.Raw
+	case source.DatePrecisionText:
+		persisted.Raw = value.Raw
 	}
 	return persisted
+}
+
+func persistedPublicationDatePointerV3(
+	value *source.SourceDate,
+) *persistedPublicationDateV3 {
+	if value == nil {
+		return nil
+	}
+	persisted := persistedPublicationDatePayloadV3(*value)
+	return &persisted
 }
 
 func (repository *PostgresRepository) Normalize(
@@ -3728,6 +3791,40 @@ func cloneRepositoryVenue(value *source.Venue) *source.Venue {
 	cloned.ISSN = append([]string(nil), value.ISSN...)
 	cloned.ISSNDetails = append([]source.VenueISSN(nil), value.ISSNDetails...)
 	return &cloned
+}
+
+func persistedOpenAccessPayloadV4(
+	value source.OpenAccess,
+) *persistedOpenAccessV4 {
+	if value.IsOA == nil &&
+		value.Status == "" &&
+		value.URL == "" &&
+		value.AnyRepositoryHasFulltext == nil {
+		return nil
+	}
+	return &persistedOpenAccessV4{
+		IsOA:   cloneRepositoryBool(value.IsOA),
+		Status: value.Status,
+		URL:    value.URL,
+		AnyRepositoryHasFulltext: cloneRepositoryBool(
+			value.AnyRepositoryHasFulltext,
+		),
+	}
+}
+
+func persistedLicensePayloadsV4(
+	values []source.License,
+) []persistedLicenseV4 {
+	result := make([]persistedLicenseV4, len(values))
+	for index, value := range values {
+		result[index] = persistedLicenseV4{
+			Name:       value.Name,
+			ID:         value.ID,
+			URL:        value.URL,
+			SourcePath: value.SourcePath,
+		}
+	}
+	return result
 }
 
 func dereferenceString(value *string) string {

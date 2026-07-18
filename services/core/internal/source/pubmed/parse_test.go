@@ -14,6 +14,32 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/pubmed"
 )
 
+func TestPubMedParserVersionIsExplicitAndAttachedToRecords(t *testing.T) {
+	t.Parallel()
+
+	if pubmed.ParserVersion != "pubmed/pubmed-article-v1" {
+		t.Fatalf("ParserVersion = %q", pubmed.ParserVersion)
+	}
+	payload, err := os.ReadFile("testdata/efetch.xml")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	records, err := pubmed.Parse(payload)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	for index, record := range records {
+		if record.ParserVersion != pubmed.ParserVersion {
+			t.Fatalf(
+				"records[%d].ParserVersion = %q, want %q",
+				index,
+				record.ParserVersion,
+				pubmed.ParserVersion,
+			)
+		}
+	}
+}
+
 func TestParseMapsPubMedArticleAndPreservesExactSingleElementBytes(t *testing.T) {
 	t.Parallel()
 

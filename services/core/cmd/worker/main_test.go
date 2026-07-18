@@ -224,8 +224,13 @@ func TestRealMainRejectsInvalidOrUnboundedCommandsBeforeMutation(t *testing.T) {
 		},
 		{
 			name: "crossref unbounded",
-			args: []string{"sync", "crossref", "--max-results", "10"},
-			want: "date window or issn",
+			args: []string{
+				"sync",
+				"crossref-created",
+				"--max-results",
+				"10",
+			},
+			want: "both from-date and to-date",
 		},
 		{
 			name: "catalog publish missing formula version",

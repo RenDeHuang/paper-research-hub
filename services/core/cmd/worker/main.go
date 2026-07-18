@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/abstractanalysis"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/analysis"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/catalog"
@@ -29,6 +30,7 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/config"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/ingestion"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/openairesponses"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/crossref"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/httpclient"
@@ -42,17 +44,20 @@ type commandKind string
 const (
 	commandSyncOpenAlex                commandKind = "sync_openalex"
 	commandSyncPubMed                  commandKind = "sync_pubmed"
-	commandSyncCrossref                commandKind = "sync_crossref"
+	commandSyncCrossrefCreated         commandKind = "sync_crossref_created"
+	commandSyncCrossrefUpdated         commandKind = "sync_crossref_updated"
 	commandImportJCR                   commandKind = "import_jcr"
 	commandImportSubjects              commandKind = "import_subjects"
 	commandAssessVenues                commandKind = "assess_venues"
 	commandAssessBiomedicalEligibility commandKind = "assess_biomedical_eligibility"
 	commandAnalyzeCitations            commandKind = "analyze_citations"
+	commandAnalyzeAbstractRoutes       commandKind = "analyze_abstract_routes"
 	commandAnalyzeTrends               commandKind = "analyze_trends"
 	commandAnalyzeJournals             commandKind = "analyze_journals"
 	commandAnalyzeOpportunities        commandKind = "analyze_opportunities"
 	commandPublishCatalog              commandKind = "publish_catalog"
 	maxSyncResults                                 = 1000
+	abstractAnalysisRequestTimeout                 = 2 * time.Minute
 )
 
 type workerCommand struct {
@@ -93,6 +98,10 @@ type workerCommand struct {
 	MinimumSupportCount            int
 	MinimumFieldBaselineCount      int
 	RuleSetVersion                 string
+	PromptVersion                  string
+	SchemaVersion                  string
+	AnalysisCutoff                 time.Time
+	Limit                          int
 }
 
 type commandRunner func(
@@ -100,6 +109,29 @@ type commandRunner func(
 	config.Config,
 	workerCommand,
 ) (map[string]any, error)
+
+type connectorRunStore interface {
+	Start(context.Context, ingestion.ConnectorClaim) (ingestion.ConnectorRun, error)
+	RecordPage(
+		context.Context,
+		ingestion.ConnectorRun,
+		ingestion.ConnectorPageReceipt,
+	) error
+	Succeed(context.Context, ingestion.ConnectorRun) error
+	Fail(context.Context, ingestion.ConnectorRun) error
+}
+
+type crossrefFetchFunc func(
+	context.Context,
+	crossref.Query,
+	crossref.PageReceiptRecorder,
+) source.ClientSequence
+
+type ingestionRunFunc func(
+	context.Context,
+	ingestion.Job,
+	ingestion.EventSequence,
+) (ingestion.JobSummary, error)
 
 func main() {
 	ctx, stop := signal.NotifyContext(
@@ -158,6 +190,9 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	}
 	if args[0] == "analyze" {
 		switch args[1] {
+		case "abstract-routes":
+			command, err := parseAbstractAnalysisCommand(args[2:])
+			return command, config.RoleAbstractAnalysis, err
 		case "citations":
 			command, err := parseCitationAnalysisCommand(args[2:])
 			return command, config.RoleCitationAnalysis, err
@@ -172,7 +207,7 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 			return command, config.RoleBiomedicalAnalysis, err
 		default:
 			return workerCommand{}, "", fmt.Errorf(
-				"unsupported analyze target %q; expected citations, trends, journals, or opportunities",
+				"unsupported analyze target %q; expected abstract-routes, citations, trends, journals, or opportunities",
 				args[1],
 			)
 		}
@@ -229,15 +264,130 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	case "pubmed":
 		command, err := parsePubMedCommand(args[2:])
 		return command, config.RolePubMedSync, err
-	case "crossref":
-		command, err := parseCrossrefCommand(args[2:])
+	case "crossref-created":
+		command, err := parseCrossrefCommand(
+			commandSyncCrossrefCreated,
+			args[2:],
+		)
+		return command, config.RoleCrossrefSync, err
+	case "crossref-updated":
+		command, err := parseCrossrefCommand(
+			commandSyncCrossrefUpdated,
+			args[2:],
+		)
 		return command, config.RoleCrossrefSync, err
 	default:
 		return workerCommand{}, "", fmt.Errorf(
-			"unsupported sync source %q; expected openalex, pubmed, or crossref",
+			"unsupported sync source %q; expected openalex, pubmed, crossref-created, or crossref-updated",
 			args[1],
 		)
 	}
+}
+
+func parseAbstractAnalysisCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("analyze abstract-routes", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	var cutoff string
+	set.StringVar(
+		&command.PromptVersion,
+		"prompt-version",
+		"",
+		"frozen abstract analysis prompt version",
+	)
+	set.StringVar(
+		&command.SchemaVersion,
+		"schema-version",
+		"",
+		"frozen abstract analysis schema version",
+	)
+	set.StringVar(
+		&cutoff,
+		"analysis-cutoff",
+		"",
+		"explicit RFC3339Nano source revision cutoff",
+	)
+	set.IntVar(
+		&command.Limit,
+		"limit",
+		0,
+		"maximum exact Work revisions to analyze",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"parse abstract route analysis flags: %w",
+			err,
+		)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected abstract route analysis arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+
+	command.Kind = commandAnalyzeAbstractRoutes
+	if command.PromptVersion == "" {
+		return workerCommand{}, errors.New(
+			"abstract route analysis requires an explicit --prompt-version",
+		)
+	}
+	if command.PromptVersion != strings.TrimSpace(command.PromptVersion) {
+		return workerCommand{}, errors.New(
+			"abstract route analysis prompt-version must be trimmed",
+		)
+	}
+	if command.PromptVersion != abstractanalysis.PromptVersion {
+		return workerCommand{}, fmt.Errorf(
+			"abstract route analysis --prompt-version must equal %s",
+			abstractanalysis.PromptVersion,
+		)
+	}
+	if command.SchemaVersion == "" {
+		return workerCommand{}, errors.New(
+			"abstract route analysis requires an explicit --schema-version",
+		)
+	}
+	if command.SchemaVersion != strings.TrimSpace(command.SchemaVersion) {
+		return workerCommand{}, errors.New(
+			"abstract route analysis schema-version must be trimmed",
+		)
+	}
+	if command.SchemaVersion != abstractanalysis.SchemaVersion {
+		return workerCommand{}, fmt.Errorf(
+			"abstract route analysis --schema-version must equal %s",
+			abstractanalysis.SchemaVersion,
+		)
+	}
+	if cutoff == "" {
+		return workerCommand{}, errors.New(
+			"abstract route analysis requires an explicit --analysis-cutoff",
+		)
+	}
+	if cutoff != strings.TrimSpace(cutoff) {
+		return workerCommand{}, errors.New(
+			"abstract route analysis cutoff must be trimmed",
+		)
+	}
+	parsedCutoff, err := time.Parse(time.RFC3339Nano, cutoff)
+	if err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"abstract route analysis cutoff must use RFC3339Nano: %w",
+			err,
+		)
+	}
+	if parsedCutoff.IsZero() {
+		return workerCommand{}, errors.New(
+			"abstract route analysis cutoff must be non-zero",
+		)
+	}
+	command.AnalysisCutoff = parsedCutoff.UTC()
+	if command.Limit < 1 || command.Limit > 1000 {
+		return workerCommand{}, errors.New(
+			"abstract route analysis limit must be between 1 and 1000",
+		)
+	}
+	return command, nil
 }
 
 func parseCitationAnalysisCommand(args []string) (workerCommand, error) {
@@ -1404,8 +1554,23 @@ func parsePubMedCommand(args []string) (workerCommand, error) {
 	return command, nil
 }
 
-func parseCrossrefCommand(args []string) (workerCommand, error) {
-	set := flag.NewFlagSet("sync crossref", flag.ContinueOnError)
+func parseCrossrefCommand(
+	kind commandKind,
+	args []string,
+) (workerCommand, error) {
+	var target string
+	switch kind {
+	case commandSyncCrossrefCreated:
+		target = "crossref-created"
+	case commandSyncCrossrefUpdated:
+		target = "crossref-updated"
+	default:
+		return workerCommand{}, fmt.Errorf(
+			"invalid Crossref stream command kind %q",
+			kind,
+		)
+	}
+	set := flag.NewFlagSet("sync "+target, flag.ContinueOnError)
 	set.SetOutput(io.Discard)
 	var command workerCommand
 	var fromDate, toDate string
@@ -1420,28 +1585,23 @@ func parseCrossrefCommand(args []string) (workerCommand, error) {
 	if set.NArg() != 0 {
 		return workerCommand{}, fmt.Errorf("unexpected Crossref arguments: %s", strings.Join(set.Args(), " "))
 	}
-	if (fromDate == "") != (toDate == "") {
+	if fromDate == "" || toDate == "" {
 		return workerCommand{}, errors.New("Crossref sync requires both from-date and to-date")
 	}
 	var err error
-	if fromDate != "" {
-		command.FromDate, err = parseDateFlag("from-date", fromDate)
-		if err != nil {
-			return workerCommand{}, err
-		}
-		command.ToDate, err = parseDateFlag("to-date", toDate)
-		if err != nil {
-			return workerCommand{}, err
-		}
-		if command.FromDate.After(command.ToDate) {
-			return workerCommand{}, errors.New("Crossref from-date must not follow to-date")
-		}
+	command.FromDate, err = parseDateFlag("from-date", fromDate)
+	if err != nil {
+		return workerCommand{}, err
 	}
-	command.Kind = commandSyncCrossref
+	command.ToDate, err = parseDateFlag("to-date", toDate)
+	if err != nil {
+		return workerCommand{}, err
+	}
+	if command.FromDate.After(command.ToDate) {
+		return workerCommand{}, errors.New("Crossref from-date must not follow to-date")
+	}
+	command.Kind = kind
 	command.ISSNs = issns.values()
-	if command.FromDate.IsZero() && len(command.ISSNs) == 0 {
-		return workerCommand{}, errors.New("Crossref sync requires a date window or ISSN")
-	}
 	if err := validateMaxResults(command.MaxResults); err != nil {
 		return workerCommand{}, err
 	}
@@ -1496,6 +1656,8 @@ func runCommand(
 	}
 	defer pool.Close()
 	switch command.Kind {
+	case commandAnalyzeAbstractRoutes:
+		return runAbstractAnalysis(ctx, pool, cfg, command)
 	case commandAnalyzeCitations:
 		return runCitationAnalysis(ctx, pool, command)
 	case commandAnalyzeTrends:
@@ -1516,6 +1678,88 @@ func runCommand(
 		return runSubjectImport(ctx, pool, command)
 	default:
 		return runSync(ctx, pool, cfg, command)
+	}
+}
+
+func runAbstractAnalysis(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	cfg config.Config,
+	command workerCommand,
+) (map[string]any, error) {
+	store, err := abstractanalysis.NewPostgresStore(pool)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create abstract analysis store: %w",
+			err,
+		)
+	}
+	client, err := openairesponses.New(
+		&http.Client{Timeout: abstractAnalysisRequestTimeout},
+		openairesponses.Config{
+			BaseURL: cfg.OpenAI.BaseURL,
+			Mode:    openairesponses.Mode(cfg.OpenAI.APIMode),
+			APIKey:  cfg.OpenAI.APIKey,
+			Model:   cfg.OpenAI.Model,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create OpenAI Responses client: %w",
+			err,
+		)
+	}
+	service, err := abstractanalysis.NewService(
+		store,
+		client,
+		openairesponses.Mode(cfg.OpenAI.APIMode),
+		cfg.OpenAI.Model,
+		time.Now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create abstract route analysis service: %w",
+			err,
+		)
+	}
+	summary, err := service.Analyze(ctx, abstractAnalysisInput(command))
+	if err != nil {
+		return nil, fmt.Errorf("analyze abstract routes: %w", err)
+	}
+	return abstractAnalysisResult(
+		command,
+		cfg.OpenAI.APIMode,
+		cfg.OpenAI.Model,
+		summary,
+	), nil
+}
+
+func abstractAnalysisInput(
+	command workerCommand,
+) abstractanalysis.AnalyzeInput {
+	return abstractanalysis.AnalyzeInput{
+		PromptVersion: command.PromptVersion,
+		SchemaVersion: command.SchemaVersion,
+		Cutoff:        command.AnalysisCutoff,
+		Limit:         command.Limit,
+	}
+}
+
+func abstractAnalysisResult(
+	command workerCommand,
+	apiMode string,
+	requestedModel string,
+	summary abstractanalysis.Summary,
+) map[string]any {
+	return map[string]any{
+		"prompt_version":  command.PromptVersion,
+		"schema_version":  command.SchemaVersion,
+		"analysis_cutoff": command.AnalysisCutoff.Format(time.RFC3339Nano),
+		"api_mode":        apiMode,
+		"requested_model": requestedModel,
+		"selected":        summary.Selected,
+		"succeeded":       summary.Succeeded,
+		"failed":          summary.Failed,
 	}
 }
 
@@ -1974,6 +2218,16 @@ func runSync(
 	if err != nil {
 		return nil, err
 	}
+	if command.Kind == commandSyncCrossrefCreated ||
+		command.Kind == commandSyncCrossrefUpdated {
+		return runCrossrefSync(
+			ctx,
+			pool,
+			cfg,
+			command,
+			service.Run,
+		)
+	}
 	records, logicalSource, err := fetchRecords(ctx, cfg, command)
 	if err != nil {
 		return nil, err
@@ -1992,10 +2246,201 @@ func runSync(
 	if err != nil {
 		return nil, err
 	}
-	summary, err := service.Run(ctx, job, recordEvents(logicalSource, records))
+	summary, err := service.Run(
+		ctx,
+		job,
+		recordEventsForCommand(command, logicalSource, records),
+	)
 	if err != nil {
 		return nil, err
 	}
+	return syncSummaryResult(summary), nil
+}
+
+func runCrossrefSync(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	cfg config.Config,
+	command workerCommand,
+	runIngestion ingestionRunFunc,
+) (map[string]any, error) {
+	client, err := crossref.NewClient(
+		http.DefaultClient,
+		crossref.Config{
+			BaseURL:          cfg.Crossref.Request.BaseURL,
+			ContactEmail:     cfg.Crossref.ContactEmail,
+			UserAgent:        "paper-research-hub/0.1 (+mailto:" + cfg.Crossref.ContactEmail + ")",
+			BatchSize:        min(cfg.Crossref.Request.BatchSize, 1000),
+			Timeout:          cfg.Crossref.Request.Timeout,
+			RateLimit:        httpclient.RateLimit{Requests: 10, Interval: time.Second},
+			MaxRetries:       cfg.Crossref.Request.MaxRetries,
+			MaxWait:          cfg.Crossref.Request.MaxWait,
+			InitialBackoff:   500 * time.Millisecond,
+			MaxBackoff:       10 * time.Second,
+			MaxResponseBytes: 64 << 20,
+		},
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	payload := commandPayload(command)
+	idempotencyKey, err := commandIdempotencyKey(source.Crossref, payload)
+	if err != nil {
+		return nil, err
+	}
+	job, err := ingestion.NewJob(
+		"sync/"+source.Crossref+"/"+idempotencyKey,
+		source.Crossref,
+		idempotencyKey,
+		payload,
+	)
+	if err != nil {
+		return nil, err
+	}
+	store, err := ingestion.NewPostgresConnectorRunStore(pool)
+	if err != nil {
+		return nil, err
+	}
+	summary, err := executeCrossrefConnectorRun(
+		ctx,
+		command,
+		job,
+		store,
+		client.FetchWithPageReceipts,
+		runIngestion,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return syncSummaryResult(summary), nil
+}
+
+func executeCrossrefConnectorRun(
+	ctx context.Context,
+	command workerCommand,
+	job ingestion.Job,
+	store connectorRunStore,
+	fetch crossrefFetchFunc,
+	runIngestion ingestionRunFunc,
+) (ingestion.JobSummary, error) {
+	query, err := crossrefQuery(command)
+	if err != nil {
+		return ingestion.JobSummary{}, err
+	}
+	claim, err := ingestion.NewConnectorClaim(
+		source.Crossref,
+		string(query.Stream),
+		ingestion.WatermarkTimestamp,
+		command.FromDate,
+		command.ToDate.AddDate(0, 0, 1),
+		job.IdempotencyKey,
+	)
+	if err != nil {
+		return ingestion.JobSummary{}, err
+	}
+	run, err := store.Start(ctx, claim)
+	if err != nil {
+		return ingestion.JobSummary{}, err
+	}
+
+	records := fetch(
+		ctx,
+		query,
+		func(
+			pageContext context.Context,
+			page crossref.PageReceipt,
+		) error {
+			receipt, receiptErr := ingestion.NewConnectorPageReceipt(
+				run.ID,
+				page.Ordinal,
+				page.CursorIn,
+				page.CursorOut,
+				page.ContentSHA256,
+				page.RecordCount,
+			)
+			if receiptErr != nil {
+				return receiptErr
+			}
+			return store.RecordPage(pageContext, run, receipt)
+		},
+	)
+	fetchFailed := false
+	trackedRecords := func(yield func(source.Record, error) bool) {
+		for record, recordErr := range records {
+			if recordErr != nil {
+				fetchFailed = true
+			}
+			if !yield(record, recordErr) {
+				return
+			}
+		}
+	}
+	summary, err := runIngestion(
+		ctx,
+		job,
+		recordEventsForCommand(
+			command,
+			source.Crossref,
+			source.ClientSequence(trackedRecords),
+		),
+	)
+	if err != nil {
+		stage := "ingestion"
+		code := "ingestion_failed"
+		if fetchFailed {
+			stage = "fetch"
+			code = "crossref_fetch_failed"
+		}
+		return ingestion.JobSummary{}, errors.Join(
+			err,
+			failConnectorRun(ctx, store, run, stage, code),
+		)
+	}
+
+	succeeded, err := run.Succeed()
+	if err != nil {
+		return ingestion.JobSummary{}, errors.Join(
+			err,
+			failConnectorRun(
+				ctx,
+				store,
+				run,
+				"watermark",
+				"watermark_transition_failed",
+			),
+		)
+	}
+	if err := store.Succeed(ctx, succeeded); err != nil {
+		return ingestion.JobSummary{}, errors.Join(
+			err,
+			failConnectorRun(
+				ctx,
+				store,
+				run,
+				"watermark",
+				"watermark_advance_failed",
+			),
+		)
+	}
+	return summary, nil
+}
+
+func failConnectorRun(
+	ctx context.Context,
+	store connectorRunStore,
+	run ingestion.ConnectorRun,
+	stage string,
+	code string,
+) error {
+	failed, err := run.Fail(stage, code)
+	if err != nil {
+		return err
+	}
+	return store.Fail(context.WithoutCancel(ctx), failed)
+}
+
+func syncSummaryResult(summary ingestion.JobSummary) map[string]any {
 	return map[string]any{
 		"job_id":       summary.JobID,
 		"status":       summary.Status,
@@ -2006,7 +2451,7 @@ func runSync(
 		"deleted":      summary.Deleted,
 		"unchanged":    summary.Unchanged,
 		"failed":       summary.Failed,
-	}, nil
+	}
 }
 
 func runJCRImport(
@@ -2124,7 +2569,7 @@ func fetchRecords(
 		}
 		return client.Fetch(ctx, history), source.PubMed, nil
 
-	case commandSyncCrossref:
+	case commandSyncCrossrefCreated, commandSyncCrossrefUpdated:
 		client, err := crossref.NewClient(
 			http.DefaultClient,
 			crossref.Config{
@@ -2145,15 +2590,9 @@ func fetchRecords(
 		if err != nil {
 			return nil, "", err
 		}
-		query := crossref.Query{
-			ISSNs:      command.ISSNs,
-			MaxResults: command.MaxResults,
-		}
-		if !command.FromDate.IsZero() {
-			query.IndexedDateWindow = crossref.DateWindow{
-				From: command.FromDate,
-				To:   command.ToDate,
-			}
+		query, err := crossrefQuery(command)
+		if err != nil {
+			return nil, "", err
 		}
 		return client.Fetch(ctx, query), source.Crossref, nil
 
@@ -2162,13 +2601,74 @@ func fetchRecords(
 	}
 }
 
+func crossrefQuery(command workerCommand) (crossref.Query, error) {
+	var stream crossref.Stream
+	switch command.Kind {
+	case commandSyncCrossrefCreated:
+		stream = crossref.StreamCreated
+	case commandSyncCrossrefUpdated:
+		stream = crossref.StreamUpdated
+	default:
+		return crossref.Query{}, fmt.Errorf(
+			"unsupported Crossref command kind %q",
+			command.Kind,
+		)
+	}
+	return crossref.Query{
+		Stream: stream,
+		DateWindow: crossref.DateWindow{
+			From: command.FromDate,
+			To:   command.ToDate,
+		},
+		ISSNs:      append([]string(nil), command.ISSNs...),
+		MaxResults: command.MaxResults,
+	}, nil
+}
+
 func recordEvents(
 	logicalSource string,
 	records source.ClientSequence,
 ) ingestion.EventSequence {
+	return recordEventsWithRevisionTime(
+		logicalSource,
+		records,
+		recordRevisionTime,
+	)
+}
+
+type recordRevisionTimeFunc func(source.Record) (time.Time, bool)
+
+func recordEventsForCommand(
+	command workerCommand,
+	logicalSource string,
+	records source.ClientSequence,
+) ingestion.EventSequence {
+	selector := recordRevisionTimeFunc(recordRevisionTime)
+	switch command.Kind {
+	case commandSyncCrossrefCreated:
+		selector = func(record source.Record) (time.Time, bool) {
+			return exactRecordTime(record.CreatedAt)
+		}
+	case commandSyncCrossrefUpdated:
+		selector = func(record source.Record) (time.Time, bool) {
+			return exactRecordTime(record.UpdatedAt)
+		}
+	}
+	return recordEventsWithRevisionTime(logicalSource, records, selector)
+}
+
+func recordEventsWithRevisionTime(
+	logicalSource string,
+	records source.ClientSequence,
+	revisionTime recordRevisionTimeFunc,
+) ingestion.EventSequence {
 	return func(yield func(ingestion.Event, error) bool) {
 		if records == nil {
 			yield(nil, errors.New("source record sequence is required"))
+			return
+		}
+		if revisionTime == nil {
+			yield(nil, errors.New("record revision-time selector is required"))
 			return
 		}
 		position := int64(0)
@@ -2186,7 +2686,7 @@ func recordEvents(
 				))
 				return
 			}
-			sourceTime, ok := recordRevisionTime(record)
+			sourceTime, ok := revisionTime(record)
 			if !ok {
 				yield(nil, fmt.Errorf(
 					"record %s:%s has no deterministic source revision time",
@@ -2213,6 +2713,13 @@ func recordEvents(
 			}
 		}
 	}
+}
+
+func exactRecordTime(value *time.Time) (time.Time, bool) {
+	if value == nil || value.IsZero() {
+		return time.Time{}, false
+	}
+	return value.UTC(), true
 }
 
 func recordRevisionTime(record source.Record) (time.Time, bool) {

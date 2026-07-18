@@ -22,6 +22,7 @@ const (
 	RoleCatalogPublish     Role = "catalog-publish"
 	RoleCitationAnalysis   Role = "citation-analysis"
 	RoleBiomedicalAnalysis Role = "biomedical-analysis"
+	RoleAbstractAnalysis   Role = "abstract-analysis"
 	RoleVenueAssessment    Role = "venue-assessment"
 	RoleOpenAlexSync       Role = "openalex-sync"
 	RolePubMedSync         Role = "pubmed-sync"
@@ -45,6 +46,7 @@ type Config struct {
 	Database    DatabaseConfig  `json:"database"`
 	Catalog     CatalogConfig   `json:"catalog"`
 	Worker      WorkerConfig    `json:"worker"`
+	OpenAI      OpenAIConfig    `json:"openai"`
 	OpenAlex    OpenAlexConfig  `json:"openalex"`
 	PubMed      PubMedConfig    `json:"pubmed"`
 	Crossref    CrossrefConfig  `json:"crossref"`
@@ -99,6 +101,13 @@ type RequestConfig struct {
 	BatchSize  int           `json:"batch_size"`
 }
 
+type OpenAIConfig struct {
+	BaseURL string `json:"base_url,omitempty"`
+	APIMode string `json:"api_mode,omitempty"`
+	APIKey  string `json:"-"`
+	Model   string `json:"model,omitempty"`
+}
+
 type OpenAlexConfig struct {
 	Request      RequestConfig `json:"request"`
 	ContactEmail string        `json:"contact_email,omitempty"`
@@ -144,6 +153,7 @@ type RedactedConfig struct {
 	Database    RedactedDatabaseConfig  `json:"database"`
 	Catalog     RedactedCatalogConfig   `json:"catalog"`
 	Worker      WorkerConfig            `json:"worker"`
+	OpenAI      RedactedOpenAIConfig    `json:"openai"`
 	OpenAlex    RedactedOpenAlexConfig  `json:"openalex"`
 	PubMed      RedactedPubMedConfig    `json:"pubmed"`
 	Crossref    CrossrefConfig          `json:"crossref"`
@@ -164,6 +174,13 @@ type RedactedDatabaseConfig struct {
 
 type RedactedCatalogConfig struct {
 	CursorSecret string `json:"cursor_secret,omitempty"`
+}
+
+type RedactedOpenAIConfig struct {
+	BaseURL string `json:"base_url,omitempty"`
+	APIMode string `json:"api_mode,omitempty"`
+	APIKey  string `json:"api_key,omitempty"`
+	Model   string `json:"model,omitempty"`
 }
 
 type RedactedOpenAlexConfig struct {
@@ -266,6 +283,12 @@ func LoadFrom(role Role, lookup LookupEnv) (Config, error) {
 			CursorSecret: optional(lookup, "CATALOG_CURSOR_SECRET"),
 		},
 		Worker: workerConfig,
+		OpenAI: OpenAIConfig{
+			BaseURL: optional(lookup, "OPENAI_BASE_URL"),
+			APIMode: optional(lookup, "OPENAI_API_MODE"),
+			APIKey:  optional(lookup, "OPENAI_API_KEY"),
+			Model:   optional(lookup, "OPENAI_MODEL"),
+		},
 		OpenAlex: OpenAlexConfig{
 			Request:      openAlexRequest,
 			ContactEmail: optional(lookup, "OPENALEX_CONTACT_EMAIL"),
@@ -322,6 +345,36 @@ func (cfg Config) validateRole(role Role) error {
 		RoleBiomedicalAnalysis,
 		RoleVenueAssessment:
 		return nil
+	case RoleAbstractAnalysis:
+		if err := validateRequiredTrimmed(
+			"OPENAI_BASE_URL",
+			cfg.OpenAI.BaseURL,
+		); err != nil {
+			return err
+		}
+		if err := validateOpenAIBaseURL(cfg.OpenAI.BaseURL); err != nil {
+			return err
+		}
+		if err := validateRequiredTrimmed(
+			"OPENAI_API_MODE",
+			cfg.OpenAI.APIMode,
+		); err != nil {
+			return err
+		}
+		switch cfg.OpenAI.APIMode {
+		case "responses", "chat_completions":
+		default:
+			return errors.New(
+				"OPENAI_API_MODE must be responses or chat_completions",
+			)
+		}
+		if err := validateRequiredTrimmed(
+			"OPENAI_API_KEY",
+			cfg.OpenAI.APIKey,
+		); err != nil {
+			return err
+		}
+		return validateRequiredTrimmed("OPENAI_MODEL", cfg.OpenAI.Model)
 	case RoleOpenAlexSync:
 		if strings.TrimSpace(cfg.OpenAlex.APIKey) == "" {
 			return errors.New("OPENALEX_API_KEY is required")
@@ -369,6 +422,7 @@ func supportedRole(role Role) bool {
 		RoleCatalogPublish,
 		RoleCitationAnalysis,
 		RoleBiomedicalAnalysis,
+		RoleAbstractAnalysis,
 		RoleVenueAssessment,
 		RoleOpenAlexSync,
 		RolePubMedSync,
@@ -621,6 +675,52 @@ func validateHTTPURL(key, raw string) error {
 	return nil
 }
 
+func validateOpenAIBaseURL(raw string) error {
+	if raw != strings.TrimSpace(raw) {
+		return errors.New("OPENAI_BASE_URL must be trimmed")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Hostname() == "" {
+		return errors.New(
+			"OPENAI_BASE_URL must be an absolute http:// or https:// URL",
+		)
+	}
+	if parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" ||
+		parsed.RawFragment != "" {
+		return errors.New(
+			"OPENAI_BASE_URL must not contain credentials, query, or fragment",
+		)
+	}
+	if parsed.Scheme == "http" && !isLoopbackHost(parsed.Hostname()) {
+		return errors.New(
+			"OPENAI_BASE_URL must use HTTPS unless it targets a loopback host",
+		)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
+}
+
+func validateRequiredTrimmed(key, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is required", key)
+	}
+	if value != strings.TrimSpace(value) {
+		return fmt.Errorf("%s must be trimmed", key)
+	}
+	return nil
+}
+
 func validateEmailRequired(key, value string) error {
 	if value == "" {
 		return fmt.Errorf("%s is required", key)
@@ -734,6 +834,12 @@ func (cfg Config) Redacted() RedactedConfig {
 			CursorSecret: redactedSecret(cfg.Catalog.CursorSecret),
 		},
 		Worker: cfg.Worker,
+		OpenAI: RedactedOpenAIConfig{
+			BaseURL: cfg.OpenAI.BaseURL,
+			APIMode: cfg.OpenAI.APIMode,
+			APIKey:  redactedSecret(cfg.OpenAI.APIKey),
+			Model:   cfg.OpenAI.Model,
+		},
 		OpenAlex: RedactedOpenAlexConfig{
 			Request:      cfg.OpenAlex.Request,
 			ContactEmail: cfg.OpenAlex.ContactEmail,

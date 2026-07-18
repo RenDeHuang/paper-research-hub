@@ -85,19 +85,23 @@ watermark。重放相同来源修订不能产生重复 Work。
 
 ```text
 OPENAI_BASE_URL
+OPENAI_API_MODE
 OPENAI_API_KEY
 OPENAI_MODEL
 ```
 
-三个配置对摘要分析 Worker 都是必填项。没有默认模型、没有第二供应商、没有静默降级。
+四个配置对摘要分析 Worker 都是必填项。`OPENAI_API_MODE` 只能显式选择
+`responses` 或 `chat_completions`。没有接口自动探测、没有默认模型、没有第二供应商、
+没有静默降级。
 API Key 不写入数据库、日志、Catalog、错误正文或 Git。
 
 ### API 契约
 
-Worker 使用 OpenAI Responses API 兼容接口和严格 JSON Schema 输出。每个分析 run 保存：
+Worker 使用所选 OpenAI-compatible API 模式和严格 JSON Schema 输出。每个分析 run 保存：
 
 - `model_provider=openai-compatible`
-- 实际 `model_name`
+- `api_mode`
+- 请求模型与 provider 返回的实际模型
 - `prompt_version`
 - `schema_version`
 - 输入摘要的 SHA-256

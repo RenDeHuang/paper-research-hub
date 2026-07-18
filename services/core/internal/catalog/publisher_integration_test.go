@@ -543,7 +543,7 @@ func TestPublisherRejectsPublicationAssertionSetMismatchWithNormalizedHistory(
 				includeWorkLink:         true,
 				includeWorkID:           true,
 				includeNormalized:       true,
-				normalizedPayloadSchema: "normalized-record/v3",
+				normalizedPayloadSchema: "normalized-record/v4",
 				publicationModel:        "Electronic",
 				publicationStatus:       test.publicationStatus,
 				publicationHistory:      test.history,
@@ -597,7 +597,7 @@ func TestPublisherPreloadsPublicationEvidenceForMultipleWorks(t *testing.T) {
 		includeWorkLink:         true,
 		includeWorkID:           true,
 		includeNormalized:       true,
-		normalizedPayloadSchema: "normalized-record/v3",
+		normalizedPayloadSchema: "normalized-record/v4",
 		publicationModel:        "Electronic",
 		publicationStatus:       "epublish",
 		publicationHistory: publisherPublicationHistoryFromEvents(
@@ -673,7 +673,7 @@ func TestPublisherRejectsV3WinnerWithoutPublicationState(t *testing.T) {
 		includeWorkLink:         true,
 		includeWorkID:           true,
 		includeNormalized:       true,
-		normalizedPayloadSchema: "normalized-record/v3",
+		normalizedPayloadSchema: "normalized-record/v4",
 		publicationModel:        "Electronic",
 		publicationStatus:       "epublish",
 		noJCRAssessment:         true,
@@ -1941,7 +1941,7 @@ func TestPublisherLoadsNormalizedPayloadByBoundAssertionID(t *testing.T) {
 			raw_event_id, source_record_uuid, normalization_policy_version,
 			payload_schema_version, normalized_payload
 		) VALUES (
-			$1, $2, 'normalize/v1', 'normalized-record/v3',
+			$1, $2, 'normalize/v1', 'normalized-record/v4',
 			'{
 				"source":"openalex",
 				"source_record_id":"openalex:publisher-normalized-binding",
@@ -2443,7 +2443,7 @@ func insertPublisherVisibleWork(
 		if options.includePublicationMetadata || options.publicationStatus != "" {
 			normalizedPayloadMap["publication_status"] = options.publicationStatus
 		}
-		if options.normalizedPayloadSchema == "normalized-record/v3" {
+		if options.normalizedPayloadSchema == "normalized-record/v4" {
 			history := options.publicationHistory
 			if history == nil {
 				history = []publisherPublicationHistoryFixture{}

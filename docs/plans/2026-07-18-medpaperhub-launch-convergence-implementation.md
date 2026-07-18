@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Deliver a locally deployable medpaperhub that ingests real multi-source papers, publishes only records with verified official URLs, extracts evidence-bound research routes from abstracts through a strict OpenAI-compatible Responses API schema, computes trends and journal profiles, and explains journal fit for a user abstract.
+**Goal:** Deliver a locally deployable medpaperhub that ingests real multi-source papers, publishes only records with verified official URLs, extracts evidence-bound research routes from abstracts through an explicitly configured OpenAI-compatible strict JSON Schema API mode, computes trends and journal profiles, and explains journal fit for a user abstract.
 
 **Architecture:** Keep the decoupled Go API/Worker/Migrate, Nuxt Web, PostgreSQL, OpenAPI, and immutable Catalog boundaries. Execute nine business tasks as vertical release slices; database, deduplication, watermarks, recovery, APIs, UI, tests, and deployment are completion criteria inside those slices rather than separate product milestones.
 
-**Tech Stack:** Go 1.26, PostgreSQL 18, Nuxt 4, Vue 3, TypeScript, OpenAPI 3.1, OpenAI-compatible Responses API, strict JSON Schema, Vitest, Playwright, Docker Compose, shell deployment scripts, GitHub Actions.
+**Tech Stack:** Go 1.26, PostgreSQL 18, Nuxt 4, Vue 3, TypeScript, OpenAPI 3.1, OpenAI-compatible Responses or Chat Completions API selected explicitly per deployment, strict JSON Schema, Vitest, Playwright, Docker Compose, shell deployment scripts, GitHub Actions.
 
 ---
 

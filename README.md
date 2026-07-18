@@ -116,12 +116,13 @@ cp .env.example .env
 5. JCR Category 与 Subject rule 的 exact-link reconciliation；该步骤由 Subject/JCR importer 在事务内自动执行，当前没有独立 `reconcile` 命令；
 6. `assess venues`；
 7. `assess biomedical-eligibility`；
-8. `analyze citations` 从一个明确来源生成不可变引用分析 run；
-9. `analyze trends` 生成不可变 publication trend run；
-10. `analyze journals` 生成不可变 journal editorial-pattern run；
-11. `analyze opportunities` 显式绑定 citation、trend、journal 三个上游 run；
-12. `publish catalog` 显式绑定 citation source 与四个 analysis run ID；
-13. 启动并验证独立的 Go API 与 Nuxt Web。
+8. `analyze abstract-routes` 使用严格 JSON Schema 和摘要原文证据生成不可变研究路线 run；
+9. `analyze citations` 从一个明确来源生成不可变引用分析 run；
+10. `analyze trends` 生成不可变 publication trend run；
+11. `analyze journals` 生成不可变 journal editorial-pattern run；
+12. `analyze opportunities` 显式绑定 citation、trend、journal 三个上游 run；
+13. `publish catalog` 显式绑定 citation source 与四个 analysis run ID；
+14. 启动并验证独立的 Go API 与 Nuxt Web。
 
 完整 Docker volume mount、本地原生命令、全部 Worker flags、receipt 查询和验证 SQL 见 [`docs/deployment/biomedical-pipeline.md`](docs/deployment/biomedical-pipeline.md)。
 
@@ -194,11 +195,17 @@ make typecheck
 
 - **OpenAlex**：`sync openalex`，需要 `OPENALEX_CONTACT_EMAIL` 与 `OPENALEX_API_KEY`，用于论文发现与开放元数据同步。
 - **PubMed**：`sync pubmed`，需要显式日期窗口、query 或 exact ISSN、`NCBI_TOOL` 与 `NCBI_EMAIL`；可选 `NCBI_API_KEY` 只用于授权配额。该命令已经串联抓取、raw、规范化与投影，不存在单独的 normalize/project CLI。
-- **Crossref**：`sync crossref`，需要 `CROSSREF_CONTACT_EMAIL`，用于 DOI、ISSN、许可和出版关系增强。
+- **Crossref**：`sync crossref-created` 用 `created` 流做最新论文发现，`sync crossref-updated` 用 `deposited/update` 流同步修订；两者都需要 `CROSSREF_CONTACT_EMAIL` 和显式日期区间。`indexed` 只保存为来源证据，不作为首次发现或修订时间。
 - **Biomedical Subject**：`import subjects`，导入不可变、版本化、exact JCR Category allowlist，并在事务内执行 exact-link reconciliation。
 - **JCR**：`import jcr`，`JCR_IMPORT_PATH` 必须指向用户明确授权的 CSV，`JCR_SOURCE_LICENSE` 必须记录该导出的授权或许可依据。系统不会推断许可，也不会用推断指标替代 JCR 数据。
 - **Venue assessment**：`assess venues`，仅接受完整 policy version/label `journal-all-q1/v2`，并绑定明确的 JCR receipt 与 metric year。
 - **Biomedical eligibility**：`assess biomedical-eligibility`，对当前 Work 批量固化 exact Subject 资格决定。
+- **Abstract route analysis**：`analyze abstract-routes`，要求显式
+  `abstract-route-prompt/v1`、`abstract-route/v1`、分析截止时间和批量上限；
+  通过显式 `OPENAI_API_MODE=responses|chat_completions` 调用
+  OpenAI-compatible 严格 JSON Schema 输出研究路线，并保存 API 模式、
+  请求模型、实际模型、输入摘要及哈希、完整输出 Schema、响应 ID、
+  token usage 和逐字段摘要证据。系统不会自动探测接口或切换模式。
 - **Citation analysis**：`analyze citations`，从一个明确 citation source 生成不可变 citation count、velocity 与 cohort percentile 结果；不会混合来源或把证据不足填成 `0`。
 - **Trend analysis**：`analyze trends`，按预声明窗口、支持度和模型选择边界生成不可变 publication trend run。
 - **Journal analysis**：`analyze journals`，按预声明窗口和最低支持度生成不可变 editorial-pattern run。

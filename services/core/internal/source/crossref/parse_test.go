@@ -15,6 +15,17 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/crossref"
 )
 
+func TestCrossrefParserVersionIsExplicitAndStable(t *testing.T) {
+	t.Parallel()
+
+	if crossref.ParserVersion != "crossref/works-v2" {
+		t.Fatalf(
+			"ParserVersion = %q, want versioned field-assertion contract",
+			crossref.ParserVersion,
+		)
+	}
+}
+
 func TestParseRequiresAndNormalizesDOIAsCrossrefIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -25,6 +36,13 @@ func TestParseRequiresAndNormalizesDOIAsCrossrefIdentity(t *testing.T) {
 	}
 	if record.Source != source.Crossref {
 		t.Fatalf("Source = %q, want crossref", record.Source)
+	}
+	if record.ParserVersion != crossref.ParserVersion {
+		t.Fatalf(
+			"record.ParserVersion = %q, want %q",
+			record.ParserVersion,
+			crossref.ParserVersion,
+		)
 	}
 	if record.SourceRecordID != "10.1000/abc" {
 		t.Fatalf("SourceRecordID = %q", record.SourceRecordID)
@@ -155,7 +173,7 @@ func TestParseMapsCrossrefItemWithoutInventingValues(t *testing.T) {
 	assertTime(
 		t,
 		record.UpdatedAt,
-		time.Date(2026, time.July, 16, 3, 45, 0, 0, time.UTC),
+		time.Date(2026, time.July, 14, 16, 30, 0, 0, time.UTC),
 	)
 
 	wantLicenses := []source.License{
@@ -205,7 +223,8 @@ func TestParseMapsCrossrefItemWithoutInventingValues(t *testing.T) {
 		{Field: "electronic_publication_date", SourcePath: "$.published-online.date-parts"},
 		{Field: "electronic_published_at", SourcePath: "$.published-online.date-parts"},
 		{Field: "created_at", SourcePath: "$.created.date-time"},
-		{Field: "updated_at", SourcePath: "$.indexed.date-time"},
+		{Field: "updated_at", SourcePath: "$.deposited.date-time"},
+		{Field: "crossref_indexed_at", SourcePath: "$.indexed.date-time"},
 		{Field: "licenses", SourcePath: "$.license[0].URL"},
 		{Field: "licenses", SourcePath: "$.license[1].URL"},
 		{Field: "relations", SourcePath: "$.update-to"},
@@ -215,6 +234,58 @@ func TestParseMapsCrossrefItemWithoutInventingValues(t *testing.T) {
 	}
 	if record.Scope.Status != source.ScopePending {
 		t.Fatalf("Scope = %#v, want pending", record.Scope)
+	}
+}
+
+func TestIndexedDoesNotCreateRevisionOrFirstDiscoveryTime(t *testing.T) {
+	t.Parallel()
+
+	firstRaw := []byte(`{
+		"DOI":"10.1000/legacy-2019",
+		"created":{"date-time":"2019-03-04T05:06:07Z"},
+		"indexed":{"date-time":"2026-07-17T23:59:00Z"}
+	}`)
+	reindexedRaw := []byte(`{
+		"DOI":"10.1000/legacy-2019",
+		"created":{"date-time":"2019-03-04T05:06:07Z"},
+		"indexed":{"date-time":"2026-07-18T00:01:00Z"}
+	}`)
+
+	first, err := crossref.Parse(firstRaw)
+	if err != nil {
+		t.Fatalf("Parse(first) error = %v", err)
+	}
+	reindexed, err := crossref.Parse(reindexedRaw)
+	if err != nil {
+		t.Fatalf("Parse(reindexed) error = %v", err)
+	}
+
+	wantCreated := time.Date(2019, time.March, 4, 5, 6, 7, 0, time.UTC)
+	assertTime(t, first.CreatedAt, wantCreated)
+	assertTime(t, reindexed.CreatedAt, wantCreated)
+	if first.UpdatedAt != nil || reindexed.UpdatedAt != nil {
+		t.Fatalf(
+			"UpdatedAt = %v / %v, indexed must not create a revision timestamp",
+			first.UpdatedAt,
+			reindexed.UpdatedAt,
+		)
+	}
+	wantEvidence := []source.FieldEvidence{
+		{Field: "identifiers", SourcePath: "$.DOI"},
+		{Field: "created_at", SourcePath: "$.created.date-time"},
+		{Field: "crossref_indexed_at", SourcePath: "$.indexed.date-time"},
+	}
+	if !slices.Equal(first.Evidence, wantEvidence) ||
+		!slices.Equal(reindexed.Evidence, wantEvidence) {
+		t.Fatalf(
+			"indexed evidence = %#v / %#v, want exact source-only assertion %#v",
+			first.Evidence,
+			reindexed.Evidence,
+			wantEvidence,
+		)
+	}
+	if first.Raw.SHA256 == reindexed.Raw.SHA256 {
+		t.Fatal("indexed-only source revision must remain distinguishable in raw evidence")
 	}
 }
 
@@ -422,6 +493,8 @@ func TestParseRejectsInvalidCrossrefDatesAndTimestamps(t *testing.T) {
 		{name: "day invalid", body: `"published":{"date-parts":[[2026,2,30]]}`, want: "day"},
 		{name: "created missing date-time", body: `"created":{"timestamp":1700000000000}`, want: "created"},
 		{name: "created malformed", body: `"created":{"date-time":"not-a-time"}`, want: "created"},
+		{name: "deposited missing date-time", body: `"deposited":{"timestamp":1700000000000}`, want: "deposited"},
+		{name: "deposited malformed", body: `"deposited":{"date-time":"2026-07-16"}`, want: "deposited"},
 		{name: "indexed missing date-time", body: `"indexed":{"timestamp":1700000000000}`, want: "indexed"},
 		{name: "indexed malformed", body: `"indexed":{"date-time":"2026-07-16"}`, want: "indexed"},
 	}

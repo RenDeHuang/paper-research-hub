@@ -1686,7 +1686,7 @@ func loadCurrentPublicationStates(
 			return nil, catalogPublicationEvidenceError(workID, err)
 		}
 		if state.Source != "pubmed" ||
-			normalizedSchema.String != "normalized-record/v3" ||
+			normalizedSchema.String != "normalized-record/v4" ||
 			payload.Source != state.Source ||
 			payload.SourceRecordID != sourceRecordExternalID.String ||
 			!equalOptionalString(state.PublicationModel, normalizedModel) ||

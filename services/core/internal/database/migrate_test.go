@@ -104,6 +104,8 @@ var expectedSchemaTables = []string{
 	"work_lifecycle_assertions",
 	"work_lifecycle_states",
 	"work_channel_admission_decisions",
+	"connector_runs",
+	"abstract_route_analysis_runs",
 }
 
 var expectedSchemaTablesWithoutGeneratedID = []string{
@@ -113,6 +115,8 @@ var expectedSchemaTablesWithoutGeneratedID = []string{
 	"public_catalog_journals",
 	"work_publication_states",
 	"content_channels",
+	"connector_watermarks",
+	"connector_run_pages",
 }
 
 var expectedScopeAndChannelConstraints = []string{
@@ -289,6 +293,8 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		"conference_identifiers_parent_unsealed",
 		"conference_official_hosts_parent_unsealed",
 		"work_domain_assertions_immutable",
+		"connector_run_pages_immutable",
+		"abstract_route_analysis_runs_terminal_immutable",
 	})
 
 	rows, err = pool.Query(ctx, `
@@ -326,6 +332,8 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 20, name: "scope_and_channel_registries"},
 		{version: 21, name: "scope_registry_sealing"},
 		{version: 22, name: "scope_registry_serialization_and_missing_admissions"},
+		{version: 23, name: "connector_runs"},
+		{version: 27, name: "abstract_route_analysis"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -369,8 +377,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 22 {
-		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
+	if len(migrations) != 24 {
+		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -2955,8 +2963,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 22 {
-		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
+	if len(migrations) != 24 {
+		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -4377,8 +4385,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 22 {
-		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
+	if len(migrations) != 24 {
+		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -6197,8 +6205,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 22 {
-		t.Fatalf("embedded migration count = %d, want 22", len(migrations))
+	if len(migrations) != 24 {
+		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
 	}
 
 	pool := openTestPool(t)
