@@ -26,14 +26,14 @@ deploy_contract_secret_assignment_is_allowed() {
     "")
       return 0
       ;;
-    replace-* | optional-*)
+    replace-* | optional-* | development-only-*)
       [ -n "${assignment_value#*-}" ]
       return
       ;;
   esac
 
   if printf '%s\n' "${assignment_value}" |
-    grep -E '^<[^<>]+>$|^\$\{[A-Za-z_][A-Za-z0-9_]*\}$|^\$\{\{[[:space:]]*(secrets|env)\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\}\}$|^\$\{[A-Za-z_][A-Za-z0-9_]*:-((replace|optional)-[^}]+)?\}$' >/dev/null 2>&1; then
+    grep -E '^<[^<>]+>$|^\$\{[A-Za-z_][A-Za-z0-9_]*\}$|^\$\{\{[[:space:]]*(secrets|env)\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\}\}$|^\$\{[A-Za-z_][A-Za-z0-9_]*:-((replace|optional|development-only)-[^}]+)?\}$' >/dev/null 2>&1; then
     return 0
   fi
 
@@ -156,6 +156,7 @@ for allowed_assignment in \
   '<replace-with-api-key>' \
   'replace-with-api-key' \
   'optional-authorized-key' \
+  'development-only-local-secret' \
   '${OPENAI_API_KEY}' \
   '${{ secrets.GITHUB_TOKEN }}'; do
   deploy_contract_secret_assignment_is_allowed \
@@ -168,7 +169,7 @@ deploy_contract_secret_assignment_is_allowed \
   "services/example/config_test.go" ||
   fail "secret assignment scanner rejected a short test fixture"
 if deploy_contract_secret_assignment_is_allowed \
-  "development-only-catalog-cursor-secret-change-me" \
+  "production-catalog-cursor-secret-value" \
   ".env.example"; then
   fail "secret assignment scanner accepted an obvious non-placeholder value"
 fi

@@ -613,7 +613,7 @@ psql "${DATABASE_URL}" -At \
 
 ```bash
 export DATABASE_URL='postgres://paper_hub:paper_hub_local@localhost:5432/paper_hub?sslmode=disable'
-export CATALOG_CURSOR_SECRET='replace-with-at-least-32-byte-local-secret'
+export CATALOG_CURSOR_SECRET='development-only-catalog-cursor-secret-change-me'
 go -C services/core run ./cmd/api
 ```
 
