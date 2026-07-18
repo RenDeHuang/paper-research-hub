@@ -6,6 +6,100 @@ import (
 	"time"
 )
 
+func TestAllQ1Policy(t *testing.T) {
+	t.Parallel()
+
+	item := venueForTest(
+		t,
+		"venue-all-q1",
+		"Synthetic All-Q1 Journal",
+		"1234-5679",
+		"1234-5679",
+		"2049-3630",
+	)
+	policy, err := NewJournalPolicy("journal-all-q1/v2")
+	if err != nil {
+		t.Fatalf("NewJournalPolicy() error = %v", err)
+	}
+	evaluatedAt := time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC)
+
+	for _, test := range []struct {
+		name     string
+		jif      string
+		quartile Quartile
+		decision PolicyDecision
+	}{
+		{
+			name:     "low JIF Q1 accepted",
+			jif:      "0.1",
+			quartile: QuartileQ1,
+			decision: PolicyDecisionAccepted,
+		},
+		{
+			name:     "high JIF Q1 accepted",
+			jif:      "99",
+			quartile: QuartileQ1,
+			decision: PolicyDecisionAccepted,
+		},
+		{
+			name:     "high JIF Q2 rejected",
+			jif:      "99",
+			quartile: QuartileQ2,
+			decision: PolicyDecisionRejected,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			result, evaluateErr := policy.Evaluate(
+				item,
+				2025,
+				[]MetricSnapshot{
+					mustMetricSnapshot(
+						t,
+						item.ID(),
+						2025,
+						"Exact Authorized Category",
+						test.jif,
+						test.quartile,
+						MetricStatusKnown,
+						"synthetic-jcr",
+					),
+				},
+				evaluatedAt,
+			)
+			if evaluateErr != nil {
+				t.Fatalf("Evaluate() error = %v", evaluateErr)
+			}
+			if result.Decision() != test.decision {
+				t.Fatalf(
+					"Decision() = %q, want %q",
+					result.Decision(),
+					test.decision,
+				)
+			}
+			if test.decision == PolicyDecisionAccepted &&
+				!slices.Equal(
+					result.MatchedRules(),
+					[]MatchedRule{MatchedRuleAnyQ1},
+				) {
+				t.Fatalf(
+					"MatchedRules() = %#v, want only jcr_q1",
+					result.MatchedRules(),
+				)
+			}
+			if test.decision != PolicyDecisionAccepted &&
+				len(result.MatchedRules()) != 0 {
+				t.Fatalf(
+					"MatchedRules() = %#v, want none",
+					result.MatchedRules(),
+				)
+			}
+		})
+	}
+}
+
 func TestJournalPolicyAcceptsHighJIFOrAnyQ1WithVersionedEvidence(t *testing.T) {
 	t.Parallel()
 

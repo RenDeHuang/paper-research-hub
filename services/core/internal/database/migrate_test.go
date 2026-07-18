@@ -7150,6 +7150,66 @@ func TestDeletingWorkRetainsEvidenceAndGlobalRepository(t *testing.T) {
 	}
 }
 
+func TestJCRRegistryV2MigrationAddsExactCategoryEvidenceAndPolicy(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	rows, err := pool.Query(ctx, `
+		SELECT column_name
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND table_name = 'venue_metric_snapshots'
+		  AND column_name IN (
+			'registry_version',
+			'edition_year',
+			'jif_rank',
+			'category_journal_count',
+			'jif_percentile'
+		  )
+	`)
+	if err != nil {
+		t.Fatalf("query JCR Registry v2 columns: %v", err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			t.Fatalf("scan JCR Registry v2 column: %v", err)
+		}
+		columns[column] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate JCR Registry v2 columns: %v", err)
+	}
+	for _, column := range []string{
+		"registry_version",
+		"edition_year",
+		"jif_rank",
+		"category_journal_count",
+		"jif_percentile",
+	} {
+		if !columns[column] {
+			t.Fatalf("JCR Registry v2 column %q is missing", column)
+		}
+	}
+
+	var policyCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM venue_policy_versions
+		WHERE policy_name = 'journal-all-q1'
+		  AND version_number = 2
+		  AND definition ->> 'policy_version' = 'journal-all-q1/v2'
+		  AND definition -> 'accept' = '["jcr_q1"]'::jsonb
+	`).Scan(&policyCount); err != nil {
+		t.Fatalf("query journal-all-q1/v2 policy: %v", err)
+	}
+	if policyCount != 1 {
+		t.Fatalf("journal-all-q1/v2 policy rows = %d, want 1", policyCount)
+	}
+}
+
 func TestSyntheticJCRFixtureMatchesPreexistingVenuesByExactISSN(t *testing.T) {
 	pool := openMigratedTestPool(t)
 	ctx := testContext(t)

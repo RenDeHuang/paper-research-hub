@@ -71,6 +71,67 @@ func TestParseDecimalRejectsNonDecimalOrNegativeValues(t *testing.T) {
 	}
 }
 
+func TestJCRRegistryV2ImporterRejectsInvalidKnownAndUnknownEvidence(t *testing.T) {
+	t.Parallel()
+
+	item := venueForTest(
+		t,
+		"venue-registry-v2",
+		"Synthetic Registry V2 Journal",
+		"1234-5679",
+		"1234-5679",
+		"2049-3630",
+	)
+	header := "title,issn_l,issn,eissn,edition_year,metric_year,category,jif,jif_rank,category_journal_count,jif_percentile,quartile,status,source\n"
+	for _, test := range []struct {
+		name string
+		row  string
+		want string
+	}{
+		{
+			name: "percentile above one hundred",
+			row:  "Synthetic Registry V2 Journal,1234-5679,1234-5679,2049-3630,2026,2025,Oncology,12.5,1,100,100.000001,Q1,known,synthetic-jcr\n",
+			want: "JIF percentile",
+		},
+		{
+			name: "rank exceeds category count",
+			row:  "Synthetic Registry V2 Journal,1234-5679,1234-5679,2049-3630,2026,2025,Oncology,12.5,101,100,99,Q1,known,synthetic-jcr\n",
+			want: "rank",
+		},
+		{
+			name: "unknown row fabricates known rank evidence",
+			row:  "Synthetic Registry V2 Journal,1234-5679,1234-5679,2049-3630,,2025,Oncology,,1,,,,unknown,synthetic-jcr\n",
+			want: "unknown metric",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			sink := &fakeJCRSink{}
+			importer := mustNewJCRImporter(
+				t,
+				&fakeJCRRepository{venues: []Venue{item}},
+				sink,
+			)
+			_, err := importer.Import(
+				context.Background(),
+				strings.NewReader(header+test.row),
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"Import() error = %v, want containing %q",
+					err,
+					test.want,
+				)
+			}
+			if sink.calls != 0 {
+				t.Fatalf("JCRSink calls = %d, want zero", sink.calls)
+			}
+		})
+	}
+}
+
 func TestJCRImporterPreservesCategoriesUnknownRowsAndImportMetadata(t *testing.T) {
 	t.Parallel()
 
