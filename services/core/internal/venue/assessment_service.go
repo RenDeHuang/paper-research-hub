@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const JournalJIFOrQ1PolicyVersion = "journal-jif-or-q1/v1"
+const (
+	JournalAllQ1PolicyName    = "journal-all-q1"
+	JournalAllQ1PolicyVersion = "journal-all-q1/v2"
+)
 
 type AssessmentInput struct {
 	JCRImportReceiptID string
@@ -102,11 +105,11 @@ func (service *AssessmentService) Assess(
 		)
 	}
 	policyVersion := strings.TrimSpace(input.PolicyVersion)
-	if policyVersion != JournalJIFOrQ1PolicyVersion {
+	if policyVersion != JournalAllQ1PolicyVersion {
 		return AssessmentSummary{}, fmt.Errorf(
 			"unsupported policy version %q; expected %s",
 			input.PolicyVersion,
-			JournalJIFOrQ1PolicyVersion,
+			JournalAllQ1PolicyVersion,
 		)
 	}
 	if input.AssessedAt.IsZero() {

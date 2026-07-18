@@ -148,6 +148,13 @@ func (status MetricStatus) Valid() bool {
 	}
 }
 
+type MetricRegistryVersion string
+
+const (
+	MetricRegistryLegacyV1 MetricRegistryVersion = "legacy/v1"
+	MetricRegistryJCRV2    MetricRegistryVersion = "jcr-registry/v2"
+)
+
 type MetricKey struct {
 	venueID    string
 	metricYear int
@@ -200,12 +207,21 @@ func (key MetricKey) String() string {
 }
 
 type MetricSnapshot struct {
-	key      MetricKey
-	jif      Decimal
-	hasJIF   bool
-	quartile Quartile
-	status   MetricStatus
-	source   string
+	key                  MetricKey
+	registryVersion      MetricRegistryVersion
+	editionYear          int
+	hasEditionYear       bool
+	jif                  Decimal
+	hasJIF               bool
+	jifRank              int
+	hasJIFRank           bool
+	categoryJournalCount int
+	hasCategoryCount     bool
+	jifPercentile        Decimal
+	hasJIFPercentile     bool
+	quartile             Quartile
+	status               MetricStatus
+	source               string
 }
 
 func NewMetricSnapshot(
@@ -213,6 +229,65 @@ func NewMetricSnapshot(
 	metricYear int,
 	category string,
 	jif *Decimal,
+	quartile Quartile,
+	status MetricStatus,
+	source string,
+) (MetricSnapshot, error) {
+	return newMetricSnapshot(
+		venueID,
+		metricYear,
+		category,
+		MetricRegistryLegacyV1,
+		nil,
+		jif,
+		nil,
+		nil,
+		nil,
+		quartile,
+		status,
+		source,
+	)
+}
+
+func NewJCRRegistryV2MetricSnapshot(
+	venueID string,
+	metricYear int,
+	category string,
+	editionYear *int,
+	jif *Decimal,
+	jifRank *int,
+	categoryJournalCount *int,
+	jifPercentile *Decimal,
+	quartile Quartile,
+	status MetricStatus,
+	source string,
+) (MetricSnapshot, error) {
+	return newMetricSnapshot(
+		venueID,
+		metricYear,
+		category,
+		MetricRegistryJCRV2,
+		editionYear,
+		jif,
+		jifRank,
+		categoryJournalCount,
+		jifPercentile,
+		quartile,
+		status,
+		source,
+	)
+}
+
+func newMetricSnapshot(
+	venueID string,
+	metricYear int,
+	category string,
+	registryVersion MetricRegistryVersion,
+	editionYear *int,
+	jif *Decimal,
+	jifRank *int,
+	categoryJournalCount *int,
+	jifPercentile *Decimal,
 	quartile Quartile,
 	status MetricStatus,
 	source string,
@@ -228,6 +303,13 @@ func NewMetricSnapshot(
 	if normalizedSource == "" {
 		return MetricSnapshot{}, errors.New("metric source is required")
 	}
+	if registryVersion != MetricRegistryLegacyV1 &&
+		registryVersion != MetricRegistryJCRV2 {
+		return MetricSnapshot{}, fmt.Errorf(
+			"invalid metric registry version %q",
+			registryVersion,
+		)
+	}
 
 	var storedJIF Decimal
 	hasJIF := jif != nil
@@ -237,25 +319,89 @@ func NewMetricSnapshot(
 		}
 		storedJIF = *jif
 	}
+	var storedPercentile Decimal
+	hasPercentile := jifPercentile != nil
+	if hasPercentile {
+		if !jifPercentile.Valid() {
+			return MetricSnapshot{}, errors.New("metric JIF percentile is invalid")
+		}
+		hundred, parseErr := ParseDecimal("100")
+		if parseErr != nil {
+			panic(parseErr)
+		}
+		if jifPercentile.Cmp(hundred) > 0 {
+			return MetricSnapshot{}, errors.New(
+				"metric JIF percentile must be between 0 and 100",
+			)
+		}
+		storedPercentile = *jifPercentile
+	}
 	switch status {
 	case MetricStatusKnown:
 		if !hasJIF || !quartile.Valid() {
 			return MetricSnapshot{}, errors.New("known metric requires JIF and quartile")
 		}
+		if registryVersion == MetricRegistryJCRV2 {
+			if editionYear == nil ||
+				jifRank == nil ||
+				categoryJournalCount == nil ||
+				!hasPercentile {
+				return MetricSnapshot{}, errors.New(
+					"known JCR Registry v2 metric requires edition year, JIF, rank, category journal count, JIF percentile, and quartile",
+				)
+			}
+			if *editionYear < 1900 || *editionYear > 3000 {
+				return MetricSnapshot{}, fmt.Errorf(
+					"edition_year %d is outside 1900..3000",
+					*editionYear,
+				)
+			}
+			if *jifRank < 1 || *categoryJournalCount < 1 ||
+				*jifRank > *categoryJournalCount {
+				return MetricSnapshot{}, fmt.Errorf(
+					"JIF rank %d must be between 1 and category journal count %d",
+					*jifRank,
+					*categoryJournalCount,
+				)
+			}
+		}
 	case MetricStatusUnknown:
-		if hasJIF || quartile != "" {
-			return MetricSnapshot{}, errors.New("unknown metric must not contain JIF or quartile")
+		if editionYear != nil ||
+			hasJIF ||
+			jifRank != nil ||
+			categoryJournalCount != nil ||
+			hasPercentile ||
+			quartile != "" {
+			return MetricSnapshot{}, errors.New(
+				"unknown metric must not contain edition year, JIF, rank, category journal count, JIF percentile, or quartile",
+			)
 		}
 	}
 
-	return MetricSnapshot{
-		key:      key,
-		jif:      storedJIF,
-		hasJIF:   hasJIF,
-		quartile: quartile,
-		status:   status,
-		source:   normalizedSource,
-	}, nil
+	snapshot := MetricSnapshot{
+		key:              key,
+		registryVersion:  registryVersion,
+		jif:              storedJIF,
+		hasJIF:           hasJIF,
+		jifPercentile:    storedPercentile,
+		hasJIFPercentile: hasPercentile,
+		quartile:         quartile,
+		status:           status,
+		source:           normalizedSource,
+	}
+	if editionYear != nil {
+		snapshot.editionYear = *editionYear
+		snapshot.hasEditionYear = true
+	}
+	if jifRank != nil {
+		snapshot.jifRank = *jifRank
+		snapshot.hasJIFRank = true
+	}
+	if categoryJournalCount != nil {
+		snapshot.categoryJournalCount = *categoryJournalCount
+		snapshot.hasCategoryCount = true
+	}
+	return snapshot, nil
 }
 
 func (snapshot MetricSnapshot) Key() MetricKey {
@@ -274,6 +420,14 @@ func (snapshot MetricSnapshot) Category() string {
 	return snapshot.key.Category()
 }
 
+func (snapshot MetricSnapshot) RegistryVersion() MetricRegistryVersion {
+	return snapshot.registryVersion
+}
+
+func (snapshot MetricSnapshot) EditionYear() (int, bool) {
+	return snapshot.editionYear, snapshot.hasEditionYear
+}
+
 func (snapshot MetricSnapshot) HasJIF() bool {
 	return snapshot.hasJIF
 }
@@ -289,6 +443,29 @@ func (snapshot MetricSnapshot) Quartile() Quartile {
 	return snapshot.quartile
 }
 
+func (snapshot MetricSnapshot) JIFRank() (int, bool) {
+	return snapshot.jifRank, snapshot.hasJIFRank
+}
+
+func (snapshot MetricSnapshot) CategoryJournalCount() (int, bool) {
+	return snapshot.categoryJournalCount, snapshot.hasCategoryCount
+}
+
+func (snapshot MetricSnapshot) JIFPercentile() (Decimal, bool) {
+	return snapshot.jifPercentile, snapshot.hasJIFPercentile
+}
+
+func (snapshot MetricSnapshot) CompleteKnownEvidence() bool {
+	return snapshot.status == MetricStatusKnown &&
+		snapshot.registryVersion == MetricRegistryJCRV2 &&
+		snapshot.hasEditionYear &&
+		snapshot.hasJIF &&
+		snapshot.hasJIFRank &&
+		snapshot.hasCategoryCount &&
+		snapshot.hasJIFPercentile &&
+		snapshot.quartile.Valid()
+}
+
 func (snapshot MetricSnapshot) Status() MetricStatus {
 	return snapshot.status
 }
@@ -299,13 +476,25 @@ func (snapshot MetricSnapshot) Source() string {
 
 func (snapshot MetricSnapshot) Equal(other MetricSnapshot) bool {
 	if snapshot.key != other.key ||
+		snapshot.registryVersion != other.registryVersion ||
+		snapshot.editionYear != other.editionYear ||
+		snapshot.hasEditionYear != other.hasEditionYear ||
 		snapshot.hasJIF != other.hasJIF ||
+		snapshot.jifRank != other.jifRank ||
+		snapshot.hasJIFRank != other.hasJIFRank ||
+		snapshot.categoryJournalCount != other.categoryJournalCount ||
+		snapshot.hasCategoryCount != other.hasCategoryCount ||
+		snapshot.hasJIFPercentile != other.hasJIFPercentile ||
 		snapshot.quartile != other.quartile ||
 		snapshot.status != other.status ||
 		snapshot.source != other.source {
 		return false
 	}
-	return !snapshot.hasJIF || snapshot.jif.Cmp(other.jif) == 0
+	if snapshot.hasJIF && snapshot.jif.Cmp(other.jif) != 0 {
+		return false
+	}
+	return !snapshot.hasJIFPercentile ||
+		snapshot.jifPercentile.Cmp(other.jifPercentile) == 0
 }
 
 type ImportReceipt struct {
@@ -678,11 +867,15 @@ func (importer *JCRImporter) Import(
 			)
 		}
 
-		snapshot, err := NewMetricSnapshot(
+		snapshot, err := NewJCRRegistryV2MetricSnapshot(
 			matches[0].ID(),
 			row.metricYear,
 			row.category,
+			row.editionYear,
 			row.jif,
+			row.jifRank,
+			row.categoryJournalCount,
+			row.jifPercentile,
 			row.quartile,
 			row.status,
 			row.source,
@@ -733,14 +926,18 @@ func (importer *JCRImporter) Import(
 }
 
 type parsedJCRRow struct {
-	title       string
-	identifiers ISSNSet
-	metricYear  int
-	category    string
-	jif         *Decimal
-	quartile    Quartile
-	status      MetricStatus
-	source      string
+	title                string
+	identifiers          ISSNSet
+	editionYear          *int
+	metricYear           int
+	category             string
+	jif                  *Decimal
+	jifRank              *int
+	categoryJournalCount *int
+	jifPercentile        *Decimal
+	quartile             Quartile
+	status               MetricStatus
+	source               string
 }
 
 func spoolJCRCSV(
@@ -843,9 +1040,13 @@ func parseJCRCSV(
 		"issn_l",
 		"issn",
 		"eissn",
+		"edition_year",
 		"metric_year",
 		"category",
 		"jif",
+		"jif_rank",
+		"category_journal_count",
+		"jif_percentile",
 		"quartile",
 		"status",
 		"source",
@@ -958,14 +1159,37 @@ func parseJCRRow(
 		return parsedJCRRow{}, fmt.Errorf("invalid metric status %q", status)
 	}
 	jifRaw := field("jif")
+	editionYearRaw := field("edition_year")
+	jifRankRaw := field("jif_rank")
+	categoryJournalCountRaw := field("category_journal_count")
+	jifPercentileRaw := field("jif_percentile")
 	quartileRaw := field("quartile")
+	var editionYear *int
 	var jif *Decimal
+	var jifRank *int
+	var categoryJournalCount *int
+	var jifPercentile *Decimal
 	var quartile Quartile
 	switch status {
 	case MetricStatusKnown:
-		if jifRaw == "" || quartileRaw == "" {
-			return parsedJCRRow{}, errors.New("known metric requires JIF and quartile")
+		if editionYearRaw == "" ||
+			jifRaw == "" ||
+			jifRankRaw == "" ||
+			categoryJournalCountRaw == "" ||
+			jifPercentileRaw == "" ||
+			quartileRaw == "" {
+			return parsedJCRRow{}, errors.New(
+				"known metric requires edition year, JIF, rank, category journal count, JIF percentile, and quartile",
+			)
 		}
+		parsedEditionYear, parseErr := strconv.Atoi(editionYearRaw)
+		if parseErr != nil || parsedEditionYear < 1900 || parsedEditionYear > 3000 {
+			return parsedJCRRow{}, fmt.Errorf(
+				"edition_year %q is outside 1900..3000",
+				editionYearRaw,
+			)
+		}
+		editionYear = &parsedEditionYear
 		if decimalPlaces(jifRaw) > maxDecimalPlaces {
 			return parsedJCRRow{}, fmt.Errorf(
 				"%w: JIF %q exceeds maximum decimal places %d",
@@ -979,13 +1203,66 @@ func parseJCRRow(
 			return parsedJCRRow{}, fmt.Errorf("invalid JIF: %w", err)
 		}
 		jif = &parsedJIF
+		parsedRank, parseErr := strconv.Atoi(jifRankRaw)
+		if parseErr != nil {
+			return parsedJCRRow{}, fmt.Errorf("invalid JIF rank %q", jifRankRaw)
+		}
+		parsedCategoryCount, parseErr := strconv.Atoi(categoryJournalCountRaw)
+		if parseErr != nil {
+			return parsedJCRRow{}, fmt.Errorf(
+				"invalid category journal count %q",
+				categoryJournalCountRaw,
+			)
+		}
+		if parsedRank < 1 || parsedCategoryCount < 1 ||
+			parsedRank > parsedCategoryCount {
+			return parsedJCRRow{}, fmt.Errorf(
+				"JIF rank %d must be between 1 and category journal count %d",
+				parsedRank,
+				parsedCategoryCount,
+			)
+		}
+		jifRank = &parsedRank
+		categoryJournalCount = &parsedCategoryCount
+		if decimalPlaces(jifPercentileRaw) > maxDecimalPlaces {
+			return parsedJCRRow{}, fmt.Errorf(
+				"%w: JIF percentile %q exceeds maximum decimal places %d",
+				ErrJCRLimitExceeded,
+				jifPercentileRaw,
+				maxDecimalPlaces,
+			)
+		}
+		parsedPercentile, parseErr := ParseDecimal(jifPercentileRaw)
+		if parseErr != nil {
+			return parsedJCRRow{}, fmt.Errorf(
+				"invalid JIF percentile: %w",
+				parseErr,
+			)
+		}
+		hundred, parseErr := ParseDecimal("100")
+		if parseErr != nil {
+			panic(parseErr)
+		}
+		if parsedPercentile.Cmp(hundred) > 0 {
+			return parsedJCRRow{}, errors.New(
+				"JIF percentile must be between 0 and 100",
+			)
+		}
+		jifPercentile = &parsedPercentile
 		quartile = Quartile(strings.ToUpper(quartileRaw))
 		if !quartile.Valid() {
 			return parsedJCRRow{}, fmt.Errorf("invalid JCR quartile %q", quartileRaw)
 		}
 	case MetricStatusUnknown:
-		if jifRaw != "" || quartileRaw != "" {
-			return parsedJCRRow{}, errors.New("unknown metric must not contain JIF or quartile")
+		if editionYearRaw != "" ||
+			jifRaw != "" ||
+			jifRankRaw != "" ||
+			categoryJournalCountRaw != "" ||
+			jifPercentileRaw != "" ||
+			quartileRaw != "" {
+			return parsedJCRRow{}, errors.New(
+				"unknown metric must not contain edition year, JIF, rank, category journal count, JIF percentile, or quartile",
+			)
 		}
 	}
 
@@ -994,14 +1271,18 @@ func parseJCRRow(
 		title = field("title")
 	}
 	return parsedJCRRow{
-		title:       title,
-		identifiers: identifiers,
-		metricYear:  metricYear,
-		category:    category,
-		jif:         jif,
-		quartile:    quartile,
-		status:      status,
-		source:      source,
+		title:                title,
+		identifiers:          identifiers,
+		editionYear:          editionYear,
+		metricYear:           metricYear,
+		category:             category,
+		jif:                  jif,
+		jifRank:              jifRank,
+		categoryJournalCount: categoryJournalCount,
+		jifPercentile:        jifPercentile,
+		quartile:             quartile,
+		status:               status,
+		source:               source,
 	}, nil
 }
 

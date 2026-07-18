@@ -11,8 +11,7 @@ import (
 type MatchedRule string
 
 const (
-	MatchedRuleJIFAtLeast10 MatchedRule = "jif_gte_10"
-	MatchedRuleAnyQ1        MatchedRule = "jcr_q1"
+	MatchedRuleAnyQ1 MatchedRule = "jcr_q1"
 )
 
 type PolicyDecision string
@@ -25,8 +24,7 @@ const (
 )
 
 type JournalPolicy struct {
-	version   string
-	threshold Decimal
+	version string
 }
 
 func NewJournalPolicy(version string) (JournalPolicy, error) {
@@ -34,11 +32,13 @@ func NewJournalPolicy(version string) (JournalPolicy, error) {
 	if normalizedVersion == "" {
 		return JournalPolicy{}, errors.New("journal policy version is required")
 	}
-	threshold, err := ParseDecimal("10")
-	if err != nil {
-		return JournalPolicy{}, fmt.Errorf("construct journal policy threshold: %w", err)
+	if normalizedVersion != JournalAllQ1PolicyVersion {
+		return JournalPolicy{}, fmt.Errorf(
+			"unsupported journal policy version %q",
+			normalizedVersion,
+		)
 	}
-	return JournalPolicy{version: normalizedVersion, threshold: threshold}, nil
+	return JournalPolicy{version: normalizedVersion}, nil
 }
 
 func (policy JournalPolicy) Version() string {
@@ -57,6 +57,14 @@ func (evidence CategoryEvidence) MetricYear() int {
 	return evidence.snapshot.MetricYear()
 }
 
+func (evidence CategoryEvidence) RegistryVersion() MetricRegistryVersion {
+	return evidence.snapshot.RegistryVersion()
+}
+
+func (evidence CategoryEvidence) EditionYear() (int, bool) {
+	return evidence.snapshot.EditionYear()
+}
+
 func (evidence CategoryEvidence) Category() string {
 	return evidence.snapshot.Category()
 }
@@ -71,6 +79,18 @@ func (evidence CategoryEvidence) JIF() Decimal {
 
 func (evidence CategoryEvidence) Quartile() Quartile {
 	return evidence.snapshot.Quartile()
+}
+
+func (evidence CategoryEvidence) JIFRank() (int, bool) {
+	return evidence.snapshot.JIFRank()
+}
+
+func (evidence CategoryEvidence) CategoryJournalCount() (int, bool) {
+	return evidence.snapshot.CategoryJournalCount()
+}
+
+func (evidence CategoryEvidence) JIFPercentile() (Decimal, bool) {
+	return evidence.snapshot.JIFPercentile()
 }
 
 func (evidence CategoryEvidence) Status() MetricStatus {
@@ -120,7 +140,7 @@ func (policy JournalPolicy) Evaluate(
 	metrics []MetricSnapshot,
 	evaluatedAt time.Time,
 ) (PolicyResult, error) {
-	if strings.TrimSpace(policy.version) == "" || !policy.threshold.Valid() {
+	if policy.version != JournalAllQ1PolicyVersion {
 		return PolicyResult{}, errors.New("journal policy is invalid")
 	}
 	if metricYear < 1900 || metricYear > 3000 {
@@ -145,7 +165,6 @@ func (policy JournalPolicy) Evaluate(
 
 	evidence := make([]CategoryEvidence, 0, len(metrics))
 	hasUnknown := len(metrics) == 0
-	matchedJIF := false
 	matchedQ1 := false
 	for index, metric := range metrics {
 		if metric.VenueID() != item.ID() {
@@ -169,17 +188,15 @@ func (policy JournalPolicy) Evaluate(
 			hasUnknown = true
 			continue
 		}
-		if metric.JIF().Cmp(policy.threshold) >= 0 {
-			matchedJIF = true
+		if !metric.CompleteKnownEvidence() {
+			hasUnknown = true
+			continue
 		}
 		if metric.Quartile() == QuartileQ1 {
 			matchedQ1 = true
 		}
 	}
 	base.categoryEvidence = evidence
-	if matchedJIF {
-		base.matchedRules = append(base.matchedRules, MatchedRuleJIFAtLeast10)
-	}
 	if matchedQ1 {
 		base.matchedRules = append(base.matchedRules, MatchedRuleAnyQ1)
 	}
