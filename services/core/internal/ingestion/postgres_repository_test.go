@@ -1162,6 +1162,101 @@ func TestPostgresRepositoryPersistsPublicationEventsSuppressesAheadOfPrintEPubli
 	}
 }
 
+func TestPostgresRepositorySuppressesEPublishWithoutTopLevelPublicationStatus(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543274",
+		"10.1000/pubmed.epublish-without-status",
+		"pubmed:76543274",
+		time.Date(2026, time.July, 18, 9, 40, 0, 0, time.UTC),
+		"epublish-without-status",
+		1,
+		"Electronic",
+		"",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry(
+				"epublish",
+				2026,
+				time.July,
+				18,
+				source.DatePrecisionDay,
+				1,
+			),
+		},
+	)
+	projectPublicationEnvelope(
+		t,
+		repository,
+		envelope,
+		"epublish-without-status",
+		nil,
+	)
+
+	var eventAssertionCount int
+	var electronicDate *time.Time
+	var electronicState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM work_publication_event_assertions),
+			electronic_published_on,
+			electronic_published_state
+		FROM work_publication_states
+	`).Scan(
+		&eventAssertionCount,
+		&electronicDate,
+		&electronicState,
+	); err != nil {
+		t.Fatalf("query epublish without top-level status: %v", err)
+	}
+	assertOptionalPublicationDate(t, electronicDate, nil)
+	if eventAssertionCount != 0 || electronicState != "missing" {
+		t.Fatalf(
+			"epublish without status = assertions %d state %q, want 0/missing",
+			eventAssertionCount,
+			electronicState,
+		)
+	}
+}
+
+func TestNormalizedPublicationEventAssertionsRejectMalformedUnknownStatus(t *testing.T) {
+	record := recordPayload(publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543275",
+		"10.1000/pubmed.invalid-unknown-status",
+		"pubmed:76543275",
+		time.Date(2026, time.July, 18, 9, 45, 0, 0, time.UTC),
+		"invalid-unknown-status",
+		1,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry(
+				" FutureStatus ",
+				2026,
+				time.July,
+				18,
+				source.DatePrecisionDay,
+				1,
+			),
+		},
+	).Record)
+
+	_, err := normalizedPublicationEventAssertions(record)
+	if err == nil ||
+		!strings.Contains(err.Error(), "status") ||
+		!strings.Contains(err.Error(), "trimmed") {
+		t.Fatalf(
+			"normalizedPublicationEventAssertions(malformed unknown) error = %v, want trimmed status error",
+			err,
+		)
+	}
+}
+
 func TestPostgresRepositoryPersistsPublicationEventsProjectsConflicts(t *testing.T) {
 	pool := openIngestionTestPool(t)
 	repository := mustPostgresRepository(t, pool)
@@ -1841,6 +1936,530 @@ func TestPostgresRepositoryExcludeReconcilesPublicationWinner(t *testing.T) {
 			)
 		}
 	})
+}
+
+func TestPostgresRepositoryRejectsCorruptFallbackPublicationAssertionSet(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	doi := "10.1000/pubmed.corrupt-fallback-set"
+	baseTime := time.Date(2026, time.July, 18, 10, 0, 0, 0, time.UTC)
+	fallback := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543276",
+		doi,
+		"pubmed:76543276",
+		baseTime,
+		"corrupt-fallback-older",
+		1,
+		"Print",
+		"ppublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry(
+				"ppublish",
+				2026,
+				time.July,
+				10,
+				source.DatePrecisionDay,
+				1,
+			),
+		},
+	)
+	current := publicationRepositoryEnvelope(
+		t,
+		source.PubMed,
+		"76543277",
+		doi,
+		"pubmed:76543277",
+		baseTime.Add(time.Hour),
+		"corrupt-fallback-current",
+		1,
+		"Electronic",
+		"epublish",
+		[]source.PublicationHistoryEntry{
+			publicationHistoryEntry(
+				"epublish",
+				2026,
+				time.July,
+				17,
+				source.DatePrecisionDay,
+				1,
+			),
+		},
+	)
+	_, _, fallbackNormalized, _ := projectPublicationEnvelope(
+		t,
+		repository,
+		fallback,
+		"corrupt-fallback-older",
+		nil,
+	)
+	currentJob, _, currentNormalized, _ := projectPublicationEnvelope(
+		t,
+		repository,
+		current,
+		"corrupt-fallback-current",
+		nil,
+	)
+	insertPublicationEventAssertionFixture(
+		t,
+		pool,
+		fallbackNormalized.AssertionID,
+		99,
+		"print_published",
+		"ppublish",
+		time.Date(2026, time.July, 11, 0, 0, 0, 0, time.UTC),
+	)
+
+	if _, err := repository.Exclude(
+		ctx,
+		currentJob.ID,
+		currentNormalized,
+		source.ScopeDecision{
+			Status: source.ScopeExcluded,
+			Reason: "publication_evidence_reviewed_out",
+		},
+		"scope/pubmed-v2",
+	); err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"publication event assertion replay conflicts with immutable assertion set",
+		) {
+		t.Fatalf(
+			"Exclude(corrupt fallback) error = %v, want immutable assertion set conflict",
+			err,
+		)
+	}
+
+	var (
+		currentScopeStatus              string
+		workProjectionNormalizedID      string
+		publicationStateNormalizedID    string
+		printDate, electronicDate       *time.Time
+		printState, electronicState     string
+		immutableEventAssertionRowCount int
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(
+				SELECT scope_status
+				FROM ingestion_source_states
+				WHERE logical_source = $2
+				  AND event_key = $3
+			),
+			work_state.normalized_assertion_id::text,
+			publication_state.normalized_assertion_id::text,
+			publication_state.print_published_on,
+			publication_state.print_published_state,
+			publication_state.electronic_published_on,
+			publication_state.electronic_published_state,
+			(SELECT count(*) FROM work_publication_event_assertions)
+		FROM work_projection_states AS work_state
+		JOIN work_publication_states AS publication_state
+		  ON publication_state.work_id = work_state.work_id
+		WHERE work_state.normalized_assertion_id = $1
+		  AND publication_state.normalized_assertion_id = $1
+	`,
+		currentNormalized.AssertionID,
+		current.LogicalSource,
+		current.EventKey,
+	).Scan(
+		&currentScopeStatus,
+		&workProjectionNormalizedID,
+		&publicationStateNormalizedID,
+		&printDate,
+		&printState,
+		&electronicDate,
+		&electronicState,
+		&immutableEventAssertionRowCount,
+	); err != nil {
+		t.Fatalf("query corrupt fallback rollback state: %v", err)
+	}
+	assertOptionalPublicationDate(t, printDate, nil)
+	assertOptionalPublicationDate(
+		t,
+		electronicDate,
+		publicationDate(2026, time.July, 17),
+	)
+	if currentScopeStatus != string(source.ScopeIncluded) ||
+		workProjectionNormalizedID != currentNormalized.AssertionID ||
+		publicationStateNormalizedID != currentNormalized.AssertionID ||
+		printState != "missing" ||
+		electronicState != "known" ||
+		immutableEventAssertionRowCount != 3 {
+		t.Fatalf(
+			"corrupt fallback rollback = scope %q work %q publication %q states %q/%q assertions %d",
+			currentScopeStatus,
+			workProjectionNormalizedID,
+			publicationStateNormalizedID,
+			printState,
+			electronicState,
+			immutableEventAssertionRowCount,
+		)
+	}
+}
+
+func TestPostgresRepositoryProjectReconcilesPreviousAndNewWork(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	baseTime := time.Date(2026, time.July, 18, 10, 30, 0, 0, time.UTC)
+	eventKey := "crossref:mutable-work"
+	first := publicationRepositoryEnvelope(
+		t,
+		source.Crossref,
+		"crossref-record-a",
+		"10.1000/source-move-a",
+		eventKey,
+		baseTime,
+		"source-move-a",
+		1,
+		"",
+		"",
+		nil,
+	)
+	second := publicationRepositoryEnvelope(
+		t,
+		source.Crossref,
+		"crossref-record-b",
+		"10.1000/source-move-b",
+		eventKey,
+		baseTime.Add(time.Hour),
+		"source-move-b",
+		2,
+		"",
+		"",
+		nil,
+	)
+	projectPublicationEnvelope(t, repository, first, "source-move-a", nil)
+	_, _, secondNormalized, _ := projectPublicationEnvelope(
+		t,
+		repository,
+		second,
+		"source-move-b",
+		nil,
+	)
+
+	var (
+		oldProjectionStates, oldPublicationStates int
+		newProjectionStates, newPublicationStates int
+		newWorkNormalizedID                       string
+		newPublicationNormalizedID                string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(
+				SELECT count(*)
+				FROM work_projection_states AS state
+				JOIN works AS work ON work.id = state.work_id
+				WHERE work.canonical_key = 'doi:10.1000/source-move-a'
+			),
+			(
+				SELECT count(*)
+				FROM work_publication_states AS state
+				JOIN works AS work ON work.id = state.work_id
+				WHERE work.canonical_key = 'doi:10.1000/source-move-a'
+			),
+			(
+				SELECT count(*)
+				FROM work_projection_states AS state
+				JOIN works AS work ON work.id = state.work_id
+				WHERE work.canonical_key = 'doi:10.1000/source-move-b'
+			),
+			(
+				SELECT count(*)
+				FROM work_publication_states AS state
+				JOIN works AS work ON work.id = state.work_id
+				WHERE work.canonical_key = 'doi:10.1000/source-move-b'
+			),
+			(
+				SELECT state.normalized_assertion_id::text
+				FROM work_projection_states AS state
+				JOIN works AS work ON work.id = state.work_id
+				WHERE work.canonical_key = 'doi:10.1000/source-move-b'
+			),
+			(
+				SELECT state.normalized_assertion_id::text
+				FROM work_publication_states AS state
+				JOIN works AS work ON work.id = state.work_id
+				WHERE work.canonical_key = 'doi:10.1000/source-move-b'
+			)
+	`).Scan(
+		&oldProjectionStates,
+		&oldPublicationStates,
+		&newProjectionStates,
+		&newPublicationStates,
+		&newWorkNormalizedID,
+		&newPublicationNormalizedID,
+	); err != nil {
+		t.Fatalf("query source work move state: %v", err)
+	}
+	if oldProjectionStates != 0 ||
+		oldPublicationStates != 0 ||
+		newProjectionStates != 1 ||
+		newPublicationStates != 1 ||
+		newWorkNormalizedID != secondNormalized.AssertionID ||
+		newPublicationNormalizedID != secondNormalized.AssertionID {
+		t.Fatalf(
+			"source work move = old %d/%d new %d/%d normalized %q/%q, want 0/0/1/1/%q",
+			oldProjectionStates,
+			oldPublicationStates,
+			newProjectionStates,
+			newPublicationStates,
+			newWorkNormalizedID,
+			newPublicationNormalizedID,
+			secondNormalized.AssertionID,
+		)
+	}
+}
+
+func TestPostgresRepositorySerializesConcurrentWorkWinnerChanges(t *testing.T) {
+	testCases := []struct {
+		name         string
+		secondAction string
+	}{
+		{
+			name:         "concurrent excludes clear all winners",
+			secondAction: "exclude",
+		},
+		{
+			name:         "exclude and project retain included winner",
+			secondAction: "project",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIngestionTestPool(t)
+			repository := mustPostgresRepository(t, pool)
+			ctx := context.Background()
+			doi := "10.1000/pubmed.concurrent-work-winner-" + testCase.secondAction
+			baseTime := time.Date(2026, time.July, 18, 11, 0, 0, 0, time.UTC)
+			fallback := publicationRepositoryEnvelope(
+				t,
+				source.PubMed,
+				"76543278",
+				doi,
+				"pubmed:76543278",
+				baseTime,
+				"concurrent-fallback-"+testCase.secondAction,
+				1,
+				"Print",
+				"ppublish",
+				[]source.PublicationHistoryEntry{
+					publicationHistoryEntry(
+						"ppublish",
+						2026,
+						time.July,
+						10,
+						source.DatePrecisionDay,
+						1,
+					),
+				},
+			)
+			current := publicationRepositoryEnvelope(
+				t,
+				source.PubMed,
+				"76543279",
+				doi,
+				"pubmed:76543279",
+				baseTime.Add(time.Hour),
+				"concurrent-current-"+testCase.secondAction,
+				1,
+				"Electronic",
+				"epublish",
+				[]source.PublicationHistoryEntry{
+					publicationHistoryEntry(
+						"epublish",
+						2026,
+						time.July,
+						17,
+						source.DatePrecisionDay,
+						1,
+					),
+				},
+			)
+			fallbackJob, _, fallbackNormalized, _ := projectPublicationEnvelope(
+				t,
+				repository,
+				fallback,
+				"concurrent-fallback-"+testCase.secondAction,
+				nil,
+			)
+			currentJob, _, currentNormalized, _ := projectPublicationEnvelope(
+				t,
+				repository,
+				current,
+				"concurrent-current-"+testCase.secondAction,
+				nil,
+			)
+
+			expectedWinnerNormalizedID := ""
+			secondOperation := func(
+				operationContext context.Context,
+				operationRepository *PostgresRepository,
+			) error {
+				_, excludeErr := operationRepository.Exclude(
+					operationContext,
+					fallbackJob.ID,
+					fallbackNormalized,
+					source.ScopeDecision{
+						Status: source.ScopeExcluded,
+						Reason: "publication_evidence_reviewed_out",
+					},
+					"scope/pubmed-v2",
+				)
+				return excludeErr
+			}
+			if testCase.secondAction == "project" {
+				replacement := publicationRepositoryEnvelope(
+					t,
+					source.PubMed,
+					fallback.Record.SourceRecordID,
+					doi,
+					fallback.EventKey,
+					baseTime.Add(2*time.Hour),
+					"concurrent-replacement-project",
+					2,
+					"Print",
+					"ppublish",
+					[]source.PublicationHistoryEntry{
+						publicationHistoryEntry(
+							"ppublish",
+							2026,
+							time.July,
+							18,
+							source.DatePrecisionDay,
+							1,
+						),
+					},
+				)
+				replacementJob := startPubMedRepositoryJob(
+					t,
+					repository,
+					"concurrent-replacement-project",
+				)
+				replacementRaw, err := repository.PersistRaw(
+					ctx,
+					replacementJob.ID,
+					replacement,
+				)
+				if err != nil {
+					t.Fatalf("PersistRaw(replacement project) error = %v", err)
+				}
+				replacementNormalized, err := repository.Normalize(
+					ctx,
+					replacementJob.ID,
+					replacementRaw,
+					"normalization/pubmed-v1",
+				)
+				if err != nil {
+					t.Fatalf("Normalize(replacement project) error = %v", err)
+				}
+				replacementCandidate, err := NewProjectionCandidate(
+					replacementNormalized,
+					source.ScopeDecision{
+						Status: source.ScopeIncluded,
+						Reason: "controlled_identity_present",
+					},
+				)
+				if err != nil {
+					t.Fatalf(
+						"NewProjectionCandidate(replacement project) error = %v",
+						err,
+					)
+				}
+				expectedWinnerNormalizedID = replacementNormalized.AssertionID
+				secondOperation = func(
+					operationContext context.Context,
+					operationRepository *PostgresRepository,
+				) error {
+					_, projectErr := operationRepository.Project(
+						operationContext,
+						replacementJob.ID,
+						replacementCandidate,
+						"scope/pubmed-v2",
+						"projection/pubmed-v2",
+					)
+					return projectErr
+				}
+			}
+
+			releaseFirstUpdate := make(chan struct{})
+			firstTracer := newPostgresQueryStartBarrierTracer(
+				func(sql string) bool {
+					return strings.Contains(sql, "UPDATE works")
+				},
+				releaseFirstUpdate,
+			)
+			firstPool := openTracedIngestionTestPool(t, pool, firstTracer)
+			firstRepository := mustPostgresRepository(t, firstPool)
+			secondPool := openNamedIngestionTestPool(
+				t,
+				pool,
+				"concurrent-work-winner-second",
+			)
+			secondRepository := mustPostgresRepository(t, secondPool)
+			operationContext, cancelOperations := context.WithTimeout(ctx, 10*time.Second)
+			defer cancelOperations()
+			firstDone := make(chan error, 1)
+			secondDone := make(chan error, 1)
+
+			go func() {
+				_, excludeErr := firstRepository.Exclude(
+					operationContext,
+					currentJob.ID,
+					currentNormalized,
+					source.ScopeDecision{
+						Status: source.ScopeExcluded,
+						Reason: "publication_evidence_reviewed_out",
+					},
+					"scope/pubmed-v2",
+				)
+				firstDone <- excludeErr
+			}()
+			waitForPostgresTraceSignal(
+				t,
+				operationContext,
+				firstTracer.queryStarted,
+				"first Exclude to select its fallback winner",
+			)
+
+			go func() {
+				secondDone <- secondOperation(
+					operationContext,
+					secondRepository,
+				)
+			}()
+			secondCompleted, secondErr := waitForPostgresResultOrApplicationLock(
+				t,
+				operationContext,
+				pool,
+				"concurrent-work-winner-second",
+				secondDone,
+			)
+
+			close(releaseFirstUpdate)
+			firstErr := <-firstDone
+			if !secondCompleted {
+				secondErr = <-secondDone
+			}
+			if firstErr != nil || secondErr != nil {
+				t.Fatalf(
+					"concurrent winner changes errors = first exclude %v second %s %v",
+					firstErr,
+					testCase.secondAction,
+					secondErr,
+				)
+			}
+			assertWorkWinnerDatabaseInvariant(
+				t,
+				pool,
+				expectedWinnerNormalizedID,
+			)
+		})
+	}
 }
 
 func TestPostgresRepositoryPublicationEventAssertionReplayRejectsExtraSet(t *testing.T) {
@@ -4533,6 +5152,36 @@ func insertExtraPublicationEventAssertion(
 	ordinal int,
 ) {
 	t.Helper()
+	insertPublicationEventAssertionFixture(
+		t,
+		pool,
+		normalizedAssertionID,
+		ordinal,
+		"accepted",
+		"accepted",
+		time.Date(2026, time.July, 3, 0, 0, 0, 0, time.UTC),
+	)
+}
+
+func insertPublicationEventAssertionFixture(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	normalizedAssertionID string,
+	ordinal int,
+	eventKind string,
+	statusRaw string,
+	eventDate time.Time,
+) {
+	t.Helper()
+	sourceDate, err := json.Marshal(map[string]any{
+		"year":      eventDate.Year(),
+		"month":     int(eventDate.Month()),
+		"day":       eventDate.Day(),
+		"precision": "day",
+	})
+	if err != nil {
+		t.Fatalf("encode extra publication source date: %v", err)
+	}
 	command, err := pool.Exec(context.Background(), `
 		INSERT INTO work_publication_event_assertions (
 			projection_assertion_id,
@@ -4553,17 +5202,24 @@ func insertExtraPublicationEventAssertion(
 			projection.normalized_assertion_id,
 			projection.source_record_uuid,
 			projection.work_id,
-			'accepted',
-			DATE '2026-07-03',
+			$3,
+			$4,
 			'day',
-			'{"year":2026,"month":7,"day":3,"precision":"day"}'::jsonb,
-			'accepted',
+			$5,
+			$6,
 			NULL,
 			'/manual/extra-publication-assertion',
 			$2
 		FROM ingestion_projection_assertions AS projection
 		WHERE projection.normalized_assertion_id = $1
-	`, normalizedAssertionID, ordinal)
+	`,
+		normalizedAssertionID,
+		ordinal,
+		eventKind,
+		eventDate,
+		sourceDate,
+		statusRaw,
+	)
 	if err != nil {
 		t.Fatalf("insert extra publication event assertion: %v", err)
 	}
@@ -5043,12 +5699,13 @@ type postgresRepositoryStartResult struct {
 type postgresQueryBarrierContextKey struct{}
 
 type postgresQueryBarrierTracer struct {
-	match           func(string) bool
-	releaseQueryEnd <-chan struct{}
-	queryStarted    chan struct{}
-	queryEnded      chan struct{}
-	startOnce       sync.Once
-	endOnce         sync.Once
+	match             func(string) bool
+	releaseQueryStart <-chan struct{}
+	releaseQueryEnd   <-chan struct{}
+	queryStarted      chan struct{}
+	queryEnded        chan struct{}
+	startOnce         sync.Once
+	endOnce           sync.Once
 }
 
 func newPostgresQueryBarrierTracer(
@@ -5063,6 +5720,18 @@ func newPostgresQueryBarrierTracer(
 	}
 }
 
+func newPostgresQueryStartBarrierTracer(
+	match func(string) bool,
+	releaseQueryStart <-chan struct{},
+) *postgresQueryBarrierTracer {
+	return &postgresQueryBarrierTracer{
+		match:             match,
+		releaseQueryStart: releaseQueryStart,
+		queryStarted:      make(chan struct{}),
+		queryEnded:        make(chan struct{}),
+	}
+}
+
 func (tracer *postgresQueryBarrierTracer) TraceQueryStart(
 	ctx context.Context,
 	_ *pgx.Conn,
@@ -5074,6 +5743,12 @@ func (tracer *postgresQueryBarrierTracer) TraceQueryStart(
 	tracer.startOnce.Do(func() {
 		close(tracer.queryStarted)
 	})
+	if tracer.releaseQueryStart != nil {
+		select {
+		case <-tracer.releaseQueryStart:
+		case <-ctx.Done():
+		}
+	}
 	return context.WithValue(ctx, postgresQueryBarrierContextKey{}, tracer)
 }
 
@@ -5094,6 +5769,172 @@ func (tracer *postgresQueryBarrierTracer) TraceQueryEnd(
 	select {
 	case <-tracer.releaseQueryEnd:
 	case <-ctx.Done():
+	}
+}
+
+func waitForPostgresResultOrApplicationLock(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	applicationName string,
+	results <-chan error,
+) (bool, error) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case result := <-results:
+			return true, result
+		case <-ticker.C:
+			var waiting bool
+			if err := pool.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM pg_stat_activity
+					WHERE application_name = $1
+					  AND wait_event_type = 'Lock'
+				)
+			`, applicationName).Scan(&waiting); err != nil {
+				t.Fatalf(
+					"inspect PostgreSQL result/lock wait for %q: %v",
+					applicationName,
+					err,
+				)
+			}
+			if waiting {
+				return false, nil
+			}
+		case <-ctx.Done():
+			t.Fatalf(
+				"wait for PostgreSQL result/lock for %q: %v",
+				applicationName,
+				ctx.Err(),
+			)
+			return false, ctx.Err()
+		}
+	}
+}
+
+func assertWorkWinnerDatabaseInvariant(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	expectedNormalizedAssertionID string,
+) {
+	t.Helper()
+	var (
+		workProjectionStates       int
+		workPublicationStates      int
+		includedSourceStates       int
+		invalidWinnerSourceStates  int
+		mismatchedPublicationState int
+		actualNormalizedID         string
+	)
+	if err := pool.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*) FROM work_projection_states),
+			(SELECT count(*) FROM work_publication_states),
+			(
+				SELECT count(*)
+				FROM ingestion_source_states
+				WHERE scope_status = 'included'
+				  AND NOT is_deleted
+			),
+			(
+				SELECT count(*)
+				FROM work_projection_states AS winner
+				LEFT JOIN ingestion_source_states AS source_state
+				  ON source_state.work_id = winner.work_id
+				 AND source_state.normalized_assertion_id =
+					 winner.normalized_assertion_id
+				 AND source_state.raw_event_id = winner.raw_event_id
+				 AND source_state.source_record_uuid =
+					 winner.source_record_uuid
+				 AND source_state.source_time = winner.source_time
+				 AND source_state.tie_break_key = winner.tie_break_key
+				 AND source_state.position = winner.position
+				 AND source_state.scope_policy_version =
+					 winner.scope_policy_version
+				 AND source_state.projection_policy_version =
+					 winner.projection_policy_version
+				WHERE source_state.logical_source IS NULL
+				   OR source_state.scope_status <> 'included'
+				   OR source_state.is_deleted
+			),
+			(
+				SELECT count(*)
+				FROM work_projection_states AS winner
+				LEFT JOIN ingestion_projection_assertions AS projection
+				  ON projection.normalized_assertion_id =
+					 winner.normalized_assertion_id
+				 AND projection.raw_event_id = winner.raw_event_id
+				 AND projection.source_record_uuid =
+					 winner.source_record_uuid
+				 AND projection.work_id = winner.work_id
+				 AND projection.scope_policy_version =
+					 winner.scope_policy_version
+				 AND projection.projection_policy_version =
+					 winner.projection_policy_version
+				LEFT JOIN work_publication_states AS publication
+				  ON publication.work_id = winner.work_id
+				WHERE projection.id IS NULL
+				   OR publication.work_id IS NULL
+				   OR publication.projection_assertion_id <> projection.id
+				   OR publication.normalized_assertion_id <>
+					 winner.normalized_assertion_id
+				   OR publication.source_record_id <>
+					 winner.source_record_uuid
+			),
+			COALESCE((
+				SELECT normalized_assertion_id::text
+				FROM work_projection_states
+				ORDER BY work_id
+				LIMIT 1
+			), '')
+	`).Scan(
+		&workProjectionStates,
+		&workPublicationStates,
+		&includedSourceStates,
+		&invalidWinnerSourceStates,
+		&mismatchedPublicationState,
+		&actualNormalizedID,
+	); err != nil {
+		t.Fatalf("query work winner database invariant: %v", err)
+	}
+	if invalidWinnerSourceStates != 0 || mismatchedPublicationState != 0 {
+		t.Fatalf(
+			"work winner invariant = invalid source %d mismatched publication %d",
+			invalidWinnerSourceStates,
+			mismatchedPublicationState,
+		)
+	}
+	if expectedNormalizedAssertionID == "" {
+		if workProjectionStates != 0 ||
+			workPublicationStates != 0 ||
+			includedSourceStates != 0 ||
+			actualNormalizedID != "" {
+			t.Fatalf(
+				"cleared work winner invariant = projection %d publication %d included %d normalized %q, want 0/0/0/empty",
+				workProjectionStates,
+				workPublicationStates,
+				includedSourceStates,
+				actualNormalizedID,
+			)
+		}
+		return
+	}
+	if workProjectionStates != 1 ||
+		workPublicationStates != 1 ||
+		includedSourceStates != 1 ||
+		actualNormalizedID != expectedNormalizedAssertionID {
+		t.Fatalf(
+			"included work winner invariant = projection %d publication %d included %d normalized %q, want 1/1/1/%q",
+			workProjectionStates,
+			workPublicationStates,
+			includedSourceStates,
+			actualNormalizedID,
+			expectedNormalizedAssertionID,
+		)
 	}
 }
 

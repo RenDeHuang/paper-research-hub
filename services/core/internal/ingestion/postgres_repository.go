@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -780,6 +781,9 @@ func (repository *PostgresRepository) Exclude(
 	if err != nil {
 		return ProjectionResult{}, err
 	}
+	if err := lockWorkProjectionStates(ctx, tx, previousWorkID); err != nil {
+		return ProjectionResult{}, err
+	}
 	sourceRecordUUID, err := normalizedSourceRecordID(
 		ctx,
 		tx,
@@ -863,12 +867,13 @@ func (repository *PostgresRepository) Project(
 	defer func() {
 		_ = tx.Rollback(context.Background())
 	}()
-	if _, err := lockSourceState(
+	previousWorkID, err := lockSourceState(
 		ctx,
 		tx,
 		candidate.LogicalSource,
 		candidate.EventKey,
-	); err != nil {
+	)
+	if err != nil {
 		return ProjectionResult{}, err
 	}
 	sourceRecordUUID, normalizedRecord, candidatePayload, err :=
@@ -897,12 +902,25 @@ func (repository *PostgresRepository) Project(
 			return ProjectionResult{}, fmt.Errorf("lock canonical identifier: %w", err)
 		}
 	}
-	workID, canonicalKey, err := resolveWork(
+	workID, incomingCanonicalKey, err := resolveWork(
 		ctx,
 		tx,
 		candidate.Record,
 		identifiers,
 		identity,
+	)
+	if err != nil {
+		return ProjectionResult{}, err
+	}
+	workIDs := sortedUniqueWorkIDs(previousWorkID, workID)
+	if err := lockWorkProjectionStates(ctx, tx, workIDs...); err != nil {
+		return ProjectionResult{}, err
+	}
+	canonicalKey, err := coordinateWorkCanonicalIdentity(
+		ctx,
+		tx,
+		workID,
+		incomingCanonicalKey,
 	)
 	if err != nil {
 		return ProjectionResult{}, err
@@ -1045,12 +1063,18 @@ func (repository *PostgresRepository) Project(
 
 	status := ProjectionStatusUnchanged
 	if stateChanged {
-		applied, err := applyWinningProjection(ctx, tx, workID)
-		if err != nil {
-			return ProjectionResult{}, err
-		}
-		if applied {
-			status = ProjectionStatusProjected
+		for _, affectedWorkID := range workIDs {
+			applied, err := applyWinningProjection(
+				ctx,
+				tx,
+				affectedWorkID,
+			)
+			if err != nil {
+				return ProjectionResult{}, err
+			}
+			if applied {
+				status = ProjectionStatusProjected
+			}
 		}
 	}
 	if err := incrementProjectionCounter(ctx, tx, jobID, status); err != nil {
@@ -1091,6 +1115,9 @@ func (repository *PostgresRepository) ApplyDeletion(
 	}
 	if currentWorkID != "" {
 		workID = &currentWorkID
+	}
+	if err := lockWorkProjectionStates(ctx, tx, currentWorkID); err != nil {
+		return ProjectionResult{}, err
 	}
 	changed, err := upsertSourceState(
 		ctx,
@@ -1255,6 +1282,15 @@ func resolveWork(
 	for value := range workIDs {
 		workID = value
 	}
+	return workID, incomingKey, nil
+}
+
+func coordinateWorkCanonicalIdentity(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID string,
+	incomingKey string,
+) (string, error) {
 	var existingKey string
 	if err := tx.QueryRow(ctx, `
 		SELECT canonical_key
@@ -1262,7 +1298,7 @@ func resolveWork(
 		WHERE id = $1
 		FOR UPDATE
 	`, workID).Scan(&existingKey); err != nil {
-		return "", "", fmt.Errorf("lock canonical work: %w", err)
+		return "", fmt.Errorf("lock canonical work: %w", err)
 	}
 	if identityPriority(incomingKey) < identityPriority(existingKey) {
 		if _, err := tx.Exec(ctx, `
@@ -1270,11 +1306,11 @@ func resolveWork(
 			SET canonical_key = $2, updated_at = now()
 			WHERE id = $1
 		`, workID, incomingKey); err != nil {
-			return "", "", fmt.Errorf("upgrade canonical work identity: %w", err)
+			return "", fmt.Errorf("upgrade canonical work identity: %w", err)
 		}
 		existingKey = incomingKey
 	}
-	return workID, existingKey, nil
+	return existingKey, nil
 }
 
 func identityPriority(canonicalKey string) int {
@@ -1562,22 +1598,15 @@ func persistPublicationEventAssertions(
 			return err
 		}
 	}
-	var persistedCount int
-	if err := tx.QueryRow(ctx, `
-		SELECT count(*)
-		FROM work_publication_event_assertions
-		WHERE projection_assertion_id = $1
-	`, projectionAssertionID).Scan(&persistedCount); err != nil {
-		return fmt.Errorf("count publication event assertion set: %w", err)
-	}
-	if persistedCount != len(assertions) {
-		return fmt.Errorf(
-			"publication event assertion replay conflicts with immutable assertion set: persisted %d, expected %d",
-			persistedCount,
-			len(assertions),
-		)
-	}
-	return nil
+	return validatePublicationEventAssertionSet(
+		ctx,
+		tx,
+		projectionAssertionID,
+		normalizedAssertionID,
+		sourceRecordID,
+		workID,
+		record,
+	)
 }
 
 func normalizedPublicationEventAssertions(
@@ -1593,28 +1622,19 @@ func normalizedPublicationEventAssertions(
 	if err != nil {
 		return nil, err
 	}
+	publicationStatusRaw, err := normalizedOptionalPublicationRaw(
+		record.PublicationStatus,
+		"publication status",
+	)
+	if err != nil {
+		return nil, err
+	}
 	assertions := make(
 		[]publicationEventAssertion,
 		0,
 		len(record.PublicationHistory),
 	)
 	for _, entry := range record.PublicationHistory {
-		eventKind := ""
-		switch entry.Status {
-		case "accepted":
-			eventKind = "accepted"
-		case "aheadofprint":
-			eventKind = "ahead_of_print"
-		case "ppublish":
-			eventKind = "print_published"
-		case "epublish":
-			if record.PublicationStatus == "aheadofprint" {
-				continue
-			}
-			eventKind = "electronic_published"
-		default:
-			continue
-		}
 		if entry.Status == "" || strings.TrimSpace(entry.Status) != entry.Status {
 			return nil, fmt.Errorf(
 				"PubMed publication history ordinal %d status must be non-empty and trimmed",
@@ -1649,6 +1669,27 @@ func normalizedPublicationEventAssertions(
 				entry.Ordinal,
 				err,
 			)
+		}
+		eventKind := ""
+		switch entry.Status {
+		case "accepted":
+			eventKind = "accepted"
+		case "aheadofprint":
+			eventKind = "ahead_of_print"
+		case "ppublish":
+			eventKind = "print_published"
+		case "epublish":
+			if publicationStatusRaw == nil {
+				continue
+			}
+			switch *publicationStatusRaw {
+			case "ppublish", "epublish":
+				eventKind = "electronic_published"
+			default:
+				continue
+			}
+		default:
+			continue
 		}
 		assertions = append(assertions, publicationEventAssertion{
 			EventKind:           eventKind,
@@ -1822,6 +1863,177 @@ func persistPublicationEventAssertion(
 		)
 	}
 	return nil
+}
+
+type persistedPublicationEventAssertion struct {
+	NormalizedAssertionID string
+	SourceRecordID        string
+	WorkID                string
+	EventKind             string
+	EventDate             *time.Time
+	DatePrecision         source.DatePrecision
+	SourceDate            []byte
+	StatusRaw             string
+	PublicationModelRaw   *string
+	SourcePath            string
+	Ordinal               int
+}
+
+func validatePublicationEventAssertionSet(
+	ctx context.Context,
+	tx pgx.Tx,
+	projectionAssertionID string,
+	normalizedAssertionID string,
+	sourceRecordID string,
+	workID string,
+	record persistedRecordPayloadV3,
+) error {
+	expected, err := normalizedPublicationEventAssertions(record)
+	if err != nil {
+		return err
+	}
+	expectedByOrdinal := make(
+		map[int]publicationEventAssertion,
+		len(expected),
+	)
+	for _, assertion := range expected {
+		if _, duplicate := expectedByOrdinal[assertion.Ordinal]; duplicate {
+			return publicationEventAssertionSetConflict(
+				fmt.Sprintf("duplicate expected ordinal %d", assertion.Ordinal),
+			)
+		}
+		expectedByOrdinal[assertion.Ordinal] = assertion
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT
+			normalized_assertion_id::text,
+			source_record_id::text,
+			work_id::text,
+			event_kind,
+			event_date,
+			date_precision,
+			source_date,
+			status_raw,
+			publication_model_raw,
+			source_path,
+			ordinal
+		FROM work_publication_event_assertions
+		WHERE projection_assertion_id = $1
+		ORDER BY ordinal
+	`, projectionAssertionID)
+	if err != nil {
+		return fmt.Errorf("read publication event assertion set: %w", err)
+	}
+	defer rows.Close()
+
+	persistedCount := 0
+	for rows.Next() {
+		var persisted persistedPublicationEventAssertion
+		if err := rows.Scan(
+			&persisted.NormalizedAssertionID,
+			&persisted.SourceRecordID,
+			&persisted.WorkID,
+			&persisted.EventKind,
+			&persisted.EventDate,
+			&persisted.DatePrecision,
+			&persisted.SourceDate,
+			&persisted.StatusRaw,
+			&persisted.PublicationModelRaw,
+			&persisted.SourcePath,
+			&persisted.Ordinal,
+		); err != nil {
+			return fmt.Errorf("scan publication event assertion set: %w", err)
+		}
+		persistedCount++
+		assertion, ok := expectedByOrdinal[persisted.Ordinal]
+		if !ok {
+			return publicationEventAssertionSetConflict(
+				fmt.Sprintf("unexpected ordinal %d", persisted.Ordinal),
+			)
+		}
+		sourceDateMatches, err := publicationSourceDatesEqual(
+			persisted.SourceDate,
+			assertion.SourceDate,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"compare publication event assertion ordinal %d source date: %w",
+				persisted.Ordinal,
+				err,
+			)
+		}
+		if persisted.NormalizedAssertionID != normalizedAssertionID ||
+			persisted.SourceRecordID != sourceRecordID ||
+			persisted.WorkID != workID ||
+			persisted.EventKind != assertion.EventKind ||
+			!publicationEventDatesEqual(
+				persisted.EventDate,
+				assertion.EventDate,
+			) ||
+			persisted.DatePrecision != assertion.DatePrecision ||
+			!sourceDateMatches ||
+			persisted.StatusRaw != assertion.StatusRaw ||
+			!optionalStringsEqual(
+				persisted.PublicationModelRaw,
+				assertion.PublicationModelRaw,
+			) ||
+			persisted.SourcePath != assertion.SourcePath {
+			return publicationEventAssertionSetConflict(
+				fmt.Sprintf("ordinal %d fields differ", persisted.Ordinal),
+			)
+		}
+		delete(expectedByOrdinal, persisted.Ordinal)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate publication event assertion set: %w", err)
+	}
+	if persistedCount != len(expected) || len(expectedByOrdinal) != 0 {
+		return publicationEventAssertionSetConflict(
+			fmt.Sprintf(
+				"persisted %d assertions, expected %d",
+				persistedCount,
+				len(expected),
+			),
+		)
+	}
+	return nil
+}
+
+func publicationEventAssertionSetConflict(detail string) error {
+	return fmt.Errorf(
+		"publication event assertion replay conflicts with immutable assertion set: %s",
+		detail,
+	)
+}
+
+func publicationEventDatesEqual(left, right *time.Time) bool {
+	switch {
+	case left == nil || right == nil:
+		return left == nil && right == nil
+	default:
+		return left.Equal(*right)
+	}
+}
+
+func publicationSourceDatesEqual(left, right []byte) (bool, error) {
+	var leftValue, rightValue any
+	if err := json.Unmarshal(left, &leftValue); err != nil {
+		return false, fmt.Errorf("decode persisted source date: %w", err)
+	}
+	if err := json.Unmarshal(right, &rightValue); err != nil {
+		return false, fmt.Errorf("decode expected source date: %w", err)
+	}
+	return reflect.DeepEqual(leftValue, rightValue), nil
+}
+
+func optionalStringsEqual(left, right *string) bool {
+	switch {
+	case left == nil || right == nil:
+		return left == nil && right == nil
+	default:
+		return *left == *right
+	}
 }
 
 type biomedicalMeSHQualifierAssertion struct {
@@ -2435,6 +2647,48 @@ func lockSourceState(
 	return workID, nil
 }
 
+func sortedUniqueWorkIDs(workIDs ...string) []string {
+	unique := make(map[string]struct{}, len(workIDs))
+	for _, workID := range workIDs {
+		if workID != "" {
+			unique[workID] = struct{}{}
+		}
+	}
+	sorted := make([]string, 0, len(unique))
+	for workID := range unique {
+		sorted = append(sorted, workID)
+	}
+	slices.Sort(sorted)
+	return sorted
+}
+
+func lockWorkProjectionStates(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs ...string,
+) error {
+	for _, workID := range sortedUniqueWorkIDs(workIDs...) {
+		if strings.TrimSpace(workID) != workID {
+			return fmt.Errorf(
+				"work projection state ID %q must be trimmed",
+				workID,
+			)
+		}
+		if _, err := tx.Exec(ctx, `
+			SELECT pg_advisory_xact_lock(
+				hashtextextended('work_projection_state:' || $1, 0)
+			)
+		`, workID); err != nil {
+			return fmt.Errorf(
+				"lock work projection state %s: %w",
+				workID,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
 type sourceState struct {
 	LogicalSource           string
 	EventKey                string
@@ -2745,6 +2999,17 @@ func replaceWorkPublicationState(
 	sourceRecordID string,
 	normalizedRecord persistedRecordPayloadV3,
 ) error {
+	if err := validatePublicationEventAssertionSet(
+		ctx,
+		tx,
+		projectionAssertionID,
+		normalizedAssertionID,
+		sourceRecordID,
+		workID,
+		normalizedRecord,
+	); err != nil {
+		return err
+	}
 	states := map[string]publicationDateState{
 		"print_published":      {State: "missing"},
 		"electronic_published": {State: "missing"},

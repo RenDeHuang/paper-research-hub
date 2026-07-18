@@ -237,6 +237,59 @@ func TestEnvelopeConstructorsRejectInvalidMetadataAndSourceMismatch(t *testing.T
 	}
 }
 
+func TestEnvelopeRejectsNonCanonicalSource(t *testing.T) {
+	t.Parallel()
+
+	raw := mustRawRecord(t, `{"id":"W1"}`)
+	now := time.Date(2026, time.July, 18, 9, 30, 0, 0, time.UTC)
+	testCases := []struct {
+		name          string
+		logicalSource string
+		recordSource  string
+	}{
+		{
+			name:          "record source leading whitespace",
+			logicalSource: source.OpenAlex,
+			recordSource:  " " + source.OpenAlex,
+		},
+		{
+			name:          "record source trailing whitespace",
+			logicalSource: source.OpenAlex,
+			recordSource:  source.OpenAlex + " ",
+		},
+		{
+			name:          "logical source whitespace",
+			logicalSource: " " + source.OpenAlex + " ",
+			recordSource:  source.OpenAlex,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewEnvelope(
+				testCase.logicalSource,
+				"openalex:W1",
+				now,
+				"1",
+				1,
+				source.Record{
+					Source:         testCase.recordSource,
+					SourceRecordID: "W1",
+					Raw:            raw,
+				},
+				raw,
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), "source") {
+				t.Fatalf(
+					"NewEnvelope(non-canonical source) error = %v, want source validation error",
+					err,
+				)
+			}
+		})
+	}
+}
+
 func TestNewEnvelopeDeepCopiesNestedRecordAndRawPayload(t *testing.T) {
 	t.Parallel()
 

@@ -62,7 +62,7 @@ func NewEnvelope(
 	raw source.RawRecord,
 ) (Envelope, error) {
 	envelope := Envelope{
-		LogicalSource: strings.TrimSpace(logicalSource),
+		LogicalSource: logicalSource,
 		EventKey:      strings.TrimSpace(eventKey),
 		SourceTime:    sourceTime.UTC(),
 		TieBreakKey:   strings.TrimSpace(tieBreakKey),
@@ -90,7 +90,13 @@ func (envelope Envelope) Validate() error {
 	); err != nil {
 		return err
 	}
-	if strings.TrimSpace(envelope.Record.Source) != envelope.LogicalSource {
+	if envelope.Record.Source == "" {
+		return errors.New("ingestion record source is required")
+	}
+	if strings.TrimSpace(envelope.Record.Source) != envelope.Record.Source {
+		return errors.New("ingestion record source must be trimmed")
+	}
+	if envelope.Record.Source != envelope.LogicalSource {
 		return fmt.Errorf(
 			"record source %q conflicts with logical source %q",
 			envelope.Record.Source,
@@ -148,7 +154,7 @@ func NewDeletionEnvelope(
 	raw source.RawRecord,
 ) (DeletionEnvelope, error) {
 	envelope := DeletionEnvelope{
-		LogicalSource: strings.TrimSpace(logicalSource),
+		LogicalSource: logicalSource,
 		EventKey:      strings.TrimSpace(eventKey),
 		SourceTime:    sourceTime.UTC(),
 		TieBreakKey:   strings.TrimSpace(tieBreakKey),
@@ -201,8 +207,11 @@ func validateEventMetadata(
 	tieBreakKey string,
 	position int64,
 ) error {
-	if strings.TrimSpace(logicalSource) == "" {
+	if logicalSource == "" {
 		return errors.New("ingestion logical source is required")
+	}
+	if strings.TrimSpace(logicalSource) != logicalSource {
+		return errors.New("ingestion logical source must be trimmed")
 	}
 	if strings.TrimSpace(eventKey) == "" {
 		return errors.New("ingestion event key is required")
