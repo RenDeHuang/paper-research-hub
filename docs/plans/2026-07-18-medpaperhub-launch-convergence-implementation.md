@@ -151,7 +151,6 @@ git commit -m "ops: add local release deployment contract"
 - Create: `data/sources/preprint-sources.v1.csv`
 - Create: `data/venues/conference-venues.v1.csv`
 - Modify: `data/subjects/README.md`
-- Modify: `contracts/openapi.yaml`
 
 **Step 1: Write failing Registry tests**
 
@@ -214,7 +213,7 @@ Expected: PASS.
 git add services/core/migrations/000020_scope_and_channel_registries.sql \
   services/core/internal/scope services/core/internal/biomed \
   services/core/cmd/worker/biomedical_eligibility_command_test.go \
-  data/subjects data/sources data/venues contracts/openapi.yaml
+  data/subjects data/sources data/venues
 git commit -m "feat(registry): add domains and content channels"
 ```
 
