@@ -284,21 +284,82 @@ func (observer *crossrefResponseObserver) explicitCursorInvalidOrExpired() bool 
 	if err != nil {
 		return false
 	}
-	rawMessage, exists := fields["message"]
-	if !exists {
+	if err := rejectUnexpectedJSONFields(
+		fields,
+		"Crossref cursor error",
+		"status",
+		"message-type",
+		"message",
+	); err != nil {
 		return false
 	}
-	message, err := decodeJSONString(
-		rawMessage,
-		"Crossref cursor error message",
+	status, err := requiredJSONString(
+		fields,
+		"status",
+		"Crossref cursor error",
 	)
-	if err != nil {
+	if err != nil || status != "failed" {
 		return false
 	}
-	message = strings.ToLower(message)
-	return strings.Contains(message, "cursor") &&
-		(strings.Contains(message, "invalid") ||
-			strings.Contains(message, "expired"))
+	messageType, err := requiredJSONString(
+		fields,
+		"message-type",
+		"Crossref cursor error",
+	)
+	if err != nil || messageType != "resource-failure" {
+		return false
+	}
+	rawMessage, exists := fields["message"]
+	if !exists || isJSONNull(rawMessage) {
+		return false
+	}
+	var failures []json.RawMessage
+	if err := json.Unmarshal(rawMessage, &failures); err != nil ||
+		len(failures) == 0 {
+		return false
+	}
+
+	cursorFailure := false
+	for index, rawFailure := range failures {
+		path := fmt.Sprintf("Crossref cursor error message[%d]", index)
+		failure, err := decodeJSONObject(rawFailure, path)
+		if err != nil {
+			return false
+		}
+		if err := rejectUnexpectedJSONFields(
+			failure,
+			path,
+			"type",
+			"message",
+		); err != nil {
+			return false
+		}
+		failureType, err := requiredJSONString(
+			failure,
+			"type",
+			path,
+		)
+		if err != nil ||
+			failureType != strings.TrimSpace(failureType) ||
+			failureType == "" {
+			return false
+		}
+		message, err := requiredJSONString(
+			failure,
+			"message",
+			path,
+		)
+		if err != nil ||
+			message != strings.TrimSpace(message) ||
+			message == "" {
+			return false
+		}
+		switch failureType {
+		case "cursor-invalid", "cursor-expired":
+			cursorFailure = true
+		}
+	}
+	return cursorFailure
 }
 
 func FetchCrossrefCatalog(

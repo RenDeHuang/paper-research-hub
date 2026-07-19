@@ -1334,9 +1334,16 @@ func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
 			}
 			if expireOnce.CompareAndSwap(true, false) {
 				writer.Header().Set("Content-Type", "application/json")
-				writer.WriteHeader(http.StatusBadRequest)
+				writer.WriteHeader(http.StatusNotFound)
 				_, _ = writer.Write([]byte(
-					`{"status":"failed","message":"Cursor is invalid or expired"}`,
+					`{
+						"status":"failed",
+						"message-type":"resource-failure",
+						"message":[{
+							"type":"cursor-invalid",
+							"message":"Cursor is invalid or expired"
+						}]
+					}`,
 				))
 				return
 			}
@@ -1379,6 +1386,151 @@ func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
 		"page-2-cursor",
 	}) {
 		t.Fatalf("request cursors = %v, want cursor reset flow", got)
+	}
+}
+
+func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		statusCode int
+		payload    string
+		want       bool
+	}{
+		{
+			name:       "real cursor invalid response",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"cursor-invalid",
+					"message":"Cursor specified but no cursor is associated with the request"
+				}]
+			}`,
+			want: true,
+		},
+		{
+			name:       "explicit cursor expired type",
+			statusCode: http.StatusGone,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"cursor-expired",
+					"message":"Cursor lifetime elapsed"
+				}]
+			}`,
+			want: true,
+		},
+		{
+			name:       "legacy string message is unsupported",
+			statusCode: http.StatusBadRequest,
+			payload: `{
+				"status":"failed",
+				"message":"Cursor is invalid or expired"
+			}`,
+			want: false,
+		},
+		{
+			name:       "message text alone is insufficient",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"resource-not-found",
+					"message":"Cursor is invalid or expired"
+				}]
+			}`,
+			want: false,
+		},
+		{
+			name:       "cursor substring type is insufficient",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"possibly-cursor-invalid",
+					"message":"Cursor rejected"
+				}]
+			}`,
+			want: false,
+		},
+		{
+			name:       "unexpected top level field is rejected",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"cursor-invalid",
+					"message":"Cursor rejected"
+				}],
+				"unexpected":true
+			}`,
+			want: false,
+		},
+		{
+			name:       "unexpected failure item field is rejected",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"cursor-invalid",
+					"message":"Cursor rejected",
+					"value":"legacy"
+				}]
+			}`,
+			want: false,
+		},
+		{
+			name:       "wrong message type is rejected",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"work-list",
+				"message":[{
+					"type":"cursor-invalid",
+					"message":"Cursor rejected"
+				}]
+			}`,
+			want: false,
+		},
+		{
+			name:       "non error status is rejected",
+			statusCode: http.StatusOK,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"cursor-invalid",
+					"message":"Cursor rejected"
+				}]
+			}`,
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			observer := &crossrefResponseObserver{
+				statusCode: test.statusCode,
+				body:       []byte(test.payload),
+			}
+			if got := observer.explicitCursorInvalidOrExpired(); got != test.want {
+				t.Fatalf(
+					"explicitCursorInvalidOrExpired() = %t, want %t",
+					got,
+					test.want,
+				)
+			}
+		})
 	}
 }
 
@@ -1651,6 +1803,85 @@ func TestCrossrefCatalogCommitFailuresRemainRecoverable(t *testing.T) {
 				t.Fatalf("stage %s recovery error = %v", stage, err)
 			}
 		})
+	}
+}
+
+func TestCrossrefCatalogPublishParentSyncFailureRollsBackToPartial(t *testing.T) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		validCrossrefJournalItem("Publish Sync Journal", "0028-0836"),
+	)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		requests.Add(1)
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	finalDirectory := filepath.Join(
+		config.CacheDir,
+		crossrefCatalogFinalDirectoryName,
+	)
+	var failed atomic.Bool
+	ops := defaultCrossrefCatalogFileOps()
+	ops.syncDir = func(path string) error {
+		if path == config.CacheDir {
+			if _, err := os.Stat(finalDirectory); err == nil &&
+				failed.CompareAndSwap(false, true) {
+				return errors.New("injected final parent fsync failure")
+			}
+		}
+		return syncDirectory(path)
+	}
+	config.fileOps = &ops
+	if _, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	); err == nil ||
+		!strings.Contains(err.Error(), "injected final parent fsync failure") {
+		t.Fatalf("publish parent fsync failure error = %v", err)
+	}
+	if _, err := os.Stat(finalDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncertain final generation remained visible: %v", err)
+	}
+	partial := readCrossrefCatalogManifest(t, config.CacheDir)
+	if partial.Complete ||
+		partial.RecordCount != 1 ||
+		partial.TotalResults == nil ||
+		*partial.TotalResults != 1 {
+		t.Fatalf("recoverable partial after parent fsync failure = %#v", partial)
+	}
+
+	config.fileOps = nil
+	recovered, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("recovery after parent fsync failure error = %v", err)
+	}
+	if !recovered.Resumed ||
+		recovered.Replayed ||
+		!recovered.Manifest.Complete {
+		t.Fatalf("recovered result = %#v", recovered)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf(
+			"recovery made %d network requests, want reuse of committed partial",
+			requests.Load(),
+		)
 	}
 }
 
