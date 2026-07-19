@@ -116,12 +116,18 @@ func BuildBatches(count, maxResults, batchSize int) ([]Batch, error) {
 	}
 
 	total := min(count, maxResults)
-	batches := make([]Batch, 0, (total+batchSize-1)/batchSize)
-	for start := 0; start < total; start += batchSize {
+	batchCount := total / batchSize
+	if total%batchSize != 0 {
+		batchCount++
+	}
+	batches := make([]Batch, 0, batchCount)
+	for start := 0; start < total; {
+		retMax := min(batchSize, total-start)
 		batches = append(batches, Batch{
 			RetStart: start,
-			RetMax:   min(batchSize, total-start),
+			RetMax:   retMax,
 		})
+		start += retMax
 	}
 	return batches, nil
 }

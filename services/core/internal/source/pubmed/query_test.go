@@ -220,3 +220,32 @@ func TestSearchResultBuildsStableBoundedBatches(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildBatchesHandlesMaxIntWithoutOverflow(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	batchSize := maxInt/2 + 1
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("BuildBatches() panicked near MaxInt: %v", recovered)
+		}
+	}()
+
+	batches, err := pubmed.BuildBatches(maxInt, maxInt, batchSize)
+	if err != nil {
+		t.Fatalf("BuildBatches() error = %v", err)
+	}
+	want := []pubmed.Batch{
+		{RetStart: 0, RetMax: batchSize},
+		{RetStart: batchSize, RetMax: maxInt - batchSize},
+	}
+	if len(batches) != len(want) {
+		t.Fatalf("batches = %#v, want %#v", batches, want)
+	}
+	for index := range want {
+		if batches[index] != want[index] {
+			t.Fatalf("batch %d = %#v, want %#v", index, batches[index], want[index])
+		}
+	}
+}

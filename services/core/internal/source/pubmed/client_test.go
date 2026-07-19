@@ -193,6 +193,42 @@ func TestClientDerivesNCBIRateLimitFromOptionalAPIKey(t *testing.T) {
 	}
 }
 
+func TestClientSharesRateLimitStateAcrossSearchAndCountCoverage(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = writer.Write([]byte(
+			`{"esearchresult":{"count":"0","querykey":"1","webenv":"shared-history"}}`,
+		))
+	}))
+	defer server.Close()
+
+	clock := &recordingClock{now: time.Unix(0, 0)}
+	client := newClient(t, server, nil, httpclient.Dependencies{
+		Now: clock.Now,
+		Sleep: func(ctx context.Context, delay time.Duration) error {
+			return clock.Sleep(ctx, delay)
+		},
+	})
+	if _, err := client.Search(context.Background(), validSearchQuery()); err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if _, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+		JournalISSNs: []string{"0028-0836"},
+	}); err != nil {
+		t.Fatalf("CountCoverage() error = %v", err)
+	}
+
+	if requests != 2 {
+		t.Fatalf("physical requests = %d, want Search and CountCoverage", requests)
+	}
+	if got := clock.Sleeps(); !slices.Equal(got, []time.Duration{time.Second / 10}) {
+		t.Fatalf("shared rate-limit sleeps = %v, want [100ms]", got)
+	}
+}
+
 func TestClientUsesBoundedRetryAndRedactsAPIKey(t *testing.T) {
 	t.Parallel()
 
@@ -618,6 +654,159 @@ func TestSearchAndCountCoverageUseStrictESearchDecoderSymmetrically(t *testing.T
 				})
 			}
 		})
+	}
+}
+
+func TestSearchAndCountCoverageRequireExactESearchKeys(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		payload   string
+		wantCount int64
+		wantError bool
+	}{
+		{
+			name: "uppercase result alias is not the exact result field",
+			payload: `{"ESEARCHRESULT":` +
+				`{"count":"7","querykey":"1","webenv":"alias-history"}}`,
+			wantError: true,
+		},
+		{
+			name: "uppercase count alias is not the exact count field",
+			payload: `{"esearchresult":` +
+				`{"COUNT":"7","querykey":"1","webenv":"history"}}`,
+			wantError: true,
+		},
+		{
+			name: "uppercase count cannot override exact count",
+			payload: `{"esearchresult":` +
+				`{"count":"1","COUNT":"7","querykey":"1","webenv":"history"}}`,
+			wantCount: 1,
+		},
+		{
+			name: "uppercase result cannot override exact result",
+			payload: `{"esearchresult":` +
+				`{"count":"1","querykey":"1","webenv":"history"},` +
+				`"ESEARCHRESULT":` +
+				`{"count":"7","querykey":"7","webenv":"alias-history"}}`,
+			wantCount: 1,
+		},
+	}
+	operations := []struct {
+		name string
+		call func(*pubmed.Client) (int64, error)
+	}{
+		{
+			name: "Search",
+			call: func(client *pubmed.Client) (int64, error) {
+				result, err := client.Search(context.Background(), validSearchQuery())
+				return int64(result.Count), err
+			},
+		},
+		{
+			name: "CountCoverage",
+			call: func(client *pubmed.Client) (int64, error) {
+				result, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+					JournalISSNs: []string{"0028-0836"},
+				})
+				return result.Count, err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			for _, operation := range operations {
+				operation := operation
+				t.Run(operation.name, func(t *testing.T) {
+					server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+						_, _ = writer.Write([]byte(tt.payload))
+					}))
+					defer server.Close()
+					client := newClient(t, server, nil, httpclient.Dependencies{})
+
+					count, err := operation.call(client)
+					if tt.wantError {
+						if err == nil {
+							t.Fatalf("%s accepted case-insensitive ESearch alias with count %d", operation.name, count)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("%s error = %v", operation.name, err)
+					}
+					if count != tt.wantCount {
+						t.Fatalf("%s count = %d, want exact count %d", operation.name, count, tt.wantCount)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestSearchRequiresExactHistoryFieldKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		payload string
+	}{
+		{
+			name: "query key",
+			payload: `{"esearchresult":` +
+				`{"count":"0","QUERYKEY":"1","webenv":"history"}}`,
+		},
+		{
+			name: "web environment",
+			payload: `{"esearchresult":` +
+				`{"count":"0","querykey":"1","WEBENV":"history"}}`,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = writer.Write([]byte(tt.payload))
+			}))
+			defer server.Close()
+			client := newClient(t, server, nil, httpclient.Dependencies{})
+
+			if result, err := client.Search(context.Background(), validSearchQuery()); err == nil {
+				t.Fatalf("Search() = %#v, want missing exact history field error", result)
+			}
+			if result, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+				JournalISSNs: []string{"0028-0836"},
+			}); err != nil || result.Count != 0 {
+				t.Fatalf("CountCoverage() = %#v, %v; want exact count and ignored history aliases", result, err)
+			}
+		})
+	}
+}
+
+func TestSearchAcceptsMaximumPlatformCountWithoutConversionOverflow(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	payload := fmt.Sprintf(
+		`{"esearchresult":{"count":"%d","querykey":"1","webenv":"history"}}`,
+		maxInt,
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(payload))
+	}))
+	defer server.Close()
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+
+	result, err := client.Search(context.Background(), validSearchQuery())
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if result.Count != maxInt {
+		t.Fatalf("Count = %d, want platform MaxInt %d", result.Count, maxInt)
+	}
+	if !slices.Equal(result.Batches, []pubmed.Batch{{RetStart: 0, RetMax: 1}}) {
+		t.Fatalf("Batches = %#v, want bounded single result batch", result.Batches)
 	}
 }
 
