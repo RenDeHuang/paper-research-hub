@@ -74,6 +74,24 @@ func TestLoadSourceFilesAcceptsExactHeaderAndPreservesSourceFields(t *testing.T)
 	}
 }
 
+func TestLoadSourceFilesOpenFailureReportsPathAndStageWithoutRow(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "missing-source.csv")
+	_, err := LoadSourceFiles([]string{path})
+	if err == nil {
+		t.Fatal("LoadSourceFiles() error = nil, want open failure")
+	}
+	for _, want := range []string{path, "open source CSV"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("LoadSourceFiles() error = %q, want %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "row ") {
+		t.Fatalf("LoadSourceFiles() open error = %q, must not invent a row number", err)
+	}
+}
+
 func TestLoadSourceFilesRequiresExactHeader(t *testing.T) {
 	t.Parallel()
 
@@ -118,6 +136,32 @@ func TestLoadSourceFilesRequiresExactHeader(t *testing.T) {
 				"verification_status",
 			},
 		},
+		{
+			name: "UTF-8 BOM",
+			header: []string{
+				"\ufeffdomain",
+				"source_order",
+				"journal_name",
+				"impact_factor",
+				"jcr_value",
+				"cass_value",
+				"source_url",
+				"verification_status",
+			},
+		},
+		{
+			name: "misspelled field",
+			header: []string{
+				"domain",
+				"source_order",
+				"journal_title",
+				"impact_factor",
+				"jcr_value",
+				"cass_value",
+				"source_url",
+				"verification_status",
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -131,6 +175,68 @@ func TestLoadSourceFilesRequiresExactHeader(t *testing.T) {
 			if !strings.Contains(err.Error(), "exact header") {
 				t.Fatalf("LoadSourceFiles() error = %q, want exact header failure", err)
 			}
+			expected := strings.Join(testSourceCSVHeader, ",")
+			actual := strings.Join(test.header, ",")
+			for _, want := range []string{
+				"expected " + strconv.Quote(expected),
+				"actual " + strconv.Quote(actual),
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("LoadSourceFiles() error = %q, want %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadSourceFilesRejectsInvalidUTF8InEveryHeaderField(t *testing.T) {
+	t.Parallel()
+
+	for fieldIndex, fieldName := range testSourceCSVHeader {
+		fieldIndex := fieldIndex
+		fieldName := fieldName
+		t.Run(fieldName, func(t *testing.T) {
+			t.Parallel()
+
+			header := append([]string(nil), testSourceCSVHeader...)
+			header[fieldIndex] += string([]byte{0xff})
+			path := writeSourceCSV(t, header, nil)
+
+			err := loadSourceFilesError(t, path)
+			assertInvalidUTF8SourceLoadError(
+				t,
+				err,
+				path,
+				1,
+				fieldName,
+				fieldIndex,
+			)
+		})
+	}
+}
+
+func TestLoadSourceFilesRejectsInvalidUTF8InEveryDataField(t *testing.T) {
+	t.Parallel()
+
+	for fieldIndex, fieldName := range testSourceCSVHeader {
+		fieldIndex := fieldIndex
+		fieldName := fieldName
+		t.Run(fieldName, func(t *testing.T) {
+			t.Parallel()
+
+			record := validSourceCSVRecord("medicine", "1", "Journal One")
+			record[fieldIndex] += string([]byte{0xff})
+			path := writeSourceCSV(t, testSourceCSVHeader, [][]string{record})
+
+			err := loadSourceFilesError(t, path)
+			assertInvalidUTF8SourceLoadError(
+				t,
+				err,
+				path,
+				2,
+				fieldName,
+				fieldIndex,
+			)
 		})
 	}
 }
@@ -401,5 +507,27 @@ func assertSourceLoadError(t *testing.T, err error, path string, rowNumber int) 
 	wantRow := fmt.Sprintf("row %d", rowNumber)
 	if !strings.Contains(err.Error(), wantRow) {
 		t.Fatalf("LoadSourceFiles() error = %q, want %q", err, wantRow)
+	}
+}
+
+func assertInvalidUTF8SourceLoadError(
+	t *testing.T,
+	err error,
+	path string,
+	rowNumber int,
+	fieldName string,
+	fieldIndex int,
+) {
+	t.Helper()
+
+	assertSourceLoadError(t, err, path, rowNumber)
+	for _, want := range []string{
+		"invalid UTF-8",
+		fmt.Sprintf("%q", fieldName),
+		fmt.Sprintf("index %d", fieldIndex),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("LoadSourceFiles() error = %q, want %q", err, want)
+		}
 	}
 }

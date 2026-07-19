@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const VerificationStatusPendingClarivate = "pending_clarivate_verification"
@@ -54,7 +55,7 @@ func loadSourceFile(
 ) ([]SourceRow, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("%s: row 1: open source CSV: %w", path, err)
+		return nil, fmt.Errorf("%s: open source CSV: %w", path, err)
 	}
 	defer file.Close()
 
@@ -66,11 +67,15 @@ func loadSourceFile(
 	if err != nil {
 		return nil, fmt.Errorf("%s: row 1: read CSV header: %w", path, err)
 	}
+	if err := validateSourceCSVUTF8(path, 1, header); err != nil {
+		return nil, err
+	}
 	if !slices.Equal(header, sourceCSVHeader) {
 		return nil, fmt.Errorf(
-			"%s: row 1: exact header must be %q",
+			"%s: row 1: exact header mismatch: expected %q, actual %q",
 			path,
 			strings.Join(sourceCSVHeader, ","),
+			strings.Join(header, ","),
 		)
 	}
 	reader.FieldsPerRecord = len(sourceCSVHeader)
@@ -88,6 +93,9 @@ func loadSourceFile(
 				rowNumber,
 				readErr,
 			)
+		}
+		if err := validateSourceCSVUTF8(path, rowNumber, record); err != nil {
+			return nil, err
 		}
 
 		sourceOrderRaw := strings.TrimSpace(record[1])
@@ -150,4 +158,29 @@ func loadSourceFile(
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+func validateSourceCSVUTF8(path string, rowNumber int, fields []string) error {
+	for fieldIndex, field := range fields {
+		if utf8.ValidString(field) {
+			continue
+		}
+
+		if fieldIndex < len(sourceCSVHeader) {
+			return fmt.Errorf(
+				"%s: row %d: field %q (index %d) contains invalid UTF-8",
+				path,
+				rowNumber,
+				sourceCSVHeader[fieldIndex],
+				fieldIndex,
+			)
+		}
+		return fmt.Errorf(
+			"%s: row %d: field index %d contains invalid UTF-8",
+			path,
+			rowNumber,
+			fieldIndex,
+		)
+	}
+	return nil
 }
