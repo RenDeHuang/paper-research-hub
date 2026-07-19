@@ -1,0 +1,4 @@
+domain,source_order,journal_name,impact_factor,jcr_value,cass_value,source_url,verification_status
+ medicine , 1 ,"  MiXeD: Journal—A  /  B	C  ", 101.8 ,"  生物工程与应用微生物-1区
+药学-1区  ", 1区 , https://example.test/medicine/1 , pending_clarivate_verification
+biology,7,NATURE Reviews: Cell.Biology,33.2,Q1,1区,https://example.test/biology/7,pending_clarivate_verification
