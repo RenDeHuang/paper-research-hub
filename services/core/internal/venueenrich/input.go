@@ -1,6 +1,7 @@
 package venueenrich
 
 import (
+	"bytes"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -35,6 +36,11 @@ type sourceLocation struct {
 	rowNumber int
 }
 
+type SourcePayload struct {
+	Path string
+	Data []byte
+}
+
 func LoadSourceFiles(paths []string) ([]SourceRow, error) {
 	rows := make([]SourceRow, 0)
 	seen := make(map[sourceKey]sourceLocation)
@@ -49,6 +55,27 @@ func LoadSourceFiles(paths []string) ([]SourceRow, error) {
 	return rows, nil
 }
 
+func LoadSourcePayloads(
+	payloads []SourcePayload,
+) ([]SourceRow, []int, error) {
+	rows := make([]SourceRow, 0)
+	rowCounts := make([]int, len(payloads))
+	seen := make(map[sourceKey]sourceLocation)
+	for index, payload := range payloads {
+		fileRows, err := loadSourceReader(
+			payload.Path,
+			bytes.NewReader(payload.Data),
+			seen,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		rowCounts[index] = len(fileRows)
+		rows = append(rows, fileRows...)
+	}
+	return rows, rowCounts, nil
+}
+
 func loadSourceFile(
 	path string,
 	seen map[sourceKey]sourceLocation,
@@ -59,7 +86,15 @@ func loadSourceFile(
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
+	return loadSourceReader(path, file, seen)
+}
+
+func loadSourceReader(
+	path string,
+	source io.Reader,
+	seen map[sourceKey]sourceLocation,
+) ([]SourceRow, error) {
+	reader := csv.NewReader(source)
 	header, err := reader.Read()
 	if errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%s: row 1: source CSV is empty", path)

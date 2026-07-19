@@ -744,6 +744,117 @@ func TestJournalPubMedRegistryOutputFailureCleansTempsAndNewFinals(t *testing.T)
 	}
 }
 
+func TestJournalPubMedRegistryConcurrentFinalCreationNeverOverwrites(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	t.Run("output final", func(t *testing.T) {
+		directory := t.TempDir()
+		outputPath := filepath.Join(directory, "registry.csv")
+		reportPath := filepath.Join(directory, "registry.report.json")
+		ops := defaultRegistryFileOps()
+		ops.before = func(stage string) error {
+			if stage != registryPublishOutput {
+				return nil
+			}
+			return os.WriteFile(
+				outputPath,
+				[]byte("concurrent output"),
+				0o600,
+			)
+		}
+
+		err := publishRegistryArtifacts(
+			outputPath,
+			[]byte("csv"),
+			reportPath,
+			[]byte("report"),
+			ops,
+		)
+		if err == nil {
+			t.Fatal("publishRegistryArtifacts() error = nil, want no-replace failure")
+		}
+		if got, readErr := os.ReadFile(outputPath); readErr != nil {
+			t.Fatalf("ReadFile(output) error = %v", readErr)
+		} else if string(got) != "concurrent output" {
+			t.Fatalf("output contents = %q, want concurrent output preserved", got)
+		}
+		if _, statErr := os.Lstat(reportPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("report final unexpectedly published: %v", statErr)
+		}
+		assertRegistryTempsAbsent(t, directory)
+	})
+
+	t.Run("report final rolls back output", func(t *testing.T) {
+		directory := t.TempDir()
+		outputPath := filepath.Join(directory, "registry.csv")
+		reportPath := filepath.Join(directory, "registry.report.json")
+		ops := defaultRegistryFileOps()
+		ops.before = func(stage string) error {
+			if stage != registryPublishReport {
+				return nil
+			}
+			return os.WriteFile(
+				reportPath,
+				[]byte("concurrent report"),
+				0o600,
+			)
+		}
+
+		err := publishRegistryArtifacts(
+			outputPath,
+			[]byte("csv"),
+			reportPath,
+			[]byte("report"),
+			ops,
+		)
+		if err == nil {
+			t.Fatal("publishRegistryArtifacts() error = nil, want no-replace failure")
+		}
+		if _, statErr := os.Lstat(outputPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("output final was not rolled back: %v", statErr)
+		}
+		if got, readErr := os.ReadFile(reportPath); readErr != nil {
+			t.Fatalf("ReadFile(report) error = %v", readErr)
+		} else if string(got) != "concurrent report" {
+			t.Fatalf("report contents = %q, want concurrent report preserved", got)
+		}
+		assertRegistryTempsAbsent(t, directory)
+	})
+}
+
+func TestJournalPubMedRegistryReportsTemporaryCleanupFailure(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	outputPath := filepath.Join(directory, "registry.csv")
+	reportPath := filepath.Join(
+		directory,
+		"missing",
+		"registry.report.json",
+	)
+	ops := defaultRegistryFileOps()
+	ops.remove = func(string) error {
+		return errors.New("injected temporary cleanup failure")
+	}
+
+	err := publishRegistryArtifacts(
+		outputPath,
+		[]byte("csv"),
+		reportPath,
+		[]byte("report"),
+		ops,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "injected temporary cleanup failure") {
+		t.Fatalf(
+			"publishRegistryArtifacts() error = %v, want cleanup failure",
+			err,
+		)
+	}
+}
+
 func TestJournalPubMedRegistryRejectsEquivalentFinalPathsBeforePublishing(
 	t *testing.T,
 ) {
@@ -874,6 +985,70 @@ func TestJournalPubMedRegistryCaseOnlyMissingFinalAliasesFollowFilesystem(
 		t.Fatalf("report contents = %q, want report", got)
 	}
 	assertRegistryTempsAbsent(t, directory)
+	assertRegistryCaseProbesAbsent(t, directory)
+}
+
+func TestJournalPubMedRegistryCaseOnlyParentAndFinalAliasesFollowFilesystem(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	caseInsensitive := journalRegistryFilesystemIsCaseInsensitive(
+		t,
+		directory,
+	)
+	upperParent := filepath.Join(directory, "Parent")
+	lowerParent := filepath.Join(directory, "parent")
+	if err := os.Mkdir(upperParent, 0o700); err != nil {
+		t.Fatalf("Mkdir(upper parent) error = %v", err)
+	}
+	if !caseInsensitive {
+		if err := os.Mkdir(lowerParent, 0o700); err != nil {
+			t.Fatalf("Mkdir(lower parent) error = %v", err)
+		}
+	}
+	outputPath := filepath.Join(upperParent, "Registry")
+	reportPath := filepath.Join(lowerParent, "registry")
+
+	err := publishRegistryArtifacts(
+		outputPath,
+		[]byte("csv"),
+		reportPath,
+		[]byte("report"),
+		defaultRegistryFileOps(),
+	)
+	if caseInsensitive {
+		if err == nil || !strings.Contains(err.Error(), "same final") {
+			t.Fatalf(
+				"publishRegistryArtifacts() error = %v, want full-path case-alias rejection",
+				err,
+			)
+		}
+		assertRegistryFinalsAbsent(t, outputPath, reportPath)
+		assertRegistryTempsAbsent(t, upperParent)
+		assertRegistryCaseProbesAbsent(t, directory)
+		return
+	}
+
+	if err != nil {
+		t.Fatalf(
+			"publishRegistryArtifacts() error = %v on case-sensitive filesystem",
+			err,
+		)
+	}
+	if got, readErr := os.ReadFile(outputPath); readErr != nil {
+		t.Fatalf("ReadFile(output) error = %v", readErr)
+	} else if string(got) != "csv" {
+		t.Fatalf("output contents = %q, want csv", got)
+	}
+	if got, readErr := os.ReadFile(reportPath); readErr != nil {
+		t.Fatalf("ReadFile(report) error = %v", readErr)
+	} else if string(got) != "report" {
+		t.Fatalf("report contents = %q, want report", got)
+	}
+	assertRegistryTempsAbsent(t, upperParent)
+	assertRegistryTempsAbsent(t, lowerParent)
 	assertRegistryCaseProbesAbsent(t, directory)
 }
 
@@ -1043,6 +1218,79 @@ func TestJournalPubMedRegistryRejectsResolvedRowWithUnattemptedReceipt(
 	}
 }
 
+func TestJournalPubMedRegistryInputRowsAndReceiptUseOneSnapshot(t *testing.T) {
+	t.Parallel()
+
+	snapshotA := journalRegistrySourcePayload(
+		t,
+		"medicine",
+		1,
+		"Snapshot A Journal",
+	)
+	snapshotB := journalRegistrySourcePayload(
+		t,
+		"medicine",
+		1,
+		"Snapshot B Journal",
+	)
+	biology := journalRegistrySourcePayload(
+		t,
+		"biology",
+		1,
+		"Biology Journal",
+	)
+	computer := journalRegistrySourcePayload(
+		t,
+		"computer_science",
+		1,
+		"Computer Journal",
+	)
+	paths := []string{"changing.csv", "biology.csv", "computer.csv"}
+	snapshots := map[string][][]byte{
+		paths[0]: {snapshotA, snapshotB, snapshotA},
+		paths[1]: {biology, biology, biology},
+		paths[2]: {computer, computer, computer},
+	}
+	readCounts := make(map[string]int)
+	readFile := func(path string) ([]byte, error) {
+		index := readCounts[path]
+		readCounts[path]++
+		pathSnapshots := snapshots[path]
+		if index >= len(pathSnapshots) {
+			return nil, fmt.Errorf("unexpected read %d for %q", index+1, path)
+		}
+		return slices.Clone(pathSnapshots[index]), nil
+	}
+
+	rows, receipts, err := loadRegistryInputs(paths, readFile)
+	if err != nil {
+		t.Fatalf("loadRegistryInputs() error = %v", err)
+	}
+	if len(rows) != 3 || len(receipts) != 3 {
+		t.Fatalf(
+			"loadRegistryInputs() rows=%d receipts=%d, want 3 each",
+			len(rows),
+			len(receipts),
+		)
+	}
+	if rows[0].SourceJournalName != "Snapshot A Journal" {
+		t.Fatalf(
+			"rows[0].SourceJournalName = %q, want receipt snapshot A",
+			rows[0].SourceJournalName,
+		)
+	}
+	if receipts[0].Bytes != int64(len(snapshotA)) ||
+		receipts[0].SHA256 != sha256Hex(snapshotA) ||
+		receipts[0].Rows != 1 {
+		t.Fatalf("receipt[0] = %#v, want snapshot A metadata", receipts[0])
+	}
+	for _, path := range paths {
+		if readCounts[path] != 1 {
+			t.Fatalf("read count for %q = %d, want exactly 1", path, readCounts[path])
+		}
+	}
+}
+
 type journalRegistryInputSpec struct {
 	domain string
 	rows   int
@@ -1106,6 +1354,51 @@ func writeJournalRegistryInputs(
 		paths = append(paths, path)
 	}
 	return paths
+}
+
+func journalRegistrySourcePayload(
+	t *testing.T,
+	domain string,
+	sourceOrder int,
+	journalName string,
+) []byte {
+	t.Helper()
+
+	var payload bytes.Buffer
+	writer := csv.NewWriter(&payload)
+	if err := writer.Write([]string{
+		"domain",
+		"source_order",
+		"journal_name",
+		"impact_factor",
+		"jcr_value",
+		"cass_value",
+		"source_url",
+		"verification_status",
+	}); err != nil {
+		t.Fatalf("Write(source payload header) error = %v", err)
+	}
+	if err := writer.Write([]string{
+		domain,
+		strconv.Itoa(sourceOrder),
+		journalName,
+		"12.3",
+		"Category-1区",
+		"1区",
+		fmt.Sprintf(
+			"https://example.test/%s/%d",
+			domain,
+			sourceOrder,
+		),
+		venueenrich.VerificationStatusPendingClarivate,
+	}); err != nil {
+		t.Fatalf("Write(source payload row) error = %v", err)
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		t.Fatalf("source payload csv.Writer error = %v", err)
+	}
+	return payload.Bytes()
 }
 
 func journalRegistryCatalog(fetchedAt time.Time) venueenrich.CrossrefCatalog {

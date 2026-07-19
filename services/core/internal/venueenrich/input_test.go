@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -71,6 +72,52 @@ func TestLoadSourceFilesAcceptsExactHeaderAndPreservesSourceFields(t *testing.T)
 			"second SourceJournalName = %q, want exact source title",
 			second.SourceJournalName,
 		)
+	}
+}
+
+func TestLoadSourcePayloadsUsesProvidedBytesAndReportsPerPayloadRows(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	firstFile := writeSourceCSV(
+		t,
+		testSourceCSVHeader,
+		[][]string{
+			validSourceCSVRecord("medicine", "1", "Snapshot Journal"),
+			validSourceCSVRecord("medicine", "2", "Second Journal"),
+		},
+	)
+	secondFile := writeSourceCSV(
+		t,
+		testSourceCSVHeader,
+		[][]string{
+			validSourceCSVRecord("biology", "1", "Biology Journal"),
+		},
+	)
+	firstPayload, err := os.ReadFile(firstFile)
+	if err != nil {
+		t.Fatalf("ReadFile(first payload) error = %v", err)
+	}
+	secondPayload, err := os.ReadFile(secondFile)
+	if err != nil {
+		t.Fatalf("ReadFile(second payload) error = %v", err)
+	}
+
+	rows, rowCounts, err := LoadSourcePayloads([]SourcePayload{
+		{Path: "snapshot-medicine.csv", Data: firstPayload},
+		{Path: "snapshot-biology.csv", Data: secondPayload},
+	})
+	if err != nil {
+		t.Fatalf("LoadSourcePayloads() error = %v", err)
+	}
+	if !slices.Equal(rowCounts, []int{2, 1}) {
+		t.Fatalf("LoadSourcePayloads() row counts = %v, want [2 1]", rowCounts)
+	}
+	if len(rows) != 3 ||
+		rows[0].SourceJournalName != "Snapshot Journal" ||
+		rows[2].Domain != "biology" {
+		t.Fatalf("LoadSourcePayloads() rows = %#v", rows)
 	}
 }
 

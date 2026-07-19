@@ -202,7 +202,7 @@ type registryReport struct {
 
 type registryFileOps struct {
 	before  func(string) error
-	rename  func(string, string) error
+	link    func(string, string) error
 	remove  func(string) error
 	syncDir func(string) error
 }
@@ -404,7 +404,7 @@ func (runner registryRunner) run(
 		return registryResult{}, err
 	}
 
-	sourceRows, inputs, err := loadRegistryInputs(command.Inputs)
+	sourceRows, inputs, err := loadRegistryInputs(command.Inputs, os.ReadFile)
 	if err != nil {
 		return registryResult{}, err
 	}
@@ -550,8 +550,8 @@ func (dependencies registryDependencies) validated() (registryDependencies, erro
 	if dependencies.fileOps.before == nil {
 		dependencies.fileOps.before = defaultOps.before
 	}
-	if dependencies.fileOps.rename == nil {
-		dependencies.fileOps.rename = defaultOps.rename
+	if dependencies.fileOps.link == nil {
+		dependencies.fileOps.link = defaultOps.link
 	}
 	if dependencies.fileOps.remove == nil {
 		dependencies.fileOps.remove = defaultOps.remove
@@ -606,16 +606,20 @@ func pubMedClientConfig(
 
 func loadRegistryInputs(
 	paths []string,
+	readFile func(string) ([]byte, error),
 ) ([]venueenrich.SourceRow, []registryInputReceipt, error) {
 	if len(paths) != 3 {
 		return nil, nil, errors.New(
 			"registry input metadata requires exactly three paths",
 		)
 	}
+	if readFile == nil {
+		return nil, nil, errors.New("registry input reader is required")
+	}
 	receipts := make([]registryInputReceipt, len(paths))
-	originalPayloads := make([][]byte, len(paths))
+	payloads := make([]venueenrich.SourcePayload, len(paths))
 	for index, path := range paths {
-		payload, err := os.ReadFile(path)
+		payload, err := readFile(path)
 		if err != nil {
 			return nil, nil, fmt.Errorf(
 				"input %d %q: read raw bytes: %w",
@@ -624,56 +628,35 @@ func loadRegistryInputs(
 				err,
 			)
 		}
-		fileRows, err := venueenrich.LoadSourceFiles([]string{path})
-		if err != nil {
-			return nil, nil, fmt.Errorf(
-				"input %d %q: load logical rows: %w",
-				index+1,
-				path,
-				err,
-			)
+		payloads[index] = venueenrich.SourcePayload{
+			Path: path,
+			Data: payload,
 		}
-		originalPayloads[index] = payload
 		receipts[index] = registryInputReceipt{
 			Ordinal: index + 1,
 			Path:    path,
-			Rows:    len(fileRows),
 			Bytes:   int64(len(payload)),
 			SHA256:  sha256Hex(payload),
 		}
 	}
-	rows, err := venueenrich.LoadSourceFiles(paths)
+	rows, rowCounts, err := venueenrich.LoadSourcePayloads(payloads)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load three source files: %w", err)
+		return nil, nil, fmt.Errorf("load three immutable source payloads: %w", err)
 	}
-	totalRows := 0
-	for _, receipt := range receipts {
-		totalRows += receipt.Rows
-	}
-	if totalRows != len(rows) {
-		return nil, nil, fmt.Errorf(
-			"input logical row reconciliation failed: per-file=%d combined=%d",
-			totalRows,
-			len(rows),
+	if len(rowCounts) != len(receipts) {
+		return nil, nil, errors.New(
+			"input logical row counts do not match immutable payload count",
 		)
 	}
-	for index, path := range paths {
-		payload, err := os.ReadFile(path)
-		if err != nil {
-			return nil, nil, fmt.Errorf(
-				"input %d %q: re-read raw bytes: %w",
-				index+1,
-				path,
-				err,
-			)
-		}
-		if !bytes.Equal(payload, originalPayloads[index]) {
-			return nil, nil, fmt.Errorf(
-				"input %d %q changed while registry inputs were loaded",
-				index+1,
-				path,
-			)
-		}
+	totalRows := 0
+	for index, rowCount := range rowCounts {
+		receipts[index].Rows = rowCount
+		totalRows += rowCount
+	}
+	if totalRows != len(rows) {
+		return nil, nil, errors.New(
+			"input logical row counts do not reconcile with immutable payloads",
+		)
 	}
 	return rows, receipts, nil
 }
@@ -1284,8 +1267,14 @@ func publishRegistryArtifacts(
 	}
 	reportTemp, err := writeRegistryTemp(reportPath, reportPayload)
 	if err != nil {
-		_ = ops.remove(outputTemp)
-		return err
+		return errors.Join(
+			err,
+			cleanupRegistryPath(
+				ops.remove,
+				outputTemp,
+				"output CSV temporary file",
+			),
+		)
 	}
 	outputPublished := false
 	reportPublished := false
@@ -1294,19 +1283,35 @@ func publishRegistryArtifacts(
 			return
 		}
 		cleanupErr := errors.Join(
-			ignoreNotExist(ops.remove(outputTemp)),
-			ignoreNotExist(ops.remove(reportTemp)),
+			cleanupRegistryPath(
+				ops.remove,
+				outputTemp,
+				"output CSV temporary file",
+			),
+			cleanupRegistryPath(
+				ops.remove,
+				reportTemp,
+				"report temporary file",
+			),
 		)
 		if reportPublished {
 			cleanupErr = errors.Join(
 				cleanupErr,
-				ignoreNotExist(ops.remove(reportPath)),
+				cleanupRegistryPath(
+					ops.remove,
+					reportPath,
+					"published report",
+				),
 			)
 		}
 		if outputPublished {
 			cleanupErr = errors.Join(
 				cleanupErr,
-				ignoreNotExist(ops.remove(outputPath)),
+				cleanupRegistryPath(
+					ops.remove,
+					outputPath,
+					"published output CSV",
+				),
 			)
 		}
 		returnErr = errors.Join(returnErr, cleanupErr)
@@ -1315,10 +1320,16 @@ func publishRegistryArtifacts(
 	if err := ops.before(registryPublishOutput); err != nil {
 		return err
 	}
-	if err := ops.rename(outputTemp, outputPath); err != nil {
-		return fmt.Errorf("rename output CSV temporary file: %w", err)
+	if err := ops.link(outputTemp, outputPath); err != nil {
+		return fmt.Errorf(
+			"publish output CSV without replacing final: %w",
+			err,
+		)
 	}
 	outputPublished = true
+	if err := ops.remove(outputTemp); err != nil {
+		return fmt.Errorf("unlink published output CSV temporary file: %w", err)
+	}
 	outputTemp = ""
 	if err := ops.syncDir(filepath.Dir(outputPath)); err != nil {
 		return fmt.Errorf("sync output CSV directory: %w", err)
@@ -1327,10 +1338,16 @@ func publishRegistryArtifacts(
 	if err := ops.before(registryPublishReport); err != nil {
 		return err
 	}
-	if err := ops.rename(reportTemp, reportPath); err != nil {
-		return fmt.Errorf("rename report temporary file: %w", err)
+	if err := ops.link(reportTemp, reportPath); err != nil {
+		return fmt.Errorf(
+			"publish report without replacing final: %w",
+			err,
+		)
 	}
 	reportPublished = true
+	if err := ops.remove(reportTemp); err != nil {
+		return fmt.Errorf("unlink published report temporary file: %w", err)
+	}
 	reportTemp = ""
 	if err := ops.syncDir(filepath.Dir(reportPath)); err != nil {
 		return fmt.Errorf("sync report directory: %w", err)
@@ -1377,30 +1394,23 @@ func validateDistinctRegistryPaths(outputPath, reportPath string) error {
 		)
 	}
 	if errors.Is(output.lstatErr, os.ErrNotExist) &&
-		errors.Is(report.lstatErr, os.ErrNotExist) {
-		outputParent := filepath.Dir(output.canonical)
-		reportParent := filepath.Dir(report.canonical)
-		outputBase := filepath.Base(output.canonical)
-		reportBase := filepath.Base(report.canonical)
-		if outputParent == reportParent &&
-			outputBase != reportBase &&
-			strings.EqualFold(outputBase, reportBase) {
-			aliases, probeErr := probeRegistryCaseAlias(
-				outputParent,
-				outputBase,
-				reportBase,
+		errors.Is(report.lstatErr, os.ErrNotExist) &&
+		output.canonical != report.canonical &&
+		strings.EqualFold(output.canonical, report.canonical) {
+		aliases, probeErr := probeRegistryCaseAlias(
+			output.canonical,
+			report.canonical,
+		)
+		if probeErr != nil {
+			return fmt.Errorf(
+				"probe registry final path case sensitivity: %w",
+				probeErr,
 			)
-			if probeErr != nil {
-				return fmt.Errorf(
-					"probe registry final path case sensitivity: %w",
-					probeErr,
-				)
-			}
-			if aliases {
-				return errors.New(
-					"output and report resolve to the same final path on a case-insensitive filesystem",
-				)
-			}
+		}
+		if aliases {
+			return errors.New(
+				"output and report resolve to the same final path on a case-insensitive filesystem",
+			)
 		}
 	}
 	return nil
@@ -1502,11 +1512,10 @@ func canonicalRegistryPath(path string) (string, error) {
 }
 
 func probeRegistryCaseAlias(
-	parent string,
-	firstBase string,
-	secondBase string,
+	firstPath string,
+	secondPath string,
 ) (aliases bool, returnErr error) {
-	probeParent, err := nearestExistingRegistryDirectory(parent)
+	probeParent, err := registryCaseProbeParent(firstPath, secondPath)
 	if err != nil {
 		return false, err
 	}
@@ -1534,43 +1543,66 @@ func probeRegistryCaseAlias(
 		}
 	}()
 
-	firstPath := filepath.Join(probeDirectory, firstBase)
+	firstRelative, err := filepath.Rel(probeParent, firstPath)
+	if err != nil || registryRelativePathEscapes(firstRelative) {
+		return false, fmt.Errorf(
+			"resolve first case-sensitivity probe path %q from %q",
+			firstPath,
+			probeParent,
+		)
+	}
+	secondRelative, err := filepath.Rel(probeParent, secondPath)
+	if err != nil || registryRelativePathEscapes(secondRelative) {
+		return false, fmt.Errorf(
+			"resolve second case-sensitivity probe path %q from %q",
+			secondPath,
+			probeParent,
+		)
+	}
+	firstProbePath := filepath.Join(probeDirectory, firstRelative)
+	if err := os.MkdirAll(filepath.Dir(firstProbePath), 0o700); err != nil {
+		return false, fmt.Errorf(
+			"create case-sensitivity probe parent for %q: %w",
+			firstProbePath,
+			err,
+		)
+	}
 	first, err := os.OpenFile(
-		firstPath,
+		firstProbePath,
 		os.O_CREATE|os.O_EXCL|os.O_WRONLY,
 		0o600,
 	)
 	if err != nil {
 		return false, fmt.Errorf(
 			"create case-sensitivity probe %q: %w",
-			firstPath,
+			firstProbePath,
 			err,
 		)
 	}
 	if err := first.Close(); err != nil {
 		return false, fmt.Errorf(
 			"close case-sensitivity probe %q: %w",
-			firstPath,
+			firstProbePath,
 			err,
 		)
 	}
-	firstInfo, err := os.Lstat(firstPath)
+	firstInfo, err := os.Lstat(firstProbePath)
 	if err != nil {
 		return false, fmt.Errorf(
 			"Lstat case-sensitivity probe %q: %w",
-			firstPath,
+			firstProbePath,
 			err,
 		)
 	}
-	secondPath := filepath.Join(probeDirectory, secondBase)
-	secondInfo, err := os.Lstat(secondPath)
+	secondProbePath := filepath.Join(probeDirectory, secondRelative)
+	secondInfo, err := os.Lstat(secondProbePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf(
 			"Lstat case-sensitivity probe alias %q: %w",
-			secondPath,
+			secondProbePath,
 			err,
 		)
 	}
@@ -1580,6 +1612,31 @@ func probeRegistryCaseAlias(
 		)
 	}
 	return true, nil
+}
+
+func registryCaseProbeParent(firstPath, secondPath string) (string, error) {
+	current := filepath.Dir(firstPath)
+	for {
+		relative, err := filepath.Rel(current, secondPath)
+		if err == nil && !registryRelativePathEscapes(relative) {
+			return nearestExistingRegistryDirectory(current)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf(
+				"registry case-alias paths %q and %q have no common parent",
+				firstPath,
+				secondPath,
+			)
+		}
+		current = parent
+	}
+}
+
+func registryRelativePathEscapes(path string) bool {
+	return path == ".." ||
+		strings.HasPrefix(path, ".."+string(filepath.Separator)) ||
+		filepath.IsAbs(path)
 }
 
 func nearestExistingRegistryDirectory(path string) (string, error) {
@@ -1628,10 +1685,32 @@ func writeRegistryTemp(path string, payload []byte) (returnPath string, returnEr
 		)
 	}
 	tempPath := temp.Name()
+	tempClosed := false
 	defer func() {
 		if returnErr != nil {
-			_ = temp.Close()
-			_ = os.Remove(tempPath)
+			var closeErr error
+			if !tempClosed {
+				closeErr = temp.Close()
+				if errors.Is(closeErr, os.ErrClosed) {
+					closeErr = nil
+				}
+			}
+			removeErr := ignoreNotExist(os.Remove(tempPath))
+			if closeErr != nil {
+				closeErr = fmt.Errorf(
+					"close temporary file during cleanup for %q: %w",
+					path,
+					closeErr,
+				)
+			}
+			if removeErr != nil {
+				removeErr = fmt.Errorf(
+					"remove temporary file during cleanup for %q: %w",
+					path,
+					removeErr,
+				)
+			}
+			returnErr = errors.Join(returnErr, closeErr, removeErr)
 		}
 	}()
 	if _, err := temp.Write(payload); err != nil {
@@ -1643,13 +1722,14 @@ func writeRegistryTemp(path string, payload []byte) (returnPath string, returnEr
 	if err := temp.Close(); err != nil {
 		return "", fmt.Errorf("close temporary file for %q: %w", path, err)
 	}
+	tempClosed = true
 	return tempPath, nil
 }
 
 func defaultRegistryFileOps() registryFileOps {
 	return registryFileOps{
 		before: func(string) error { return nil },
-		rename: os.Rename,
+		link:   os.Link,
 		remove: os.Remove,
 		syncDir: func(path string) error {
 			directory, err := os.Open(path)
@@ -1667,6 +1747,20 @@ func defaultRegistryFileOps() registryFileOps {
 			return errors.Join(syncErr, closeErr)
 		},
 	}
+}
+
+func cleanupRegistryPath(
+	remove func(string) error,
+	path string,
+	description string,
+) error {
+	if path == "" {
+		return nil
+	}
+	if err := ignoreNotExist(remove(path)); err != nil {
+		return fmt.Errorf("remove %s %q: %w", description, path, err)
+	}
+	return nil
 }
 
 func validateExplicitPath(name, value string) error {
