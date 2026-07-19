@@ -75,6 +75,32 @@ func TestIdentityPriorityMatchesDomainPrecedence(t *testing.T) {
 	}
 }
 
+func TestPubMedBiomedicalRepositoryEnvelopeBuildsDOILessRecord(t *testing.T) {
+	envelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76549990",
+		"",
+		time.Date(2026, time.July, 17, 7, 59, 0, 0, time.UTC),
+	)
+	if got := envelope.Record.Identity.CanonicalKey(); got != "pmid:76549990" {
+		t.Fatalf("DOI-less fixture identity = %q, want pmid:76549990", got)
+	}
+	for _, identifier := range envelope.Record.Identifiers {
+		if identifier.Scheme == source.IdentifierDOI {
+			t.Fatalf("DOI-less fixture identifiers contain DOI %#v", identifier)
+		}
+	}
+	for _, rejected := range envelope.Record.RejectedIdentifiers {
+		if rejected.Scheme == source.IdentifierDOI {
+			t.Fatalf("DOI-less fixture rejected identifiers contain DOI %#v", rejected)
+		}
+	}
+	if bytes.Contains(envelope.Raw.Payload, []byte(`EIdType="doi"`)) ||
+		bytes.Contains(envelope.Raw.Payload, []byte(`IdType="doi"`)) {
+		t.Fatalf("DOI-less fixture raw XML still contains a DOI element: %s", envelope.Raw.Payload)
+	}
+}
+
 func TestPostgresRepositoryPersistsPubMedBiomedicalSemantics(t *testing.T) {
 	pool := openIngestionTestPool(t)
 	repository := mustPostgresRepository(t, pool)
@@ -731,9 +757,6 @@ func TestPostgresRepositoryReplaysRawEventWithNewNormalizedPayloadSchema(t *test
 func TestPostgresRepositoryReplaysDOILessPubMedWithNewIdentityPolicyVersion(
 	t *testing.T,
 ) {
-	pool := openIngestionTestPool(t)
-	repository := mustPostgresRepository(t, pool)
-	ctx := context.Background()
 	envelope := pubMedBiomedicalRepositoryEnvelope(
 		t,
 		"76549991",
@@ -748,6 +771,9 @@ func TestPostgresRepositoryReplaysDOILessPubMedWithNewIdentityPolicyVersion(
 			envelope.Record.Identity.CanonicalKey(),
 		)
 	}
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
 	job := startPubMedRepositoryJob(t, repository, "pmid-identity-policy-replay")
 	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
 	if err != nil {
@@ -3917,9 +3943,6 @@ func TestPostgresRepositoryConvergesIndependentSourcesOnSharedDOI(t *testing.T) 
 }
 
 func TestPostgresRepositoryProjectsPMIDIdentityRebuiltFromIdentifiers(t *testing.T) {
-	pool := openIngestionTestPool(t)
-	repository := mustPostgresRepository(t, pool)
-	ctx := context.Background()
 	envelope := pubMedBiomedicalRepositoryEnvelope(
 		t,
 		"76549992",
@@ -3931,6 +3954,9 @@ func TestPostgresRepositoryProjectsPMIDIdentityRebuiltFromIdentifiers(t *testing
 		t.Fatalf("validate PMID-only reconstruction envelope: %v", err)
 	}
 
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
 	job := startPubMedRepositoryJob(t, repository, "pmid-identity-reconstruction")
 	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
 	if err != nil {
@@ -4009,9 +4035,6 @@ func TestPostgresRepositoryUpgradesExistingWorkBySharedPMIDPriority(t *testing.T
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			pool := openIngestionTestPool(t)
-			repository := mustPostgresRepository(t, pool)
-			ctx := context.Background()
 			existing := canonicalIdentityRepositoryEnvelope(
 				t,
 				testCase.existingScheme,
@@ -4019,6 +4042,15 @@ func TestPostgresRepositoryUpgradesExistingWorkBySharedPMIDPriority(t *testing.T
 				testCase.pmid,
 				time.Date(2026, time.July, 17, 9, 10, 0, 0, time.UTC),
 			)
+			pubMed := pubMedBiomedicalRepositoryEnvelope(
+				t,
+				testCase.pmid,
+				"",
+				time.Date(2026, time.July, 17, 9, 20, 0, 0, time.UTC),
+			)
+			pool := openIngestionTestPool(t)
+			repository := mustPostgresRepository(t, pool)
+			ctx := context.Background()
 			projectPublicationEnvelope(
 				t,
 				repository,
@@ -4027,12 +4059,6 @@ func TestPostgresRepositoryUpgradesExistingWorkBySharedPMIDPriority(t *testing.T
 				nil,
 			)
 
-			pubMed := pubMedBiomedicalRepositoryEnvelope(
-				t,
-				testCase.pmid,
-				"",
-				time.Date(2026, time.July, 17, 9, 20, 0, 0, time.UTC),
-			)
 			projectPublicationEnvelope(
 				t,
 				repository,
@@ -5802,6 +5828,18 @@ func pubMedBiomedicalRepositoryEnvelopeFromXML(
 	titleMarker string,
 ) Envelope {
 	t.Helper()
+	doiELocationXML := ""
+	doiArticleIDXML := ""
+	if strings.TrimSpace(doi) != "" {
+		doiELocationXML = fmt.Sprintf(
+			`<ELocationID EIdType="doi" ValidYN="Y">%s</ELocationID>`,
+			doi,
+		)
+		doiArticleIDXML = fmt.Sprintf(
+			`<ArticleId IdType="doi">%s</ArticleId>`,
+			doi,
+		)
+	}
 	record, err := pubmed.ParseRecord([]byte(fmt.Sprintf(`
 <PubmedArticle Status="MEDLINE">
   <MedlineCitation Status="MEDLINE" Owner="NLM">
@@ -5837,7 +5875,7 @@ func pubMedBiomedicalRepositoryEnvelopeFromXML(
       <ArticleDate DateType="Electronic">
         <Year>2026</Year><Month>07</Month><Day>14</Day>
       </ArticleDate>
-      <ELocationID EIdType="doi" ValidYN="Y">%s</ELocationID>
+      %s
     </Article>
     <MedlineJournalInfo>
       <Country>United States</Country>
@@ -5869,17 +5907,17 @@ func pubMedBiomedicalRepositoryEnvelopeFromXML(
     <ArticleIdList>
       <ArticleId IdType="pubmed">%s</ArticleId>
       <ArticleId IdType="pmc">PMC%s</ArticleId>
-      <ArticleId IdType="doi">%s</ArticleId>
+      %s
     </ArticleIdList>
   </PubmedData>
 </PubmedArticle>`,
 		pmid,
 		titleMarker,
-		doi,
+		doiELocationXML,
 		descriptorLabel,
 		pmid,
 		pmid,
-		doi,
+		doiArticleIDXML,
 	)))
 	if err != nil {
 		t.Fatalf("pubmed.ParseRecord() error = %v", err)

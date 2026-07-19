@@ -175,6 +175,45 @@ BEGIN
 END;
 $$;
 
+DO $$
+DECLARE
+    invalid_pmid text;
+BEGIN
+    SELECT normalized_value
+    INTO invalid_pmid
+    FROM external_identifiers
+    WHERE scheme = 'pmid'
+      AND normalized_value !~ '^[1-9][0-9]*$'
+    ORDER BY normalized_value, id
+    LIMIT 1;
+
+    IF FOUND THEN
+        RAISE EXCEPTION
+            'cannot validate historical PMID external identifier %: value is not canonical',
+            invalid_pmid
+            USING
+                ERRCODE = '23514',
+                TABLE = 'external_identifiers',
+                COLUMN = 'normalized_value',
+                CONSTRAINT = 'external_identifiers_normalized_value_check';
+    END IF;
+END;
+$$;
+
+ALTER TABLE external_identifiers
+    DROP CONSTRAINT external_identifiers_normalized_value_check;
+
+ALTER TABLE external_identifiers
+    ADD CONSTRAINT external_identifiers_normalized_value_check
+    CHECK (
+        normalize_paper_identifier(scheme, normalized_value) IS NOT NULL
+        AND normalized_value = normalize_paper_identifier(scheme, normalized_value)
+    )
+    NOT VALID;
+
+ALTER TABLE external_identifiers
+    VALIDATE CONSTRAINT external_identifiers_normalized_value_check;
+
 ALTER TABLE works
     DROP CONSTRAINT works_canonical_key_check;
 

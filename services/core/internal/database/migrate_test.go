@@ -6158,8 +6158,12 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 		!strings.Contains(
 			last.SQL,
 			"VALIDATE CONSTRAINT works_canonical_key_check",
+		) ||
+		!strings.Contains(
+			last.SQL,
+			"VALIDATE CONSTRAINT external_identifiers_normalized_value_check",
 		) {
-		t.Fatal("PMID migration must validate the replacement canonical key constraint")
+		t.Fatal("PMID migration must validate both replacement identifier constraints")
 	}
 
 	pool := openTestPool(t)
@@ -6172,6 +6176,14 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 		VALUES ('pmid:12345678', 'active', 'Pre-PMID canonical identity')
 	`)
 	assertPostgresError(t, err, "23514", "works_canonical_key_check")
+
+	historicalWorkID := insertWork(t, pool, "openreview:valid_historical_pmid")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+		VALUES ($1, 'pmid', '12345679')
+	`, historicalWorkID); err != nil {
+		t.Fatalf("insert valid historical PMID before v28: %v", err)
+	}
 
 	if err := UpMigrations(ctx, pool, migrations); err != nil {
 		t.Fatalf("apply 000028_pmid_canonical_identity: %v", err)
@@ -6193,24 +6205,60 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 			normalizedCanonicalKey,
 		)
 	}
-	var constraintValidated bool
+	var worksConstraintValidated, externalConstraintValidated bool
 	if err := pool.QueryRow(ctx, `
-		SELECT convalidated
-		FROM pg_constraint
-		WHERE connamespace = 'public'::regnamespace
-		  AND conrelid = 'works'::regclass
-		  AND conname = 'works_canonical_key_check'
-	`).Scan(&constraintValidated); err != nil {
-		t.Fatalf("query PMID canonical constraint validation state: %v", err)
+		SELECT
+			(SELECT convalidated
+			 FROM pg_constraint
+			 WHERE connamespace = 'public'::regnamespace
+			   AND conrelid = 'works'::regclass
+			   AND conname = 'works_canonical_key_check'),
+			(SELECT convalidated
+			 FROM pg_constraint
+			 WHERE connamespace = 'public'::regnamespace
+			   AND conrelid = 'external_identifiers'::regclass
+			   AND conname = 'external_identifiers_normalized_value_check')
+	`).Scan(&worksConstraintValidated, &externalConstraintValidated); err != nil {
+		t.Fatalf("query PMID constraint validation state: %v", err)
 	}
-	if !constraintValidated {
-		t.Fatal("works_canonical_key_check remains NOT VALID after PMID migration")
+	if !worksConstraintValidated || !externalConstraintValidated {
+		t.Fatalf(
+			"PMID constraints validated = works %v external identifiers %v, want true/true",
+			worksConstraintValidated,
+			externalConstraintValidated,
+		)
+	}
+	var historicalPMIDs int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM external_identifiers
+		WHERE work_id = $1
+		  AND scheme = 'pmid'
+		  AND normalized_value = '12345679'
+	`, historicalWorkID).Scan(&historicalPMIDs); err != nil {
+		t.Fatalf("query valid historical PMID after v28: %v", err)
+	}
+	if historicalPMIDs != 1 {
+		t.Fatalf("valid historical PMID rows after v28 = %d, want 1", historicalPMIDs)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO works (canonical_key, status, title)
 		VALUES ('pmid:12345678', 'active', 'PMID canonical identity')
 	`); err != nil {
 		t.Fatalf("insert valid PMID canonical identity: %v", err)
+	}
+
+	for _, invalidPMID := range []string{"0", "0123"} {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+			VALUES ($1, 'pmid', $2)
+		`, historicalWorkID, invalidPMID)
+		assertPostgresError(
+			t,
+			err,
+			"23514",
+			"external_identifiers_normalized_value_check",
+		)
 	}
 
 	for _, canonicalKey := range []string{
@@ -6246,6 +6294,111 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 	}
 	if applied != 1 {
 		t.Fatalf("applied PMID migration records = %d, want 1", applied)
+	}
+}
+
+func TestMigratePMIDCanonicalIdentityRejectsInvalidHistoricalExternalIdentifiersAtomically(
+	t *testing.T,
+) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+
+	for _, invalidPMID := range []string{"0", "0123"} {
+		t.Run(invalidPMID, func(t *testing.T) {
+			pool := openTestPool(t)
+			ctx := testContext(t)
+			if err := UpMigrations(
+				ctx,
+				pool,
+				migrations[:len(migrations)-1],
+			); err != nil {
+				t.Fatalf("apply migrations before 000028: %v", err)
+			}
+			workID := insertWork(
+				t,
+				pool,
+				"openreview:invalid_historical_pmid_"+invalidPMID,
+			)
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO external_identifiers (
+					work_id, scheme, normalized_value
+				) VALUES ($1, 'pmid', $2)
+			`, workID, invalidPMID); err != nil {
+				t.Fatalf("insert historical PMID %q before v28: %v", invalidPMID, err)
+			}
+
+			err := UpMigrations(ctx, pool, migrations)
+			assertPostgresError(
+				t,
+				err,
+				"23514",
+				"external_identifiers_normalized_value_check",
+			)
+			var pgError *pgconn.PgError
+			if !errors.As(err, &pgError) {
+				t.Fatalf("v28 invalid historical PMID error = %T %v", err, err)
+			}
+			wantMessage := fmt.Sprintf(
+				"cannot validate historical PMID external identifier %s: value is not canonical",
+				invalidPMID,
+			)
+			if pgError.Message != wantMessage {
+				t.Fatalf(
+					"v28 invalid historical PMID message = %q, want %q",
+					pgError.Message,
+					wantMessage,
+				)
+			}
+
+			var (
+				appliedV28         int
+				retainedIdentifier int
+				legacyNormalized   *string
+				pmidCanonicalKey   *string
+				constraintValid    bool
+			)
+			if err := pool.QueryRow(ctx, `
+				SELECT
+					(SELECT count(*) FROM schema_migrations WHERE version = 28),
+					(SELECT count(*)
+					 FROM external_identifiers
+					 WHERE work_id = $1
+					   AND scheme = 'pmid'
+					   AND normalized_value = $2),
+					normalize_paper_identifier('pmid', $2),
+					normalize_work_canonical_key('pmid:123'),
+					(SELECT convalidated
+					 FROM pg_constraint
+					 WHERE connamespace = 'public'::regnamespace
+					   AND conrelid = 'external_identifiers'::regclass
+					   AND conname = 'external_identifiers_normalized_value_check')
+			`, workID, invalidPMID).Scan(
+				&appliedV28,
+				&retainedIdentifier,
+				&legacyNormalized,
+				&pmidCanonicalKey,
+				&constraintValid,
+			); err != nil {
+				t.Fatalf("query failed v28 migration state: %v", err)
+			}
+			if appliedV28 != 0 ||
+				retainedIdentifier != 1 ||
+				legacyNormalized == nil ||
+				*legacyNormalized != invalidPMID ||
+				pmidCanonicalKey != nil ||
+				!constraintValid {
+				t.Fatalf(
+					"failed v28 state = applied %d retained %d legacy normalized %v canonical %v constraint valid %v",
+					appliedV28,
+					retainedIdentifier,
+					legacyNormalized,
+					pmidCanonicalKey,
+					constraintValid,
+				)
+			}
+		})
 	}
 }
 
