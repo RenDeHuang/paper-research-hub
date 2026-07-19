@@ -1,0 +1,57 @@
+{
+  "status": "ok",
+  "message-type": "journal-list",
+  "message-version": "1.0.0",
+  "message": {
+    "total-results": 3,
+    "items-per-page": 2,
+    "next-cursor": "page-2-cursor",
+    "query": {
+      "start-index": 0,
+      "search-terms": null
+    },
+    "items": [
+      {
+        "title": "Journal of Reproducible Metadata",
+        "ISSN": [
+          "0028-0836",
+          "2049-3630"
+        ],
+        "issn-type": [
+          {
+            "value": "0028-0836",
+            "type": "print"
+          },
+          {
+            "value": "2049-3630",
+            "type": "electronic"
+          }
+        ],
+        "publisher": "Deterministic Publishing Society",
+        "counts": {
+          "total-dois": 25,
+          "current-dois": 3
+        },
+        "future-field": {
+          "must": "remain in raw journal JSON"
+        }
+      },
+      {
+        "title": "Transactions on Exact Matching",
+        "ISSN": [
+          "1476-4687"
+        ],
+        "issn-type": [
+          {
+            "value": "1476-4687",
+            "type": "electronic"
+          }
+        ],
+        "publisher": "Evidence First Press",
+        "counts": {
+          "total-dois": 9
+        }
+      }
+    ]
+  }
+}
