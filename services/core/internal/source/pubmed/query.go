@@ -5,11 +5,20 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
 
 var issnPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{3}[0-9X]$`)
+
+type DateType string
+
+const (
+	DateTypePublication  DateType = "publication"
+	DateTypeEntrez       DateType = "entrez"
+	DateTypeModification DateType = "modification"
+)
 
 type DateWindow struct {
 	From time.Time
@@ -19,8 +28,13 @@ type DateWindow struct {
 type SearchQuery struct {
 	Term         string
 	JournalISSNs []string
+	DateType     DateType
 	DateWindow   DateWindow
 	MaxResults   int
+}
+
+type CoverageQuery struct {
+	JournalISSNs []string
 }
 
 type Batch struct {
@@ -36,6 +50,10 @@ type SearchResult struct {
 }
 
 func (query SearchQuery) Values() (url.Values, error) {
+	dateType, err := query.DateType.entrezValue()
+	if err != nil {
+		return nil, err
+	}
 	if query.DateWindow.From.IsZero() || query.DateWindow.To.IsZero() {
 		return nil, errors.New("PubMed Entrez date window requires both from and to dates")
 	}
@@ -54,17 +72,13 @@ func (query SearchQuery) Values() (url.Values, error) {
 	}
 
 	values := make(url.Values)
-	values.Set("datetype", "edat")
+	values.Set("datetype", dateType)
 	values.Set("mindate", from.Format("2006/01/02"))
 	values.Set("maxdate", to.Format("2006/01/02"))
 
 	term := strings.TrimSpace(query.Term)
 	if len(issns) > 0 {
-		filters := make([]string, len(issns))
-		for index, issn := range issns {
-			filters[index] = issn + "[issn]"
-		}
-		journalFilter := "(" + strings.Join(filters, " OR ") + ")"
+		journalFilter := exactISSNOR(issns)
 		if term == "" {
 			term = journalFilter
 		} else {
@@ -74,6 +88,19 @@ func (query SearchQuery) Values() (url.Values, error) {
 	if term != "" {
 		values.Set("term", term)
 	}
+	return values, nil
+}
+
+func (query CoverageQuery) values() (url.Values, error) {
+	issns, err := normalizedISSNs(query.JournalISSNs)
+	if err != nil {
+		return nil, err
+	}
+	if len(issns) == 0 {
+		return nil, errors.New("PubMed coverage requires at least one journal ISSN")
+	}
+	values := make(url.Values)
+	values.Set("term", exactISSNOR(issns))
 	return values, nil
 }
 
@@ -113,7 +140,29 @@ func normalizedISSNs(values []string) ([]string, error) {
 		seen[value] = struct{}{}
 		result = append(result, value)
 	}
+	sort.Strings(result)
 	return result, nil
+}
+
+func exactISSNOR(issns []string) string {
+	filters := make([]string, len(issns))
+	for index, issn := range issns {
+		filters[index] = issn + "[issn]"
+	}
+	return "(" + strings.Join(filters, " OR ") + ")"
+}
+
+func (dateType DateType) entrezValue() (string, error) {
+	switch dateType {
+	case DateTypePublication:
+		return "pdat", nil
+	case DateTypeEntrez:
+		return "edat", nil
+	case DateTypeModification:
+		return "mdat", nil
+	default:
+		return "", fmt.Errorf("invalid PubMed date type %q", dateType)
+	}
 }
 
 func validISSN(value string) bool {

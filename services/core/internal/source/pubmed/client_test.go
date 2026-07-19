@@ -2,6 +2,7 @@ package pubmed_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
@@ -42,6 +43,7 @@ func TestSearchUsesHistoryServerIdentityDateWindowAndStableBatches(t *testing.T)
 	result, err := client.Search(context.Background(), pubmed.SearchQuery{
 		Term:         "agents",
 		JournalISSNs: []string{"0028-0836"},
+		DateType:     pubmed.DateTypeEntrez,
 		DateWindow: pubmed.DateWindow{
 			From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
 			To:   time.Date(2026, time.July, 16, 0, 0, 0, 0, time.UTC),
@@ -172,6 +174,7 @@ func TestClientDerivesNCBIRateLimitFromOptionalAPIKey(t *testing.T) {
 				},
 			})
 			query := pubmed.SearchQuery{
+				DateType: pubmed.DateTypeEntrez,
 				DateWindow: pubmed.DateWindow{
 					From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
 					To:   time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),
@@ -209,6 +212,7 @@ func TestClientUsesBoundedRetryAndRedactsAPIKey(t *testing.T) {
 		},
 	})
 	_, err := client.Search(context.Background(), pubmed.SearchQuery{
+		DateType: pubmed.DateTypeEntrez,
 		DateWindow: pubmed.DateWindow{
 			From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
 			To:   time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),
@@ -263,6 +267,317 @@ func TestClientRejectsTimeoutAndResponseLimitThroughSharedPolicy(t *testing.T) {
 	})
 }
 
+func TestClientCountCoverageUsesExactCanonicalISSNORAndReturnsRawResponseSHA256(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("{\"esearchresult\":{\"count\":\"42\"}}\n")
+	var (
+		captured url.Values
+		requests int
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.URL.Path != "/entrez/eutils/esearch.fcgi" {
+			t.Errorf("path = %q, want ESearch", request.URL.Path)
+		}
+		captured = request.URL.Query()
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+	result, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+		JournalISSNs: []string{
+			" 0140-6736 ",
+			"0028-0836",
+			"0140-6736",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CountCoverage() error = %v", err)
+	}
+	if result.Count != 42 {
+		t.Fatalf("Count = %d, want 42", result.Count)
+	}
+	if want := fmt.Sprintf("%x", sha256.Sum256(payload)); result.ResponseSHA256 != want {
+		t.Fatalf("ResponseSHA256 = %q, want %q", result.ResponseSHA256, want)
+	}
+	if requests != 1 {
+		t.Fatalf("physical requests = %d, want 1", requests)
+	}
+	if got := captured.Get("term"); got != "(0028-0836[issn] OR 0140-6736[issn])" {
+		t.Fatalf("term = %q, want unique stable exact ISSN OR", got)
+	}
+	for key, want := range map[string]string{
+		"db":      "pubmed",
+		"retmode": "json",
+		"retmax":  "0",
+		"tool":    "paper-hub-test",
+		"email":   "research@example.test",
+		"api_key": "ncbi-test-secret",
+	} {
+		if got := captured.Get(key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	for _, forbidden := range []string{
+		"usehistory",
+		"datetype",
+		"mindate",
+		"maxdate",
+		"retstart",
+		"query_key",
+		"WebEnv",
+	} {
+		if captured.Has(forbidden) {
+			t.Errorf("coverage request unexpectedly included %s=%q", forbidden, captured.Get(forbidden))
+		}
+	}
+	if len(captured) != 7 {
+		t.Fatalf("coverage query keys = %v, want only exact coverage and identity parameters", captured)
+	}
+}
+
+func TestClientCountCoverageRejectsMissingOrInvalidISSNsWithoutRequest(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+
+	for _, tt := range []struct {
+		name  string
+		query pubmed.CoverageQuery
+	}{
+		{name: "missing"},
+		{name: "journal title", query: pubmed.CoverageQuery{JournalISSNs: []string{"Nature"}}},
+		{name: "invalid checksum", query: pubmed.CoverageQuery{JournalISSNs: []string{"0028-0837"}}},
+		{name: "one invalid among valid", query: pubmed.CoverageQuery{JournalISSNs: []string{"0028-0836", "bad"}}},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := client.CountCoverage(context.Background(), tt.query); err == nil {
+				t.Fatalf("CountCoverage() = %#v, want error", got)
+			}
+		})
+	}
+	if requests != 0 {
+		t.Fatalf("invalid coverage queries made %d requests, want 0", requests)
+	}
+}
+
+func TestClientCountCoverageStrictlyValidatesCountString(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "missing", payload: `{"esearchresult":{}}`},
+		{name: "number", payload: `{"esearchresult":{"count":1}}`},
+		{name: "empty", payload: `{"esearchresult":{"count":""}}`},
+		{name: "negative", payload: `{"esearchresult":{"count":"-1"}}`},
+		{name: "plus sign", payload: `{"esearchresult":{"count":"+1"}}`},
+		{name: "leading whitespace", payload: `{"esearchresult":{"count":" 1"}}`},
+		{name: "trailing whitespace", payload: `{"esearchresult":{"count":"1 "}}`},
+		{name: "decimal", payload: `{"esearchresult":{"count":"1.0"}}`},
+		{name: "unicode digit", payload: `{"esearchresult":{"count":"１"}}`},
+		{name: "int64 overflow", payload: `{"esearchresult":{"count":"9223372036854775808"}}`},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = writer.Write([]byte(tt.payload))
+			}))
+			defer server.Close()
+			client := newClient(t, server, nil, httpclient.Dependencies{})
+
+			if got, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+				JournalISSNs: []string{"0028-0836"},
+			}); err == nil {
+				t.Fatalf("CountCoverage() = %#v, want strict count error", got)
+			}
+		})
+	}
+}
+
+func TestClientCountCoverageRejectsInvalidUTF8DuplicateKeysAndTrailingJSON(t *testing.T) {
+	t.Parallel()
+
+	invalidUTF8 := append(
+		[]byte(`{"esearchresult":{"count":"1"},"ignored":"`),
+		0xff,
+	)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	for _, tt := range []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "invalid UTF-8", payload: invalidUTF8},
+		{name: "duplicate top-level key", payload: []byte(`{"esearchresult":{"count":"1"},"esearchresult":{"count":"2"}}`)},
+		{name: "duplicate result key", payload: []byte(`{"esearchresult":{"count":"1","count":"2"}}`)},
+		{name: "duplicate ignored nested key", payload: []byte(`{"ignored":{"nested":{"x":1,"x":2}},"esearchresult":{"count":"1"}}`)},
+		{name: "second JSON value", payload: []byte(`{"esearchresult":{"count":"1"}} {"second":true}`)},
+		{name: "trailing garbage", payload: []byte(`{"esearchresult":{"count":"1"}} garbage`)},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = writer.Write(tt.payload)
+			}))
+			defer server.Close()
+			client := newClient(t, server, nil, httpclient.Dependencies{})
+
+			if got, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+				JournalISSNs: []string{"0028-0836"},
+			}); err == nil {
+				t.Fatalf("CountCoverage() = %#v, want strict JSON error", got)
+			}
+		})
+	}
+}
+
+func TestClientCountCoverageReturnsCanceledContextBeforeQueryValidationOrRequest(t *testing.T) {
+	t.Parallel()
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.CountCoverage(ctx, pubmed.CoverageQuery{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CountCoverage() error = %v, want context.Canceled", err)
+	}
+	if requests != 0 {
+		t.Fatalf("canceled coverage made %d requests, want 0", requests)
+	}
+}
+
+func TestClientCountCoverageUsesSharedBoundedRetryPolicy(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		status := status
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var attempts int
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				attempts++
+				if attempts == 1 {
+					http.Error(writer, "retry", status)
+					return
+				}
+				_, _ = writer.Write([]byte(`{"esearchresult":{"count":"1"}}`))
+			}))
+			defer server.Close()
+			client := newClient(t, server, func(config *pubmed.Config) {
+				config.MaxRetries = 1
+			}, httpclient.Dependencies{
+				Now: func() time.Time { return time.Unix(0, 0) },
+				Sleep: func(context.Context, time.Duration) error {
+					return nil
+				},
+			})
+
+			result, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+				JournalISSNs: []string{"0028-0836"},
+			})
+			if err != nil {
+				t.Fatalf("CountCoverage() error = %v", err)
+			}
+			if result.Count != 1 || attempts != 2 {
+				t.Fatalf("CountCoverage() = %#v after %d attempts, want count 1 after one retry", result, attempts)
+			}
+		})
+	}
+}
+
+func TestClientCountCoverageRedactsAPIKeyAndEmailFromErrors(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		http.Error(
+			writer,
+			"rejected ncbi-test-secret for research@example.test",
+			http.StatusBadRequest,
+		)
+	}))
+	defer server.Close()
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxRetries = 0
+	}, httpclient.Dependencies{})
+
+	_, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+		JournalISSNs: []string{"0028-0836"},
+	})
+	if err == nil {
+		t.Fatal("CountCoverage() accepted HTTP 400")
+	}
+	for _, secret := range []string{"ncbi-test-secret", "research@example.test"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("CountCoverage() error leaked %q: %v", secret, err)
+		}
+	}
+}
+
+func TestClientCountCoverageDoesNotEchoCredentialsFromProtocolErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "count", payload: `{"esearchresult":{"count":"ncbi-test-secret research@example.test"}}`},
+		{name: "trailing value", payload: `{"esearchresult":{"count":"1"}} "ncbi-test-secret research@example.test"`},
+		{name: "duplicate key", payload: `{"ncbi-test-secret":1,"ncbi-test-secret":2,"esearchresult":{"count":"1"}}`},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = writer.Write([]byte(tt.payload))
+			}))
+			defer server.Close()
+			client := newClient(t, server, nil, httpclient.Dependencies{})
+
+			_, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+				JournalISSNs: []string{"0028-0836"},
+			})
+			if err == nil {
+				t.Fatal("CountCoverage() accepted invalid protocol payload")
+			}
+			for _, secret := range []string{"ncbi-test-secret", "research@example.test"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("CountCoverage() protocol error leaked %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestSearchRejectsDuplicateESearchKeys(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(
+			`{"esearchresult":{"count":"1","count":"2","querykey":"1","webenv":"history"}}`,
+		))
+	}))
+	defer server.Close()
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+
+	if got, err := client.Search(context.Background(), validSearchQuery()); err == nil {
+		t.Fatalf("Search() = %#v, want duplicate-key JSON error", got)
+	}
+}
+
 func newClient(
 	t *testing.T,
 	server *httptest.Server,
@@ -297,6 +612,7 @@ func newClient(
 
 func validSearchQuery() pubmed.SearchQuery {
 	return pubmed.SearchQuery{
+		DateType: pubmed.DateTypeEntrez,
 		DateWindow: pubmed.DateWindow{
 			From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
 			To:   time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),

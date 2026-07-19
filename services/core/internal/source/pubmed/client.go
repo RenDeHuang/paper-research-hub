@@ -1,9 +1,9 @@
 package pubmed
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +42,11 @@ type Client struct {
 	httpClient *httpclient.Client
 }
 
+type CoverageResult struct {
+	Count          int64
+	ResponseSHA256 string
+}
+
 func NewClient(
 	base *http.Client,
 	config Config,
@@ -77,7 +82,7 @@ func NewClient(
 		InitialBackoff:           config.InitialBackoff,
 		MaxBackoff:               config.MaxBackoff,
 		MaxResponseBytes:         config.MaxResponseBytes,
-		SensitiveQueryParameters: []string{"api_key"},
+		SensitiveQueryParameters: []string{"api_key", "email"},
 	}, dependencies)
 	if err != nil {
 		return nil, fmt.Errorf("create PubMed HTTP policy: %w", err)
@@ -121,31 +126,21 @@ func (client *Client) Search(ctx context.Context, query SearchQuery) (SearchResu
 		return SearchResult{}, fmt.Errorf("read PubMed ESearch response: %w", err)
 	}
 
-	var envelope struct {
-		Result struct {
-			Count    string `json:"count"`
-			WebEnv   string `json:"webenv"`
-			QueryKey string `json:"querykey"`
-		} `json:"esearchresult"`
+	result, err := decodeESearch(payload)
+	if err != nil {
+		return SearchResult{}, err
 	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	if err := decoder.Decode(&envelope); err != nil {
-		return SearchResult{}, fmt.Errorf("decode PubMed ESearch JSON: %w", err)
+	count64, err := parseESearchCount(result.Count)
+	if err != nil {
+		return SearchResult{}, err
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return SearchResult{}, errors.New("PubMed ESearch JSON contains multiple values")
-		}
-		return SearchResult{}, fmt.Errorf("decode trailing PubMed ESearch JSON: %w", err)
+	maxInt := int64(^uint(0) >> 1)
+	if count64 > maxInt {
+		return SearchResult{}, fmt.Errorf("PubMed ESearch count %q exceeds int range", result.Count)
 	}
-
-	count, err := strconv.Atoi(envelope.Result.Count)
-	if err != nil || count < 0 {
-		return SearchResult{}, fmt.Errorf("invalid PubMed ESearch count %q", envelope.Result.Count)
-	}
-	if strings.TrimSpace(envelope.Result.WebEnv) == "" ||
-		strings.TrimSpace(envelope.Result.QueryKey) == "" {
+	count := int(count64)
+	if strings.TrimSpace(result.WebEnv) == "" ||
+		strings.TrimSpace(result.QueryKey) == "" {
 		return SearchResult{}, errors.New("PubMed ESearch response requires WebEnv and QueryKey")
 	}
 	batches, err := BuildBatches(count, query.MaxResults, client.batchSize)
@@ -154,9 +149,57 @@ func (client *Client) Search(ctx context.Context, query SearchQuery) (SearchResu
 	}
 	return SearchResult{
 		Count:    count,
-		WebEnv:   envelope.Result.WebEnv,
-		QueryKey: envelope.Result.QueryKey,
+		WebEnv:   result.WebEnv,
+		QueryKey: result.QueryKey,
 		Batches:  batches,
+	}, nil
+}
+
+func (client *Client) CountCoverage(
+	ctx context.Context,
+	query CoverageQuery,
+) (CoverageResult, error) {
+	if client == nil {
+		return CoverageResult{}, errors.New("PubMed client is nil")
+	}
+	if ctx == nil {
+		return CoverageResult{}, errors.New("PubMed coverage context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return CoverageResult{}, err
+	}
+
+	values, err := query.values()
+	if err != nil {
+		return CoverageResult{}, err
+	}
+	values.Set("db", "pubmed")
+	values.Set("retmode", "json")
+	values.Set("retmax", "0")
+	client.addIdentity(values)
+
+	response, err := client.get(ctx, "esearch.fcgi", values)
+	if err != nil {
+		return CoverageResult{}, fmt.Errorf("count PubMed coverage: %w", err)
+	}
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		return CoverageResult{}, fmt.Errorf("read PubMed coverage ESearch response: %w", err)
+	}
+	responseSHA256 := sha256.Sum256(payload)
+
+	result, err := decodeESearch(payload)
+	if err != nil {
+		return CoverageResult{}, err
+	}
+	count, err := parseESearchCount(result.Count)
+	if err != nil {
+		return CoverageResult{}, err
+	}
+	return CoverageResult{
+		Count:          count,
+		ResponseSHA256: hex.EncodeToString(responseSHA256[:]),
 	}, nil
 }
 

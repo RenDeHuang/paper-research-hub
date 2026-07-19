@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"iter"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,52 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
+
+func TestLegacyPubMedSyncUsesExplicitEntrezDateType(t *testing.T) {
+	t.Parallel()
+
+	var captured string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		captured = request.URL.Query().Get("datetype")
+		_, _ = writer.Write([]byte(
+			`{"esearchresult":{"count":"0","querykey":"1","webenv":"empty-history"}}`,
+		))
+	}))
+	defer server.Close()
+
+	_, sourceName, err := fetchRecords(
+		context.Background(),
+		config.Config{
+			PubMed: config.PubMedConfig{
+				Request: config.RequestConfig{
+					BaseURL:    server.URL,
+					Timeout:    time.Second,
+					MaxRetries: 0,
+					MaxWait:    time.Second,
+					BatchSize:  100,
+				},
+				Tool:  "paper-hub-test",
+				Email: "research@example.test",
+			},
+		},
+		workerCommand{
+			Kind:       commandSyncPubMed,
+			Query:      "agents",
+			FromDate:   time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+			ToDate:     time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),
+			MaxResults: 1,
+		},
+	)
+	if err != nil {
+		t.Fatalf("fetchRecords() error = %v", err)
+	}
+	if sourceName != source.PubMed {
+		t.Fatalf("source = %q, want %q", sourceName, source.PubMed)
+	}
+	if captured != "edat" {
+		t.Fatalf("datetype = %q, want legacy sync to remain Entrez date mode", captured)
+	}
+}
 
 func TestSyncIdentityPolicyVersionsReflectPMIDSemantics(t *testing.T) {
 	t.Parallel()

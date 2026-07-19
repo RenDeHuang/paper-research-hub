@@ -2560,6 +2560,7 @@ func fetchRecords(
 		history, err := client.Search(ctx, pubmed.SearchQuery{
 			Term:         command.Query,
 			JournalISSNs: command.ISSNs,
+			DateType:     pubmed.DateTypeEntrez,
 			DateWindow: pubmed.DateWindow{
 				From: command.FromDate,
 				To:   command.ToDate,
