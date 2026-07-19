@@ -204,9 +204,9 @@ func parseRegistryRecord(
 		}
 	}
 	if resolutionStatus != venueenrich.MatchStatusResolved &&
-		pubmedSupported == venueenrich.SupportStatusYes {
+		pubmedSupported != venueenrich.SupportStatusUnknown {
 		return Journal{}, false, fmt.Errorf(
-			"registry CSV row %d non-resolved resolution_status %q cannot have pubmed_supported yes",
+			"registry CSV row %d non-resolved resolution_status %q requires pubmed_supported unknown",
 			rowNumber,
 			resolutionStatus,
 		)
@@ -243,10 +243,6 @@ func parseRegistryRecord(
 		sourceOrder:       sourceOrder,
 		sourceJournalName: record[2],
 	}, true, nil
-}
-
-func parseStrictISSNArray(raw string) ([]string, error) {
-	return parseStrictISSNArrayWithEmpty(raw, false)
 }
 
 func parseStrictISSNArrayWithEmpty(raw string, allowEmpty bool) ([]string, error) {

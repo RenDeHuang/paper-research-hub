@@ -273,6 +273,35 @@ func TestLoadRegistryValidatesAllISSNsBeforeFilteringNonEligibleRows(t *testing.
 	}
 }
 
+func TestLoadRegistryRejectsPubMedNoForNonResolvedRows(t *testing.T) {
+	t.Parallel()
+
+	for _, resolution := range []string{"ambiguous", "unresolved"} {
+		resolution := resolution
+		t.Run(resolution, func(t *testing.T) {
+			t.Parallel()
+
+			record := validRegistryRecord(
+				resolution,
+				1,
+				"",
+				"",
+				"",
+				"[]",
+				resolution,
+				"no",
+				"0",
+			)
+			if _, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record))); err == nil {
+				t.Fatalf(
+					"LoadRegistry() accepted %s + pubmed_supported=no + count=0",
+					resolution,
+				)
+			}
+		})
+	}
+}
+
 func TestLoadRegistryValidatesResolvedISSNFieldsWhenPubMedIsNotYes(t *testing.T) {
 	t.Parallel()
 
