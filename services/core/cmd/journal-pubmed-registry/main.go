@@ -1324,17 +1324,27 @@ func publishRegistryArtifacts(
 	if err := ops.before(registryPublishOutput); err != nil {
 		return err
 	}
+	outputTempInfo, err := os.Lstat(outputTemp)
+	if err != nil {
+		return fmt.Errorf("record output CSV temporary identity: %w", err)
+	}
 	if err := ops.link(outputTemp, outputPath); err != nil {
 		return fmt.Errorf(
 			"publish output CSV without replacing final: %w",
 			err,
 		)
 	}
-	outputPublished = true
-	outputPublishedInfo, err = os.Lstat(outputPath)
+	outputFinalInfo, err := os.Lstat(outputPath)
 	if err != nil {
-		return fmt.Errorf("record published output CSV identity: %w", err)
+		return fmt.Errorf("verify output CSV link identity: %w", err)
 	}
+	if !os.SameFile(outputTempInfo, outputFinalInfo) {
+		return errors.New(
+			"verify output CSV link identity: final identity does not match temporary file",
+		)
+	}
+	outputPublished = true
+	outputPublishedInfo = outputTempInfo
 	if err := ops.remove(outputTemp); err != nil {
 		return fmt.Errorf("unlink published output CSV temporary file: %w", err)
 	}
@@ -1346,17 +1356,27 @@ func publishRegistryArtifacts(
 	if err := ops.before(registryPublishReport); err != nil {
 		return err
 	}
+	reportTempInfo, err := os.Lstat(reportTemp)
+	if err != nil {
+		return fmt.Errorf("record report temporary identity: %w", err)
+	}
 	if err := ops.link(reportTemp, reportPath); err != nil {
 		return fmt.Errorf(
 			"publish report without replacing final: %w",
 			err,
 		)
 	}
-	reportPublished = true
-	reportPublishedInfo, err = os.Lstat(reportPath)
+	reportFinalInfo, err := os.Lstat(reportPath)
 	if err != nil {
-		return fmt.Errorf("record published report identity: %w", err)
+		return fmt.Errorf("verify report link identity: %w", err)
 	}
+	if !os.SameFile(reportTempInfo, reportFinalInfo) {
+		return errors.New(
+			"verify report link identity: final identity does not match temporary file",
+		)
+	}
+	reportPublished = true
+	reportPublishedInfo = reportTempInfo
 	if err := ops.remove(reportTemp); err != nil {
 		return fmt.Errorf("unlink published report temporary file: %w", err)
 	}
@@ -1781,6 +1801,10 @@ func cleanupPublishedRegistryPath(
 	expected os.FileInfo,
 	description string,
 ) error {
+	// This is intentionally best-effort: without a portable directory-scoped
+	// conditional unlink primitive, Lstat followed by Remove cannot eliminate
+	// an adversarial replacement race. It protects normal no-replace publishes
+	// and preserves a final whose inode changed before rollback.
 	if expected == nil {
 		return fmt.Errorf(
 			"preserve %s %q: published inode identity is unavailable",

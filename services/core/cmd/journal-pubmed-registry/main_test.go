@@ -896,6 +896,61 @@ func TestJournalPubMedRegistryRollbackPreservesReplacedOutputInode(
 	assertRegistryTempsAbsent(t, directory)
 }
 
+func TestJournalPubMedRegistryRejectsFinalReplacedInsideLink(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	outputPath := filepath.Join(directory, "registry.csv")
+	reportPath := filepath.Join(directory, "registry.report.json")
+	externalPayload := []byte("external during link")
+	originalLink := defaultRegistryFileOps().link
+	ops := defaultRegistryFileOps()
+	ops.link = func(tempPath, finalPath string) error {
+		if finalPath != outputPath {
+			return errors.New("report link unexpectedly attempted")
+		}
+		if err := originalLink(tempPath, finalPath); err != nil {
+			return err
+		}
+		if err := os.Remove(finalPath); err != nil {
+			return fmt.Errorf("replace linked output: remove: %w", err)
+		}
+		if err := os.WriteFile(finalPath, externalPayload, 0o600); err != nil {
+			return fmt.Errorf("replace linked output: write: %w", err)
+		}
+		return nil
+	}
+
+	err := publishRegistryArtifacts(
+		outputPath,
+		[]byte("csv"),
+		reportPath,
+		[]byte("report"),
+		ops,
+	)
+	if err == nil || !strings.Contains(err.Error(), "output") ||
+		!strings.Contains(err.Error(), "identity") {
+		t.Fatalf(
+			"publishRegistryArtifacts() error = %v, want output identity rejection",
+			err,
+		)
+	}
+	if strings.Contains(err.Error(), "report link unexpectedly attempted") {
+		t.Fatalf("publishRegistryArtifacts() reached report link: %v", err)
+	}
+	if got, readErr := os.ReadFile(outputPath); readErr != nil {
+		t.Fatalf("ReadFile(output) error = %v", readErr)
+	} else if string(got) != string(externalPayload) {
+		t.Fatalf("output contents = %q, want external payload preserved", got)
+	}
+	if _, statErr := os.Lstat(reportPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("report final unexpectedly remained: %v", statErr)
+	}
+	assertRegistryTempsAbsent(t, directory)
+}
+
 func TestJournalPubMedRegistryReportsTemporaryCleanupFailure(t *testing.T) {
 	t.Parallel()
 
