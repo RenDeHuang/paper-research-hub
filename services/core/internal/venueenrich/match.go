@@ -2,9 +2,12 @@ package venueenrich
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"slices"
 	"sort"
@@ -30,10 +33,20 @@ type crossrefMatchCandidate struct {
 	recordNumber   int
 }
 
+type crossrefTitleMatch struct {
+	status      MatchStatus
+	identityKey string
+	candidate   crossrefMatchCandidate
+}
+
 func MatchCrossrefCatalog(
 	sources []SourceRow,
 	catalog CrossrefCatalog,
 ) ([]RegistryRow, error) {
+	if len(sources) == 0 {
+		return []RegistryRow{}, nil
+	}
+
 	normalizedTitles := make([]string, len(sources))
 	targetTitles := make(map[string]struct{}, len(sources))
 	for index, source := range sources {
@@ -62,14 +75,14 @@ func MatchCrossrefCatalog(
 		targetTitles[normalized] = struct{}{}
 	}
 
-	candidates := make(
-		map[string]map[string]crossrefMatchCandidate,
+	matches := make(
+		map[string]*crossrefTitleMatch,
 		len(targetTitles),
 	)
 	if err := streamCrossrefMatchCandidates(
-		catalog.CatalogPath,
+		catalog,
 		targetTitles,
-		candidates,
+		matches,
 	); err != nil {
 		return nil, err
 	}
@@ -85,14 +98,11 @@ func MatchCrossrefCatalog(
 			MatchStatus:       MatchStatusUnresolved,
 		}
 
-		identities := candidates[normalizedTitles[index]]
-		switch len(identities) {
-		case 0:
-		case 1:
-			var candidate crossrefMatchCandidate
-			for _, current := range identities {
-				candidate = current
-			}
+		match := matches[normalizedTitles[index]]
+		switch {
+		case match == nil:
+		case match.status == MatchStatusResolved:
+			candidate := match.candidate
 			row.PrintISSN = candidate.printISSN
 			row.EISSN = candidate.electronicISSN
 			row.AllISSNs = slices.Clone(candidate.allISSNs)
@@ -101,8 +111,14 @@ func MatchCrossrefCatalog(
 			row.CrossrefTotalDOIs = candidate.totalDOIs
 			row.CrossrefSupported = SupportStatusYes
 			row.MatchStatus = MatchStatusResolved
-		default:
+		case match.status == MatchStatusAmbiguous:
 			row.MatchStatus = MatchStatusAmbiguous
+		default:
+			return nil, fmt.Errorf(
+				"source row %d: internal Crossref match state %q is invalid",
+				index+1,
+				match.status,
+			)
 		}
 
 		if err := row.Validate(); err != nil {
@@ -118,13 +134,14 @@ func MatchCrossrefCatalog(
 }
 
 func streamCrossrefMatchCandidates(
-	path string,
+	catalog CrossrefCatalog,
 	targetTitles map[string]struct{},
-	candidates map[string]map[string]crossrefMatchCandidate,
+	matches map[string]*crossrefTitleMatch,
 ) (returnErr error) {
-	if path == "" {
-		return errors.New("Crossref catalog path must not be empty")
+	if err := validateCrossrefMatchCatalog(catalog); err != nil {
+		return err
 	}
+	path := catalog.CatalogPath
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open Crossref catalog %q: %w", path, err)
@@ -150,21 +167,59 @@ func streamCrossrefMatchCandidates(
 	}
 
 	reader := bufio.NewReaderSize(file, maxCrossrefMatchRecordBytes+2)
-	for recordNumber := 1; ; recordNumber++ {
-		record, readErr := reader.ReadSlice('\n')
+	hasher := sha256.New()
+	var recordCount, catalogBytes int64
+	for {
+		line, readErr := reader.ReadSlice('\n')
+		recordNumber := int(recordCount) + 1
 		switch {
 		case readErr == nil:
-			record = record[:len(record)-1]
+			written, hashErr := hasher.Write(line)
+			if hashErr != nil {
+				return fmt.Errorf(
+					"hash Crossref catalog %q record %d: %w",
+					path,
+					recordNumber,
+					hashErr,
+				)
+			}
+			if written != len(line) {
+				return fmt.Errorf(
+					"hash Crossref catalog %q record %d: wrote %d of %d bytes",
+					path,
+					recordNumber,
+					written,
+					len(line),
+				)
+			}
+			catalogBytes += int64(len(line))
+			recordCount++
+			record := line[:len(line)-1]
 			if len(record) > maxCrossrefMatchRecordBytes {
 				return oversizedCrossrefMatchRecordError(path, recordNumber)
+			}
+			if err := processCrossrefMatchRecord(
+				path,
+				recordNumber,
+				record,
+				targetTitles,
+				matches,
+			); err != nil {
+				return err
 			}
 		case errors.Is(readErr, bufio.ErrBufferFull):
 			return oversizedCrossrefMatchRecordError(path, recordNumber)
 		case errors.Is(readErr, io.EOF):
-			if len(record) == 0 {
-				return nil
+			if len(line) == 0 {
+				return verifyCrossrefMatchCatalogStream(
+					path,
+					catalog.Manifest,
+					recordCount,
+					catalogBytes,
+					hex.EncodeToString(hasher.Sum(nil)),
+				)
 			}
-			if len(record) > maxCrossrefMatchRecordBytes {
+			if len(line) > maxCrossrefMatchRecordBytes {
 				return oversizedCrossrefMatchRecordError(path, recordNumber)
 			}
 			return fmt.Errorf(
@@ -180,85 +235,191 @@ func streamCrossrefMatchCandidates(
 				readErr,
 			)
 		}
+	}
+}
 
-		if len(record) == 0 {
-			return fmt.Errorf(
-				"Crossref catalog %q record %d is empty",
-				path,
-				recordNumber,
-			)
-		}
-		if !utf8.Valid(record) {
-			return fmt.Errorf(
-				"Crossref catalog %q record %d contains invalid UTF-8",
-				path,
-				recordNumber,
-			)
-		}
+func validateCrossrefMatchCatalog(catalog CrossrefCatalog) error {
+	if catalog.CatalogPath == "" {
+		return errors.New("Crossref catalog path must not be empty")
+	}
+	if !catalog.Manifest.Complete {
+		return errors.New(
+			"Crossref catalog manifest complete must be true",
+		)
+	}
+	sourceURL := catalog.Manifest.SourceURL
+	if sourceURL == "" || sourceURL != strings.TrimSpace(sourceURL) {
+		return errors.New(
+			"Crossref catalog manifest source_url must be non-empty and trimmed",
+		)
+	}
+	parsedSourceURL, err := url.Parse(sourceURL)
+	if err != nil ||
+		(parsedSourceURL.Scheme != "http" &&
+			parsedSourceURL.Scheme != "https") ||
+		parsedSourceURL.Host == "" ||
+		parsedSourceURL.User != nil ||
+		parsedSourceURL.Fragment != "" {
+		return fmt.Errorf(
+			"Crossref catalog manifest source_url %q must be an absolute HTTP(S) URL without credentials or fragment",
+			sourceURL,
+		)
+	}
+	if err := validateCrossrefCatalogManifest(
+		catalog.Manifest,
+		sourceURL,
+	); err != nil {
+		return err
+	}
+	return nil
+}
 
-		journal, err := decodeCrossrefJournal(record)
-		if err != nil {
-			return fmt.Errorf(
-				"Crossref catalog %q record %d: %w",
-				path,
-				recordNumber,
-				err,
-			)
-		}
-		normalizedTitle, err := NormalizeTitle(journal.Title)
-		if err != nil {
-			return fmt.Errorf(
-				"Crossref catalog %q record %d: normalize title: %w",
-				path,
-				recordNumber,
-				err,
-			)
-		}
-		if normalizedTitle == "" {
-			return fmt.Errorf(
-				"Crossref catalog %q record %d title normalizes to empty",
-				path,
-				recordNumber,
-			)
-		}
+func verifyCrossrefMatchCatalogStream(
+	path string,
+	manifest CrossrefCatalogManifest,
+	recordCount int64,
+	catalogBytes int64,
+	catalogSHA256 string,
+) error {
+	if recordCount != manifest.RecordCount {
+		return fmt.Errorf(
+			"Crossref catalog %q record count = %d, manifest = %d",
+			path,
+			recordCount,
+			manifest.RecordCount,
+		)
+	}
+	if catalogBytes != manifest.CatalogBytes {
+		return fmt.Errorf(
+			"Crossref catalog %q byte count = %d, manifest = %d",
+			path,
+			catalogBytes,
+			manifest.CatalogBytes,
+		)
+	}
+	if catalogSHA256 != manifest.CatalogSHA256 {
+		return fmt.Errorf(
+			"Crossref catalog %q SHA-256 = %s, manifest = %s",
+			path,
+			catalogSHA256,
+			manifest.CatalogSHA256,
+		)
+	}
+	return nil
+}
 
-		candidate, identityKey, err := canonicalCrossrefMatchCandidate(
-			journal,
+func processCrossrefMatchRecord(
+	path string,
+	recordNumber int,
+	record []byte,
+	targetTitles map[string]struct{},
+	matches map[string]*crossrefTitleMatch,
+) error {
+	if len(record) == 0 {
+		return fmt.Errorf(
+			"Crossref catalog %q record %d is empty",
+			path,
 			recordNumber,
 		)
-		if err != nil {
-			return fmt.Errorf(
-				"Crossref catalog %q record %d: %w",
-				path,
-				recordNumber,
-				err,
-			)
-		}
-		if _, targeted := targetTitles[normalizedTitle]; !targeted {
-			continue
-		}
-
-		identities := candidates[normalizedTitle]
-		if identities == nil {
-			identities = make(map[string]crossrefMatchCandidate)
-			candidates[normalizedTitle] = identities
-		}
-		if existing, duplicate := identities[identityKey]; duplicate {
-			if conflict := crossrefMatchEvidenceConflict(existing, candidate); conflict != "" {
-				return fmt.Errorf(
-					"Crossref catalog %q record %d conflicts with record %d for normalized title %q and ISSN set %v: %s",
-					path,
-					recordNumber,
-					existing.recordNumber,
-					normalizedTitle,
-					candidate.allISSNs,
-					conflict,
-				)
-			}
-			continue
-		}
-		identities[identityKey] = candidate
 	}
+	if !utf8.Valid(record) {
+		return fmt.Errorf(
+			"Crossref catalog %q record %d contains invalid UTF-8",
+			path,
+			recordNumber,
+		)
+	}
+
+	journal, err := decodeCrossrefJournal(record)
+	if err != nil {
+		return fmt.Errorf(
+			"Crossref catalog %q record %d: %w",
+			path,
+			recordNumber,
+			err,
+		)
+	}
+	normalizedTitle, err := NormalizeTitle(journal.Title)
+	if err != nil {
+		return fmt.Errorf(
+			"Crossref catalog %q record %d: normalize title: %w",
+			path,
+			recordNumber,
+			err,
+		)
+	}
+	if normalizedTitle == "" {
+		return fmt.Errorf(
+			"Crossref catalog %q record %d title normalizes to empty",
+			path,
+			recordNumber,
+		)
+	}
+
+	candidate, identityKey, err := canonicalCrossrefMatchCandidate(
+		journal,
+		recordNumber,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"Crossref catalog %q record %d: %w",
+			path,
+			recordNumber,
+			err,
+		)
+	}
+	if _, targeted := targetTitles[normalizedTitle]; !targeted {
+		return nil
+	}
+
+	match := matches[normalizedTitle]
+	if match == nil {
+		match = &crossrefTitleMatch{}
+		matches[normalizedTitle] = match
+	}
+	existingRecord, conflict := match.observe(identityKey, candidate)
+	if conflict != "" {
+		return fmt.Errorf(
+			"Crossref catalog %q record %d conflicts with record %d for normalized title %q and ISSN set %v: %s",
+			path,
+			recordNumber,
+			existingRecord,
+			normalizedTitle,
+			candidate.allISSNs,
+			conflict,
+		)
+	}
+	return nil
+}
+
+func (match *crossrefTitleMatch) observe(
+	identityKey string,
+	candidate crossrefMatchCandidate,
+) (existingRecord int, conflict string) {
+	switch match.status {
+	case "":
+		match.status = MatchStatusResolved
+		match.identityKey = identityKey
+		match.candidate = candidate
+	case MatchStatusResolved:
+		if match.identityKey != identityKey {
+			match.status = MatchStatusAmbiguous
+			match.identityKey = ""
+			match.candidate = crossrefMatchCandidate{}
+			return 0, ""
+		}
+		conflict = crossrefMatchEvidenceConflict(match.candidate, candidate)
+		if conflict != "" {
+			return match.candidate.recordNumber, conflict
+		}
+	case MatchStatusAmbiguous:
+	default:
+		return 0, fmt.Sprintf(
+			"internal Crossref title match state %q is invalid",
+			match.status,
+		)
+	}
+	return 0, ""
 }
 
 func canonicalCrossrefMatchCandidate(
@@ -377,12 +538,6 @@ func crossrefMatchEvidenceConflict(
 	second crossrefMatchCandidate,
 ) string {
 	switch {
-	case first.title != second.title:
-		return fmt.Sprintf(
-			"title evidence differs: %q versus %q",
-			first.title,
-			second.title,
-		)
 	case first.publisher != second.publisher:
 		return fmt.Sprintf(
 			"publisher evidence differs: %q versus %q",

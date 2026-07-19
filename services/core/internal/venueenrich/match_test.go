@@ -2,6 +2,8 @@ package venueenrich
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMatchCrossrefCatalogResolvesUniqueNormalizedTitleAndCanonicalizesISSNs(
@@ -108,6 +111,54 @@ func TestMatchCrossrefCatalogCollapsesDuplicateRowsWithTheSameIdentity(t *testin
 	}
 }
 
+func TestMatchCrossrefCatalogCollapsesEquivalentNormalizedDuplicateTitles(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Journal of Exact Matching",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+				{Value: "2049-3630", Type: "electronic"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"ＪＯＵＲＮＡＬ　OF   EXACT MATCHING",
+			"Stable Publisher",
+			19,
+			[]string{"2049-3630", "0028-0836"},
+			[]CrossrefJournalISSNType{
+				{Value: "2049-3630", Type: "electronic"},
+				{Value: "0028-0836", Type: "print"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "journal of exact matching")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].MatchStatus != MatchStatusResolved {
+		t.Fatalf("rows = %#v, want one resolved identity", rows)
+	}
+	if rows[0].CrossrefTitle != "Journal of Exact Matching" {
+		t.Fatalf(
+			"CrossrefTitle = %q, want first verified equivalent title",
+			rows[0].CrossrefTitle,
+		)
+	}
+}
+
 func TestMatchCrossrefCatalogMarksDifferentISSNSetsAmbiguousWithoutEvidence(
 	t *testing.T,
 ) {
@@ -149,6 +200,59 @@ func TestMatchCrossrefCatalogMarksDifferentISSNSetsAmbiguousWithoutEvidence(
 	assertMatchHasNoCrossrefEvidence(t, rows[0])
 	if err := rows[0].Validate(); err != nil {
 		t.Fatalf("ambiguous RegistryRow.Validate() error = %v", err)
+	}
+}
+
+func TestMatchCrossrefTitleStateDropsCandidateAfterAmbiguity(t *testing.T) {
+	t.Parallel()
+
+	var state crossrefTitleMatch
+	first := crossrefMatchCandidate{
+		title:        "Shared Journal",
+		publisher:    "Publisher",
+		totalDOIs:    1,
+		allISSNs:     []string{"0028-0836"},
+		printISSN:    "0028-0836",
+		recordNumber: 1,
+	}
+	second := crossrefMatchCandidate{
+		title:          "Shared Journal",
+		publisher:      "Publisher",
+		totalDOIs:      2,
+		allISSNs:       []string{"2049-3630"},
+		electronicISSN: "2049-3630",
+		recordNumber:   2,
+	}
+	third := crossrefMatchCandidate{
+		title:        "Shared Journal",
+		publisher:    "Publisher",
+		totalDOIs:    3,
+		allISSNs:     []string{"3141-592X"},
+		printISSN:    "3141-592X",
+		recordNumber: 3,
+	}
+
+	if _, conflict := state.observe("0028-0836", first); conflict != "" {
+		t.Fatalf("first observe conflict = %q", conflict)
+	}
+	if _, conflict := state.observe("2049-3630", second); conflict != "" {
+		t.Fatalf("second observe conflict = %q", conflict)
+	}
+	if _, conflict := state.observe("3141-592X", third); conflict != "" {
+		t.Fatalf("third observe conflict = %q", conflict)
+	}
+	if state.status != MatchStatusAmbiguous {
+		t.Fatalf("state.status = %q, want ambiguous", state.status)
+	}
+	if state.identityKey != "" ||
+		state.candidate.title != "" ||
+		state.candidate.publisher != "" ||
+		state.candidate.totalDOIs != 0 ||
+		len(state.candidate.allISSNs) != 0 ||
+		state.candidate.printISSN != "" ||
+		state.candidate.electronicISSN != "" ||
+		state.candidate.recordNumber != 0 {
+		t.Fatalf("ambiguous state retained candidate detail: %#v", state)
 	}
 }
 
@@ -250,6 +354,265 @@ func TestMatchCrossrefCatalogPreservesInputOrder(t *testing.T) {
 		MatchStatusResolved,
 	}) {
 		t.Fatalf("match statuses = %v", got)
+	}
+}
+
+func TestMatchCrossrefCatalogRejectsNewlineBoundaryTruncationAgainstManifest(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	first := matchCatalogRecord(
+		t,
+		"First Complete Journal",
+		"Publisher",
+		1,
+		[]string{"0028-0836"},
+		[]CrossrefJournalISSNType{
+			{Value: "0028-0836", Type: "print"},
+		},
+	)
+	second := matchCatalogRecord(
+		t,
+		"Truncated Away Journal",
+		"Publisher",
+		2,
+		[]string{"2049-3630"},
+		[]CrossrefJournalISSNType{
+			{Value: "2049-3630", Type: "electronic"},
+		},
+	)
+	catalog := writeMatchCatalog(t, first, second)
+	if err := os.Truncate(catalog.CatalogPath, int64(len(first)+1)); err != nil {
+		t.Fatalf("Truncate(%q) error = %v", catalog.CatalogPath, err)
+	}
+
+	_, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Truncated Away Journal")},
+		catalog,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), filepath.Base(catalog.CatalogPath)) ||
+		!strings.Contains(strings.ToLower(err.Error()), "record count") {
+		t.Fatalf(
+			"MatchCrossrefCatalog() error = %v, want located manifest record count mismatch",
+			err,
+		)
+	}
+}
+
+func TestMatchCrossrefCatalogRejectsStreamIntegrityMismatch(t *testing.T) {
+	t.Parallel()
+
+	record := matchCatalogRecord(
+		t,
+		"Integrity Journal",
+		"Publisher",
+		1,
+		[]string{"0028-0836"},
+		[]CrossrefJournalISSNType{
+			{Value: "0028-0836", Type: "print"},
+		},
+	)
+	tests := []struct {
+		name   string
+		mutate func(*CrossrefCatalogManifest)
+		want   string
+	}{
+		{
+			name: "record count",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.RecordCount++
+				manifest.Pages[0].RecordCount++
+				total := *manifest.TotalResults + 1
+				manifest.TotalResults = &total
+			},
+			want: "record count",
+		},
+		{
+			name: "catalog bytes",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.CatalogBytes++
+			},
+			want: "byte count",
+		},
+		{
+			name: "catalog SHA-256",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.CatalogSHA256 = strings.Repeat("0", sha256.Size*2)
+			},
+			want: "SHA-256",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			catalog := writeMatchCatalog(t, record)
+			test.mutate(&catalog.Manifest)
+			_, err := MatchCrossrefCatalog(
+				[]SourceRow{matchSourceRow(1, "Integrity Journal")},
+				catalog,
+			)
+			if err == nil ||
+				!strings.Contains(
+					strings.ToLower(err.Error()),
+					strings.ToLower(test.want),
+				) {
+				t.Fatalf(
+					"MatchCrossrefCatalog() error = %v, want %q mismatch",
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func TestMatchCrossrefCatalogRejectsInvalidManifestRequiredFields(t *testing.T) {
+	t.Parallel()
+
+	record := matchCatalogRecord(
+		t,
+		"Manifest Journal",
+		"Publisher",
+		1,
+		[]string{"0028-0836"},
+		[]CrossrefJournalISSNType{
+			{Value: "0028-0836", Type: "print"},
+		},
+	)
+	tests := []struct {
+		name   string
+		mutate func(*CrossrefCatalogManifest)
+		want   string
+	}{
+		{
+			name: "incomplete",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.Complete = false
+			},
+			want: "complete",
+		},
+		{
+			name: "schema version",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.SchemaVersion = ""
+			},
+			want: "schema_version",
+		},
+		{
+			name: "source URL",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.SourceURL = ""
+			},
+			want: "source_url",
+		},
+		{
+			name: "fetched at",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.FetchedAt = time.Time{}
+			},
+			want: "fetched_at",
+		},
+		{
+			name: "rows",
+			mutate: func(manifest *CrossrefCatalogManifest) {
+				manifest.Rows = 0
+			},
+			want: "rows",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			catalog := writeMatchCatalog(t, record)
+			test.mutate(&catalog.Manifest)
+			_, err := MatchCrossrefCatalog(
+				[]SourceRow{matchSourceRow(1, "Manifest Journal")},
+				catalog,
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"MatchCrossrefCatalog() error = %v, want manifest field %q",
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func TestMatchCrossrefCatalogReturnsImmediatelyForEmptySources(t *testing.T) {
+	t.Parallel()
+
+	rows, err := MatchCrossrefCatalog(nil, CrossrefCatalog{})
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog(nil) error = %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("MatchCrossrefCatalog(nil) rows = %#v, want empty", rows)
+	}
+}
+
+func TestMatchCrossrefCatalogRejectsInvalidCatalogPaths(t *testing.T) {
+	t.Parallel()
+
+	validManifest := validMatchCatalogManifest(nil, 0)
+	tests := []struct {
+		name string
+		path func(*testing.T) string
+		want string
+	}{
+		{
+			name: "empty",
+			path: func(*testing.T) string {
+				return ""
+			},
+			want: "path",
+		},
+		{
+			name: "open failure",
+			path: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "missing.jsonl")
+			},
+			want: "open",
+		},
+		{
+			name: "non regular",
+			path: func(t *testing.T) string {
+				return t.TempDir()
+			},
+			want: "regular",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := MatchCrossrefCatalog(
+				[]SourceRow{matchSourceRow(1, "Any Journal")},
+				CrossrefCatalog{
+					Manifest:    validManifest,
+					CatalogPath: test.path(t),
+				},
+			)
+			if err == nil ||
+				!strings.Contains(strings.ToLower(err.Error()), test.want) {
+				t.Fatalf(
+					"MatchCrossrefCatalog() error = %v, want %q path error",
+					err,
+					test.want,
+				)
+			}
+		})
 	}
 }
 
@@ -446,9 +809,13 @@ func TestMatchCrossrefCatalogRejectsOversizedAndUnterminatedRecords(t *testing.T
 			if err := os.WriteFile(path, test.payload, 0o600); err != nil {
 				t.Fatalf("WriteFile(%q) error = %v", path, err)
 			}
+			catalog := CrossrefCatalog{
+				Manifest:    validMatchCatalogManifest(test.payload, 1),
+				CatalogPath: path,
+			}
 			_, err := MatchCrossrefCatalog(
 				[]SourceRow{matchSourceRow(1, "Any Journal")},
-				CrossrefCatalog{CatalogPath: path},
+				catalog,
 			)
 			if err == nil ||
 				!strings.Contains(err.Error(), filepath.Base(path)) ||
@@ -487,16 +854,6 @@ func TestMatchCrossrefCatalogRejectsConflictingDuplicateEvidence(t *testing.T) {
 		second evidence
 		want   string
 	}{
-		{
-			name: "title",
-			second: evidence{
-				title:     "CONFLICT JOURNAL",
-				publisher: base.publisher,
-				totalDOIs: base.totalDOIs,
-				roles:     base.roles,
-			},
-			want: "title",
-		},
 		{
 			name: "publisher",
 			second: evidence{
@@ -630,7 +987,50 @@ func writeMatchCatalog(t *testing.T, records ...[]byte) CrossrefCatalog {
 	if err := os.WriteFile(path, payload, 0o600); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v", path, err)
 	}
-	return CrossrefCatalog{CatalogPath: path}
+	return CrossrefCatalog{
+		Manifest:    validMatchCatalogManifest(payload, int64(len(records))),
+		CatalogPath: path,
+	}
+}
+
+func validMatchCatalogManifest(
+	payload []byte,
+	recordCount int64,
+) CrossrefCatalogManifest {
+	catalogHash := sha256.Sum256(payload)
+	pageHash := sha256.Sum256(payload)
+	totalResults := recordCount
+	fetchedAt := time.Date(2026, 7, 19, 8, 9, 10, 0, time.UTC)
+	pageBytes := int64(len(payload))
+	if pageBytes == 0 {
+		pageBytes = 1
+	}
+	return CrossrefCatalogManifest{
+		SchemaVersion: CrossrefCatalogSchemaVersion,
+		SourceURL:     "https://api.crossref.org/journals",
+		FetchedAt:     fetchedAt,
+		CheckpointAt:  fetchedAt,
+		Rows:          CrossrefCatalogRows,
+		Pages: []CrossrefCatalogPageReceipt{
+			{
+				Ordinal:     1,
+				CursorIn:    "*",
+				CursorOut:   "",
+				RecordCount: int(recordCount),
+				PageFile: filepath.Join(
+					crossrefCatalogPagesDirectoryName,
+					"page-000001.json",
+				),
+				PageBytes:  pageBytes,
+				PageSHA256: hex.EncodeToString(pageHash[:]),
+			},
+		},
+		CatalogSHA256: hex.EncodeToString(catalogHash[:]),
+		CatalogBytes:  int64(len(payload)),
+		RecordCount:   recordCount,
+		TotalResults:  &totalResults,
+		Complete:      true,
+	}
 }
 
 func matchCatalogRecord(
