@@ -330,6 +330,7 @@ func (observer *crossrefResponseObserver) explicitCursorInvalidOrExpired() bool 
 			failure,
 			path,
 			"type",
+			"value",
 			"message",
 		); err != nil {
 			return false
@@ -342,6 +343,16 @@ func (observer *crossrefResponseObserver) explicitCursorInvalidOrExpired() bool 
 		if err != nil ||
 			failureType != strings.TrimSpace(failureType) ||
 			failureType == "" {
+			return false
+		}
+		value, err := requiredJSONString(
+			failure,
+			"value",
+			path,
+		)
+		if err != nil ||
+			value != strings.TrimSpace(value) ||
+			value == "" {
 			return false
 		}
 		message, err := requiredJSONString(

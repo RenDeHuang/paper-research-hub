@@ -1341,6 +1341,7 @@ func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
 						"message-type":"resource-failure",
 						"message":[{
 							"type":"cursor-invalid",
+							"value":"page-2-cursor",
 							"message":"Cursor is invalid or expired"
 						}]
 					}`,
@@ -1406,6 +1407,7 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 				"message-type":"resource-failure",
 				"message":[{
 					"type":"cursor-invalid",
+					"value":"review-provided-invalid-cursor",
 					"message":"Cursor specified but no cursor is associated with the request"
 				}]
 			}`,
@@ -1419,6 +1421,7 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 				"message-type":"resource-failure",
 				"message":[{
 					"type":"cursor-expired",
+					"value":"expired-cursor-token",
 					"message":"Cursor lifetime elapsed"
 				}]
 			}`,
@@ -1441,6 +1444,7 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 				"message-type":"resource-failure",
 				"message":[{
 					"type":"resource-not-found",
+					"value":"page-2-cursor",
 					"message":"Cursor is invalid or expired"
 				}]
 			}`,
@@ -1454,6 +1458,7 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 				"message-type":"resource-failure",
 				"message":[{
 					"type":"possibly-cursor-invalid",
+					"value":"page-2-cursor",
 					"message":"Cursor rejected"
 				}]
 			}`,
@@ -1467,6 +1472,7 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 				"message-type":"resource-failure",
 				"message":[{
 					"type":"cursor-invalid",
+					"value":"page-2-cursor",
 					"message":"Cursor rejected"
 				}],
 				"unexpected":true
@@ -1474,15 +1480,43 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 			want: false,
 		},
 		{
-			name:       "unexpected failure item field is rejected",
+			name:       "unexpected additional failure item field is rejected",
 			statusCode: http.StatusNotFound,
 			payload: `{
 				"status":"failed",
 				"message-type":"resource-failure",
 				"message":[{
 					"type":"cursor-invalid",
+					"value":"page-2-cursor",
 					"message":"Cursor rejected",
-					"value":"legacy"
+					"unexpected":true
+				}]
+			}`,
+			want: false,
+		},
+		{
+			name:       "missing value is rejected",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"cursor-invalid",
+					"message":"Cursor rejected"
+				}]
+			}`,
+			want: false,
+		},
+		{
+			name:       "non string value is rejected",
+			statusCode: http.StatusNotFound,
+			payload: `{
+				"status":"failed",
+				"message-type":"resource-failure",
+				"message":[{
+					"type":"cursor-invalid",
+					"value":404,
+					"message":"Cursor rejected"
 				}]
 			}`,
 			want: false,
@@ -1495,6 +1529,7 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 				"message-type":"work-list",
 				"message":[{
 					"type":"cursor-invalid",
+					"value":"page-2-cursor",
 					"message":"Cursor rejected"
 				}]
 			}`,
@@ -1508,6 +1543,7 @@ func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
 				"message-type":"resource-failure",
 				"message":[{
 					"type":"cursor-invalid",
+					"value":"page-2-cursor",
 					"message":"Cursor rejected"
 				}]
 			}`,
