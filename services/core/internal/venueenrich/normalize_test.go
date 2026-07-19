@@ -1,6 +1,10 @@
 package venueenrich
 
-import "testing"
+import (
+	"testing"
+
+	"golang.org/x/text/unicode/norm"
+)
 
 func TestNormalizeTitleAppliesNFKCCaseFoldingAndUnicodeWhitespaceFolding(t *testing.T) {
 	t.Parallel()
@@ -32,8 +36,8 @@ func TestNormalizeTitleAppliesNFKCCaseFoldingAndUnicodeWhitespaceFolding(t *test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			first := NormalizeTitle(test.raw)
-			second := NormalizeTitle(test.raw)
+			first := mustNormalizeTitle(t, test.raw)
+			second := mustNormalizeTitle(t, test.raw)
 			if first != test.want {
 				t.Fatalf("NormalizeTitle(%q) = %q, want %q", test.raw, first, test.want)
 			}
@@ -45,7 +49,7 @@ func TestNormalizeTitleAppliesNFKCCaseFoldingAndUnicodeWhitespaceFolding(t *test
 					first,
 				)
 			}
-			if idempotent := NormalizeTitle(first); idempotent != first {
+			if idempotent := mustNormalizeTitle(t, first); idempotent != first {
 				t.Fatalf(
 					"NormalizeTitle(%q) = %q, want idempotent %q",
 					first,
@@ -63,8 +67,53 @@ func TestNormalizeTitlePreservesPunctuation(t *testing.T) {
 	const raw = "Journal: A/B, C.D (E)—F"
 	const want = "journal: a/b, c.d (e)—f"
 
-	if got := NormalizeTitle(raw); got != want {
+	if got := mustNormalizeTitle(t, raw); got != want {
 		t.Fatalf("NormalizeTitle(%q) = %q, want punctuation-preserving %q", raw, got, want)
+	}
+}
+
+func TestNormalizeTitleReturnsFinalNFKCAndIsIdempotentAcrossCaseFoldBoundaries(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	const (
+		cherokeeUpper = "Ꭰ"
+		cherokeeLower = "ꭰ"
+	)
+
+	upper := mustNormalizeTitle(t, "ǰ "+cherokeeUpper)
+	lower := mustNormalizeTitle(t, "ǰ "+cherokeeLower)
+	if upper != lower {
+		t.Fatalf(
+			"NormalizeTitle() Cherokee case equivalents differ: %q != %q",
+			upper,
+			lower,
+		)
+	}
+	if !norm.NFKC.IsNormalString(upper) {
+		t.Fatalf("NormalizeTitle() result %q is not final NFKC", upper)
+	}
+	if second := mustNormalizeTitle(t, upper); second != upper {
+		t.Fatalf("NormalizeTitle(%q) = %q, want idempotent result", upper, second)
+	}
+}
+
+func TestNormalizeTitleRejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		string([]byte{0xff}),
+		string([]byte{0xfe}),
+		string([]byte{'J', 0xff, 'A'}),
+	} {
+		got, err := NormalizeTitle(raw)
+		if err == nil {
+			t.Fatalf("NormalizeTitle(%q) = %q, want invalid UTF-8 error", raw, got)
+		}
+		if got != "" {
+			t.Fatalf("NormalizeTitle(%q) returned %q with error, want empty result", raw, got)
+		}
 	}
 }
 
@@ -100,8 +149,8 @@ func TestNormalizeTitleDoesNotMatchHyphenReplacementPunctuationDeletionOrApproxi
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			left := NormalizeTitle(test.left)
-			right := NormalizeTitle(test.right)
+			left := mustNormalizeTitle(t, test.left)
+			right := mustNormalizeTitle(t, test.right)
 			if left == right {
 				t.Fatalf(
 					"NormalizeTitle() matched forbidden variants %q and %q as %q",
@@ -112,4 +161,14 @@ func TestNormalizeTitleDoesNotMatchHyphenReplacementPunctuationDeletionOrApproxi
 			}
 		})
 	}
+}
+
+func mustNormalizeTitle(t *testing.T, raw string) string {
+	t.Helper()
+
+	normalized, err := NormalizeTitle(raw)
+	if err != nil {
+		t.Fatalf("NormalizeTitle(%q) error = %v", raw, err)
+	}
+	return normalized
 }

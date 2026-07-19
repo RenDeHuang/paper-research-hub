@@ -37,19 +37,7 @@ func TestRegistryRowSourcePreservesDomainOrderTitleAndSourceURL(t *testing.T) {
 func TestRegistryRowRejectsInvalidISSNsAndMatchStates(t *testing.T) {
 	t.Parallel()
 
-	valid := RegistryRow{
-		SourceRow: SourceRow{
-			Domain:            "biology",
-			SourceOrder:       8,
-			SourceJournalName: "Synthetic Biology Journal",
-			SourceURL:         "https://example.test/biology",
-		},
-		ISSNL:       "1234-5679",
-		PrintISSN:   "2049-3630",
-		EISSN:       "3141-592X",
-		AllISSNs:    []string{"1234-5679", "2049-3630", "3141-592X"},
-		MatchStatus: MatchStatusResolved,
-	}
+	valid := validRegistryRow()
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid RegistryRow.Validate() error = %v", err)
 	}
@@ -58,6 +46,7 @@ func TestRegistryRowRejectsInvalidISSNsAndMatchStates(t *testing.T) {
 		name   string
 		mutate func(*RegistryRow)
 		want   string
+		forbid string
 	}{
 		{
 			name: "invalid ISSN-L checksum",
@@ -85,7 +74,8 @@ func TestRegistryRowRejectsInvalidISSNsAndMatchStates(t *testing.T) {
 			mutate: func(row *RegistryRow) {
 				row.AllISSNs = []string{"1234-5679", "2049-3631"}
 			},
-			want: "all_issns",
+			want:   "all_issns",
+			forbid: "issn_l",
 		},
 		{
 			name: "blank all ISSNs member",
@@ -120,6 +110,203 @@ func TestRegistryRowRejectsInvalidISSNsAndMatchStates(t *testing.T) {
 					test.want,
 				)
 			}
+			if test.forbid != "" && strings.Contains(err.Error(), test.forbid) {
+				t.Fatalf(
+					"RegistryRow.Validate() error = %q, must not contain %q",
+					err,
+					test.forbid,
+				)
+			}
 		})
+	}
+}
+
+func TestRegistryRowRejectsContradictorySupportEvidenceAndCounts(t *testing.T) {
+	t.Parallel()
+
+	valid := validRegistryRow()
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid RegistryRow.Validate() error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*RegistryRow)
+		want   string
+	}{
+		{
+			name: "invalid Crossref support status",
+			mutate: func(row *RegistryRow) {
+				row.CrossrefSupported = SupportStatus("supported")
+			},
+			want: "crossref_supported",
+		},
+		{
+			name: "invalid OpenAlex support status",
+			mutate: func(row *RegistryRow) {
+				row.OpenAlexSupported = SupportStatus("supported")
+			},
+			want: "openalex_supported",
+		},
+		{
+			name: "invalid PubMed support status",
+			mutate: func(row *RegistryRow) {
+				row.PubMedSupported = SupportStatus("supported")
+			},
+			want: "pubmed_supported",
+		},
+		{
+			name: "negative Crossref DOI count",
+			mutate: func(row *RegistryRow) {
+				row.CrossrefTotalDOIs = -1
+			},
+			want: "crossref_total_dois",
+		},
+		{
+			name: "negative PubMed record count",
+			mutate: func(row *RegistryRow) {
+				row.PubMedRecordCount = -1
+			},
+			want: "pubmed_record_count",
+		},
+		{
+			name: "PubMed no with positive count",
+			mutate: func(row *RegistryRow) {
+				row.PubMedSupported = SupportStatusNo
+			},
+			want: "pubmed_record_count",
+		},
+		{
+			name: "PubMed yes with zero count",
+			mutate: func(row *RegistryRow) {
+				row.PubMedRecordCount = 0
+			},
+			want: "pubmed_record_count",
+		},
+		{
+			name: "PubMed unknown with observed count",
+			mutate: func(row *RegistryRow) {
+				row.PubMedSupported = SupportStatusUnknown
+			},
+			want: "pubmed_record_count",
+		},
+		{
+			name: "Crossref yes without title",
+			mutate: func(row *RegistryRow) {
+				row.CrossrefTitle = ""
+			},
+			want: "crossref_title",
+		},
+		{
+			name: "Crossref yes without publisher",
+			mutate: func(row *RegistryRow) {
+				row.CrossrefPublisher = ""
+			},
+			want: "crossref_publisher",
+		},
+		{
+			name: "Crossref no with catalog evidence",
+			mutate: func(row *RegistryRow) {
+				row.CrossrefSupported = SupportStatusNo
+			},
+			want: "crossref_supported",
+		},
+		{
+			name: "Crossref unknown with catalog evidence",
+			mutate: func(row *RegistryRow) {
+				row.CrossrefSupported = SupportStatusUnknown
+			},
+			want: "crossref_supported",
+		},
+		{
+			name: "OpenAlex yes without source ID",
+			mutate: func(row *RegistryRow) {
+				row.OpenAlexSourceID = ""
+			},
+			want: "openalex_source_id",
+		},
+		{
+			name: "OpenAlex no with source ID",
+			mutate: func(row *RegistryRow) {
+				row.OpenAlexSupported = SupportStatusNo
+			},
+			want: "openalex_supported",
+		},
+		{
+			name: "OpenAlex unknown with source ID",
+			mutate: func(row *RegistryRow) {
+				row.OpenAlexSupported = SupportStatusUnknown
+			},
+			want: "openalex_supported",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			candidate := valid
+			candidate.AllISSNs = append([]string(nil), valid.AllISSNs...)
+			test.mutate(&candidate)
+
+			err := candidate.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"RegistryRow.Validate() error = %v, want field %q",
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func TestRegistryRowAcceptsConsistentNoAndUnknownSupportEvidence(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []SupportStatus{SupportStatusNo, SupportStatusUnknown} {
+		row := validRegistryRow()
+		row.CrossrefTitle = ""
+		row.CrossrefPublisher = ""
+		row.CrossrefTotalDOIs = 0
+		row.CrossrefSupported = status
+		row.OpenAlexSourceID = ""
+		row.OpenAlexSupported = status
+		row.PubMedSupported = status
+		row.PubMedRecordCount = 0
+		row.MatchStatus = MatchStatusUnresolved
+
+		if err := row.Validate(); err != nil {
+			t.Fatalf(
+				"RegistryRow.Validate() status %q error = %v",
+				status,
+				err,
+			)
+		}
+	}
+}
+
+func validRegistryRow() RegistryRow {
+	return RegistryRow{
+		SourceRow: SourceRow{
+			Domain:            "biology",
+			SourceOrder:       8,
+			SourceJournalName: "Synthetic Biology Journal",
+			SourceURL:         "https://example.test/biology",
+		},
+		ISSNL:             "1234-5679",
+		PrintISSN:         "2049-3630",
+		EISSN:             "3141-592X",
+		AllISSNs:          []string{"1234-5679", "2049-3630", "3141-592X"},
+		CrossrefTitle:     "Synthetic Biology Journal",
+		CrossrefPublisher: "Example Publisher",
+		CrossrefTotalDOIs: 25,
+		CrossrefSupported: SupportStatusYes,
+		OpenAlexSourceID:  "https://openalex.org/S123",
+		OpenAlexSupported: SupportStatusYes,
+		PubMedSupported:   SupportStatusYes,
+		PubMedRecordCount: 7,
+		MatchStatus:       MatchStatusResolved,
 	}
 }

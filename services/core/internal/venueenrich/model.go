@@ -33,6 +33,15 @@ const (
 	SupportStatusUnknown SupportStatus = "unknown"
 )
 
+func (status SupportStatus) Valid() bool {
+	switch status {
+	case SupportStatusYes, SupportStatusNo, SupportStatusUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
 type SourceRow struct {
 	Domain            string
 	SourceOrder       int
@@ -105,12 +114,8 @@ func (row RegistryRow) Validate() error {
 		}
 	}
 	for index, raw := range row.AllISSNs {
-		if raw == "" {
-			return fmt.Errorf("all_issns[%d] must not be empty", index)
-		}
-		if err := validateOptionalISSN(
+		if err := validateRequiredGenericISSN(
 			fmt.Sprintf("all_issns[%d]", index),
-			venue.ISSNRoleLinking,
 			raw,
 		); err != nil {
 			return err
@@ -119,7 +124,25 @@ func (row RegistryRow) Validate() error {
 	if !row.MatchStatus.Valid() {
 		return fmt.Errorf("invalid match_status %q", row.MatchStatus)
 	}
-	return nil
+	for _, candidate := range []struct {
+		field  string
+		status SupportStatus
+	}{
+		{field: "crossref_supported", status: row.CrossrefSupported},
+		{field: "openalex_supported", status: row.OpenAlexSupported},
+		{field: "pubmed_supported", status: row.PubMedSupported},
+	} {
+		if !candidate.status.Valid() {
+			return fmt.Errorf("invalid %s %q", candidate.field, candidate.status)
+		}
+	}
+	if err := validateCrossrefEvidence(row); err != nil {
+		return err
+	}
+	if err := validateOpenAlexEvidence(row); err != nil {
+		return err
+	}
+	return validatePubMedEvidence(row)
 }
 
 func validateRequiredTrimmed(field, value string) error {
@@ -143,6 +166,83 @@ func validateOptionalISSN(
 	}
 	if parsed.String() != raw {
 		return fmt.Errorf("%s must use canonical ISSN form %q", field, parsed.String())
+	}
+	return nil
+}
+
+func validateRequiredGenericISSN(field, raw string) error {
+	if raw == "" {
+		return fmt.Errorf("%s must not be empty", field)
+	}
+	parsed, err := venue.ParseISSN(venue.ISSNRoleLinking, raw)
+	if err != nil {
+		return fmt.Errorf("%s: invalid ISSN %q", field, raw)
+	}
+	if parsed.String() != raw {
+		return fmt.Errorf("%s must use canonical ISSN form %q", field, parsed.String())
+	}
+	return nil
+}
+
+func validateCrossrefEvidence(row RegistryRow) error {
+	if row.CrossrefTotalDOIs < 0 {
+		return errors.New("crossref_total_dois must not be negative")
+	}
+	if row.CrossrefSupported == SupportStatusYes {
+		if err := validateRequiredTrimmed(
+			"crossref_title",
+			row.CrossrefTitle,
+		); err != nil {
+			return err
+		}
+		return validateRequiredTrimmed(
+			"crossref_publisher",
+			row.CrossrefPublisher,
+		)
+	}
+	if row.CrossrefTitle != "" ||
+		row.CrossrefPublisher != "" ||
+		row.CrossrefTotalDOIs != 0 {
+		return fmt.Errorf(
+			"crossref_supported %q requires empty catalog fields and zero crossref_total_dois",
+			row.CrossrefSupported,
+		)
+	}
+	return nil
+}
+
+func validateOpenAlexEvidence(row RegistryRow) error {
+	if row.OpenAlexSupported == SupportStatusYes {
+		return validateRequiredTrimmed(
+			"openalex_source_id",
+			row.OpenAlexSourceID,
+		)
+	}
+	if row.OpenAlexSourceID != "" {
+		return fmt.Errorf(
+			"openalex_supported %q requires an empty openalex_source_id",
+			row.OpenAlexSupported,
+		)
+	}
+	return nil
+}
+
+func validatePubMedEvidence(row RegistryRow) error {
+	if row.PubMedRecordCount < 0 {
+		return errors.New("pubmed_record_count must not be negative")
+	}
+	switch row.PubMedSupported {
+	case SupportStatusYes:
+		if row.PubMedRecordCount == 0 {
+			return errors.New("pubmed_record_count must be positive when pubmed_supported is yes")
+		}
+	case SupportStatusNo, SupportStatusUnknown:
+		if row.PubMedRecordCount != 0 {
+			return fmt.Errorf(
+				"pubmed_record_count must be zero when pubmed_supported is %s",
+				row.PubMedSupported,
+			)
+		}
 	}
 	return nil
 }
