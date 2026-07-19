@@ -290,12 +290,12 @@ func ParseRecord(raw []byte) (source.Record, error) {
 	if err != nil {
 		return source.Record{}, err
 	}
-	var identity paper.Identifier
-	if len(dois) > 0 {
-		identity, err = paper.CanonicalIdentity(paper.Identifiers{DOI: dois}, "")
-		if err != nil {
-			return source.Record{}, fmt.Errorf("resolve PubMed PMID %s identity: %w", pmid, err)
-		}
+	identity, err := paper.CanonicalIdentity(paper.Identifiers{
+		DOI:  dois,
+		PMID: []string{pmid},
+	}, "")
+	if err != nil {
+		return source.Record{}, fmt.Errorf("resolve PubMed PMID %s identity: %w", pmid, err)
 	}
 
 	identifiers := []source.Identifier{{Scheme: source.IdentifierPMID, Value: pmid}}

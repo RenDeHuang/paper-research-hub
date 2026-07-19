@@ -19,6 +19,7 @@ const (
 	SchemeSemanticScholar Scheme = "s2"
 	SchemeS2              Scheme = SchemeSemanticScholar
 	SchemeOpenAlex        Scheme = "openalex"
+	SchemePMID            Scheme = "pmid"
 )
 
 var (
@@ -40,6 +41,8 @@ var (
 	openAlexValue     = regexp.MustCompile(`^W[0-9]+$`)
 	semanticScholarID = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	openReviewForumID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,254}$`)
+	// PubMed PMIDs are positive ASCII decimals; zero and leading zeroes are not canonical.
+	pmidValue = regexp.MustCompile(`^[1-9][0-9]*$`)
 )
 
 type Identifier struct {
@@ -50,6 +53,7 @@ type Identifier struct {
 type Identifiers struct {
 	DOI                     []string
 	DOIs                    []string
+	PMID                    []string
 	ArXiv                   []string
 	ArXivIDs                []string
 	OpenReview              []string
@@ -81,6 +85,8 @@ func NewIdentifier(scheme Scheme, raw string) (Identifier, error) {
 		value, err = NormalizeSemanticScholar(raw)
 	case SchemeOpenAlex:
 		value, err = NormalizeOpenAlex(raw)
+	case SchemePMID:
+		value, err = NormalizePMID(raw)
 	default:
 		return Identifier{}, fmt.Errorf("unsupported identifier scheme %q", scheme)
 	}
@@ -123,6 +129,10 @@ func CanonicalIdentity(identifiers Identifiers, _ string) (Identifier, error) {
 		{
 			scheme: SchemeDOI,
 			values: joinedCandidates(identifiers.DOI, identifiers.DOIs),
+		},
+		{
+			scheme: SchemePMID,
+			values: identifiers.PMID,
 		},
 		{
 			scheme: SchemeArXiv,
@@ -246,6 +256,13 @@ func NormalizeOpenAlex(raw string) (string, error) {
 		return "", fmt.Errorf("invalid OpenAlex work identifier %q", raw)
 	}
 	return normalized, nil
+}
+
+func NormalizePMID(raw string) (string, error) {
+	if !pmidValue.MatchString(raw) {
+		return "", fmt.Errorf("invalid PMID %q", raw)
+	}
+	return raw, nil
 }
 
 func removeArXivVersion(value string) (string, error) {

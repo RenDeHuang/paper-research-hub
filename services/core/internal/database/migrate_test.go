@@ -334,6 +334,7 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 22, name: "scope_registry_serialization_and_missing_admissions"},
 		{version: 23, name: "connector_runs"},
 		{version: 27, name: "abstract_route_analysis"},
+		{version: 28, name: "pmid_canonical_identity"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -377,8 +378,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 24 {
-		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
+	if len(migrations) != 25 {
+		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -509,6 +510,13 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 		t.Fatalf(
 			"twenty-second migration = %#v, want 000022_scope_registry_serialization_and_missing_admissions",
 			migrations[21],
+		)
+	}
+	if migrations[24].Version != 28 ||
+		migrations[24].Name != "pmid_canonical_identity" {
+		t.Fatalf(
+			"last migration = %#v, want 000028_pmid_canonical_identity",
+			migrations[24],
 		)
 	}
 }
@@ -2963,8 +2971,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 24 {
-		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
+	if len(migrations) != 25 {
+		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -4385,8 +4393,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 24 {
-		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
+	if len(migrations) != 25 {
+		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -6137,6 +6145,73 @@ func TestMigrationSecondRunIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMigratePMIDCanonicalIdentity(t *testing.T) {
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatalf("EmbeddedMigrations() error = %v", err)
+	}
+	last := migrations[len(migrations)-1]
+	if last.Version != 28 || last.Name != "pmid_canonical_identity" {
+		t.Fatalf("last migration = %#v, want 000028_pmid_canonical_identity", last)
+	}
+
+	pool := openTestPool(t)
+	ctx := testContext(t)
+	if err := UpMigrations(ctx, pool, migrations[:len(migrations)-1]); err != nil {
+		t.Fatalf("apply migrations before 000028: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO works (canonical_key, status, title)
+		VALUES ('pmid:12345678', 'active', 'Pre-PMID canonical identity')
+	`)
+	assertPostgresError(t, err, "23514", "works_canonical_key_check")
+
+	if err := UpMigrations(ctx, pool, migrations); err != nil {
+		t.Fatalf("apply 000028_pmid_canonical_identity: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO works (canonical_key, status, title)
+		VALUES ('pmid:12345678', 'active', 'PMID canonical identity')
+	`); err != nil {
+		t.Fatalf("insert valid PMID canonical identity: %v", err)
+	}
+
+	for _, canonicalKey := range []string{
+		"pmid:",
+		"pmid:0",
+		"pmid:012345678",
+		"pmid:+12345678",
+		"pmid:-12345678",
+		"pmid:123.45678",
+		"pmid:123 45678",
+		"pmid:PMID:12345678",
+		"pmid:https://pubmed.ncbi.nlm.nih.gov/12345678/",
+	} {
+		t.Run(canonicalKey, func(t *testing.T) {
+			_, err := pool.Exec(ctx, `
+				INSERT INTO works (canonical_key, status, title)
+				VALUES ($1, 'active', $1)
+			`, canonicalKey)
+			assertPostgresError(t, err, "23514", "works_canonical_key_check")
+		})
+	}
+
+	if err := Up(ctx, pool); err != nil {
+		t.Fatalf("repeat Up() after PMID migration: %v", err)
+	}
+	var applied int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM schema_migrations
+		WHERE version = 28 AND name = 'pmid_canonical_identity'
+	`).Scan(&applied); err != nil {
+		t.Fatalf("count applied PMID migration: %v", err)
+	}
+	if applied != 1 {
+		t.Fatalf("applied PMID migration records = %d, want 1", applied)
+	}
+}
+
 func TestConcurrentMigratorsExecuteMigrationOnce(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := testContext(t)
@@ -6205,8 +6280,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 24 {
-		t.Fatalf("embedded migration count = %d, want 24", len(migrations))
+	if len(migrations) != 25 {
+		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -6781,7 +6856,7 @@ func TestCanonicalStatusIdentifierAndProjectionConstraints(t *testing.T) {
 
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO works (canonical_key, status, title)
-		VALUES ('pmid:123', 'active', 'Invalid canonical prefix')
+		VALUES ('isbn:123', 'active', 'Invalid canonical prefix')
 	`); err == nil {
 		t.Fatal("invalid canonical prefix was accepted")
 	}

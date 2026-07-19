@@ -308,6 +308,13 @@ func TestNewIdentifierNormalizesAndValidates(t *testing.T) {
 			value:  "W123",
 			key:    "openalex:W123",
 		},
+		{
+			name:   "pmid",
+			scheme: SchemePMID,
+			raw:    "12345678",
+			value:  "12345678",
+			key:    "pmid:12345678",
+		},
 	}
 
 	for _, tt := range tests {
@@ -342,7 +349,6 @@ func TestNewIdentifierRejectsUnsupportedOrInvalidIdentifiers(t *testing.T) {
 		scheme Scheme
 		raw    string
 	}{
-		{scheme: Scheme("pmid"), raw: "12345"},
 		{scheme: SchemeDOI, raw: "not-a-doi"},
 		{scheme: SchemeArXiv, raw: "not-an-arxiv-id"},
 		{scheme: SchemeOpenReview, raw: "bad forum"},
@@ -367,6 +373,112 @@ func TestNewIdentifierRejectsUnsupportedOrInvalidIdentifiers(t *testing.T) {
 		if identifier.Valid() {
 			t.Fatalf("Identifier.Valid() = true for %#v", identifier)
 		}
+	}
+}
+
+func TestNewIdentifierRejectsInvalidPMIDValues(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		"",
+		"0",
+		"012345",
+		"+12345",
+		"-12345",
+		"123.45",
+		" 12345",
+		"12345 ",
+		"12 345",
+		"12\t345",
+		"PMID:12345",
+		"pmid:12345",
+		"https://pubmed.ncbi.nlm.nih.gov/12345/",
+		"１２３４５",
+	} {
+		raw := raw
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+
+			if got, err := NewIdentifier(SchemePMID, raw); err == nil {
+				t.Fatalf("NewIdentifier(%q, %q) = %#v, want error", SchemePMID, raw, got)
+			}
+		})
+	}
+}
+
+func TestCanonicalIdentityUsesPMIDFallbackAfterDOI(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		identifiers Identifiers
+		want        string
+	}{
+		{
+			name: "pmid without doi",
+			identifiers: Identifiers{
+				PMID: []string{"12345678"},
+			},
+			want: "pmid:12345678",
+		},
+		{
+			name: "doi over pmid",
+			identifiers: Identifiers{
+				DOI:  []string{"10.1000/priority"},
+				PMID: []string{"12345678"},
+			},
+			want: "doi:10.1000/priority",
+		},
+		{
+			name: "pmid after invalid doi",
+			identifiers: Identifiers{
+				DOI:  []string{"invalid"},
+				PMID: []string{"12345678"},
+			},
+			want: "pmid:12345678",
+		},
+		{
+			name: "pmid before non-doi schemes",
+			identifiers: Identifiers{
+				PMID:  []string{"12345678"},
+				ArXiv: []string{"2401.01234"},
+			},
+			want: "pmid:12345678",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := CanonicalIdentity(tt.identifiers, "")
+			if err != nil {
+				t.Fatalf("CanonicalIdentity() error = %v", err)
+			}
+			if got.CanonicalKey() != tt.want {
+				t.Fatalf("CanonicalIdentity() = %q, want %q", got.CanonicalKey(), tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalIdentityRejectsConflictingPMIDsEvenWithDOI(t *testing.T) {
+	t.Parallel()
+
+	got, err := CanonicalIdentity(Identifiers{
+		DOI:  []string{"10.1000/priority"},
+		PMID: []string{"12345678", "87654321"},
+	}, "")
+	if !errors.Is(err, ErrConflictingIdentifiers) {
+		t.Fatalf(
+			"CanonicalIdentity() = %#v, %v, want ErrConflictingIdentifiers",
+			got,
+			err,
+		)
+	}
+	if got.Valid() {
+		t.Fatalf("CanonicalIdentity() returned valid identity %q on PMID conflict", got)
 	}
 }
 

@@ -223,6 +223,33 @@ func TestParseReportsMalformedRequiredPMIDWithRecordPosition(t *testing.T) {
 	}
 }
 
+func TestParseRecordWithoutDOIUsesPMIDCanonicalIdentity(t *testing.T) {
+	t.Parallel()
+
+	record, err := pubmed.ParseRecord([]byte(`<PubmedArticle>
+  <MedlineCitation>
+    <PMID>12345678</PMID>
+    <Article><ArticleTitle>DOI-less PubMed record</ArticleTitle></Article>
+  </MedlineCitation>
+  <PubmedData>
+    <ArticleIdList><ArticleId IdType="pubmed">12345678</ArticleId></ArticleIdList>
+  </PubmedData>
+</PubmedArticle>`))
+	if err != nil {
+		t.Fatalf("ParseRecord() error = %v", err)
+	}
+	if got := record.Identity.CanonicalKey(); got != "pmid:12345678" {
+		t.Fatalf("Identity = %q, want PMID canonical identity", got)
+	}
+	wantIdentifiers := []source.Identifier{{
+		Scheme: source.IdentifierPMID,
+		Value:  "12345678",
+	}}
+	if !slices.Equal(record.Identifiers, wantIdentifiers) {
+		t.Fatalf("Identifiers = %#v, want %#v", record.Identifiers, wantIdentifiers)
+	}
+}
+
 func TestParseRelationAllowsAbsentPMIDButRejectsMalformedPMIDWithRecordPosition(t *testing.T) {
 	t.Parallel()
 
@@ -282,8 +309,8 @@ func TestParseRejectsSourceInvalidELocationDOIFromIdentityWithProvenance(t *test
 	if err != nil {
 		t.Fatalf("ParseRecord() error = %v", err)
 	}
-	if record.Identity.Valid() {
-		t.Fatalf("Identity = %q, source-invalid DOI must not become canonical", record.Identity)
+	if got := record.Identity.CanonicalKey(); got != "pmid:123" {
+		t.Fatalf("Identity = %q, want PMID fallback after source-invalid DOI", got)
 	}
 	if !slices.Equal(record.Identifiers, []source.Identifier{{
 		Scheme: source.IdentifierPMID,
@@ -311,8 +338,16 @@ func TestParseLeavesAbsentOptionalPubMedFieldsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseRecord() error = %v", err)
 	}
-	if record.Identity.Valid() ||
-		record.PublishedAt != nil ||
+	if got := record.Identity.CanonicalKey(); got != "pmid:123" {
+		t.Fatalf("Identity = %q, want required PMID canonical identity", got)
+	}
+	if !slices.Equal(record.Identifiers, []source.Identifier{{
+		Scheme: source.IdentifierPMID,
+		Value:  "123",
+	}}) {
+		t.Fatalf("Identifiers = %#v, want required PMID assertion", record.Identifiers)
+	}
+	if record.PublishedAt != nil ||
 		record.PublishedDate != nil ||
 		record.ElectronicPublishedAt != nil ||
 		record.ElectronicPublicationDate != nil ||
