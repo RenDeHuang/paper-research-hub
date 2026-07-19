@@ -824,6 +824,59 @@ func TestJournalPubMedRegistryRejectsEquivalentFinalPathsBeforePublishing(
 	})
 }
 
+func TestJournalPubMedRegistryCaseOnlyMissingFinalAliasesFollowFilesystem(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	caseInsensitive := journalRegistryFilesystemIsCaseInsensitive(
+		t,
+		directory,
+	)
+	outputPath := filepath.Join(directory, "Registry")
+	reportPath := filepath.Join(directory, "registry")
+
+	err := publishRegistryArtifacts(
+		outputPath,
+		[]byte("csv"),
+		reportPath,
+		[]byte("report"),
+		defaultRegistryFileOps(),
+	)
+	if caseInsensitive {
+		if err == nil || !strings.Contains(err.Error(), "same final") {
+			t.Fatalf(
+				"publishRegistryArtifacts() error = %v, want case-alias rejection",
+				err,
+			)
+		}
+		assertRegistryFinalsAbsent(t, outputPath, reportPath)
+		assertRegistryTempsAbsent(t, directory)
+		assertRegistryCaseProbesAbsent(t, directory)
+		return
+	}
+
+	if err != nil {
+		t.Fatalf(
+			"publishRegistryArtifacts() error = %v on case-sensitive filesystem",
+			err,
+		)
+	}
+	if got, readErr := os.ReadFile(outputPath); readErr != nil {
+		t.Fatalf("ReadFile(output) error = %v", readErr)
+	} else if string(got) != "csv" {
+		t.Fatalf("output contents = %q, want csv", got)
+	}
+	if got, readErr := os.ReadFile(reportPath); readErr != nil {
+		t.Fatalf("ReadFile(report) error = %v", readErr)
+	} else if string(got) != "report" {
+		t.Fatalf("report contents = %q, want report", got)
+	}
+	assertRegistryTempsAbsent(t, directory)
+	assertRegistryCaseProbesAbsent(t, directory)
+}
+
 func TestJournalPubMedRegistryRejectsExistingSymlinkAndHardlinkFinalAliases(
 	t *testing.T,
 ) {
@@ -1323,6 +1376,63 @@ func assertRegistryTempsAbsent(t *testing.T, directory string) {
 			t.Fatalf("temporary path remained in %q: %s", directory, entry.Name())
 		}
 	}
+}
+
+func assertRegistryCaseProbesAbsent(t *testing.T, directory string) {
+	t.Helper()
+
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(%q) error = %v", directory, err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(
+			entry.Name(),
+			".journal-registry-case-probe-",
+		) {
+			t.Fatalf(
+				"case-sensitivity probe remained in %q: %s",
+				directory,
+				entry.Name(),
+			)
+		}
+	}
+}
+
+func journalRegistryFilesystemIsCaseInsensitive(
+	t *testing.T,
+	directory string,
+) bool {
+	t.Helper()
+
+	probePath := filepath.Join(directory, "CaseSensitivityProbe")
+	aliasPath := filepath.Join(directory, "casesensitivityprobe")
+	if err := os.WriteFile(probePath, []byte("probe"), 0o600); err != nil {
+		t.Fatalf("WriteFile(case probe) error = %v", err)
+	}
+	defer func() {
+		if err := os.Remove(probePath); err != nil {
+			t.Errorf("Remove(case probe) error = %v", err)
+		}
+	}()
+	probeInfo, err := os.Lstat(probePath)
+	if err != nil {
+		t.Fatalf("Lstat(case probe) error = %v", err)
+	}
+	aliasInfo, err := os.Lstat(aliasPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("Lstat(case probe alias) error = %v", err)
+	}
+	if !os.SameFile(probeInfo, aliasInfo) {
+		t.Fatalf(
+			"case probe alias %q resolved to a different inode",
+			aliasPath,
+		)
+	}
+	return true
 }
 
 func validJournalRegistryArgs() []string {

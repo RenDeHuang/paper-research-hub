@@ -52,6 +52,8 @@ const (
 
 	registryPublishOutput = "output_csv"
 	registryPublishReport = "report_json"
+
+	registryCaseProbePattern = ".journal-registry-case-probe-*"
 )
 
 var registryCSVHeader = []string{
@@ -1374,6 +1376,33 @@ func validateDistinctRegistryPaths(outputPath, reportPath string) error {
 			"output and report are the same final inode via Stat",
 		)
 	}
+	if errors.Is(output.lstatErr, os.ErrNotExist) &&
+		errors.Is(report.lstatErr, os.ErrNotExist) {
+		outputParent := filepath.Dir(output.canonical)
+		reportParent := filepath.Dir(report.canonical)
+		outputBase := filepath.Base(output.canonical)
+		reportBase := filepath.Base(report.canonical)
+		if outputParent == reportParent &&
+			outputBase != reportBase &&
+			strings.EqualFold(outputBase, reportBase) {
+			aliases, probeErr := probeRegistryCaseAlias(
+				outputParent,
+				outputBase,
+				reportBase,
+			)
+			if probeErr != nil {
+				return fmt.Errorf(
+					"probe registry final path case sensitivity: %w",
+					probeErr,
+				)
+			}
+			if aliases {
+				return errors.New(
+					"output and report resolve to the same final path on a case-insensitive filesystem",
+				)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1468,6 +1497,119 @@ func canonicalRegistryPath(path string) (string, error) {
 			current = parent
 		default:
 			return "", fmt.Errorf("inspect path %q: %w", current, err)
+		}
+	}
+}
+
+func probeRegistryCaseAlias(
+	parent string,
+	firstBase string,
+	secondBase string,
+) (aliases bool, returnErr error) {
+	probeParent, err := nearestExistingRegistryDirectory(parent)
+	if err != nil {
+		return false, err
+	}
+	probeDirectory, err := os.MkdirTemp(
+		probeParent,
+		registryCaseProbePattern,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"create case-sensitivity probe directory in %q: %w",
+			probeParent,
+			err,
+		)
+	}
+	defer func() {
+		if err := os.RemoveAll(probeDirectory); err != nil {
+			returnErr = errors.Join(
+				returnErr,
+				fmt.Errorf(
+					"remove case-sensitivity probe directory %q: %w",
+					probeDirectory,
+					err,
+				),
+			)
+		}
+	}()
+
+	firstPath := filepath.Join(probeDirectory, firstBase)
+	first, err := os.OpenFile(
+		firstPath,
+		os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+		0o600,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"create case-sensitivity probe %q: %w",
+			firstPath,
+			err,
+		)
+	}
+	if err := first.Close(); err != nil {
+		return false, fmt.Errorf(
+			"close case-sensitivity probe %q: %w",
+			firstPath,
+			err,
+		)
+	}
+	firstInfo, err := os.Lstat(firstPath)
+	if err != nil {
+		return false, fmt.Errorf(
+			"Lstat case-sensitivity probe %q: %w",
+			firstPath,
+			err,
+		)
+	}
+	secondPath := filepath.Join(probeDirectory, secondBase)
+	secondInfo, err := os.Lstat(secondPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"Lstat case-sensitivity probe alias %q: %w",
+			secondPath,
+			err,
+		)
+	}
+	if !os.SameFile(firstInfo, secondInfo) {
+		return false, errors.New(
+			"case-sensitivity probe aliases resolved to different inodes",
+		)
+	}
+	return true, nil
+}
+
+func nearestExistingRegistryDirectory(path string) (string, error) {
+	current := filepath.Clean(path)
+	for {
+		info, err := os.Stat(current)
+		switch {
+		case err == nil:
+			if !info.IsDir() {
+				return "", fmt.Errorf(
+					"case-sensitivity probe parent %q is not a directory",
+					current,
+				)
+			}
+			return current, nil
+		case errors.Is(err, os.ErrNotExist):
+			parent := filepath.Dir(current)
+			if parent == current {
+				return "", fmt.Errorf(
+					"no existing directory for case-sensitivity probe path %q",
+					path,
+				)
+			}
+			current = parent
+		default:
+			return "", fmt.Errorf(
+				"inspect case-sensitivity probe parent %q: %w",
+				current,
+				err,
+			)
 		}
 	}
 }
