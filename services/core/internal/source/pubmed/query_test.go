@@ -200,6 +200,32 @@ func TestSearchQueryRejectsJournalTitlesInvalidISSNsAndMissingWindow(t *testing.
 	}
 }
 
+func TestSearchQueryEnforcesPubMedMaxSearchResults(t *testing.T) {
+	t.Parallel()
+
+	window := pubmed.DateWindow{
+		From: time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC),
+	}
+	if values, err := (pubmed.SearchQuery{
+		DateType:   pubmed.DateTypeEntrez,
+		DateWindow: window,
+		MaxResults: pubmed.MaxSearchResults + 1,
+	}).Values(); err == nil {
+		t.Fatalf("Values() = %v, want max-results limit error", values)
+	} else if !strings.Contains(err.Error(), "10000") {
+		t.Fatalf("Values() error = %v, want explicit 10000 limit", err)
+	}
+
+	if _, err := (pubmed.SearchQuery{
+		DateType:   pubmed.DateTypeEntrez,
+		DateWindow: window,
+		MaxResults: pubmed.MaxSearchResults,
+	}).Values(); err != nil {
+		t.Fatalf("Values() rejected PubMed 10000 boundary: %v", err)
+	}
+}
+
 func TestSearchResultBuildsStableBoundedBatches(t *testing.T) {
 	t.Parallel()
 
@@ -221,31 +247,57 @@ func TestSearchResultBuildsStableBoundedBatches(t *testing.T) {
 	}
 }
 
-func TestBuildBatchesHandlesMaxIntWithoutOverflow(t *testing.T) {
+func TestBuildBatchesRejectsResultsAbovePubMedLimitWithoutPanic(t *testing.T) {
 	t.Parallel()
 
 	maxInt := int(^uint(0) >> 1)
-	batchSize := maxInt/2 + 1
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			t.Fatalf("BuildBatches() panicked near MaxInt: %v", recovered)
-		}
-	}()
+	for _, tt := range []struct {
+		name       string
+		maxResults int
+	}{
+		{name: "10001", maxResults: pubmed.MaxSearchResults + 1},
+		{name: "MaxInt", maxResults: maxInt},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf(
+						"BuildBatches(%d, %d, 1) panicked: %v",
+						maxInt,
+						tt.maxResults,
+						recovered,
+					)
+				}
+			}()
 
-	batches, err := pubmed.BuildBatches(maxInt, maxInt, batchSize)
+			if _, err := pubmed.BuildBatches(maxInt, tt.maxResults, 1); err == nil {
+				t.Fatal("BuildBatches() accepted max-results above PubMed limit")
+			} else if !strings.Contains(err.Error(), "10000") {
+				t.Fatalf("BuildBatches() error = %v, want explicit 10000 limit", err)
+			}
+		})
+	}
+}
+
+func TestBuildBatchesAcceptsPubMedMaxSearchResults(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	batches, err := pubmed.BuildBatches(maxInt, pubmed.MaxSearchResults, 1)
 	if err != nil {
-		t.Fatalf("BuildBatches() error = %v", err)
+		t.Fatalf("BuildBatches() rejected PubMed 10000 boundary: %v", err)
 	}
-	want := []pubmed.Batch{
-		{RetStart: 0, RetMax: batchSize},
-		{RetStart: batchSize, RetMax: maxInt - batchSize},
+	if len(batches) != pubmed.MaxSearchResults {
+		t.Fatalf("len(batches) = %d, want 10000", len(batches))
 	}
-	if len(batches) != len(want) {
-		t.Fatalf("batches = %#v, want %#v", batches, want)
+	if batches[0] != (pubmed.Batch{RetStart: 0, RetMax: 1}) {
+		t.Fatalf("first batch = %#v", batches[0])
 	}
-	for index := range want {
-		if batches[index] != want[index] {
-			t.Fatalf("batch %d = %#v, want %#v", index, batches[index], want[index])
-		}
+	if batches[len(batches)-1] != (pubmed.Batch{
+		RetStart: pubmed.MaxSearchResults - 1,
+		RetMax:   1,
+	}) {
+		t.Fatalf("last batch = %#v", batches[len(batches)-1])
 	}
 }

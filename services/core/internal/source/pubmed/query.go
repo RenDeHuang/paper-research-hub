@@ -12,6 +12,8 @@ import (
 
 var issnPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{3}[0-9X]$`)
 
+const MaxSearchResults = 10_000
+
 type DateType string
 
 const (
@@ -62,8 +64,8 @@ func (query SearchQuery) Values() (url.Values, error) {
 	if from.After(to) {
 		return nil, errors.New("PubMed Entrez date window from date must not follow to date")
 	}
-	if query.MaxResults <= 0 {
-		return nil, errors.New("PubMed max results must be positive")
+	if err := validateMaxSearchResults(query.MaxResults); err != nil {
+		return nil, err
 	}
 
 	issns, err := normalizedISSNs(query.JournalISSNs)
@@ -108,8 +110,8 @@ func BuildBatches(count, maxResults, batchSize int) ([]Batch, error) {
 	if count < 0 {
 		return nil, errors.New("PubMed count must not be negative")
 	}
-	if maxResults <= 0 {
-		return nil, errors.New("PubMed max results must be positive")
+	if err := validateMaxSearchResults(maxResults); err != nil {
+		return nil, err
 	}
 	if batchSize <= 0 {
 		return nil, errors.New("PubMed batch size must be positive")
@@ -130,6 +132,16 @@ func BuildBatches(count, maxResults, batchSize int) ([]Batch, error) {
 		start += retMax
 	}
 	return batches, nil
+}
+
+func validateMaxSearchResults(value int) error {
+	if value < 1 || value > MaxSearchResults {
+		return fmt.Errorf(
+			"PubMed max results must be between 1 and %d",
+			MaxSearchResults,
+		)
+	}
+	return nil
 }
 
 func normalizedISSNs(values []string) ([]string, error) {
