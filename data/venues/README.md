@@ -72,3 +72,69 @@ The fixture has five rows covering:
 - an explicit `unknown` metric row;
 - a known `9.999`, Q2 row that evaluates to `rejected`;
 - a checksum-valid known row with exact decimal JIF `0`.
+
+## PubMed journal coverage registry
+
+`journal-pubmed-registry` generates the schema-v1 PubMed coverage registry from
+exactly three explicitly supplied source CSV files. The production run requires
+their combined logical row count, as parsed by `LoadSourceFiles`, to equal
+`2032`; it does not derive counts from physical lines.
+
+Required flags:
+
+```text
+--input <path>       repeat exactly three times, in source order
+--cache-dir <path>   Crossref journal catalog cache
+--output <path>      destination CSV
+--report <path>      destination JSON report
+```
+
+Required environment:
+
+```text
+NCBI_TOOL
+NCBI_EMAIL
+```
+
+`NCBI_EMAIL` must be a bare email address. `NCBI_API_KEY` is optional.
+`CROSSREF_CONTACT_EMAIL` is optional and otherwise reuses `NCBI_EMAIL`.
+The standalone command does not read or require `DATABASE_URL`.
+
+The CSV has this exact field order:
+
+```text
+domain
+source_order
+source_journal_name
+impact_factor
+jcr_value
+cass_value
+issn_l
+print_issn
+eissn
+all_issns
+crossref_publisher
+resolution_status
+pubmed_supported
+pubmed_record_count
+pubmed_checked_at
+source_url
+verification_status
+```
+
+Only uniquely resolved Crossref rows with at least one valid ISSN are queried.
+All known ISSNs for one journal are sent in one exact PubMed OR query, using one
+shared bounded client and sequential request order. A positive count is `yes`,
+a successful zero count is `no`, and a request or protocol failure is recorded
+as explicit `unknown` in the report. Ambiguous and unresolved rows are not
+queried.
+
+The command fully encodes and reconciles the CSV and typed JSON report in
+memory before publishing. Each artifact is written to a temporary file in its
+own target directory, synced, closed, and renamed. A controlled failure removes
+temporary files and any newly published final from that run. The two separate
+renames are not a cross-crash atomic transaction.
+
+This repository stage intentionally does not include the live 2032-row output
+or report; those data artifacts are generated in the dedicated data-production
+task.
