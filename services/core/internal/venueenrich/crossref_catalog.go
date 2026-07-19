@@ -26,9 +26,14 @@ import (
 
 const (
 	CrossrefCatalogRows          = 1000
-	CrossrefCatalogSchemaVersion = "crossref-journal-catalog/v1"
+	CrossrefCatalogSchemaVersion = "crossref-journal-catalog/v2"
 	CrossrefCatalogJSONLName     = "crossref-journals.v1.jsonl"
 	CrossrefCatalogManifestName  = "crossref-journals.v1.manifest.json"
+
+	crossrefCatalogFinalDirectoryName   = "crossref-journals.v1"
+	crossrefCatalogPartialDirectoryName = ".crossref-journals.v1.partial"
+	crossrefCatalogPagesDirectoryName   = "pages"
+	crossrefCatalogMessageVersion       = "1.0.0"
 
 	maxCrossrefCatalogManifestBytes = 8 << 20
 )
@@ -68,6 +73,8 @@ type CrossrefCatalogPageReceipt struct {
 	CursorIn    string `json:"cursor_in"`
 	CursorOut   string `json:"cursor_out"`
 	RecordCount int    `json:"record_count"`
+	PageFile    string `json:"page_file"`
+	PageBytes   int64  `json:"page_bytes"`
 	PageSHA256  string `json:"page_sha256"`
 }
 
@@ -94,10 +101,11 @@ type CrossrefCatalog struct {
 }
 
 type crossrefCatalogCache struct {
-	manifest CrossrefCatalogManifest
-	journals []CrossrefJournal
-	hasher   hash.Hash
-	exists   bool
+	directory string
+	manifest  CrossrefCatalogManifest
+	journals  []CrossrefJournal
+	hasher    hash.Hash
+	exists    bool
 }
 
 type crossrefJournalPage struct {
@@ -144,25 +152,38 @@ func FetchCrossrefCatalog(
 		)
 	}
 
-	catalogPath := filepath.Join(config.CacheDir, CrossrefCatalogJSONLName)
-	manifestPath := filepath.Join(config.CacheDir, CrossrefCatalogManifestName)
+	finalDirectory := filepath.Join(
+		config.CacheDir,
+		crossrefCatalogFinalDirectoryName,
+	)
+	partialDirectory := filepath.Join(
+		config.CacheDir,
+		crossrefCatalogPartialDirectoryName,
+	)
 	cache, err := loadCrossrefCatalogCache(
-		catalogPath,
-		manifestPath,
+		finalDirectory,
 		endpoint.String(),
 		config.MaxResponseBytes,
+		true,
 	)
 	if err != nil {
 		return CrossrefCatalog{}, err
 	}
-	if cache.exists && cache.manifest.Complete {
+	if cache.exists {
 		return crossrefCatalogResult(
 			cache,
-			catalogPath,
-			manifestPath,
 			true,
 			false,
 		), nil
+	}
+	cache, err = loadCrossrefCatalogCache(
+		partialDirectory,
+		endpoint.String(),
+		config.MaxResponseBytes,
+		false,
+	)
+	if err != nil {
+		return CrossrefCatalog{}, err
 	}
 
 	now := dependencies.Now
@@ -172,8 +193,7 @@ func FetchCrossrefCatalog(
 	resumed := cache.exists
 	if !cache.exists {
 		cache, err = initializeCrossrefCatalogCache(
-			catalogPath,
-			manifestPath,
+			partialDirectory,
 			endpoint.String(),
 			now().UTC(),
 		)
@@ -183,17 +203,18 @@ func FetchCrossrefCatalog(
 	}
 	if cache.manifest.TotalResults != nil &&
 		cache.manifest.RecordCount == *cache.manifest.TotalResults {
-		cache.manifest.Complete = true
-		if err := writeCrossrefCatalogManifestAtomic(
-			manifestPath,
-			cache.manifest,
-		); err != nil {
+		published, err := publishCrossrefCatalogCache(
+			cache,
+			config.CacheDir,
+			finalDirectory,
+			endpoint.String(),
+			config.MaxResponseBytes,
+		)
+		if err != nil {
 			return CrossrefCatalog{}, err
 		}
 		return crossrefCatalogResult(
-			cache,
-			catalogPath,
-			manifestPath,
+			published,
 			false,
 			resumed,
 		), nil
@@ -308,8 +329,26 @@ func FetchCrossrefCatalog(
 			)
 		}
 
+		pageOrdinal := len(cache.manifest.Pages) + 1
+		pageFile := filepath.Join(
+			crossrefCatalogPagesDirectoryName,
+			fmt.Sprintf("page-%06d.json", pageOrdinal),
+		)
+		if err := writeFileAtomic(
+			filepath.Join(cache.directory, pageFile),
+			payload,
+		); err != nil {
+			return CrossrefCatalog{}, fmt.Errorf(
+				"write Crossref journal raw page atomically: %w",
+				err,
+			)
+		}
+
 		pageJSONL := crossrefCatalogPageJSONL(page.journals)
-		if err := appendCrossrefCatalogPage(catalogPath, pageJSONL); err != nil {
+		if err := appendCrossrefCatalogPage(
+			filepath.Join(cache.directory, CrossrefCatalogJSONLName),
+			pageJSONL,
+		); err != nil {
 			return CrossrefCatalog{}, err
 		}
 		if _, err := cache.hasher.Write(pageJSONL); err != nil {
@@ -322,10 +361,12 @@ func FetchCrossrefCatalog(
 		cache.manifest.Pages = append(
 			cache.manifest.Pages,
 			CrossrefCatalogPageReceipt{
-				Ordinal:     len(cache.manifest.Pages) + 1,
+				Ordinal:     pageOrdinal,
 				CursorIn:    cursor,
 				CursorOut:   page.nextCursor,
 				RecordCount: len(page.journals),
+				PageFile:    pageFile,
+				PageBytes:   int64(len(payload)),
 				PageSHA256:  hex.EncodeToString(pageHash[:]),
 			},
 		)
@@ -334,24 +375,25 @@ func FetchCrossrefCatalog(
 		cache.manifest.CatalogSHA256 = hex.EncodeToString(cache.hasher.Sum(nil))
 		cache.journals = append(cache.journals, page.journals...)
 		if err := writeCrossrefCatalogManifestAtomic(
-			manifestPath,
+			filepath.Join(cache.directory, CrossrefCatalogManifestName),
 			cache.manifest,
 		); err != nil {
 			return CrossrefCatalog{}, err
 		}
 
 		if nextRecordCount == *cache.manifest.TotalResults {
-			cache.manifest.Complete = true
-			if err := writeCrossrefCatalogManifestAtomic(
-				manifestPath,
-				cache.manifest,
-			); err != nil {
+			published, err := publishCrossrefCatalogCache(
+				cache,
+				config.CacheDir,
+				finalDirectory,
+				endpoint.String(),
+				config.MaxResponseBytes,
+			)
+			if err != nil {
 				return CrossrefCatalog{}, err
 			}
 			return crossrefCatalogResult(
-				cache,
-				catalogPath,
-				manifestPath,
+				published,
 				false,
 				resumed,
 			), nil
@@ -364,18 +406,22 @@ func FetchCrossrefCatalog(
 
 func crossrefCatalogResult(
 	cache crossrefCatalogCache,
-	catalogPath string,
-	manifestPath string,
 	replayed bool,
 	resumed bool,
 ) CrossrefCatalog {
 	return CrossrefCatalog{
-		Journals:     cache.journals,
-		Manifest:     cache.manifest,
-		CatalogPath:  catalogPath,
-		ManifestPath: manifestPath,
-		Replayed:     replayed,
-		Resumed:      resumed,
+		Journals: cache.journals,
+		Manifest: cache.manifest,
+		CatalogPath: filepath.Join(
+			cache.directory,
+			CrossrefCatalogJSONLName,
+		),
+		ManifestPath: filepath.Join(
+			cache.directory,
+			CrossrefCatalogManifestName,
+		),
+		Replayed: replayed,
+		Resumed:  resumed,
 	}
 }
 
@@ -433,8 +479,7 @@ func crossrefCatalogPageURL(
 }
 
 func initializeCrossrefCatalogCache(
-	catalogPath string,
-	manifestPath string,
+	directory string,
 	sourceURL string,
 	fetchedAt time.Time,
 ) (crossrefCatalogCache, error) {
@@ -443,7 +488,27 @@ func initializeCrossrefCatalogCache(
 			"Crossref catalog fetched_at must not be zero",
 		)
 	}
-	if err := writeFileAtomic(catalogPath, nil); err != nil {
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		return crossrefCatalogCache{}, fmt.Errorf(
+			"create Crossref catalog partial directory: %w",
+			err,
+		)
+	}
+	if err := os.Mkdir(
+		filepath.Join(directory, crossrefCatalogPagesDirectoryName),
+		0o700,
+	); err != nil {
+		_ = os.RemoveAll(directory)
+		return crossrefCatalogCache{}, fmt.Errorf(
+			"create Crossref catalog partial pages directory: %w",
+			err,
+		)
+	}
+	if err := writeFileAtomic(
+		filepath.Join(directory, CrossrefCatalogJSONLName),
+		nil,
+	); err != nil {
+		_ = os.RemoveAll(directory)
 		return crossrefCatalogCache{}, fmt.Errorf(
 			"initialize Crossref catalog JSONL: %w",
 			err,
@@ -463,50 +528,68 @@ func initializeCrossrefCatalogCache(
 		TotalResults:  nil,
 		Complete:      false,
 	}
-	if err := writeCrossrefCatalogManifestAtomic(manifestPath, manifest); err != nil {
-		_ = os.Remove(catalogPath)
+	if err := writeCrossrefCatalogManifestAtomic(
+		filepath.Join(directory, CrossrefCatalogManifestName),
+		manifest,
+	); err != nil {
+		_ = os.RemoveAll(directory)
 		return crossrefCatalogCache{}, err
 	}
 	return crossrefCatalogCache{
-		manifest: manifest,
-		journals: []CrossrefJournal{},
-		hasher:   sha256.New(),
-		exists:   true,
+		directory: directory,
+		manifest:  manifest,
+		journals:  []CrossrefJournal{},
+		hasher:    sha256.New(),
+		exists:    true,
 	}, nil
 }
 
 func loadCrossrefCatalogCache(
-	catalogPath string,
-	manifestPath string,
+	directory string,
 	sourceURL string,
 	maxRecordBytes int64,
+	requireComplete bool,
 ) (crossrefCatalogCache, error) {
-	catalogExists, err := fileExists(catalogPath)
+	exists, err := fileExists(directory)
 	if err != nil {
 		return crossrefCatalogCache{}, err
 	}
-	manifestExists, err := fileExists(manifestPath)
-	if err != nil {
-		return crossrefCatalogCache{}, err
-	}
-	if !catalogExists && !manifestExists {
+	if !exists {
 		return crossrefCatalogCache{}, nil
 	}
-	if catalogExists != manifestExists {
+	info, err := os.Stat(directory)
+	if err != nil {
+		return crossrefCatalogCache{}, fmt.Errorf(
+			"stat Crossref catalog cache directory: %w",
+			err,
+		)
+	}
+	if !info.IsDir() {
 		return crossrefCatalogCache{}, errors.New(
-			"Crossref catalog cache is unverified: catalog JSONL and manifest must both exist",
+			"Crossref catalog cache generation must be a directory",
 		)
 	}
 
-	manifest, err := loadCrossrefCatalogManifestFile(manifestPath)
+	manifest, err := loadCrossrefCatalogManifestFile(filepath.Join(
+		directory,
+		CrossrefCatalogManifestName,
+	))
 	if err != nil {
 		return crossrefCatalogCache{}, err
 	}
 	if err := validateCrossrefCatalogManifest(manifest, sourceURL); err != nil {
 		return crossrefCatalogCache{}, err
 	}
-	journals, hasher, err := readAndVerifyCrossrefCatalogJSONL(
-		catalogPath,
+	if manifest.Complete != requireComplete {
+		return crossrefCatalogCache{}, fmt.Errorf(
+			"Crossref catalog cache complete = %t, want %t for %s",
+			manifest.Complete,
+			requireComplete,
+			directory,
+		)
+	}
+	journals, hasher, err := readAndVerifyCrossrefCatalogGeneration(
+		directory,
 		manifest,
 		maxRecordBytes,
 	)
@@ -514,11 +597,120 @@ func loadCrossrefCatalogCache(
 		return crossrefCatalogCache{}, err
 	}
 	return crossrefCatalogCache{
-		manifest: manifest,
-		journals: journals,
-		hasher:   hasher,
-		exists:   true,
+		directory: directory,
+		manifest:  manifest,
+		journals:  journals,
+		hasher:    hasher,
+		exists:    true,
 	}, nil
+}
+
+func publishCrossrefCatalogCache(
+	cache crossrefCatalogCache,
+	cacheDir string,
+	finalDirectory string,
+	sourceURL string,
+	maxRecordBytes int64,
+) (crossrefCatalogCache, error) {
+	if cache.manifest.TotalResults == nil ||
+		cache.manifest.RecordCount != *cache.manifest.TotalResults {
+		return crossrefCatalogCache{}, errors.New(
+			"Crossref catalog cannot publish before all records are verified",
+		)
+	}
+	if exists, err := fileExists(finalDirectory); err != nil {
+		return crossrefCatalogCache{}, err
+	} else if exists {
+		return crossrefCatalogCache{}, errors.New(
+			"Crossref catalog final directory already exists",
+		)
+	}
+
+	stagingDirectory, err := os.MkdirTemp(
+		cacheDir,
+		".crossref-journals.v1.publish-*",
+	)
+	if err != nil {
+		return crossrefCatalogCache{}, fmt.Errorf(
+			"create Crossref catalog publish directory: %w",
+			err,
+		)
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(stagingDirectory)
+		}
+	}()
+	if err := copyCrossrefCatalogGeneration(
+		cache.directory,
+		stagingDirectory,
+		cache.manifest,
+	); err != nil {
+		return crossrefCatalogCache{}, err
+	}
+	completeManifest := cache.manifest
+	completeManifest.Complete = true
+	if err := writeCrossrefCatalogManifestAtomic(
+		filepath.Join(stagingDirectory, CrossrefCatalogManifestName),
+		completeManifest,
+	); err != nil {
+		return crossrefCatalogCache{}, err
+	}
+	verified, err := loadCrossrefCatalogCache(
+		stagingDirectory,
+		sourceURL,
+		maxRecordBytes,
+		true,
+	)
+	if err != nil {
+		return crossrefCatalogCache{}, fmt.Errorf(
+			"verify Crossref catalog publish generation: %w",
+			err,
+		)
+	}
+	if err := os.Rename(stagingDirectory, finalDirectory); err != nil {
+		return crossrefCatalogCache{}, fmt.Errorf(
+			"atomically publish Crossref catalog generation: %w",
+			err,
+		)
+	}
+	published = true
+	verified.directory = finalDirectory
+	_ = os.RemoveAll(cache.directory)
+	return verified, nil
+}
+
+func copyCrossrefCatalogGeneration(
+	sourceDirectory string,
+	destinationDirectory string,
+	manifest CrossrefCatalogManifest,
+) error {
+	if err := os.Mkdir(
+		filepath.Join(destinationDirectory, crossrefCatalogPagesDirectoryName),
+		0o700,
+	); err != nil {
+		return fmt.Errorf("create Crossref publish pages directory: %w", err)
+	}
+	if err := copyFileAtomic(
+		filepath.Join(sourceDirectory, CrossrefCatalogJSONLName),
+		filepath.Join(destinationDirectory, CrossrefCatalogJSONLName),
+	); err != nil {
+		return fmt.Errorf("copy Crossref publish catalog JSONL: %w", err)
+	}
+	for _, receipt := range manifest.Pages {
+		if err := copyFileAtomic(
+			filepath.Join(sourceDirectory, receipt.PageFile),
+			filepath.Join(destinationDirectory, receipt.PageFile),
+		); err != nil {
+			return fmt.Errorf(
+				"copy Crossref publish raw page %d: %w",
+				receipt.Ordinal,
+				err,
+			)
+		}
+	}
+	return nil
 }
 
 func fileExists(path string) (bool, error) {
@@ -668,6 +860,24 @@ func validateCrossrefCatalogManifest(
 				receipt.RecordCount,
 			)
 		}
+		expectedPageFile := filepath.Join(
+			crossrefCatalogPagesDirectoryName,
+			fmt.Sprintf("page-%06d.json", index+1),
+		)
+		if receipt.PageFile != expectedPageFile {
+			return fmt.Errorf(
+				"Crossref catalog manifest page %d page_file = %q, want %q",
+				index+1,
+				receipt.PageFile,
+				expectedPageFile,
+			)
+		}
+		if receipt.PageBytes <= 0 {
+			return fmt.Errorf(
+				"Crossref catalog manifest page %d page_bytes must be positive",
+				index+1,
+			)
+		}
 		if err := validateLowerSHA256(
 			receipt.PageSHA256,
 			fmt.Sprintf(
@@ -743,6 +953,131 @@ func validateLowerSHA256(value string, field string) error {
 		return fmt.Errorf("%s must be a lowercase SHA-256 hex digest", field)
 	}
 	return nil
+}
+
+func readAndVerifyCrossrefCatalogGeneration(
+	directory string,
+	manifest CrossrefCatalogManifest,
+	maxRecordBytes int64,
+) ([]CrossrefJournal, hash.Hash, error) {
+	catalogPath := filepath.Join(directory, CrossrefCatalogJSONLName)
+	catalogJournals, hasher, err := readAndVerifyCrossrefCatalogJSONL(
+		catalogPath,
+		manifest,
+		maxRecordBytes,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pagesDirectory := filepath.Join(
+		directory,
+		crossrefCatalogPagesDirectoryName,
+	)
+	entries, err := os.ReadDir(pagesDirectory)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"read Crossref catalog raw pages directory: %w",
+			err,
+		)
+	}
+	if len(entries) != len(manifest.Pages) {
+		return nil, nil, fmt.Errorf(
+			"Crossref catalog raw page file count = %d, manifest receipts = %d",
+			len(entries),
+			len(manifest.Pages),
+		)
+	}
+
+	pageJournals := make([]CrossrefJournal, 0, manifest.RecordCount)
+	var previousTotal *int64
+	for _, receipt := range manifest.Pages {
+		pagePath := filepath.Join(directory, receipt.PageFile)
+		info, err := os.Stat(pagePath)
+		if err != nil {
+			return nil, nil, fmt.Errorf(
+				"stat Crossref catalog raw page %d: %w",
+				receipt.Ordinal,
+				err,
+			)
+		}
+		if !info.Mode().IsRegular() ||
+			info.Size() != receipt.PageBytes ||
+			info.Size() > maxRecordBytes {
+			return nil, nil, fmt.Errorf(
+				"Crossref catalog page SHA verification failed for page %d: bytes = %d, manifest = %d",
+				receipt.Ordinal,
+				info.Size(),
+				receipt.PageBytes,
+			)
+		}
+		payload, err := os.ReadFile(pagePath)
+		if err != nil {
+			return nil, nil, fmt.Errorf(
+				"read Crossref catalog raw page %d: %w",
+				receipt.Ordinal,
+				err,
+			)
+		}
+		pageHash := sha256.Sum256(payload)
+		if hex.EncodeToString(pageHash[:]) != receipt.PageSHA256 {
+			return nil, nil, fmt.Errorf(
+				"Crossref catalog page SHA verification failed for page %d",
+				receipt.Ordinal,
+			)
+		}
+		page, err := decodeCrossrefJournalPage(payload)
+		if err != nil {
+			return nil, nil, fmt.Errorf(
+				"validate cached Crossref raw page %d: %w",
+				receipt.Ordinal,
+				err,
+			)
+		}
+		if page.nextCursor != receipt.CursorOut ||
+			len(page.journals) != receipt.RecordCount {
+			return nil, nil, fmt.Errorf(
+				"Crossref catalog raw page %d does not match its receipt",
+				receipt.Ordinal,
+			)
+		}
+		if previousTotal != nil && page.totalResults != *previousTotal {
+			return nil, nil, fmt.Errorf(
+				"Crossref catalog raw page %d total-results changed",
+				receipt.Ordinal,
+			)
+		}
+		total := page.totalResults
+		previousTotal = &total
+		if len(page.journals) == 0 && page.nextCursor != "" {
+			return nil, nil, fmt.Errorf(
+				"Crossref catalog raw page %d is empty with continuation",
+				receipt.Ordinal,
+			)
+		}
+		pageJournals = append(pageJournals, page.journals...)
+	}
+	if manifest.TotalResults != nil &&
+		previousTotal != nil &&
+		*manifest.TotalResults != *previousTotal {
+		return nil, nil, errors.New(
+			"Crossref catalog raw pages total-results differs from manifest",
+		)
+	}
+	if len(pageJournals) != len(catalogJournals) {
+		return nil, nil, errors.New(
+			"Crossref catalog raw pages and JSONL record counts differ",
+		)
+	}
+	for index := range pageJournals {
+		if !bytes.Equal(pageJournals[index].Raw, catalogJournals[index].Raw) {
+			return nil, nil, fmt.Errorf(
+				"Crossref catalog JSONL record %d differs from verified raw page",
+				index+1,
+			)
+		}
+	}
+	return catalogJournals, hasher, nil
 }
 
 func readAndVerifyCrossrefCatalogJSONL(
@@ -944,19 +1279,20 @@ func decodeCrossrefJournalPage(
 			messageType,
 		)
 	}
-	if rawVersion, exists := envelope["message-version"]; exists {
-		version, err := decodeJSONString(
-			rawVersion,
-			"Crossref journal page message-version",
+	version, err := requiredJSONString(
+		envelope,
+		"message-version",
+		"Crossref journal page",
+	)
+	if err != nil {
+		return crossrefJournalPage{}, err
+	}
+	if version != crossrefCatalogMessageVersion {
+		return crossrefJournalPage{}, fmt.Errorf(
+			"Crossref journal page message-version = %q, want %q",
+			version,
+			crossrefCatalogMessageVersion,
 		)
-		if err != nil {
-			return crossrefJournalPage{}, err
-		}
-		if strings.TrimSpace(version) == "" {
-			return crossrefJournalPage{}, errors.New(
-				"Crossref journal page message-version must not be blank",
-			)
-		}
 	}
 
 	messageRaw, exists := envelope["message"]
@@ -1026,30 +1362,70 @@ func decodeCrossrefJournalPage(
 			"Crossref journal page message requires a non-null items array",
 		)
 	}
-	if rawItemsPerPage, exists := message["items-per-page"]; exists {
-		itemsPerPage, err := decodeJSONInt64(
-			rawItemsPerPage,
-			"Crossref journal page items-per-page",
-		)
-		if err != nil {
-			return crossrefJournalPage{}, err
-		}
-		if itemsPerPage != int64(len(rawItems)) {
-			return crossrefJournalPage{}, fmt.Errorf(
-				"Crossref journal page items-per-page = %d, actual items = %d",
-				itemsPerPage,
-				len(rawItems),
-			)
-		}
+	itemsPerPage, err := requiredJSONInt64(
+		message,
+		"items-per-page",
+		"Crossref journal page message",
+	)
+	if err != nil {
+		return crossrefJournalPage{}, err
 	}
-	if rawQuery, exists := message["query"]; exists &&
-		!isJSONNull(rawQuery) {
-		if _, err := decodeJSONObject(
-			rawQuery,
-			"Crossref journal page query",
-		); err != nil {
-			return crossrefJournalPage{}, err
-		}
+	if itemsPerPage < 0 ||
+		itemsPerPage > CrossrefCatalogRows ||
+		itemsPerPage != int64(len(rawItems)) {
+		return crossrefJournalPage{}, fmt.Errorf(
+			"Crossref journal page items-per-page = %d, actual items = %d, rows = %d",
+			itemsPerPage,
+			len(rawItems),
+			CrossrefCatalogRows,
+		)
+	}
+
+	rawQuery, exists := message["query"]
+	if !exists || isJSONNull(rawQuery) {
+		return crossrefJournalPage{}, errors.New(
+			"Crossref journal page message requires a query object",
+		)
+	}
+	query, err := decodeJSONObject(
+		rawQuery,
+		"Crossref journal page query",
+	)
+	if err != nil {
+		return crossrefJournalPage{}, err
+	}
+	if err := rejectUnexpectedJSONFields(
+		query,
+		"Crossref journal page query",
+		"start-index",
+		"search-terms",
+	); err != nil {
+		return crossrefJournalPage{}, err
+	}
+	startIndex, err := requiredJSONInt64(
+		query,
+		"start-index",
+		"Crossref journal page query",
+	)
+	if err != nil {
+		return crossrefJournalPage{}, err
+	}
+	if startIndex != 0 {
+		return crossrefJournalPage{}, fmt.Errorf(
+			"Crossref journal page query start-index = %d, want 0 for cursor request",
+			startIndex,
+		)
+	}
+	searchTerms, exists := query["search-terms"]
+	if !exists {
+		return crossrefJournalPage{}, errors.New(
+			"Crossref journal page query requires search-terms",
+		)
+	}
+	if !isJSONNull(searchTerms) {
+		return crossrefJournalPage{}, errors.New(
+			"Crossref journal page query search-terms must be null for unfiltered /journals",
+		)
 	}
 
 	journals := make([]CrossrefJournal, len(rawItems))
@@ -1443,6 +1819,43 @@ func writeFileAtomic(path string, payload []byte) (returnErr error) {
 	}
 	if err := os.Rename(tempPath, path); err != nil {
 		return fmt.Errorf("rename temporary file: %w", err)
+	}
+	return nil
+}
+
+func copyFileAtomic(sourcePath string, destinationPath string) (returnErr error) {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("open source file: %w", err)
+	}
+	defer source.Close()
+
+	directory := filepath.Dir(destinationPath)
+	temp, err := os.CreateTemp(
+		directory,
+		"."+filepath.Base(destinationPath)+".tmp-*",
+	)
+	if err != nil {
+		return fmt.Errorf("create temporary copy: %w", err)
+	}
+	tempPath := temp.Name()
+	defer func() {
+		if returnErr != nil {
+			_ = temp.Close()
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if _, err := io.Copy(temp, source); err != nil {
+		return fmt.Errorf("copy temporary file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync temporary copy: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close temporary copy: %w", err)
+	}
+	if err := os.Rename(tempPath, destinationPath); err != nil {
+		return fmt.Errorf("rename temporary copy: %w", err)
 	}
 	return nil
 }

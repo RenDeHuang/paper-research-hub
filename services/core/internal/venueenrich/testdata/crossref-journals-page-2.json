@@ -7,7 +7,7 @@
     "items-per-page": 1,
     "next-cursor": "terminal-cursor",
     "query": {
-      "start-index": 2,
+      "start-index": 0,
       "search-terms": null
     },
     "items": [

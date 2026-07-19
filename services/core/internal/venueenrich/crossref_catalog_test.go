@@ -27,6 +27,7 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 
 	pageOne := readCrossrefCatalogFixture(t, "crossref-journals-page-1.json")
 	pageTwo := readCrossrefCatalogFixture(t, "crossref-journals-page-2.json")
+	cacheDir := t.TempDir()
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
@@ -45,6 +46,12 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 		if got := request.Header.Get("User-Agent"); got != "paper-hub-catalog-test/1.0" {
 			t.Errorf("User-Agent = %q", got)
 		}
+		if _, err := os.Stat(filepath.Join(
+			cacheDir,
+			crossrefCatalogFinalDirectoryName,
+		)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("final catalog became visible during live fetch: %v", err)
+		}
 		switch cursor := request.URL.Query().Get("cursor"); cursor {
 		case "*":
 			_, _ = writer.Write(pageOne)
@@ -57,7 +64,7 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 	defer server.Close()
 
 	fetchedAt := time.Date(2026, 7, 19, 8, 9, 10, 0, time.UTC)
-	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	config := validCrossrefCatalogConfig(server.URL, cacheDir)
 	result, err := FetchCrossrefCatalog(
 		context.Background(),
 		server.Client(),
@@ -116,9 +123,19 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 	if len(result.Manifest.Pages) != 2 {
 		t.Fatalf("page receipts = %d, want 2", len(result.Manifest.Pages))
 	}
-	assertCrossrefCatalogReceipt(t, result.Manifest.Pages[0], 1, "*", "page-2-cursor", 2, pageOne)
 	assertCrossrefCatalogReceipt(
 		t,
+		filepath.Dir(result.ManifestPath),
+		result.Manifest.Pages[0],
+		1,
+		"*",
+		"page-2-cursor",
+		2,
+		pageOne,
+	)
+	assertCrossrefCatalogReceipt(
+		t,
+		filepath.Dir(result.ManifestPath),
 		result.Manifest.Pages[1],
 		2,
 		"page-2-cursor",
@@ -137,6 +154,18 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 	}
 	if !persisted.Complete || persisted.CatalogSHA256 != result.Manifest.CatalogSHA256 {
 		t.Fatalf("persisted manifest = %#v", persisted)
+	}
+	if filepath.Dir(result.CatalogPath) != filepath.Join(
+		config.CacheDir,
+		crossrefCatalogFinalDirectoryName,
+	) {
+		t.Fatalf("catalog path = %q, want atomically published final directory", result.CatalogPath)
+	}
+	if _, err := os.Stat(filepath.Join(
+		config.CacheDir,
+		crossrefCatalogPartialDirectoryName,
+	)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("verified partial cache remains after publish: %v", err)
 	}
 	assertNoCrossrefCatalogTempFiles(t, config.CacheDir)
 }
@@ -199,14 +228,15 @@ func TestCrossrefCatalogRejectsMalformedEnvelopeItemsAndFraming(t *testing.T) {
 		{
 			name: "message object",
 			payload: []byte(`{
-				"status":"ok","message-type":"journal-list","message":[]
+				"status":"ok","message-type":"journal-list",
+				"message-version":"1.0.0","message":[]
 			}`),
 			want: "message object",
 		},
 		{
 			name: "items array",
 			payload: []byte(`{
-				"status":"ok","message-type":"journal-list",
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
 				"message":{"total-results":1,"next-cursor":"next","items":{}}
 			}`),
 			want: "items array",
@@ -214,7 +244,7 @@ func TestCrossrefCatalogRejectsMalformedEnvelopeItemsAndFraming(t *testing.T) {
 		{
 			name: "missing next cursor",
 			payload: []byte(`{
-				"status":"ok","message-type":"journal-list",
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
 				"message":{"total-results":0,"items":[]}
 			}`),
 			want: "next-cursor",
@@ -254,10 +284,110 @@ func TestCrossrefCatalogRejectsMalformedEnvelopeItemsAndFraming(t *testing.T) {
 		{
 			name: "unknown message field",
 			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":null},"items":[],
+					"unexpected":true
+				}
+			}`),
+			want: "unexpected",
+		},
+		{
+			name: "missing message version",
+			payload: []byte(`{
 				"status":"ok","message-type":"journal-list",
 				"message":{
-					"total-results":0,"next-cursor":"","items":[],
-					"unexpected":true
+					"total-results":0,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":null},"items":[]
+				}
+			}`),
+			want: "message-version",
+		},
+		{
+			name: "unsupported message version",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"2.0.0",
+				"message":{
+					"total-results":0,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":null},"items":[]
+				}
+			}`),
+			want: "1.0.0",
+		},
+		{
+			name: "missing items per page",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":null},"items":[]
+				}
+			}`),
+			want: "items-per-page",
+		},
+		{
+			name: "items per page mismatch",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"items-per-page":1,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":null},"items":[]
+				}
+			}`),
+			want: "actual items",
+		},
+		{
+			name: "missing query",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"items-per-page":0,"next-cursor":"","items":[]
+				}
+			}`),
+			want: "query",
+		},
+		{
+			name: "query start index type",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":"0","search-terms":null},"items":[]
+				}
+			}`),
+			want: "start-index",
+		},
+		{
+			name: "query start index value",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":1,"search-terms":null},"items":[]
+				}
+			}`),
+			want: "want 0",
+		},
+		{
+			name: "query search terms",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":"journal"},"items":[]
+				}
+			}`),
+			want: "search-terms",
+		},
+		{
+			name: "query unexpected field",
+			payload: []byte(`{
+				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
+				"message":{
+					"total-results":0,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":null,"cursor":"unexpected"},
+					"items":[]
 				}
 			}`),
 			want: "unexpected",
@@ -855,6 +985,36 @@ func TestCrossrefCatalogReplaysOnlyVerifiedCompleteCache(t *testing.T) {
 		t.Fatalf("restore manifest error = %v", err)
 	}
 
+	pagePath := filepath.Join(
+		filepath.Dir(first.ManifestPath),
+		first.Manifest.Pages[0].PageFile,
+	)
+	pageBytes, err := os.ReadFile(pagePath)
+	if err != nil {
+		t.Fatalf("ReadFile(raw page) error = %v", err)
+	}
+	if err := os.WriteFile(pagePath, append(pageBytes, ' '), 0o600); err != nil {
+		t.Fatalf("WriteFile(tampered raw page) error = %v", err)
+	}
+	_, err = FetchCrossrefCatalog(
+		context.Background(),
+		&http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			networkCalls.Add(1)
+			return nil, errors.New("unverified page receipt must fail before network")
+		})},
+		config,
+		httpclient.Dependencies{},
+	)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "page sha") {
+		t.Fatalf("tampered raw page replay error = %v, want page SHA verification failure", err)
+	}
+	if networkCalls.Load() != 0 {
+		t.Fatalf("network calls after tampered raw page = %d, want 0", networkCalls.Load())
+	}
+	if err := os.WriteFile(pagePath, pageBytes, 0o600); err != nil {
+		t.Fatalf("restore raw page error = %v", err)
+	}
+
 	catalog, err := os.OpenFile(first.CatalogPath, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatalf("OpenFile(catalog) error = %v", err)
@@ -935,6 +1095,49 @@ func TestCrossrefCatalogResumesOnlyVerifiedIncompleteCache(t *testing.T) {
 		manifest.Pages[0].CursorOut != "page-2-cursor" {
 		t.Fatalf("interrupted manifest = %#v", manifest)
 	}
+	if _, err := os.Stat(filepath.Join(
+		config.CacheDir,
+		crossrefCatalogFinalDirectoryName,
+	)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed live run polluted final catalog: %v", err)
+	}
+	partialPagePath := filepath.Join(
+		config.CacheDir,
+		crossrefCatalogPartialDirectoryName,
+		manifest.Pages[0].PageFile,
+	)
+	partialPage, err := os.ReadFile(partialPagePath)
+	if err != nil {
+		t.Fatalf("ReadFile(partial raw page) error = %v", err)
+	}
+	if err := os.WriteFile(
+		partialPagePath,
+		append(partialPage, '\n'),
+		0o600,
+	); err != nil {
+		t.Fatalf("WriteFile(tampered partial page) error = %v", err)
+	}
+	mu.Lock()
+	requestCountBeforeVerify := len(cursors)
+	mu.Unlock()
+	_, err = FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "page sha") {
+		t.Fatalf("tampered partial resume error = %v, want page SHA verification failure", err)
+	}
+	mu.Lock()
+	requestCountAfterVerify := len(cursors)
+	mu.Unlock()
+	if requestCountAfterVerify != requestCountBeforeVerify {
+		t.Fatalf("unverified partial cache triggered network request")
+	}
+	if err := os.WriteFile(partialPagePath, partialPage, 0o600); err != nil {
+		t.Fatalf("restore partial raw page error = %v", err)
+	}
 
 	failSecond.Store(false)
 	resumed, err := FetchCrossrefCatalog(
@@ -959,44 +1162,6 @@ func TestCrossrefCatalogResumesOnlyVerifiedIncompleteCache(t *testing.T) {
 	mu.Unlock()
 	if !slices.Equal(gotCursors, []string{"*", "page-2-cursor", "page-2-cursor"}) {
 		t.Fatalf("request cursors = %v, want resume from last verified cursor", gotCursors)
-	}
-
-	manifestBytes, err := os.ReadFile(filepath.Join(config.CacheDir, CrossrefCatalogManifestName))
-	if err != nil {
-		t.Fatalf("ReadFile(manifest) error = %v", err)
-	}
-	manifestBytes = bytes.Replace(
-		manifestBytes,
-		[]byte(`"complete":true`),
-		[]byte(`"complete":false`),
-		1,
-	)
-	if err := os.WriteFile(
-		filepath.Join(config.CacheDir, CrossrefCatalogManifestName),
-		manifestBytes,
-		0o600,
-	); err != nil {
-		t.Fatalf("WriteFile(tampered incomplete manifest) error = %v", err)
-	}
-	catalog, err := os.OpenFile(
-		filepath.Join(config.CacheDir, CrossrefCatalogJSONLName),
-		os.O_APPEND|os.O_WRONLY,
-		0,
-	)
-	if err != nil {
-		t.Fatalf("OpenFile(catalog) error = %v", err)
-	}
-	_, _ = catalog.WriteString(`{"unverified":true}` + "\n")
-	_ = catalog.Close()
-
-	_, err = FetchCrossrefCatalog(
-		context.Background(),
-		server.Client(),
-		config,
-		httpclient.Dependencies{},
-	)
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "hash") {
-		t.Fatalf("unverified resume error = %v, want hash failure", err)
 	}
 }
 
@@ -1034,6 +1199,16 @@ func TestCrossrefCatalogFailureNeverLeavesCompleteManifest(t *testing.T) {
 	manifest := readCrossrefCatalogManifest(t, config.CacheDir)
 	if manifest.Complete {
 		t.Fatalf("failed fetch left complete manifest: %#v", manifest)
+	}
+	finalDir := filepath.Join(config.CacheDir, crossrefCatalogFinalDirectoryName)
+	if _, err := os.Stat(finalDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed fetch published final catalog directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(
+		config.CacheDir,
+		CrossrefCatalogJSONLName,
+	)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed fetch polluted top-level final JSONL: %v", err)
 	}
 	assertNoCrossrefCatalogTempFiles(t, config.CacheDir)
 }
@@ -1100,7 +1275,11 @@ func crossrefJournalEnvelope(
 			"total-results":  totalResults,
 			"items-per-page": len(items),
 			"next-cursor":    nextCursor,
-			"items":          items,
+			"query": map[string]any{
+				"start-index":  0,
+				"search-terms": nil,
+			},
+			"items": items,
 		},
 	})
 	if err != nil {
@@ -1111,6 +1290,7 @@ func crossrefJournalEnvelope(
 
 func assertCrossrefCatalogReceipt(
 	t *testing.T,
+	generationDir string,
 	receipt CrossrefCatalogPageReceipt,
 	ordinal int,
 	cursorIn string,
@@ -1125,8 +1305,20 @@ func assertCrossrefCatalogReceipt(
 		receipt.CursorIn != cursorIn ||
 		receipt.CursorOut != cursorOut ||
 		receipt.RecordCount != recordCount ||
+		receipt.PageFile != filepath.Join(
+			crossrefCatalogPagesDirectoryName,
+			fmt.Sprintf("page-%06d.json", ordinal),
+		) ||
+		receipt.PageBytes != int64(len(payload)) ||
 		receipt.PageSHA256 != hex.EncodeToString(hash[:]) {
 		t.Fatalf("receipt = %#v", receipt)
+	}
+	rawPage, err := os.ReadFile(filepath.Join(generationDir, receipt.PageFile))
+	if err != nil {
+		t.Fatalf("ReadFile(receipt page) error = %v", err)
+	}
+	if !bytes.Equal(rawPage, payload) {
+		t.Fatalf("receipt raw page differs from HTTP response")
 	}
 }
 
@@ -1142,7 +1334,21 @@ func assertCrossrefCatalogIncomplete(t *testing.T, cacheDir string) {
 func readCrossrefCatalogManifest(t *testing.T, cacheDir string) CrossrefCatalogManifest {
 	t.Helper()
 
-	payload, err := os.ReadFile(filepath.Join(cacheDir, CrossrefCatalogManifestName))
+	finalPath := filepath.Join(
+		cacheDir,
+		crossrefCatalogFinalDirectoryName,
+		CrossrefCatalogManifestName,
+	)
+	partialPath := filepath.Join(
+		cacheDir,
+		crossrefCatalogPartialDirectoryName,
+		CrossrefCatalogManifestName,
+	)
+	path := finalPath
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		path = partialPath
+	}
+	payload, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(manifest) error = %v", err)
 	}
