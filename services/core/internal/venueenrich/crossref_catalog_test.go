@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -80,14 +81,15 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 	if result.Replayed || result.Resumed {
 		t.Fatalf("fresh result replayed=%t resumed=%t", result.Replayed, result.Resumed)
 	}
-	if got := journalTitles(result.Journals); !slices.Equal(got, []string{
+	journals := readCrossrefCatalogJournals(t, result.CatalogPath)
+	if got := journalTitles(journals); !slices.Equal(got, []string{
 		"Journal of Reproducible Metadata",
 		"Transactions on Exact Matching",
 		"Archives of Bounded Acquisition",
 	}) {
 		t.Fatalf("journal titles = %v", got)
 	}
-	first := result.Journals[0]
+	first := journals[0]
 	if !slices.Equal(first.ISSNs, []string{"0028-0836", "2049-3630"}) ||
 		first.PrintISSN != "0028-0836" ||
 		first.ElectronicISSN != "2049-3630" ||
@@ -111,6 +113,7 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 	if result.Manifest.SchemaVersion != CrossrefCatalogSchemaVersion ||
 		result.Manifest.SourceURL != server.URL+"/journals" ||
 		!result.Manifest.FetchedAt.Equal(fetchedAt) ||
+		result.Manifest.CheckpointAt.Before(fetchedAt) ||
 		result.Manifest.Rows != CrossrefCatalogRows ||
 		result.Manifest.RecordCount != 3 ||
 		result.Manifest.TotalResults == nil ||
@@ -539,10 +542,11 @@ func TestCrossrefCatalogAcceptsObservedJournalISSNVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
 	}
-	if len(result.Journals) != 1 {
-		t.Fatalf("journals = %d, want 1", len(result.Journals))
+	journals := readCrossrefCatalogJournals(t, result.CatalogPath)
+	if len(journals) != 1 {
+		t.Fatalf("journals = %d, want 1", len(journals))
 	}
-	journal := result.Journals[0]
+	journal := journals[0]
 	if !slices.Equal(journal.ISSNs, []string{"1617-7061", "1521-3979"}) ||
 		journal.PrintISSN != "1617-7061" ||
 		journal.ElectronicISSN != "1617-7061" ||
@@ -590,10 +594,11 @@ func TestCrossrefCatalogAcceptsObservedEmptyISSNArrays(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
 	}
-	if len(result.Journals) != 1 ||
-		len(result.Journals[0].ISSNs) != 0 ||
-		len(result.Journals[0].ISSNTypes) != 0 {
-		t.Fatalf("journal = %#v, want parsed empty ISSN arrays", result.Journals)
+	journals := readCrossrefCatalogJournals(t, result.CatalogPath)
+	if len(journals) != 1 ||
+		len(journals[0].ISSNs) != 0 ||
+		len(journals[0].ISSNTypes) != 0 {
+		t.Fatalf("journal = %#v, want parsed empty ISSN arrays", journals)
 	}
 }
 
@@ -619,7 +624,7 @@ func TestCrossrefCatalogAcceptsEmptyTerminalCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
 	}
-	if len(result.Journals) != 0 ||
+	if len(readCrossrefCatalogJournals(t, result.CatalogPath)) != 0 ||
 		!result.Manifest.Complete ||
 		result.Manifest.TotalResults == nil ||
 		*result.Manifest.TotalResults != 0 ||
@@ -949,7 +954,10 @@ func TestCrossrefCatalogReplaysOnlyVerifiedCompleteCache(t *testing.T) {
 		)
 	}
 	if replayed.Manifest.CatalogSHA256 != first.Manifest.CatalogSHA256 ||
-		!slices.Equal(journalTitles(replayed.Journals), journalTitles(first.Journals)) {
+		!bytes.Equal(
+			readFile(t, replayed.CatalogPath),
+			readFile(t, first.CatalogPath),
+		) {
 		t.Fatalf("replayed result differs from fetched result")
 	}
 
@@ -1213,6 +1221,439 @@ func TestCrossrefCatalogFailureNeverLeavesCompleteManifest(t *testing.T) {
 	assertNoCrossrefCatalogTempFiles(t, config.CacheDir)
 }
 
+func TestCrossrefCatalogStalePartialRestartsFromFirstCursor(t *testing.T) {
+	t.Parallel()
+
+	pageOne := readCrossrefCatalogFixture(t, "crossref-journals-page-1.json")
+	pageTwo := readCrossrefCatalogFixture(t, "crossref-journals-page-2.json")
+	var (
+		now      = time.Date(2026, 7, 19, 8, 0, 0, 0, time.UTC)
+		mu       sync.Mutex
+		cursors  []string
+		recovery atomic.Bool
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		cursor := request.URL.Query().Get("cursor")
+		mu.Lock()
+		cursors = append(cursors, cursor)
+		mu.Unlock()
+		switch cursor {
+		case "*":
+			_, _ = writer.Write(pageOne)
+		case "page-2-cursor":
+			if !recovery.Load() {
+				http.Error(writer, "interrupted", http.StatusInternalServerError)
+				return
+			}
+			_, _ = writer.Write(pageTwo)
+		default:
+			t.Errorf("unexpected cursor %q", cursor)
+		}
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	dependencies := httpclient.Dependencies{Now: func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}}
+	if _, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		dependencies,
+	); err == nil {
+		t.Fatal("initial interrupted fetch error = nil")
+	}
+	partial := readCrossrefCatalogManifest(t, config.CacheDir)
+	if partial.CheckpointAt.IsZero() || len(partial.Pages) != 1 {
+		t.Fatalf("partial checkpoint = %#v", partial)
+	}
+
+	mu.Lock()
+	now = now.Add(CrossrefCatalogPartialTTL + time.Second)
+	mu.Unlock()
+	recovery.Store(true)
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		dependencies,
+	)
+	if err != nil {
+		t.Fatalf("stale recovery FetchCrossrefCatalog() error = %v", err)
+	}
+	if result.Resumed {
+		t.Fatal("stale partial was resumed instead of restarted")
+	}
+	mu.Lock()
+	got := append([]string(nil), cursors...)
+	mu.Unlock()
+	if !slices.Equal(got, []string{
+		"*",
+		"page-2-cursor",
+		"*",
+		"page-2-cursor",
+	}) {
+		t.Fatalf("request cursors = %v, want stale restart from *", got)
+	}
+}
+
+func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
+	t.Parallel()
+
+	pageOne := readCrossrefCatalogFixture(t, "crossref-journals-page-1.json")
+	pageTwo := readCrossrefCatalogFixture(t, "crossref-journals-page-2.json")
+	var (
+		mu            sync.Mutex
+		cursors       []string
+		interruptOnce atomic.Bool
+		expireOnce    atomic.Bool
+	)
+	interruptOnce.Store(true)
+	expireOnce.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		cursor := request.URL.Query().Get("cursor")
+		mu.Lock()
+		cursors = append(cursors, cursor)
+		mu.Unlock()
+		switch cursor {
+		case "*":
+			_, _ = writer.Write(pageOne)
+		case "page-2-cursor":
+			if interruptOnce.CompareAndSwap(true, false) {
+				http.Error(writer, "interrupted", http.StatusInternalServerError)
+				return
+			}
+			if expireOnce.CompareAndSwap(true, false) {
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(http.StatusBadRequest)
+				_, _ = writer.Write([]byte(
+					`{"status":"failed","message":"Cursor is invalid or expired"}`,
+				))
+				return
+			}
+			_, _ = writer.Write(pageTwo)
+		default:
+			t.Errorf("unexpected cursor %q", cursor)
+		}
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	if _, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	); err == nil {
+		t.Fatal("initial interrupted fetch error = nil")
+	}
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("expired cursor recovery error = %v", err)
+	}
+	if result.Resumed {
+		t.Fatal("expired cursor recovery reported resumed result")
+	}
+	mu.Lock()
+	got := append([]string(nil), cursors...)
+	mu.Unlock()
+	if !slices.Equal(got, []string{
+		"*",
+		"page-2-cursor",
+		"page-2-cursor",
+		"*",
+		"page-2-cursor",
+	}) {
+		t.Fatalf("request cursors = %v, want cursor reset flow", got)
+	}
+}
+
+func TestCrossrefCatalogUsesManifestAsOnlyPartialFrontier(t *testing.T) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		validCrossrefJournalItem("Crash Consistency Journal", "0028-0836"),
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	failCheckpoint := atomic.Bool{}
+	failCheckpoint.Store(true)
+	ops := defaultCrossrefCatalogFileOps()
+	ops.before = func(stage string) error {
+		if stage == crossrefCatalogStageManifestCheckpoint &&
+			failCheckpoint.CompareAndSwap(true, false) {
+			return errors.New("injected checkpoint failure")
+		}
+		return nil
+	}
+	config.fileOps = &ops
+	if _, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	); err == nil || !strings.Contains(err.Error(), "injected checkpoint failure") {
+		t.Fatalf("checkpoint failure error = %v", err)
+	}
+	manifest := readCrossrefCatalogManifest(t, config.CacheDir)
+	if len(manifest.Pages) != 0 || manifest.RecordCount != 0 {
+		t.Fatalf("failed checkpoint advanced manifest frontier: %#v", manifest)
+	}
+	partialDirectory := filepath.Join(
+		config.CacheDir,
+		crossrefCatalogPartialDirectoryName,
+	)
+	if _, err := os.Stat(filepath.Join(
+		partialDirectory,
+		CrossrefCatalogJSONLName,
+	)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial stage contains shared JSONL: %v", err)
+	}
+
+	config.fileOps = nil
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("recovery fetch error = %v", err)
+	}
+	if result.Manifest.RecordCount != 1 {
+		t.Fatalf("recovered manifest = %#v", result.Manifest)
+	}
+}
+
+func TestCrossrefCatalogRejectsConcurrentCacheUseAndReleasesLock(t *testing.T) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		validCrossrefJournalItem("Locked Journal", "0028-0836"),
+	)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		if requests.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := FetchCrossrefCatalog(
+			context.Background(),
+			server.Client(),
+			config,
+			httpclient.Dependencies{},
+		)
+		firstResult <- err
+	}()
+	<-started
+	_, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if !errors.Is(err, ErrCrossrefCatalogLocked) {
+		close(release)
+		t.Fatalf("concurrent fetch error = %v, want ErrCrossrefCatalogLocked", err)
+	}
+	close(release)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first fetch error = %v", err)
+	}
+	replayed, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil || !replayed.Replayed {
+		t.Fatalf("post-release replay = %#v, error %v", replayed, err)
+	}
+}
+
+func TestCrossrefCatalogDoesNotExposeFullCatalogSlice(t *testing.T) {
+	t.Parallel()
+
+	if field, exists := reflect.TypeFor[CrossrefCatalog]().FieldByName("Journals"); exists {
+		t.Fatalf("CrossrefCatalog retains full catalog field %#v", field)
+	}
+}
+
+func TestCrossrefCatalogStreamsMultipleFullPagesWithoutPartialJSONL(t *testing.T) {
+	item := validCrossrefJournalItem(
+		"Full Page Streaming Journal",
+		"0028-0836",
+	)
+	fullPage := make([]json.RawMessage, CrossrefCatalogRows)
+	for index := range fullPage {
+		fullPage[index] = item
+	}
+	const totalRecords = 2*CrossrefCatalogRows + 1
+	pages := map[string][]byte{
+		"*": crossrefJournalEnvelope(
+			t,
+			totalRecords,
+			"full-page-2",
+			fullPage...,
+		),
+		"full-page-2": crossrefJournalEnvelope(
+			t,
+			totalRecords,
+			"full-page-3",
+			fullPage...,
+		),
+		"full-page-3": crossrefJournalEnvelope(
+			t,
+			totalRecords,
+			"terminal",
+			item,
+		),
+	}
+	cacheDirectory := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		partialJSONL := filepath.Join(
+			cacheDirectory,
+			crossrefCatalogPartialDirectoryName,
+			CrossrefCatalogJSONLName,
+		)
+		if _, err := os.Stat(partialJSONL); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("partial JSONL exists during multi-page fetch: %v", err)
+		}
+		payload, exists := pages[request.URL.Query().Get("cursor")]
+		if !exists {
+			http.Error(writer, "unexpected cursor", http.StatusBadRequest)
+			return
+		}
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		validCrossrefCatalogConfig(server.URL, cacheDirectory),
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
+	}
+	catalog := readFile(t, result.CatalogPath)
+	if got := bytes.Count(catalog, []byte{'\n'}); got != totalRecords {
+		t.Fatalf("catalog records = %d, want %d", got, totalRecords)
+	}
+	if result.Manifest.RecordCount != totalRecords ||
+		len(result.Manifest.Pages) != 3 ||
+		!result.Manifest.Complete {
+		t.Fatalf("multi-page manifest = %#v", result.Manifest)
+	}
+}
+
+func TestCrossrefCatalogCommitFailuresRemainRecoverable(t *testing.T) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		validCrossrefJournalItem("Failure Injection Journal", "0028-0836"),
+	)
+	for _, stage := range []string{
+		crossrefCatalogStagePageCommit,
+		crossrefCatalogStageManifestCheckpoint,
+		crossrefCatalogStagePublish,
+	} {
+		stage := stage
+		t.Run(stage, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(
+				writer http.ResponseWriter,
+				_ *http.Request,
+			) {
+				_, _ = writer.Write(payload)
+			}))
+			defer server.Close()
+
+			config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+			var failed atomic.Bool
+			ops := defaultCrossrefCatalogFileOps()
+			ops.before = func(actual string) error {
+				if actual == stage && failed.CompareAndSwap(false, true) {
+					return fmt.Errorf("injected %s failure", stage)
+				}
+				return nil
+			}
+			config.fileOps = &ops
+			if _, err := FetchCrossrefCatalog(
+				context.Background(),
+				server.Client(),
+				config,
+				httpclient.Dependencies{},
+			); err == nil || !strings.Contains(err.Error(), "injected") {
+				t.Fatalf("stage %s error = %v", stage, err)
+			}
+			if _, err := os.Stat(filepath.Join(
+				config.CacheDir,
+				crossrefCatalogFinalDirectoryName,
+			)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stage %s failure published final catalog: %v", stage, err)
+			}
+
+			config.fileOps = nil
+			if _, err := FetchCrossrefCatalog(
+				context.Background(),
+				server.Client(),
+				config,
+				httpclient.Dependencies{},
+			); err != nil {
+				t.Fatalf("stage %s recovery error = %v", stage, err)
+			}
+		})
+	}
+}
+
 func validCrossrefCatalogConfig(baseURL, cacheDir string) CrossrefCatalogConfig {
 	return CrossrefCatalogConfig{
 		BaseURL:          baseURL,
@@ -1379,6 +1820,38 @@ func journalTitles(journals []CrossrefJournal) []string {
 		titles[index] = journal.Title
 	}
 	return titles
+}
+
+func readCrossrefCatalogJournals(
+	t *testing.T,
+	path string,
+) []CrossrefJournal {
+	t.Helper()
+
+	payload := readFile(t, path)
+	lines := bytes.Split(payload, []byte{'\n'})
+	journals := make([]CrossrefJournal, 0, len(lines))
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		journal, err := decodeCrossrefJournal(line)
+		if err != nil {
+			t.Fatalf("decode catalog JSONL: %v", err)
+		}
+		journals = append(journals, journal)
+	}
+	return journals
+}
+
+func readFile(t *testing.T, path string) []byte {
+	t.Helper()
+
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", path, err)
+	}
+	return payload
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
