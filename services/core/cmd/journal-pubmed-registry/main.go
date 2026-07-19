@@ -391,6 +391,12 @@ func (runner registryRunner) run(
 			"registry run requires exactly three input files",
 		)
 	}
+	if err := validateDistinctRegistryPaths(
+		command.OutputPath,
+		command.ReportPath,
+	); err != nil {
+		return registryResult{}, err
+	}
 	dependencies, err := runner.dependencies.validated()
 	if err != nil {
 		return registryResult{}, err
@@ -1020,7 +1026,7 @@ func validateRegistryCounts(
 		return errors.New("registry match counts do not reconcile")
 	}
 	if counts.Probes.Eligible != counts.Match.Resolved ||
-		counts.Probes.Attempted > counts.Probes.Eligible {
+		counts.Probes.Attempted != counts.Probes.Eligible {
 		return errors.New("registry probe counts do not reconcile")
 	}
 	if counts.PubMed.Yes+
@@ -1039,7 +1045,7 @@ func validateRegistryCounts(
 				domainCounts.Match.Ambiguous+
 				domainCounts.Match.Unresolved != domainCounts.InputRows ||
 			domainCounts.Probes.Eligible != domainCounts.Match.Resolved ||
-			domainCounts.Probes.Attempted > domainCounts.Probes.Eligible ||
+			domainCounts.Probes.Attempted != domainCounts.Probes.Eligible ||
 			domainCounts.PubMed.Yes+
 				domainCounts.PubMed.No+
 				domainCounts.PubMed.Unknown != domainCounts.OutputRows {
@@ -1216,6 +1222,18 @@ func validateProbeForRow(
 			"unattempted PubMed probe requires empty checked_at, response_sha256, and error",
 		)
 	}
+	if row.MatchStatus == venueenrich.MatchStatusResolved &&
+		!probe.Attempted {
+		return errors.New(
+			"resolved row requires an attempted PubMed probe",
+		)
+	}
+	if row.MatchStatus != venueenrich.MatchStatusResolved &&
+		probe.Attempted {
+		return errors.New(
+			"only resolved rows may have an attempted PubMed probe",
+		)
+	}
 	if probe.ResponseSHA256 != "" && !validSHA256(probe.ResponseSHA256) {
 		return errors.New("PubMed probe response_sha256 is invalid")
 	}
@@ -1247,8 +1265,8 @@ func publishRegistryArtifacts(
 	reportPayload []byte,
 	ops registryFileOps,
 ) (returnErr error) {
-	if outputPath == reportPath {
-		return errors.New("registry output and report paths must differ")
+	if err := validateDistinctRegistryPaths(outputPath, reportPath); err != nil {
+		return err
 	}
 	for _, path := range []string{outputPath, reportPath} {
 		if _, err := os.Lstat(path); err == nil {
@@ -1316,6 +1334,142 @@ func publishRegistryArtifacts(
 		return fmt.Errorf("sync report directory: %w", err)
 	}
 	return nil
+}
+
+type registryPathIdentity struct {
+	path      string
+	canonical string
+	lstat     os.FileInfo
+	stat      os.FileInfo
+	lstatErr  error
+	statErr   error
+}
+
+func validateDistinctRegistryPaths(outputPath, reportPath string) error {
+	output, err := inspectRegistryPathIdentity(outputPath)
+	if err != nil {
+		return fmt.Errorf("inspect output path: %w", err)
+	}
+	report, err := inspectRegistryPathIdentity(reportPath)
+	if err != nil {
+		return fmt.Errorf("inspect report path: %w", err)
+	}
+	if output.canonical == report.canonical {
+		return fmt.Errorf(
+			"output and report resolve to the same final path %q",
+			output.canonical,
+		)
+	}
+	if output.lstatErr == nil &&
+		report.lstatErr == nil &&
+		os.SameFile(output.lstat, report.lstat) {
+		return errors.New(
+			"output and report are the same final inode via Lstat",
+		)
+	}
+	if output.statErr == nil &&
+		report.statErr == nil &&
+		os.SameFile(output.stat, report.stat) {
+		return errors.New(
+			"output and report are the same final inode via Stat",
+		)
+	}
+	return nil
+}
+
+func inspectRegistryPathIdentity(path string) (registryPathIdentity, error) {
+	if err := validateExplicitPath("registry final path", path); err != nil {
+		return registryPathIdentity{}, err
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return registryPathIdentity{}, fmt.Errorf(
+			"absolute path %q: %w",
+			path,
+			err,
+		)
+	}
+	cleaned := filepath.Clean(absolute)
+	canonical, err := canonicalRegistryPath(cleaned)
+	if err != nil {
+		return registryPathIdentity{}, err
+	}
+	lstat, lstatErr := os.Lstat(cleaned)
+	stat, statErr := os.Stat(cleaned)
+	if lstatErr != nil && !errors.Is(lstatErr, os.ErrNotExist) {
+		return registryPathIdentity{}, fmt.Errorf(
+			"Lstat %q: %w",
+			cleaned,
+			lstatErr,
+		)
+	}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return registryPathIdentity{}, fmt.Errorf(
+			"Stat %q: %w",
+			cleaned,
+			statErr,
+		)
+	}
+	return registryPathIdentity{
+		path:      cleaned,
+		canonical: canonical,
+		lstat:     lstat,
+		stat:      stat,
+		lstatErr:  lstatErr,
+		statErr:   statErr,
+	}, nil
+}
+
+func canonicalRegistryPath(path string) (string, error) {
+	current := filepath.Clean(path)
+	missing := make([]string, 0, 4)
+	for {
+		_, err := os.Lstat(current)
+		switch {
+		case err == nil:
+			resolved, evalErr := filepath.EvalSymlinks(current)
+			if evalErr == nil {
+				resolvedAbsolute, absoluteErr := filepath.Abs(resolved)
+				if absoluteErr != nil {
+					return "", fmt.Errorf(
+						"absolute resolved path %q: %w",
+						resolved,
+						absoluteErr,
+					)
+				}
+				for index := len(missing) - 1; index >= 0; index-- {
+					resolvedAbsolute = filepath.Join(
+						resolvedAbsolute,
+						missing[index],
+					)
+				}
+				return filepath.Clean(resolvedAbsolute), nil
+			}
+			if !errors.Is(evalErr, os.ErrNotExist) {
+				return "", fmt.Errorf(
+					"evaluate symlinks %q: %w",
+					current,
+					evalErr,
+				)
+			}
+			// A dangling symlink cannot be resolved further. Keep the
+			// verifiable prefix and let the eventual temp creation report
+			// the unusable parent if this path is selected for publishing.
+			for index := len(missing) - 1; index >= 0; index-- {
+				current = filepath.Join(current, missing[index])
+			}
+			return filepath.Clean(current), nil
+		case errors.Is(err, os.ErrNotExist):
+			parent := filepath.Dir(current)
+			missing = append(missing, filepath.Base(current))
+			if parent == current {
+				return filepath.Clean(current), nil
+			}
+			current = parent
+		default:
+			return "", fmt.Errorf("inspect path %q: %w", current, err)
+		}
+	}
 }
 
 func writeRegistryTemp(path string, payload []byte) (returnPath string, returnErr error) {

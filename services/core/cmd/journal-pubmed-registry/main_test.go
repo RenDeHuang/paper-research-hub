@@ -744,6 +744,148 @@ func TestJournalPubMedRegistryOutputFailureCleansTempsAndNewFinals(t *testing.T)
 	}
 }
 
+func TestJournalPubMedRegistryRejectsEquivalentFinalPathsBeforePublishing(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	t.Run("absolute clean aliases", func(t *testing.T) {
+		directory := t.TempDir()
+		outputPath := filepath.Join(directory, "registry")
+		reportPath := directory + string(filepath.Separator) + "." +
+			string(filepath.Separator) + "registry"
+
+		err := publishRegistryArtifacts(
+			outputPath,
+			[]byte("csv"),
+			reportPath,
+			[]byte("report"),
+			defaultRegistryFileOps(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "same final") {
+			t.Fatalf("publishRegistryArtifacts() error = %v, want same-final rejection", err)
+		}
+		assertRegistryFinalsAbsent(t, outputPath, reportPath)
+		assertRegistryTempsAbsent(t, directory)
+	})
+
+	t.Run("symlinked parent aliases", func(t *testing.T) {
+		directory := t.TempDir()
+		realDirectory := filepath.Join(directory, "real")
+		aliasDirectory := filepath.Join(directory, "alias")
+		if err := os.Mkdir(realDirectory, 0o700); err != nil {
+			t.Fatalf("Mkdir(real) error = %v", err)
+		}
+		if err := os.Symlink(realDirectory, aliasDirectory); err != nil {
+			t.Fatalf("Symlink(alias) error = %v", err)
+		}
+		outputPath := filepath.Join(realDirectory, "registry")
+		reportPath := filepath.Join(aliasDirectory, "registry")
+
+		err := publishRegistryArtifacts(
+			outputPath,
+			[]byte("csv"),
+			reportPath,
+			[]byte("report"),
+			defaultRegistryFileOps(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "same final") {
+			t.Fatalf("publishRegistryArtifacts() error = %v, want symlink-alias rejection", err)
+		}
+		assertRegistryFinalsAbsent(t, outputPath, reportPath)
+		assertRegistryTempsAbsent(t, realDirectory)
+	})
+
+	t.Run("missing parent through symlink aliases", func(t *testing.T) {
+		directory := t.TempDir()
+		realDirectory := filepath.Join(directory, "real")
+		aliasDirectory := filepath.Join(directory, "alias")
+		if err := os.Mkdir(realDirectory, 0o700); err != nil {
+			t.Fatalf("Mkdir(real) error = %v", err)
+		}
+		if err := os.Symlink(realDirectory, aliasDirectory); err != nil {
+			t.Fatalf("Symlink(alias) error = %v", err)
+		}
+		outputPath := filepath.Join(realDirectory, "missing", "registry")
+		reportPath := filepath.Join(aliasDirectory, "missing", "registry")
+
+		err := publishRegistryArtifacts(
+			outputPath,
+			[]byte("csv"),
+			reportPath,
+			[]byte("report"),
+			defaultRegistryFileOps(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "same final") {
+			t.Fatalf("publishRegistryArtifacts() error = %v, want missing-parent alias rejection", err)
+		}
+		assertRegistryFinalsAbsent(t, outputPath, reportPath)
+		assertRegistryTempsAbsent(t, realDirectory)
+	})
+}
+
+func TestJournalPubMedRegistryRejectsExistingSymlinkAndHardlinkFinalAliases(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	t.Run("symlink final", func(t *testing.T) {
+		directory := t.TempDir()
+		targetPath := filepath.Join(directory, "target")
+		outputPath := filepath.Join(directory, "output")
+		if err := os.WriteFile(targetPath, []byte("existing"), 0o600); err != nil {
+			t.Fatalf("WriteFile(target) error = %v", err)
+		}
+		if err := os.Symlink(targetPath, outputPath); err != nil {
+			t.Fatalf("Symlink(output) error = %v", err)
+		}
+
+		err := publishRegistryArtifacts(
+			outputPath,
+			[]byte("replacement"),
+			targetPath,
+			[]byte("report"),
+			defaultRegistryFileOps(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "same final") {
+			t.Fatalf("publishRegistryArtifacts() error = %v, want symlink conflict", err)
+		}
+		if got, readErr := os.ReadFile(targetPath); readErr != nil {
+			t.Fatalf("ReadFile(target) error = %v", readErr)
+		} else if string(got) != "existing" {
+			t.Fatalf("target contents = %q, want unchanged existing content", got)
+		}
+	})
+
+	t.Run("hardlink finals", func(t *testing.T) {
+		directory := t.TempDir()
+		outputPath := filepath.Join(directory, "output")
+		reportPath := filepath.Join(directory, "report")
+		if err := os.WriteFile(outputPath, []byte("existing"), 0o600); err != nil {
+			t.Fatalf("WriteFile(output) error = %v", err)
+		}
+		if err := os.Link(outputPath, reportPath); err != nil {
+			t.Fatalf("Link(report) error = %v", err)
+		}
+
+		err := publishRegistryArtifacts(
+			outputPath,
+			[]byte("replacement"),
+			reportPath,
+			[]byte("report"),
+			defaultRegistryFileOps(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "same final") {
+			t.Fatalf("publishRegistryArtifacts() error = %v, want hardlink conflict", err)
+		}
+		if got, readErr := os.ReadFile(outputPath); readErr != nil {
+			t.Fatalf("ReadFile(output) error = %v", readErr)
+		} else if string(got) != "existing" {
+			t.Fatalf("output contents = %q, want unchanged existing content", got)
+		}
+	})
+}
+
 func TestJournalPubMedRegistryReportValidationRequires2032RowsAndValidProbes(
 	t *testing.T,
 ) {
@@ -777,6 +919,75 @@ func TestJournalPubMedRegistryReportValidationRequires2032RowsAndValidProbes(
 			t.Fatalf("validateRegistryReport() error = %v, want invalid probe receipt", err)
 		}
 	})
+}
+
+func TestJournalPubMedRegistryRejectsResolvedEligibleUnattemptedOverlay(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	report := validJournalRegistryReportForValidation()
+	report.Counts.Match.Resolved = 1
+	report.Counts.Match.Unresolved--
+	report.Counts.Probes.Eligible = 1
+	report.Counts.Probes.Attempted = 1
+	report.Counts.PubMed.Unknown--
+	report.Counts.PubMed.Yes = 1
+	report.ByDomain[0].Counts = report.Counts
+	report.Probes[0] = venueenrich.PubMedProbeReceipt{
+		Domain:         "all",
+		SourceOrder:    1,
+		ISSNs:          []string{"0028-0836"},
+		Attempted:      true,
+		CheckedAt:      "2026-07-19T01:02:03Z",
+		Status:         venueenrich.SupportStatusYes,
+		RecordCount:    1,
+		ResponseSHA256: journalRegistryHashOne,
+	}
+
+	// Overlay the report as if the resolved probe was silently left unprobed.
+	report.Probes[0].Attempted = false
+	report.Probes[0].CheckedAt = ""
+	report.Probes[0].Status = venueenrich.SupportStatusUnknown
+	report.Probes[0].RecordCount = 0
+	report.Probes[0].ResponseSHA256 = ""
+	report.Counts.Probes.Attempted = 0
+	report.Counts.PubMed.Yes = 0
+	report.Counts.PubMed.Unknown++
+	report.ByDomain[0].Counts = report.Counts
+
+	err := validateRegistryReport(report)
+	if err == nil || !strings.Contains(err.Error(), "probe counts") {
+		t.Fatalf("validateRegistryReport() error = %v, want attempted==eligible rejection", err)
+	}
+}
+
+func TestJournalPubMedRegistryRejectsResolvedRowWithUnattemptedReceipt(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	source := venueenrich.SourceRow{
+		Domain:            "medicine",
+		SourceOrder:       1,
+		SourceJournalName: "Resolved Journal",
+		SourceURL:         "https://example.test/medicine/1",
+	}
+	row := journalRegistryResolvedRow(
+		source,
+		[]string{"0028-0836", "2049-3630"},
+	)
+	probe := venueenrich.PubMedProbeReceipt{
+		Domain:      row.Domain,
+		SourceOrder: row.SourceOrder,
+		ISSNs:       slices.Clone(row.AllISSNs),
+		Status:      venueenrich.SupportStatusUnknown,
+	}
+
+	err := validateProbeForRow(row, probe)
+	if err == nil || !strings.Contains(err.Error(), "resolved") {
+		t.Fatalf("validateProbeForRow() error = %v, want resolved row attempt requirement", err)
+	}
 }
 
 type journalRegistryInputSpec struct {
@@ -996,7 +1207,7 @@ func assertJournalRegistryCountsReconcile(t *testing.T, report registryReport) {
 	if counts.InputRows != counts.OutputRows ||
 		counts.Match.Resolved+counts.Match.Ambiguous+counts.Match.Unresolved != counts.InputRows ||
 		counts.Probes.Eligible != counts.Match.Resolved ||
-		counts.Probes.Attempted > counts.Probes.Eligible ||
+		counts.Probes.Attempted != counts.Probes.Eligible ||
 		counts.PubMed.Yes+counts.PubMed.No+counts.PubMed.Unknown != counts.OutputRows {
 		t.Fatalf("top-level counts do not reconcile: %#v", counts)
 	}
@@ -1087,6 +1298,30 @@ func validJournalRegistryReportForValidation() registryReport {
 			Bytes:  1,
 			SHA256: journalRegistryHashTwo,
 		},
+	}
+}
+
+func assertRegistryFinalsAbsent(t *testing.T, paths ...string) {
+	t.Helper()
+
+	for _, path := range paths {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unexpected final path %q after rejection: %v", path, err)
+		}
+	}
+}
+
+func assertRegistryTempsAbsent(t *testing.T, directory string) {
+	t.Helper()
+
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(%q) error = %v", directory, err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("temporary path remained in %q: %s", directory, entry.Name())
+		}
 	}
 }
 
