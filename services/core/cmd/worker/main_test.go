@@ -440,11 +440,31 @@ func TestParsePubMedJournalSyncCommandsRequireStrictTypedFlags(t *testing.T) {
 			want: "backfill or daily",
 		},
 		{
+			name: "mode must be exact and not trimmed",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", " daily ",
+				"--run-date", "2026-07-19",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+			want: "backfill or daily",
+		},
+		{
 			name: "backfill rejects run date",
 			args: []string{
 				"sync", "pubmed-journals",
 				"--mode", "backfill",
 				"--run-date", "2026-07-19",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+			want: "backfill",
+		},
+		{
+			name: "backfill rejects empty run date flag",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "backfill",
+				"--run-date=",
 				"--registry", "/tmp/journal-registry.csv",
 			},
 			want: "backfill",

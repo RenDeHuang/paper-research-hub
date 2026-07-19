@@ -273,6 +273,14 @@ func (service *Service) Run(
 				request,
 				window,
 			)
+			if summaryErr := summary.Validate(); summaryErr == nil {
+				mergeSummary(&report, &report.Windows[windowIndex], summary)
+			} else if runWindowErr == nil {
+				runWindowErr = fmt.Errorf(
+					"validate PubMed ingestion summary: %w",
+					summaryErr,
+				)
+			}
 			if runWindowErr != nil {
 				report.Windows[windowIndex].Status = "failed"
 				report.Windows[windowIndex].Stage = "search_or_ingestion"
@@ -303,22 +311,8 @@ func (service *Service) Run(
 			}
 
 			report.Windows[windowIndex].Status = "succeeded"
-			report.Windows[windowIndex].RawInserted = summary.RawInserted
-			report.Windows[windowIndex].RawReused = summary.RawReused
-			report.Windows[windowIndex].Projected = summary.Projected
-			report.Windows[windowIndex].Excluded = summary.Excluded
-			report.Windows[windowIndex].Deleted = summary.Deleted
-			report.Windows[windowIndex].Unchanged = summary.Unchanged
-			report.Windows[windowIndex].Failed = summary.Failed
 			report.WindowsSucceeded++
 			report.Journals[journalIndex].WindowsSucceeded++
-			report.RawInserted += summary.RawInserted
-			report.RawReused += summary.RawReused
-			report.Projected += summary.Projected
-			report.Excluded += summary.Excluded
-			report.Deleted += summary.Deleted
-			report.Unchanged += summary.Unchanged
-			report.IngestionFailed += summary.Failed
 		}
 
 		if report.Journals[journalIndex].Status != "failed" {
@@ -402,9 +396,30 @@ func (service *Service) runWindow(
 		service.recordEvents(records),
 	)
 	if err != nil {
-		return ingestion.JobSummary{}, fmt.Errorf("ingest PubMed window: %w", err)
+		return summary, fmt.Errorf("ingest PubMed window: %w", err)
 	}
 	return summary, nil
+}
+
+func mergeSummary(
+	report *Report,
+	window *WindowReport,
+	summary ingestion.JobSummary,
+) {
+	window.RawInserted = summary.RawInserted
+	window.RawReused = summary.RawReused
+	window.Projected = summary.Projected
+	window.Excluded = summary.Excluded
+	window.Deleted = summary.Deleted
+	window.Unchanged = summary.Unchanged
+	window.Failed = summary.Failed
+	report.RawInserted += summary.RawInserted
+	report.RawReused += summary.RawReused
+	report.Projected += summary.Projected
+	report.Excluded += summary.Excluded
+	report.Deleted += summary.Deleted
+	report.Unchanged += summary.Unchanged
+	report.IngestionFailed += summary.Failed
 }
 
 func newWindowJob(request RunRequest, window SyncWindow) (ingestion.Job, error) {

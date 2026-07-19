@@ -1588,6 +1588,12 @@ func parsePubMedJournalCommand(args []string) (workerCommand, error) {
 			strings.Join(set.Args(), " "),
 		)
 	}
+	runDateSet := false
+	set.Visit(func(value *flag.Flag) {
+		if value.Name == "run-date" {
+			runDateSet = true
+		}
+	})
 	if err := validateExplicitPath("--registry", command.Registry); err != nil {
 		return workerCommand{}, err
 	}
@@ -1596,17 +1602,16 @@ func parsePubMedJournalCommand(args []string) (workerCommand, error) {
 			"PubMed journal sync --lookback-days must be exactly 3",
 		)
 	}
-	command.Mode = strings.TrimSpace(command.Mode)
 	var err error
 	switch command.Mode {
 	case string(pubmedsync.ModeBackfill):
-		if runDate != "" {
+		if runDateSet {
 			return workerCommand{}, errors.New(
 				"PubMed journal backfill does not accept --run-date",
 			)
 		}
 	case string(pubmedsync.ModeDaily):
-		if runDate == "" {
+		if !runDateSet || runDate == "" {
 			return workerCommand{}, errors.New(
 				"PubMed journal daily sync requires --run-date",
 			)

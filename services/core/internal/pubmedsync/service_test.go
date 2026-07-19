@@ -87,6 +87,36 @@ func (runner *serviceFakeIngestion) Run(
 	)
 }
 
+type serviceSummaryErrorIngestion struct {
+	calls        []serviceRunCall
+	summaryByKey map[string]ingestion.JobSummary
+	errorByKey   map[string]error
+}
+
+func (runner *serviceSummaryErrorIngestion) Run(
+	_ context.Context,
+	job ingestion.Job,
+	_ ingestion.EventSequence,
+) (ingestion.JobSummary, error) {
+	runner.calls = append(runner.calls, serviceRunCall{job: job})
+	summary := runner.summaryByKey[job.IdempotencyKey]
+	if summary.JobID == "" {
+		var err error
+		summary, err = ingestion.NewJobSummary(
+			"job-"+job.IdempotencyKey,
+			ingestion.JobStatusSucceeded,
+			ingestion.JobSummaryCounts{
+				RawInserted: 1,
+				Projected:   1,
+			},
+		)
+		if err != nil {
+			return ingestion.JobSummary{}, err
+		}
+	}
+	return summary, runner.errorByKey[job.IdempotencyKey]
+}
+
 func TestServiceBackfillUsesFixedWindowCompleteISSNSetAndStableJobKey(t *testing.T) {
 	t.Parallel()
 
@@ -305,6 +335,126 @@ func TestServiceDailyUsesEDATThenMDATAndContinuesAfterWindowFailure(t *testing.T
 	}
 	if got := runner.calls[2].job.Payload["journal_name"]; got != "Second Daily Journal" {
 		t.Fatalf("second journal = %#v, want registry order", got)
+	}
+}
+
+func TestServiceMergesPersistedSummaryWhenIngestionReturnsSummaryAndError(t *testing.T) {
+	t.Parallel()
+
+	searcher := &serviceFakeSearcher{}
+	fetcher := &serviceFakeFetcher{}
+	sentinel := errors.New("persisted ingestion failure")
+	firstWindow, err := PlanDaily(
+		mustServiceJournal(t, "1234-5679"),
+		time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("PlanDaily() error = %v", err)
+	}
+	failedSummary, err := ingestion.NewJobSummary(
+		"persisted-failed-job",
+		ingestion.JobStatusSucceeded,
+		ingestion.JobSummaryCounts{
+			RawInserted: 2,
+			RawReused:   3,
+			Projected:   4,
+			Excluded:    5,
+			Deleted:     6,
+			Unchanged:   7,
+			Failed:      8,
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewJobSummary() error = %v", err)
+	}
+	runner := &serviceSummaryErrorIngestion{
+		summaryByKey: map[string]ingestion.JobSummary{
+			firstWindow[0].Key(): failedSummary,
+		},
+		errorByKey: map[string]error{
+			firstWindow[0].Key(): sentinel,
+		},
+	}
+	service, err := NewService(
+		searcher,
+		fetcher,
+		runner.Run,
+		func(source.ClientSequence) ingestion.EventSequence {
+			return func(yield func(ingestion.Event, error) bool) {}
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	report, err := service.Run(context.Background(), RunRequest{
+		Mode:         ModeDaily,
+		RunDate:      time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
+		LookbackDays: 3,
+		Registry: bytes.NewReader(encodeRegistryCSV(
+			testRegistryHeader,
+			validRegistryRecord(
+				"Summary Error Journal",
+				1,
+				"1234-5679",
+				"",
+				"",
+				`["1234-5679"]`,
+				"resolved",
+				"yes",
+				"1",
+			),
+			validRegistryRecord(
+				"Later Journal",
+				2,
+				"9876-5434",
+				"",
+				"",
+				`["9876-5434"]`,
+				"resolved",
+				"yes",
+				"1",
+			),
+		)),
+	})
+	if err == nil || !errors.Is(err, sentinel) {
+		t.Fatalf("Run() error = %v, want persisted ingestion failure", err)
+	}
+	if len(runner.calls) != 4 {
+		t.Fatalf("ingestion calls = %d, want later windows to continue", len(runner.calls))
+	}
+	if report.WindowsFailed != 1 || report.WindowsSucceeded != 3 {
+		t.Fatalf(
+			"window status counts = %d/%d, want 1 failed and 3 succeeded",
+			report.WindowsFailed,
+			report.WindowsSucceeded,
+		)
+	}
+	if report.RawInserted != 5 ||
+		report.RawReused != 3 ||
+		report.Projected != 7 ||
+		report.Excluded != 5 ||
+		report.Deleted != 6 ||
+		report.Unchanged != 7 ||
+		report.IngestionFailed != 8 {
+		t.Fatalf("aggregated report = %#v", report)
+	}
+	var failedWindow *WindowReport
+	for index := range report.Windows {
+		if report.Windows[index].WindowKey == firstWindow[0].Key() {
+			failedWindow = &report.Windows[index]
+			break
+		}
+	}
+	if failedWindow == nil || failedWindow.Status != "failed" ||
+		failedWindow.RawInserted != failedSummary.RawInserted ||
+		failedWindow.RawReused != failedSummary.RawReused ||
+		failedWindow.Projected != failedSummary.Projected ||
+		failedWindow.Excluded != failedSummary.Excluded ||
+		failedWindow.Deleted != failedSummary.Deleted ||
+		failedWindow.Unchanged != failedSummary.Unchanged ||
+		failedWindow.Failed != failedSummary.Failed {
+		t.Fatalf("failed window report = %#v, want persisted summary plus failure status", failedWindow)
 	}
 }
 
