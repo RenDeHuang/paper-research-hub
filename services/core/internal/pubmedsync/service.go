@@ -375,25 +375,46 @@ func (service *Service) runWindow(
 	request RunRequest,
 	window SyncWindow,
 ) (ingestion.JobSummary, error) {
-	history, err := service.searcher.Search(ctx, pubmed.SearchQuery{
-		JournalISSNs: window.Journal().ISSNs(),
-		DateType:     window.DateType(),
-		DateWindow:   window.DateWindow(),
-		MaxResults:   pubmed.MaxSearchResults,
-	})
-	if err != nil {
-		return ingestion.JobSummary{}, fmt.Errorf("search PubMed window: %w", err)
-	}
-
 	job, err := newWindowJob(request, window)
 	if err != nil {
 		return ingestion.JobSummary{}, err
 	}
-	records := service.fetcher.Fetch(ctx, history)
+
+	events := func(yield func(ingestion.Event, error) bool) {
+		history, err := service.searcher.Search(ctx, pubmed.SearchQuery{
+			JournalISSNs: window.Journal().ISSNs(),
+			DateType:     window.DateType(),
+			DateWindow:   window.DateWindow(),
+			MaxResults:   pubmed.MaxSearchResults,
+		})
+		if err != nil {
+			yield(nil, fmt.Errorf("search PubMed window: %w", err))
+			return
+		}
+		if history.Count >= pubmed.MaxSearchResults {
+			yield(
+				nil,
+				fmt.Errorf(
+					"PubMed search count %d reaches fetch limit %d for window %q; refusing truncated fetch",
+					history.Count,
+					pubmed.MaxSearchResults,
+					window.Key(),
+				),
+			)
+			return
+		}
+
+		records := service.fetcher.Fetch(ctx, history)
+		for event, err := range service.recordEvents(records) {
+			if !yield(event, err) {
+				return
+			}
+		}
+	}
 	summary, err := service.runIngestion(
 		ctx,
 		job,
-		service.recordEvents(records),
+		events,
 	)
 	if err != nil {
 		return summary, fmt.Errorf("ingest PubMed window: %w", err)

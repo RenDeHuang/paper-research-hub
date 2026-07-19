@@ -45,6 +45,20 @@ func (searcher *serviceFakeSearcher) Search(
 	return result, nil
 }
 
+type serviceConfiguredSearcher struct {
+	calls  []serviceSearchCall
+	result pubmed.SearchResult
+	err    error
+}
+
+func (searcher *serviceConfiguredSearcher) Search(
+	_ context.Context,
+	query pubmed.SearchQuery,
+) (pubmed.SearchResult, error) {
+	searcher.calls = append(searcher.calls, serviceSearchCall{query: query})
+	return searcher.result, searcher.err
+}
+
 type serviceFakeFetcher struct {
 	calls []pubmed.SearchResult
 }
@@ -70,9 +84,12 @@ type serviceFakeIngestion struct {
 func (runner *serviceFakeIngestion) Run(
 	_ context.Context,
 	job ingestion.Job,
-	_ ingestion.EventSequence,
+	events ingestion.EventSequence,
 ) (ingestion.JobSummary, error) {
 	runner.calls = append(runner.calls, serviceRunCall{job: job})
+	if err := consumeServiceEvents(events); err != nil {
+		return ingestion.JobSummary{}, err
+	}
 	if err := runner.failByKey[job.IdempotencyKey]; err != nil {
 		return ingestion.JobSummary{}, err
 	}
@@ -96,9 +113,12 @@ type serviceSummaryErrorIngestion struct {
 func (runner *serviceSummaryErrorIngestion) Run(
 	_ context.Context,
 	job ingestion.Job,
-	_ ingestion.EventSequence,
+	events ingestion.EventSequence,
 ) (ingestion.JobSummary, error) {
 	runner.calls = append(runner.calls, serviceRunCall{job: job})
+	if err := consumeServiceEvents(events); err != nil {
+		return ingestion.JobSummary{}, err
+	}
 	summary := runner.summaryByKey[job.IdempotencyKey]
 	if summary.JobID == "" {
 		var err error
@@ -115,6 +135,15 @@ func (runner *serviceSummaryErrorIngestion) Run(
 		}
 	}
 	return summary, runner.errorByKey[job.IdempotencyKey]
+}
+
+func consumeServiceEvents(events ingestion.EventSequence) error {
+	for _, eventErr := range events {
+		if eventErr != nil {
+			return eventErr
+		}
+	}
+	return nil
 }
 
 func TestServiceBackfillUsesFixedWindowCompleteISSNSetAndStableJobKey(t *testing.T) {
@@ -335,6 +364,159 @@ func TestServiceDailyUsesEDATThenMDATAndContinuesAfterWindowFailure(t *testing.T
 	}
 	if got := runner.calls[2].job.Payload["journal_name"]; got != "Second Daily Journal" {
 		t.Fatalf("second journal = %#v, want registry order", got)
+	}
+}
+
+func TestServiceSearchFailureStillRunsIndependentWindowJob(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("PubMed ESearch unavailable")
+	searcher := &serviceConfiguredSearcher{err: sentinel}
+	fetcher := &serviceFakeFetcher{}
+	runner := &serviceFakeIngestion{failByKey: map[string]error{}}
+	service, err := NewService(
+		searcher,
+		fetcher,
+		runner.Run,
+		func(records source.ClientSequence) ingestion.EventSequence {
+			return recordEventsForServiceTest(records)
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	journal := mustServiceJournal(t, "1234-5679")
+	windows, err := PlanDaily(
+		journal,
+		time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("PlanDaily() error = %v", err)
+	}
+	report, runErr := service.Run(context.Background(), RunRequest{
+		Mode:         ModeDaily,
+		RunDate:      time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
+		LookbackDays: 3,
+		Registry: bytes.NewReader(encodeRegistryCSV(
+			testRegistryHeader,
+			validRegistryRecord(
+				"Search Failure Journal",
+				1,
+				"1234-5679",
+				"",
+				"",
+				`["1234-5679"]`,
+				"resolved",
+				"yes",
+				"1",
+			),
+		)),
+	})
+	if runErr == nil || !errors.Is(runErr, sentinel) {
+		t.Fatalf("Run() error = %v, want Search error", runErr)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runIngestion calls = %d, want one job per failed window", len(runner.calls))
+	}
+	if len(fetcher.calls) != 0 {
+		t.Fatalf("Fetch() calls = %d, want zero after Search failure", len(fetcher.calls))
+	}
+	for index, call := range runner.calls {
+		if call.job.IdempotencyKey != windows[index].Key() {
+			t.Errorf(
+				"runIngestion call %d job key = %q, want window key %q",
+				index,
+				call.job.IdempotencyKey,
+				windows[index].Key(),
+			)
+		}
+	}
+	if report.WindowsFailed != 2 || report.WindowsSucceeded != 0 {
+		t.Fatalf(
+			"report window status = %d/%d, want 2 failed and 0 succeeded",
+			report.WindowsFailed,
+			report.WindowsSucceeded,
+		)
+	}
+}
+
+func TestServiceRejectsSearchCountAtPubMedLimitBeforeFetch(t *testing.T) {
+	t.Parallel()
+
+	searcher := &serviceConfiguredSearcher{
+		result: pubmed.SearchResult{
+			Count:    pubmed.MaxSearchResults,
+			WebEnv:   "service-test-web-env",
+			QueryKey: "1",
+		},
+	}
+	fetcher := &serviceFakeFetcher{}
+	runner := &serviceFakeIngestion{failByKey: map[string]error{}}
+	service, err := NewService(
+		searcher,
+		fetcher,
+		runner.Run,
+		func(records source.ClientSequence) ingestion.EventSequence {
+			return recordEventsForServiceTest(records)
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	report, runErr := service.Run(context.Background(), RunRequest{
+		Mode:         ModeDaily,
+		RunDate:      time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
+		LookbackDays: 3,
+		Registry: bytes.NewReader(encodeRegistryCSV(
+			testRegistryHeader,
+			validRegistryRecord(
+				"Count Limit Journal",
+				1,
+				"1234-5679",
+				"",
+				"",
+				`["1234-5679"]`,
+				"resolved",
+				"yes",
+				"1",
+			),
+		)),
+	})
+	if runErr == nil ||
+		!strings.Contains(strings.ToLower(runErr.Error()), "limit") {
+		t.Fatalf("Run() error = %v, want explicit PubMed limit error", runErr)
+	}
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search() calls = %d, want one per daily window", len(searcher.calls))
+	}
+	if len(fetcher.calls) != 0 {
+		t.Fatalf("Fetch() calls = %d, want zero at PubMed limit", len(fetcher.calls))
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runIngestion calls = %d, want failed jobs to be persisted", len(runner.calls))
+	}
+	if report.WindowsFailed != 2 || report.WindowsSucceeded != 0 {
+		t.Fatalf(
+			"report window status = %d/%d, want 2 failed and 0 succeeded",
+			report.WindowsFailed,
+			report.WindowsSucceeded,
+		)
+	}
+}
+
+func recordEventsForServiceTest(records source.ClientSequence) ingestion.EventSequence {
+	return func(yield func(ingestion.Event, error) bool) {
+		for record, err := range records {
+			if !yield(nil, err) {
+				return
+			}
+			if err != nil {
+				return
+			}
+			_ = record
+		}
 	}
 }
 
