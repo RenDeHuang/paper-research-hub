@@ -125,7 +125,7 @@ func TestLoadRegistryReturnsOnlyResolvedPubMedSupportedRows(t *testing.T) {
 			"1234-5679",
 			"",
 			"2049-3630",
-			"[]",
+			`["1234-5679","2049-3630"]`,
 			"resolved",
 			"no",
 			"0",
@@ -152,6 +152,176 @@ func TestLoadRegistryReturnsOnlyResolvedPubMedSupportedRows(t *testing.T) {
 	}
 	if got := journals[0].SourceJournalName(); got != "eligible" {
 		t.Fatalf("SourceJournalName() = %q, want eligible", got)
+	}
+}
+
+func TestLoadRegistryValidatesAllISSNsBeforeFilteringNonEligibleRows(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		resolution string
+		supported  string
+		count      string
+		allISSNs   string
+		wantError  bool
+	}{
+		{
+			name:       "unresolved empty array is allowed",
+			resolution: "unresolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   "[]",
+		},
+		{
+			name:       "ambiguous empty array is allowed",
+			resolution: "ambiguous",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   "[]",
+		},
+		{
+			name:       "unresolved non-json",
+			resolution: "unresolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   "not-json",
+			wantError:  true,
+		},
+		{
+			name:       "unresolved null",
+			resolution: "unresolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   "null",
+			wantError:  true,
+		},
+		{
+			name:       "unresolved non-array",
+			resolution: "unresolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   `{}`,
+			wantError:  true,
+		},
+		{
+			name:       "unresolved trailing json",
+			resolution: "unresolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   `["1234-5679"] {}`,
+			wantError:  true,
+		},
+		{
+			name:       "unresolved invalid checksum",
+			resolution: "unresolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   `["1234-5678"]`,
+			wantError:  true,
+		},
+		{
+			name:       "unresolved noncanonical case",
+			resolution: "unresolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   `["3141-592x"]`,
+			wantError:  true,
+		},
+		{
+			name:       "resolved no requires non-empty array",
+			resolution: "resolved",
+			supported:  "no",
+			count:      "0",
+			allISSNs:   "[]",
+			wantError:  true,
+		},
+		{
+			name:       "resolved unknown requires non-empty array",
+			resolution: "resolved",
+			supported:  "unknown",
+			count:      "0",
+			allISSNs:   "[]",
+			wantError:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			record := validRegistryRecord(
+				tt.name,
+				1,
+				"",
+				"",
+				"",
+				tt.allISSNs,
+				tt.resolution,
+				tt.supported,
+				tt.count,
+			)
+			_, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
+			if tt.wantError && err == nil {
+				t.Fatal("LoadRegistry() returned nil error for invalid all_issns")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("LoadRegistry() error = %v, want valid non-eligible row", err)
+			}
+		})
+	}
+}
+
+func TestLoadRegistryValidatesResolvedISSNFieldsWhenPubMedIsNotYes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		issnL  string
+		print  string
+		eissn  string
+		wantOK bool
+	}{
+		{
+			name:   "canonical linking ISSN in all_issns",
+			issnL:  "1234-5679",
+			wantOK: true,
+		},
+		{
+			name:  "linking ISSN absent from all_issns",
+			issnL: "9876-5434",
+		},
+		{
+			name:  "noncanonical electronic ISSN",
+			eissn: "3141-592x",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			record := validRegistryRecord(
+				tt.name,
+				1,
+				tt.issnL,
+				tt.print,
+				tt.eissn,
+				`["1234-5679"]`,
+				"resolved",
+				"no",
+				"0",
+			)
+			_, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
+			if tt.wantOK && err != nil {
+				t.Fatalf("LoadRegistry() error = %v, want resolved non-eligible row", err)
+			}
+			if !tt.wantOK && err == nil {
+				t.Fatal("LoadRegistry() accepted invalid resolved ISSN evidence")
+			}
+		})
 	}
 }
 

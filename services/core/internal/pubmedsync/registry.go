@@ -212,12 +212,10 @@ func parseRegistryRecord(
 		)
 	}
 
-	if resolutionStatus != venueenrich.MatchStatusResolved ||
-		pubmedSupported != venueenrich.SupportStatusYes {
-		return Journal{}, false, nil
-	}
-
-	issns, err := parseStrictISSNArray(record[9])
+	issns, err := parseStrictISSNArrayWithEmpty(
+		record[9],
+		resolutionStatus != venueenrich.MatchStatusResolved,
+	)
 	if err != nil {
 		return Journal{}, false, fmt.Errorf(
 			"registry CSV row %d all_issns: %w",
@@ -229,43 +227,13 @@ func parseRegistryRecord(
 	for _, issn := range issns {
 		issnSet[issn] = struct{}{}
 	}
-	for _, field := range []struct {
-		name string
-		role venue.ISSNRole
-		raw  string
-	}{
-		{name: "issn_l", role: venue.ISSNRoleLinking, raw: record[6]},
-		{name: "print_issn", role: venue.ISSNRolePrint, raw: record[7]},
-		{name: "eissn", role: venue.ISSNRoleElectronic, raw: record[8]},
-	} {
-		if field.raw == "" {
-			continue
-		}
-		parsed, err := venue.ParseISSN(field.role, field.raw)
-		if err != nil {
-			return Journal{}, false, fmt.Errorf(
-				"registry CSV row %d %s: %w",
-				rowNumber,
-				field.name,
-				err,
-			)
-		}
-		if parsed.String() != field.raw {
-			return Journal{}, false, fmt.Errorf(
-				"registry CSV row %d %s must use canonical ISSN %q",
-				rowNumber,
-				field.name,
-				parsed.String(),
-			)
-		}
-		if _, ok := issnSet[field.raw]; !ok {
-			return Journal{}, false, fmt.Errorf(
-				"registry CSV row %d %s %q is absent from all_issns",
-				rowNumber,
-				field.name,
-				field.raw,
-			)
-		}
+	if err := validateRegistryISSNFields(rowNumber, record, issnSet); err != nil {
+		return Journal{}, false, err
+	}
+
+	if resolutionStatus != venueenrich.MatchStatusResolved ||
+		pubmedSupported != venueenrich.SupportStatusYes {
+		return Journal{}, false, nil
 	}
 
 	return Journal{
@@ -278,6 +246,10 @@ func parseRegistryRecord(
 }
 
 func parseStrictISSNArray(raw string) ([]string, error) {
+	return parseStrictISSNArrayWithEmpty(raw, false)
+}
+
+func parseStrictISSNArrayWithEmpty(raw string, allowEmpty bool) ([]string, error) {
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	var values []string
 	if err := decoder.Decode(&values); err != nil {
@@ -290,7 +262,10 @@ func parseStrictISSNArray(raw string) ([]string, error) {
 		}
 		return nil, fmt.Errorf("must not contain trailing JSON: %w", err)
 	}
-	if values == nil || len(values) == 0 {
+	if values == nil {
+		return nil, errors.New("must be a JSON string array")
+	}
+	if len(values) == 0 && !allowEmpty {
 		return nil, errors.New("must contain at least one ISSN")
 	}
 
@@ -317,6 +292,52 @@ func parseStrictISSNArray(raw string) ([]string, error) {
 		}
 	}
 	return values, nil
+}
+
+func validateRegistryISSNFields(
+	rowNumber int,
+	record []string,
+	issnSet map[string]struct{},
+) error {
+	for _, field := range []struct {
+		name string
+		role venue.ISSNRole
+		raw  string
+	}{
+		{name: "issn_l", role: venue.ISSNRoleLinking, raw: record[6]},
+		{name: "print_issn", role: venue.ISSNRolePrint, raw: record[7]},
+		{name: "eissn", role: venue.ISSNRoleElectronic, raw: record[8]},
+	} {
+		if field.raw == "" {
+			continue
+		}
+		parsed, err := venue.ParseISSN(field.role, field.raw)
+		if err != nil {
+			return fmt.Errorf(
+				"registry CSV row %d %s: %w",
+				rowNumber,
+				field.name,
+				err,
+			)
+		}
+		if parsed.String() != field.raw {
+			return fmt.Errorf(
+				"registry CSV row %d %s must use canonical ISSN %q",
+				rowNumber,
+				field.name,
+				parsed.String(),
+			)
+		}
+		if _, ok := issnSet[field.raw]; !ok {
+			return fmt.Errorf(
+				"registry CSV row %d %s %q is absent from all_issns",
+				rowNumber,
+				field.name,
+				field.raw,
+			)
+		}
+	}
+	return nil
 }
 
 func validateRegistryRecordUTF8(rowNumber int, record []string) error {
