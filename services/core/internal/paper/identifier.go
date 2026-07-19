@@ -259,10 +259,11 @@ func NormalizeOpenAlex(raw string) (string, error) {
 }
 
 func NormalizePMID(raw string) (string, error) {
-	if !pmidValue.MatchString(raw) {
+	normalized := strings.TrimSpace(raw)
+	if !pmidValue.MatchString(normalized) {
 		return "", fmt.Errorf("invalid PMID %q", raw)
 	}
-	return raw, nil
+	return normalized, nil
 }
 
 func removeArXivVersion(value string) (string, error) {

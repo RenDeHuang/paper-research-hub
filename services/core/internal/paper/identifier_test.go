@@ -311,7 +311,7 @@ func TestNewIdentifierNormalizesAndValidates(t *testing.T) {
 		{
 			name:   "pmid",
 			scheme: SchemePMID,
-			raw:    "12345678",
+			raw:    " 12345678 ",
 			value:  "12345678",
 			key:    "pmid:12345678",
 		},
@@ -376,18 +376,40 @@ func TestNewIdentifierRejectsUnsupportedOrInvalidIdentifiers(t *testing.T) {
 	}
 }
 
+func TestNormalizePMIDTrimsSurroundingWhitespace(t *testing.T) {
+	t.Parallel()
+
+	for raw, want := range map[string]string{
+		" 12345 ":           "12345",
+		"\t12345\n":         "12345",
+		"\u00a012345\u00a0": "12345",
+	} {
+		raw, want := raw, want
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := NormalizePMID(raw)
+			if err != nil {
+				t.Fatalf("NormalizePMID(%q) error = %v", raw, err)
+			}
+			if got != want {
+				t.Fatalf("NormalizePMID(%q) = %q, want %q", raw, got, want)
+			}
+		})
+	}
+}
+
 func TestNewIdentifierRejectsInvalidPMIDValues(t *testing.T) {
 	t.Parallel()
 
 	for _, raw := range []string{
 		"",
+		" \t\n ",
 		"0",
 		"012345",
 		"+12345",
 		"-12345",
 		"123.45",
-		" 12345",
-		"12345 ",
 		"12 345",
 		"12\t345",
 		"PMID:12345",
@@ -403,6 +425,24 @@ func TestNewIdentifierRejectsInvalidPMIDValues(t *testing.T) {
 				t.Fatalf("NewIdentifier(%q, %q) = %#v, want error", SchemePMID, raw, got)
 			}
 		})
+	}
+}
+
+func TestCanonicalIdentityRejectsConflictingPMIDsAfterTrimmingWhitespace(t *testing.T) {
+	t.Parallel()
+
+	got, err := CanonicalIdentity(Identifiers{
+		PMID: []string{" 12345678 ", "\t12345678\n", " 87654321 "},
+	}, "")
+	if !errors.Is(err, ErrConflictingIdentifiers) {
+		t.Fatalf(
+			"CanonicalIdentity() = %#v, %v, want ErrConflictingIdentifiers",
+			got,
+			err,
+		)
+	}
+	if got.Valid() {
+		t.Fatalf("CanonicalIdentity() returned valid identity %q on normalized PMID conflict", got)
 	}
 }
 
