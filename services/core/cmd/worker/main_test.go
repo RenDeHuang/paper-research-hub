@@ -379,6 +379,189 @@ func TestRealMainRejectsInvalidOrUnboundedCommandsBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestParsePubMedJournalSyncCommandsRequireStrictTypedFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "valid backfill",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "backfill",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+		},
+		{
+			name: "valid daily",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "daily",
+				"--run-date", "2026-07-19",
+				"--lookback-days", "3",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+		},
+		{
+			name: "missing mode",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+			want: "mode",
+		},
+		{
+			name: "missing registry",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "backfill",
+			},
+			want: "registry",
+		},
+		{
+			name: "missing daily run date",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "daily",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+			want: "run-date",
+		},
+		{
+			name: "invalid mode",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "coverage",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+			want: "backfill or daily",
+		},
+		{
+			name: "backfill rejects run date",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "backfill",
+				"--run-date", "2026-07-19",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+			want: "backfill",
+		},
+		{
+			name: "lookback must remain three",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "daily",
+				"--run-date", "2026-07-19",
+				"--lookback-days", "2",
+				"--registry", "/tmp/journal-registry.csv",
+			},
+			want: "lookback-days",
+		},
+		{
+			name: "extra arguments rejected",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "backfill",
+				"--registry", "/tmp/journal-registry.csv",
+				"unexpected",
+			},
+			want: "unexpected",
+		},
+		{
+			name: "registry path must be trimmed",
+			args: []string{
+				"sync", "pubmed-journals",
+				"--mode", "backfill",
+				"--registry", " /tmp/journal-registry.csv",
+			},
+			want: "explicit",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			command, role, err := parseWorkerCommand(test.args)
+			if test.want != "" {
+				if err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(test.want)) {
+					t.Fatalf("parseWorkerCommand() error = %v, want containing %q", err, test.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseWorkerCommand() error = %v", err)
+			}
+			if role != config.RolePubMedSync ||
+				command.Kind != commandSyncPubMedJournals ||
+				command.LookbackDays != 3 ||
+				command.Registry != "/tmp/journal-registry.csv" {
+				t.Fatalf("command/role = %#v/%q", command, role)
+			}
+			switch command.Mode {
+			case "backfill":
+				if !command.RunDate.IsZero() {
+					t.Fatalf("backfill RunDate = %s, want zero", command.RunDate)
+				}
+			case "daily":
+				if !command.RunDate.Equal(time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)) {
+					t.Fatalf("daily RunDate = %s, want 2026-07-19 UTC", command.RunDate)
+				}
+			default:
+				t.Fatalf("command mode = %q", command.Mode)
+			}
+		})
+	}
+}
+
+func TestRealMainOutputsPartialPubMedJournalReportBeforeReturningError(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+	sentinel := errors.New("one journal window failed")
+	code := realMain(
+		context.Background(),
+		[]string{
+			"sync", "pubmed-journals",
+			"--mode", "daily",
+			"--run-date", "2026-07-19",
+			"--registry", "/tmp/journal-registry.csv",
+		},
+		&stdout,
+		&stderr,
+		func(key string) (string, bool) {
+			values := map[string]string{
+				"DATABASE_URL": "postgres://paper:secret@localhost/papers",
+				"NCBI_TOOL":    "paper-hub-test",
+				"NCBI_EMAIL":   "research@example.test",
+			}
+			value, ok := values[key]
+			return value, ok
+		},
+		func(_ context.Context, _ config.Config, _ workerCommand) (map[string]any, error) {
+			return map[string]any{
+				"mode":            "daily",
+				"windows_failed":  1,
+				"failure_message": sentinel.Error(),
+			}, sentinel
+		},
+	)
+	if code != 1 {
+		t.Fatalf("realMain() code = %d, want 1", code)
+	}
+	if !strings.Contains(stdout.String(), `"windows_failed":1`) {
+		t.Fatalf("stdout = %q, want report JSON despite runner error", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "run worker command") ||
+		!strings.Contains(stderr.String(), sentinel.Error()) {
+		t.Fatalf("stderr = %q, want runner error", stderr.String())
+	}
+}
+
 func TestRealMainParsesJCRImportWithExplicitLicensedFile(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	var received workerCommand

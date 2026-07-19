@@ -31,6 +31,7 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/database"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/ingestion"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/openairesponses"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/pubmedsync"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/crossref"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/httpclient"
@@ -44,6 +45,7 @@ type commandKind string
 const (
 	commandSyncOpenAlex                      commandKind = "sync_openalex"
 	commandSyncPubMed                        commandKind = "sync_pubmed"
+	commandSyncPubMedJournals                commandKind = "sync_pubmed_journals"
 	commandSyncCrossrefCreated               commandKind = "sync_crossref_created"
 	commandSyncCrossrefUpdated               commandKind = "sync_crossref_updated"
 	commandImportJCR                         commandKind = "import_jcr"
@@ -66,11 +68,15 @@ type workerCommand struct {
 	Kind                           commandKind
 	Query                          string
 	Filter                         string
+	Mode                           string
 	FromDate                       time.Time
 	ToDate                         time.Time
+	RunDate                        time.Time
 	ISSNs                          []string
 	MaxResults                     int
+	LookbackDays                   int
 	File                           string
+	Registry                       string
 	FormulaVersion                 string
 	GeneratedAt                    time.Time
 	MetricYear                     int
@@ -171,14 +177,16 @@ func realMain(
 		return 1
 	}
 	result, err := runner(ctx, cfg, command)
-	if err != nil {
-		fmt.Fprintf(stderr, "run worker command: %v\n", err)
-		return 1
-	}
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(result); err != nil {
-		fmt.Fprintf(stderr, "encode worker result: %v\n", err)
+	if err == nil || result != nil {
+		if encodeErr := encoder.Encode(result); encodeErr != nil {
+			fmt.Fprintf(stderr, "encode worker result: %v\n", encodeErr)
+			return 1
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "run worker command: %v\n", err)
 		return 1
 	}
 	return 0
@@ -266,6 +274,9 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	case "pubmed":
 		command, err := parsePubMedCommand(args[2:])
 		return command, config.RolePubMedSync, err
+	case "pubmed-journals":
+		command, err := parsePubMedJournalCommand(args[2:])
+		return command, config.RolePubMedSync, err
 	case "crossref-created":
 		command, err := parseCrossrefCommand(
 			commandSyncCrossrefCreated,
@@ -280,7 +291,7 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 		return command, config.RoleCrossrefSync, err
 	default:
 		return workerCommand{}, "", fmt.Errorf(
-			"unsupported sync source %q; expected openalex, pubmed, crossref-created, or crossref-updated",
+			"unsupported sync source %q; expected openalex, pubmed, pubmed-journals, crossref-created, or crossref-updated",
 			args[1],
 		)
 	}
@@ -1556,6 +1567,64 @@ func parsePubMedCommand(args []string) (workerCommand, error) {
 	return command, nil
 }
 
+func parsePubMedJournalCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("sync pubmed-journals", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	var runDate string
+	set.StringVar(&command.Mode, "mode", "", "backfill or daily")
+	set.StringVar(&runDate, "run-date", "", "daily run date YYYY-MM-DD")
+	set.IntVar(&command.LookbackDays, "lookback-days", 3, "daily inclusive lookback window")
+	set.StringVar(&command.Registry, "registry", "", "explicit PubMed journal registry path")
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"parse PubMed journal sync flags: %w",
+			err,
+		)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected PubMed journal sync arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+	if err := validateExplicitPath("--registry", command.Registry); err != nil {
+		return workerCommand{}, err
+	}
+	if command.LookbackDays != 3 {
+		return workerCommand{}, errors.New(
+			"PubMed journal sync --lookback-days must be exactly 3",
+		)
+	}
+	command.Mode = strings.TrimSpace(command.Mode)
+	var err error
+	switch command.Mode {
+	case string(pubmedsync.ModeBackfill):
+		if runDate != "" {
+			return workerCommand{}, errors.New(
+				"PubMed journal backfill does not accept --run-date",
+			)
+		}
+	case string(pubmedsync.ModeDaily):
+		if runDate == "" {
+			return workerCommand{}, errors.New(
+				"PubMed journal daily sync requires --run-date",
+			)
+		}
+		command.RunDate, err = parseDateFlag("run-date", runDate)
+		if err != nil {
+			return workerCommand{}, err
+		}
+	default:
+		return workerCommand{}, fmt.Errorf(
+			"invalid PubMed journal sync mode %q; expected backfill or daily",
+			command.Mode,
+		)
+	}
+	command.Kind = commandSyncPubMedJournals
+	return command, nil
+}
+
 func parseCrossrefCommand(
 	kind commandKind,
 	args []string,
@@ -1623,6 +1692,14 @@ func parseDateFlag(name string, value string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("%s must use YYYY-MM-DD: %w", name, err)
 	}
 	return parsed.UTC(), nil
+}
+
+func validateExplicitPath(name, value string) error {
+	if strings.TrimSpace(value) == "" ||
+		value != strings.TrimSpace(value) {
+		return fmt.Errorf("%s must be explicit and non-empty", name)
+	}
+	return nil
 }
 
 type stringListFlag []string
@@ -2199,6 +2276,9 @@ func runSync(
 	cfg config.Config,
 	command workerCommand,
 ) (map[string]any, error) {
+	if command.Kind == commandSyncPubMedJournals {
+		return runPubMedJournalSync(ctx, pool, cfg, command)
+	}
 	repository, err := ingestion.NewPostgresRepository(pool)
 	if err != nil {
 		return nil, err
@@ -2257,6 +2337,69 @@ func runSync(
 		return nil, err
 	}
 	return syncSummaryResult(summary), nil
+}
+
+func runPubMedJournalSync(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	cfg config.Config,
+	command workerCommand,
+) (map[string]any, error) {
+	registry, err := os.Open(command.Registry)
+	if err != nil {
+		return nil, fmt.Errorf("open PubMed journal registry: %w", err)
+	}
+	defer registry.Close()
+
+	repository, err := ingestion.NewPostgresRepository(pool)
+	if err != nil {
+		return nil, err
+	}
+	scopePolicy := ingestion.NewControlledIdentityScopePolicy(
+		syncControlledIdentityScopePolicyVersion,
+	)
+	projectionPolicy := ingestion.NewDeterministicProjectionPolicy(
+		syncProjectionPolicyVersion,
+	)
+	ingestionService, err := ingestion.NewService(
+		repository,
+		repository,
+		repository,
+		repository,
+		scopePolicy,
+		projectionPolicy,
+	)
+	if err != nil {
+		return nil, err
+	}
+	client, err := newPubMedClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	service, err := pubmedsync.NewService(
+		client,
+		client,
+		ingestionService.Run,
+		func(records source.ClientSequence) ingestion.EventSequence {
+			return recordEventsForCommand(
+				workerCommand{Kind: commandSyncPubMed},
+				source.PubMed,
+				records,
+			)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	report, runErr := service.Run(ctx, pubmedsync.RunRequest{
+		Mode:         pubmedsync.Mode(command.Mode),
+		RunDate:      command.RunDate,
+		LookbackDays: command.LookbackDays,
+		RegistryPath: command.Registry,
+		Registry:     registry,
+	})
+	return report.Result(), runErr
 }
 
 func runCrossrefSync(
@@ -2536,24 +2679,7 @@ func fetchRecords(
 		}), source.OpenAlex, nil
 
 	case commandSyncPubMed:
-		client, err := pubmed.NewClient(
-			http.DefaultClient,
-			pubmed.Config{
-				BaseURL:          cfg.PubMed.Request.BaseURL,
-				Tool:             cfg.PubMed.Tool,
-				Email:            cfg.PubMed.Email,
-				APIKey:           cfg.PubMed.APIKey,
-				UserAgent:        "paper-research-hub/0.1 (+mailto:" + cfg.PubMed.Email + ")",
-				BatchSize:        min(cfg.PubMed.Request.BatchSize, 10_000),
-				Timeout:          cfg.PubMed.Request.Timeout,
-				MaxRetries:       cfg.PubMed.Request.MaxRetries,
-				MaxWait:          cfg.PubMed.Request.MaxWait,
-				InitialBackoff:   500 * time.Millisecond,
-				MaxBackoff:       10 * time.Second,
-				MaxResponseBytes: 64 << 20,
-			},
-			httpclient.Dependencies{},
-		)
+		client, err := newPubMedClient(cfg)
 		if err != nil {
 			return nil, "", err
 		}
@@ -2602,6 +2728,27 @@ func fetchRecords(
 	default:
 		return nil, "", fmt.Errorf("unsupported worker command kind %q", command.Kind)
 	}
+}
+
+func newPubMedClient(cfg config.Config) (*pubmed.Client, error) {
+	return pubmed.NewClient(
+		http.DefaultClient,
+		pubmed.Config{
+			BaseURL:          cfg.PubMed.Request.BaseURL,
+			Tool:             cfg.PubMed.Tool,
+			Email:            cfg.PubMed.Email,
+			APIKey:           cfg.PubMed.APIKey,
+			UserAgent:        "paper-research-hub/0.1 (+mailto:" + cfg.PubMed.Email + ")",
+			BatchSize:        min(cfg.PubMed.Request.BatchSize, 10_000),
+			Timeout:          cfg.PubMed.Request.Timeout,
+			MaxRetries:       cfg.PubMed.Request.MaxRetries,
+			MaxWait:          cfg.PubMed.Request.MaxWait,
+			InitialBackoff:   500 * time.Millisecond,
+			MaxBackoff:       10 * time.Second,
+			MaxResponseBytes: 64 << 20,
+		},
+		httpclient.Dependencies{},
+	)
 }
 
 func crossrefQuery(command workerCommand) (crossref.Query, error) {
