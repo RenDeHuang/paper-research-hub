@@ -339,6 +339,86 @@ func TestClientCountCoverageUsesExactCanonicalISSNORAndReturnsRawResponseSHA256(
 	}
 }
 
+func TestClientCountCoverageAcceptsZeroCount(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("{\"esearchresult\":{\"count\":\"0\"}}\r\n\t ")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+	client := newClient(t, server, nil, httpclient.Dependencies{})
+
+	result, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+		JournalISSNs: []string{"0028-0836"},
+	})
+	if err != nil {
+		t.Fatalf("CountCoverage() error = %v", err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("Count = %d, want 0", result.Count)
+	}
+	if want := fmt.Sprintf("%x", sha256.Sum256(payload)); result.ResponseSHA256 != want {
+		t.Fatalf("ResponseSHA256 = %q, want %q", result.ResponseSHA256, want)
+	}
+}
+
+func TestClientCountCoverageReturnsTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("closed test server unexpectedly received a request")
+	}))
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxRetries = 0
+	}, httpclient.Dependencies{})
+	server.Close()
+
+	if got, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+		JournalISSNs: []string{"0028-0836"},
+	}); err == nil {
+		t.Fatalf("CountCoverage() = %#v, want transport/network error", got)
+	}
+}
+
+func TestClientCountCoverageUsesHTTPClientTimeout(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.Timeout = 10 * time.Millisecond
+		config.MaxRetries = 0
+	}, httpclient.Dependencies{})
+
+	if got, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+		JournalISSNs: []string{"0028-0836"},
+	}); err == nil {
+		t.Fatalf("CountCoverage() = %#v, want HTTP client timeout", got)
+	}
+}
+
+func TestClientCountCoverageReturnsResponseTooLarge(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(strings.Repeat("x", 33)))
+	}))
+	defer server.Close()
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxResponseBytes = 32
+	}, httpclient.Dependencies{})
+
+	_, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+		JournalISSNs: []string{"0028-0836"},
+	})
+	if !errors.Is(err, httpclient.ErrResponseTooLarge) {
+		t.Fatalf("CountCoverage() error = %v, want ErrResponseTooLarge", err)
+	}
+}
+
 func TestClientCountCoverageRejectsMissingOrInvalidISSNsWithoutRequest(t *testing.T) {
 	t.Parallel()
 
@@ -436,6 +516,106 @@ func TestClientCountCoverageRejectsInvalidUTF8DuplicateKeysAndTrailingJSON(t *te
 				JournalISSNs: []string{"0028-0836"},
 			}); err == nil {
 				t.Fatalf("CountCoverage() = %#v, want strict JSON error", got)
+			}
+		})
+	}
+}
+
+func TestSearchAndCountCoverageUseStrictESearchDecoderSymmetrically(t *testing.T) {
+	t.Parallel()
+
+	valid := []byte(`{"esearchresult":{"count":"0","querykey":"1","webenv":"history"}}`)
+	invalidUTF8 := append(
+		[]byte(`{"ignored":"`),
+		0xff,
+	)
+	invalidUTF8 = append(
+		invalidUTF8,
+		[]byte(`","esearchresult":{"count":"0","querykey":"1","webenv":"history"}}`)...,
+	)
+	tests := []struct {
+		name    string
+		payload []byte
+		reject  bool
+	}{
+		{
+			name:    "invalid UTF-8",
+			payload: invalidUTF8,
+			reject:  true,
+		},
+		{
+			name: "duplicate top-level key",
+			payload: []byte(
+				`{"esearchresult":{"count":"0","querykey":"1","webenv":"history"},` +
+					`"esearchresult":{"count":"0","querykey":"1","webenv":"history"}}`,
+			),
+			reject: true,
+		},
+		{
+			name: "duplicate nested key",
+			payload: []byte(
+				`{"ignored":{"nested":{"x":1,"x":2}},` +
+					`"esearchresult":{"count":"0","querykey":"1","webenv":"history"}}`,
+			),
+			reject: true,
+		},
+		{
+			name:    "trailing second value",
+			payload: append(append([]byte(nil), valid...), []byte(` {"second":true}`)...),
+			reject:  true,
+		},
+		{
+			name:    "trailing garbage",
+			payload: append(append([]byte(nil), valid...), []byte(` garbage`)...),
+			reject:  true,
+		},
+		{
+			name:    "trailing whitespace",
+			payload: append(append([]byte(nil), valid...), []byte(" \r\n\t")...),
+		},
+	}
+	operations := []struct {
+		name string
+		call func(*pubmed.Client) error
+	}{
+		{
+			name: "Search",
+			call: func(client *pubmed.Client) error {
+				_, err := client.Search(context.Background(), validSearchQuery())
+				return err
+			},
+		},
+		{
+			name: "CountCoverage",
+			call: func(client *pubmed.Client) error {
+				_, err := client.CountCoverage(context.Background(), pubmed.CoverageQuery{
+					JournalISSNs: []string{"0028-0836"},
+				})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			for _, operation := range operations {
+				operation := operation
+				t.Run(operation.name, func(t *testing.T) {
+					server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+						_, _ = writer.Write(tt.payload)
+					}))
+					defer server.Close()
+					client := newClient(t, server, nil, httpclient.Dependencies{})
+
+					err := operation.call(client)
+					if tt.reject && err == nil {
+						t.Fatalf("%s accepted invalid ESearch JSON", operation.name)
+					}
+					if !tt.reject && err != nil {
+						t.Fatalf("%s rejected trailing JSON whitespace: %v", operation.name, err)
+					}
+				})
 			}
 		})
 	}
