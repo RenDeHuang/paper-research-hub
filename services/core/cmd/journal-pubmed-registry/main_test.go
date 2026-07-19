@@ -824,6 +824,78 @@ func TestJournalPubMedRegistryConcurrentFinalCreationNeverOverwrites(
 	})
 }
 
+func TestJournalPubMedRegistryRollbackPreservesReplacedOutputInode(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	outputPath := filepath.Join(directory, "registry.csv")
+	reportPath := filepath.Join(directory, "registry.report.json")
+	var publishedInfo os.FileInfo
+	var replacementInfo os.FileInfo
+	ops := defaultRegistryFileOps()
+	ops.before = func(stage string) error {
+		if stage != registryPublishReport {
+			return nil
+		}
+		var err error
+		publishedInfo, err = os.Stat(outputPath)
+		if err != nil {
+			return fmt.Errorf("stat published output before replacement: %w", err)
+		}
+		if err := os.Remove(outputPath); err != nil {
+			return fmt.Errorf("remove published output for replacement: %w", err)
+		}
+		if err := os.WriteFile(
+			outputPath,
+			[]byte("external replacement"),
+			0o600,
+		); err != nil {
+			return fmt.Errorf("write external output replacement: %w", err)
+		}
+		replacementInfo, err = os.Stat(outputPath)
+		if err != nil {
+			return fmt.Errorf("stat external output replacement: %w", err)
+		}
+		return nil
+	}
+	originalLink := ops.link
+	ops.link = func(tempPath, finalPath string) error {
+		if finalPath == reportPath {
+			return errors.New("injected report publish failure")
+		}
+		return originalLink(tempPath, finalPath)
+	}
+
+	err := publishRegistryArtifacts(
+		outputPath,
+		[]byte("csv"),
+		reportPath,
+		[]byte("report"),
+		ops,
+	)
+	if err == nil || !strings.Contains(err.Error(), "injected report publish failure") {
+		t.Fatalf("publishRegistryArtifacts() error = %v, want injected failure", err)
+	}
+	if !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("publishRegistryArtifacts() error = %v, want rollback conflict", err)
+	}
+	if publishedInfo == nil || replacementInfo == nil ||
+		os.SameFile(publishedInfo, replacementInfo) {
+		t.Fatalf("output replacement did not create a new inode")
+	}
+	if got, readErr := os.ReadFile(outputPath); readErr != nil {
+		t.Fatalf("ReadFile(output) error = %v", readErr)
+	} else if string(got) != "external replacement" {
+		t.Fatalf("output contents = %q, want external replacement preserved", got)
+	}
+	if _, statErr := os.Lstat(reportPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("report final unexpectedly remained: %v", statErr)
+	}
+	assertRegistryTempsAbsent(t, directory)
+}
+
 func TestJournalPubMedRegistryReportsTemporaryCleanupFailure(t *testing.T) {
 	t.Parallel()
 

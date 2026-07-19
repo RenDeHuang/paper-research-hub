@@ -1278,6 +1278,8 @@ func publishRegistryArtifacts(
 	}
 	outputPublished := false
 	reportPublished := false
+	var outputPublishedInfo os.FileInfo
+	var reportPublishedInfo os.FileInfo
 	defer func() {
 		if returnErr == nil {
 			return
@@ -1297,9 +1299,10 @@ func publishRegistryArtifacts(
 		if reportPublished {
 			cleanupErr = errors.Join(
 				cleanupErr,
-				cleanupRegistryPath(
+				cleanupPublishedRegistryPath(
 					ops.remove,
 					reportPath,
+					reportPublishedInfo,
 					"published report",
 				),
 			)
@@ -1307,9 +1310,10 @@ func publishRegistryArtifacts(
 		if outputPublished {
 			cleanupErr = errors.Join(
 				cleanupErr,
-				cleanupRegistryPath(
+				cleanupPublishedRegistryPath(
 					ops.remove,
 					outputPath,
+					outputPublishedInfo,
 					"published output CSV",
 				),
 			)
@@ -1327,6 +1331,10 @@ func publishRegistryArtifacts(
 		)
 	}
 	outputPublished = true
+	outputPublishedInfo, err = os.Lstat(outputPath)
+	if err != nil {
+		return fmt.Errorf("record published output CSV identity: %w", err)
+	}
 	if err := ops.remove(outputTemp); err != nil {
 		return fmt.Errorf("unlink published output CSV temporary file: %w", err)
 	}
@@ -1345,6 +1353,10 @@ func publishRegistryArtifacts(
 		)
 	}
 	reportPublished = true
+	reportPublishedInfo, err = os.Lstat(reportPath)
+	if err != nil {
+		return fmt.Errorf("record published report identity: %w", err)
+	}
 	if err := ops.remove(reportTemp); err != nil {
 		return fmt.Errorf("unlink published report temporary file: %w", err)
 	}
@@ -1761,6 +1773,41 @@ func cleanupRegistryPath(
 		return fmt.Errorf("remove %s %q: %w", description, path, err)
 	}
 	return nil
+}
+
+func cleanupPublishedRegistryPath(
+	remove func(string) error,
+	path string,
+	expected os.FileInfo,
+	description string,
+) error {
+	if expected == nil {
+		return fmt.Errorf(
+			"preserve %s %q: published inode identity is unavailable",
+			description,
+			path,
+		)
+	}
+	current, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf(
+			"inspect %s %q before rollback: %w",
+			description,
+			path,
+			err,
+		)
+	}
+	if !os.SameFile(current, expected) {
+		return fmt.Errorf(
+			"preserve %s %q: final was replaced before rollback",
+			description,
+			path,
+		)
+	}
+	return cleanupRegistryPath(remove, path, description)
 }
 
 func validateExplicitPath(name, value string) error {

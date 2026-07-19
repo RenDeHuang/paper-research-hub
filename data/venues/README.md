@@ -131,9 +131,10 @@ queried.
 
 The command fully encodes and reconciles the CSV and typed JSON report in
 memory before publishing. Each artifact is written to a temporary file in its
-own target directory, synced, closed, and renamed. A controlled failure removes
-temporary files and any newly published final from that run. The two separate
-renames are not a cross-crash atomic transaction.
+own target directory, synced, closed, published with an atomic no-replace
+hard-link, and then the temporary link is unlinked. A controlled failure
+removes temporary files and any newly published final from that run. The two
+separate hard-link publishes are not a cross-crash atomic transaction.
 
 This repository stage intentionally does not include the live 2032-row output
 or report; those data artifacts are generated in the dedicated data-production
