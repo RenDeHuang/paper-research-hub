@@ -15,7 +15,7 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
-const ParserVersion = "pubmed/pubmed-article-v1"
+const ParserVersion = "pubmed/pubmed-article-v2"
 
 var (
 	pmidPattern  = regexp.MustCompile(`^[1-9][0-9]*$`)

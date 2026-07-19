@@ -6154,6 +6154,13 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 	if last.Version != 28 || last.Name != "pmid_canonical_identity" {
 		t.Fatalf("last migration = %#v, want 000028_pmid_canonical_identity", last)
 	}
+	if !strings.Contains(last.SQL, "NOT VALID") ||
+		!strings.Contains(
+			last.SQL,
+			"VALIDATE CONSTRAINT works_canonical_key_check",
+		) {
+		t.Fatal("PMID migration must validate the replacement canonical key constraint")
+	}
 
 	pool := openTestPool(t)
 	ctx := testContext(t)
@@ -6168,6 +6175,36 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 
 	if err := UpMigrations(ctx, pool, migrations); err != nil {
 		t.Fatalf("apply 000028_pmid_canonical_identity: %v", err)
+	}
+	var normalizedPMID, normalizedCanonicalKey *string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			normalize_paper_identifier('pmid', ' 12345678 '),
+			normalize_work_canonical_key('pmid:12345678')
+	`).Scan(&normalizedPMID, &normalizedCanonicalKey); err != nil {
+		t.Fatalf("normalize PMID after migration: %v", err)
+	}
+	if normalizedPMID == nil || *normalizedPMID != "12345678" ||
+		normalizedCanonicalKey == nil ||
+		*normalizedCanonicalKey != "pmid:12345678" {
+		t.Fatalf(
+			"PMID normalizers = %v/%v, want 12345678/pmid:12345678",
+			normalizedPMID,
+			normalizedCanonicalKey,
+		)
+	}
+	var constraintValidated bool
+	if err := pool.QueryRow(ctx, `
+		SELECT convalidated
+		FROM pg_constraint
+		WHERE connamespace = 'public'::regnamespace
+		  AND conrelid = 'works'::regclass
+		  AND conname = 'works_canonical_key_check'
+	`).Scan(&constraintValidated); err != nil {
+		t.Fatalf("query PMID canonical constraint validation state: %v", err)
+	}
+	if !constraintValidated {
+		t.Fatal("works_canonical_key_check remains NOT VALID after PMID migration")
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO works (canonical_key, status, title)
@@ -6209,6 +6246,141 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 	}
 	if applied != 1 {
 		t.Fatalf("applied PMID migration records = %d, want 1", applied)
+	}
+}
+
+func TestPMIDNormalizationMatchesPaperDomainRules(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	testCases := []struct {
+		name      string
+		raw       string
+		want      string
+		wantError bool
+	}{
+		{name: "canonical", raw: "123", want: "123"},
+		{name: "surrounding whitespace", raw: " 456 ", want: "456"},
+		{name: "empty", raw: "", wantError: true},
+		{name: "zero", raw: "0", wantError: true},
+		{name: "leading zero", raw: "0123", wantError: true},
+		{name: "plus prefix", raw: "+123", wantError: true},
+		{name: "minus prefix", raw: "-123", wantError: true},
+		{name: "decimal", raw: "123.4", wantError: true},
+		{name: "internal whitespace", raw: "12 3", wantError: true},
+		{name: "PMID prefix", raw: "PMID:123", wantError: true},
+		{
+			name:      "PubMed URL",
+			raw:       "https://pubmed.ncbi.nlm.nih.gov/123/",
+			wantError: true,
+		},
+	}
+
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			goNormalized, goErr := paperdomain.NormalizePMID(testCase.raw)
+			if testCase.wantError {
+				if goErr == nil {
+					t.Fatalf(
+						"paper.NormalizePMID(%q) = %q, want error",
+						testCase.raw,
+						goNormalized,
+					)
+				}
+			} else {
+				if goErr != nil {
+					t.Fatalf("paper.NormalizePMID(%q) error = %v", testCase.raw, goErr)
+				}
+				if goNormalized != testCase.want {
+					t.Fatalf(
+						"paper.NormalizePMID(%q) = %q, want %q",
+						testCase.raw,
+						goNormalized,
+						testCase.want,
+					)
+				}
+			}
+
+			var databaseNormalized, canonicalKey *string
+			if err := pool.QueryRow(ctx, `
+				SELECT
+					normalize_paper_identifier('pmid', $1),
+					normalize_work_canonical_key('pmid:' || $1)
+			`, testCase.raw).Scan(
+				&databaseNormalized,
+				&canonicalKey,
+			); err != nil {
+				t.Fatalf("normalize PMID in PostgreSQL: %v", err)
+			}
+			if testCase.wantError {
+				if databaseNormalized != nil || canonicalKey != nil {
+					t.Fatalf(
+						"database normalized invalid PMID %q to %v/%v",
+						testCase.raw,
+						databaseNormalized,
+						canonicalKey,
+					)
+				}
+				workID := insertWork(
+					t,
+					pool,
+					fmt.Sprintf("openreview:pmid_invalid_%d", index),
+				)
+				_, err := pool.Exec(ctx, `
+					INSERT INTO works (canonical_key, status, title)
+					VALUES ($1, 'active', $1)
+				`, "pmid:"+testCase.raw)
+				assertPostgresError(t, err, "23514", "works_canonical_key_check")
+				_, err = pool.Exec(ctx, `
+					INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+					VALUES ($1, 'pmid', $2)
+				`, workID, testCase.raw)
+				assertPostgresError(
+					t,
+					err,
+					"23514",
+					"external_identifiers_normalized_value_check",
+				)
+				return
+			}
+			if databaseNormalized == nil || *databaseNormalized != goNormalized ||
+				canonicalKey == nil ||
+				*canonicalKey != "pmid:"+goNormalized {
+				t.Fatalf(
+					"database PMID normalization for %q = %v/%v, want %q/pmid:%s",
+					testCase.raw,
+					databaseNormalized,
+					canonicalKey,
+					goNormalized,
+					goNormalized,
+				)
+			}
+			workID := insertWork(t, pool, "pmid:"+goNormalized)
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+				VALUES ($1, 'pmid', $2)
+			`, workID, goNormalized); err != nil {
+				t.Fatalf("insert normalized PMID external identifier: %v", err)
+			}
+			if testCase.raw == goNormalized {
+				return
+			}
+			_, err := pool.Exec(ctx, `
+				INSERT INTO works (canonical_key, status, title)
+				VALUES ($1, 'active', $1)
+			`, "pmid:"+testCase.raw)
+			assertPostgresError(t, err, "23514", "works_canonical_key_check")
+			_, err = pool.Exec(ctx, `
+				INSERT INTO external_identifiers (work_id, scheme, normalized_value)
+				VALUES ($1, 'pmid', $2)
+			`, workID, testCase.raw)
+			assertPostgresError(
+				t,
+				err,
+				"23514",
+				"external_identifiers_normalized_value_check",
+			)
+		})
 	}
 }
 

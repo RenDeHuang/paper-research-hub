@@ -19,6 +19,24 @@ import (
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
+func TestSyncIdentityPolicyVersionsReflectPMIDSemantics(t *testing.T) {
+	t.Parallel()
+
+	if syncControlledIdentityScopePolicyVersion !=
+		"scope/controlled-canonical-identity/v2" {
+		t.Fatalf(
+			"sync controlled identity scope policy version = %q",
+			syncControlledIdentityScopePolicyVersion,
+		)
+	}
+	if syncProjectionPolicyVersion != "projection/latest-source-revision/v2" {
+		t.Fatalf(
+			"sync projection policy version = %q",
+			syncProjectionPolicyVersion,
+		)
+	}
+}
+
 func TestRealMainParsesBoundedOpenAlexSyncBeforeExecution(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	var received workerCommand

@@ -42,22 +42,24 @@ import (
 type commandKind string
 
 const (
-	commandSyncOpenAlex                commandKind = "sync_openalex"
-	commandSyncPubMed                  commandKind = "sync_pubmed"
-	commandSyncCrossrefCreated         commandKind = "sync_crossref_created"
-	commandSyncCrossrefUpdated         commandKind = "sync_crossref_updated"
-	commandImportJCR                   commandKind = "import_jcr"
-	commandImportSubjects              commandKind = "import_subjects"
-	commandAssessVenues                commandKind = "assess_venues"
-	commandAssessBiomedicalEligibility commandKind = "assess_biomedical_eligibility"
-	commandAnalyzeCitations            commandKind = "analyze_citations"
-	commandAnalyzeAbstractRoutes       commandKind = "analyze_abstract_routes"
-	commandAnalyzeTrends               commandKind = "analyze_trends"
-	commandAnalyzeJournals             commandKind = "analyze_journals"
-	commandAnalyzeOpportunities        commandKind = "analyze_opportunities"
-	commandPublishCatalog              commandKind = "publish_catalog"
-	maxSyncResults                                 = 1000
-	abstractAnalysisRequestTimeout                 = 2 * time.Minute
+	commandSyncOpenAlex                      commandKind = "sync_openalex"
+	commandSyncPubMed                        commandKind = "sync_pubmed"
+	commandSyncCrossrefCreated               commandKind = "sync_crossref_created"
+	commandSyncCrossrefUpdated               commandKind = "sync_crossref_updated"
+	commandImportJCR                         commandKind = "import_jcr"
+	commandImportSubjects                    commandKind = "import_subjects"
+	commandAssessVenues                      commandKind = "assess_venues"
+	commandAssessBiomedicalEligibility       commandKind = "assess_biomedical_eligibility"
+	commandAnalyzeCitations                  commandKind = "analyze_citations"
+	commandAnalyzeAbstractRoutes             commandKind = "analyze_abstract_routes"
+	commandAnalyzeTrends                     commandKind = "analyze_trends"
+	commandAnalyzeJournals                   commandKind = "analyze_journals"
+	commandAnalyzeOpportunities              commandKind = "analyze_opportunities"
+	commandPublishCatalog                    commandKind = "publish_catalog"
+	maxSyncResults                                       = 1000
+	abstractAnalysisRequestTimeout                       = 2 * time.Minute
+	syncControlledIdentityScopePolicyVersion             = "scope/controlled-canonical-identity/v2"
+	syncProjectionPolicyVersion                          = "projection/latest-source-revision/v2"
 )
 
 type workerCommand struct {
@@ -2202,10 +2204,10 @@ func runSync(
 		return nil, err
 	}
 	scopePolicy := ingestion.NewControlledIdentityScopePolicy(
-		"scope/controlled-canonical-identity/v1",
+		syncControlledIdentityScopePolicyVersion,
 	)
 	projectionPolicy := ingestion.NewDeterministicProjectionPolicy(
-		"projection/latest-source-revision/v1",
+		syncProjectionPolicyVersion,
 	)
 	service, err := ingestion.NewService(
 		repository,

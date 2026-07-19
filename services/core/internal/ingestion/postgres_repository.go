@@ -1252,6 +1252,8 @@ func controlledIdentifiers(
 			switch identifier.Scheme {
 			case string(paper.SchemeDOI):
 				identifiers.DOI = append(identifiers.DOI, identifier.Value)
+			case string(paper.SchemePMID):
+				identifiers.PMID = append(identifiers.PMID, identifier.Value)
 			case string(paper.SchemeArXiv):
 				identifiers.ArXiv = append(identifiers.ArXiv, identifier.Value)
 			case string(paper.SchemeOpenAlex):
@@ -1384,14 +1386,16 @@ func identityPriority(canonicalKey string) int {
 	switch scheme {
 	case string(paper.SchemeDOI):
 		return 0
-	case string(paper.SchemeArXiv):
+	case string(paper.SchemePMID):
 		return 1
-	case string(paper.SchemeOpenReview):
+	case string(paper.SchemeArXiv):
 		return 2
-	case string(paper.SchemeSemanticScholar):
+	case string(paper.SchemeOpenReview):
 		return 3
-	case string(paper.SchemeOpenAlex):
+	case string(paper.SchemeSemanticScholar):
 		return 4
+	case string(paper.SchemeOpenAlex):
+		return 5
 	default:
 		return 100
 	}

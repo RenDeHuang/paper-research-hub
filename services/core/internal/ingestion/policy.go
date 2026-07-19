@@ -64,6 +64,8 @@ func canonicalizableRecord(record source.Record) bool {
 		switch identifier.Scheme {
 		case source.IdentifierDOI:
 			identifiers.DOI = append(identifiers.DOI, identifier.Value)
+		case source.IdentifierPMID:
+			identifiers.PMID = append(identifiers.PMID, identifier.Value)
 		case source.IdentifierArXiv:
 			identifiers.ArXiv = append(identifiers.ArXiv, identifier.Value)
 		case source.IdentifierOpenAlex:

@@ -32,6 +32,49 @@ var (
 	postgresRepositoryContainerErr  error
 )
 
+func TestControlledIdentifiersRebuildsPMIDCanonicalIdentity(t *testing.T) {
+	identifiers, identity, err := controlledIdentifiers(source.Record{
+		Identifiers: []source.Identifier{{
+			Scheme: source.IdentifierPMID,
+			Value:  " 12345678 ",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("controlledIdentifiers() error = %v", err)
+	}
+	if got := identity.CanonicalKey(); got != "pmid:12345678" {
+		t.Fatalf("controlled identity = %q, want pmid:12345678", got)
+	}
+	want := []controlledIdentifier{{Scheme: "pmid", Value: "12345678"}}
+	if !slices.Equal(identifiers, want) {
+		t.Fatalf("controlled identifiers = %#v, want %#v", identifiers, want)
+	}
+}
+
+func TestIdentityPriorityMatchesDomainPrecedence(t *testing.T) {
+	t.Parallel()
+
+	for canonicalKey, want := range map[string]int{
+		"doi:10.1000/test":   0,
+		"pmid:12345678":      1,
+		"arxiv:2401.01234":   2,
+		"openreview:Forum_1": 3,
+		"s2:0123456789abcdef0123456789abcdef01234567": 4,
+		"openalex:W123": 5,
+		"unsupported:x": 100,
+		"malformed":     100,
+	} {
+		canonicalKey, want := canonicalKey, want
+		t.Run(canonicalKey, func(t *testing.T) {
+			t.Parallel()
+
+			if got := identityPriority(canonicalKey); got != want {
+				t.Fatalf("identityPriority(%q) = %d, want %d", canonicalKey, got, want)
+			}
+		})
+	}
+}
+
 func TestPostgresRepositoryPersistsPubMedBiomedicalSemantics(t *testing.T) {
 	pool := openIngestionTestPool(t)
 	repository := mustPostgresRepository(t, pool)
@@ -681,6 +724,157 @@ func TestPostgresRepositoryReplaysRawEventWithNewNormalizedPayloadSchema(t *test
 			sourceStateNormalized,
 			workStateNormalized,
 			normalized.AssertionID,
+		)
+	}
+}
+
+func TestPostgresRepositoryReplaysDOILessPubMedWithNewIdentityPolicyVersion(
+	t *testing.T,
+) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76549991",
+		"",
+		time.Date(2026, time.July, 17, 8, 46, 0, 0, time.UTC),
+	)
+	if envelope.Record.ParserVersion != "pubmed/pubmed-article-v2" ||
+		envelope.Record.Identity.CanonicalKey() != "pmid:76549991" {
+		t.Fatalf(
+			"current DOI-less PubMed parse = parser %q identity %q",
+			envelope.Record.ParserVersion,
+			envelope.Record.Identity.CanonicalKey(),
+		)
+	}
+	job := startPubMedRepositoryJob(t, repository, "pmid-identity-policy-replay")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+
+	legacyPayload := recordPayload(envelope.Record)
+	legacyPayload.ParserVersion = "pubmed/pubmed-article-v1"
+	legacyPayload.CanonicalKey = ""
+	legacyJSON, err := json.Marshal(legacyPayload)
+	if err != nil {
+		t.Fatalf("encode legacy PMID-less normalized payload: %v", err)
+	}
+	identityJSON, err := json.Marshal(map[string]any{
+		"canonical_key": "",
+		"identifiers":   legacyPayload.Identifiers,
+	})
+	if err != nil {
+		t.Fatalf("encode legacy PubMed source identity: %v", err)
+	}
+	rawJSON, err := sourceRecordJSON(envelope.Raw)
+	if err != nil {
+		t.Fatalf("encode legacy PubMed raw payload: %v", err)
+	}
+	var sourceRecordID, legacyNormalizedID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO source_records (
+			source, source_record_id, source_identity, source_time,
+			content_hash, raw_payload
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id::text
+	`,
+		envelope.LogicalSource,
+		envelope.Record.SourceRecordID,
+		identityJSON,
+		envelope.SourceTime,
+		envelope.Raw.SHA256,
+		rawJSON,
+	).Scan(&sourceRecordID); err != nil {
+		t.Fatalf("insert legacy DOI-less PubMed source record: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO ingestion_normalized_records (
+			raw_event_id, source_record_uuid, normalization_policy_version,
+			payload_schema_version, normalized_payload
+		) VALUES ($1, $2, $3, $4, $5)
+		RETURNING id::text
+	`,
+		raw.ID,
+		sourceRecordID,
+		"scope/controlled-canonical-identity/v1",
+		normalizedPayloadSchemaVersion,
+		legacyJSON,
+	).Scan(&legacyNormalizedID); err != nil {
+		t.Fatalf("insert legacy DOI-less normalized assertion: %v", err)
+	}
+
+	if _, err := repository.Normalize(
+		ctx,
+		job.ID,
+		raw,
+		"scope/controlled-canonical-identity/v1",
+	); err == nil || !strings.Contains(err.Error(), "conflicting policy or payload") {
+		t.Fatalf("Normalize(v1 replay) error = %v, want payload conflict", err)
+	}
+
+	normalized, err := repository.Normalize(
+		ctx,
+		job.ID,
+		raw,
+		"scope/controlled-canonical-identity/v2",
+	)
+	if err != nil {
+		t.Fatalf("Normalize(v2 replay) error = %v", err)
+	}
+	if normalized.AssertionID == legacyNormalizedID ||
+		normalized.Record.Identity.CanonicalKey() != "pmid:76549991" {
+		t.Fatalf(
+			"v2 normalized replay = assertion %q identity %q, legacy %q",
+			normalized.AssertionID,
+			normalized.Record.Identity.CanonicalKey(),
+			legacyNormalizedID,
+		)
+	}
+	scopePolicy := NewControlledIdentityScopePolicy(
+		"scope/controlled-canonical-identity/v2",
+	)
+	decision, err := scopePolicy.Evaluate(ctx, normalized)
+	if err != nil {
+		t.Fatalf("Evaluate(v2 replay) error = %v", err)
+	}
+	projectionPolicy := NewDeterministicProjectionPolicy(
+		"projection/latest-source-revision/v2",
+	)
+	candidate, err := projectionPolicy.Prepare(ctx, normalized, decision)
+	if err != nil {
+		t.Fatalf("Prepare(v2 replay) error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		scopePolicy.Version(),
+		projectionPolicy.Version(),
+	); err != nil {
+		t.Fatalf("Project(v2 replay) error = %v", err)
+	}
+
+	var normalizedCount, legacyCount, workCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM ingestion_normalized_records WHERE raw_event_id = $1),
+			(SELECT count(*) FROM ingestion_normalized_records WHERE id = $2),
+			(SELECT count(*) FROM works WHERE canonical_key = 'pmid:76549991')
+	`, raw.ID, legacyNormalizedID).Scan(
+		&normalizedCount,
+		&legacyCount,
+		&workCount,
+	); err != nil {
+		t.Fatalf("query PMID identity replay state: %v", err)
+	}
+	if normalizedCount != 2 || legacyCount != 1 || workCount != 1 {
+		t.Fatalf(
+			"PMID identity replay = normalized %d legacy %d work %d, want 2/1/1",
+			normalizedCount,
+			legacyCount,
+			workCount,
 		)
 	}
 }
@@ -3722,6 +3916,158 @@ func TestPostgresRepositoryConvergesIndependentSourcesOnSharedDOI(t *testing.T) 
 	}
 }
 
+func TestPostgresRepositoryProjectsPMIDIdentityRebuiltFromIdentifiers(t *testing.T) {
+	pool := openIngestionTestPool(t)
+	repository := mustPostgresRepository(t, pool)
+	ctx := context.Background()
+	envelope := pubMedBiomedicalRepositoryEnvelope(
+		t,
+		"76549992",
+		"",
+		time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+	)
+	envelope.Record.Identity = paper.Identifier{}
+	if err := envelope.Validate(); err != nil {
+		t.Fatalf("validate PMID-only reconstruction envelope: %v", err)
+	}
+
+	job := startPubMedRepositoryJob(t, repository, "pmid-identity-reconstruction")
+	raw, err := repository.PersistRaw(ctx, job.ID, envelope)
+	if err != nil {
+		t.Fatalf("PersistRaw() error = %v", err)
+	}
+	normalized, err := repository.Normalize(
+		ctx,
+		job.ID,
+		raw,
+		"scope/controlled-canonical-identity/v2",
+	)
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	candidate, err := NewProjectionCandidate(
+		normalized,
+		source.ScopeDecision{
+			Status: source.ScopeIncluded,
+			Reason: "controlled_canonical_identity_present",
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewProjectionCandidate() error = %v", err)
+	}
+	if _, err := repository.Project(
+		ctx,
+		job.ID,
+		candidate,
+		"scope/controlled-canonical-identity/v2",
+		"projection/latest-source-revision/v2",
+	); err != nil {
+		t.Fatalf("Project() error = %v", err)
+	}
+
+	var works int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM works WHERE canonical_key = 'pmid:76549992'
+	`).Scan(&works); err != nil {
+		t.Fatalf("query reconstructed PMID Work: %v", err)
+	}
+	if works != 1 {
+		t.Fatalf("reconstructed PMID Works = %d, want 1", works)
+	}
+}
+
+func TestPostgresRepositoryUpgradesExistingWorkBySharedPMIDPriority(t *testing.T) {
+	testCases := []struct {
+		name             string
+		existingScheme   paper.Scheme
+		existingValue    string
+		pmid             string
+		wantCanonicalKey string
+	}{
+		{
+			name:             "OpenAlex upgrades to PMID",
+			existingScheme:   paper.SchemeOpenAlex,
+			existingValue:    "W76549993",
+			pmid:             "76549993",
+			wantCanonicalKey: "pmid:76549993",
+		},
+		{
+			name:             "arXiv upgrades to PMID",
+			existingScheme:   paper.SchemeArXiv,
+			existingValue:    "2407.00001",
+			pmid:             "76549994",
+			wantCanonicalKey: "pmid:76549994",
+		},
+		{
+			name:             "DOI remains canonical",
+			existingScheme:   paper.SchemeDOI,
+			existingValue:    "10.1000/pmid-priority",
+			pmid:             "76549995",
+			wantCanonicalKey: "doi:10.1000/pmid-priority",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			pool := openIngestionTestPool(t)
+			repository := mustPostgresRepository(t, pool)
+			ctx := context.Background()
+			existing := canonicalIdentityRepositoryEnvelope(
+				t,
+				testCase.existingScheme,
+				testCase.existingValue,
+				testCase.pmid,
+				time.Date(2026, time.July, 17, 9, 10, 0, 0, time.UTC),
+			)
+			projectPublicationEnvelope(
+				t,
+				repository,
+				existing,
+				"pmid-priority-existing-"+testCase.pmid,
+				nil,
+			)
+
+			pubMed := pubMedBiomedicalRepositoryEnvelope(
+				t,
+				testCase.pmid,
+				"",
+				time.Date(2026, time.July, 17, 9, 20, 0, 0, time.UTC),
+			)
+			projectPublicationEnvelope(
+				t,
+				repository,
+				pubMed,
+				"pmid-priority-pubmed-"+testCase.pmid,
+				nil,
+			)
+
+			var canonicalKey string
+			var works int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+					min(canonical_key),
+					count(*)
+				FROM works
+				WHERE id = (
+					SELECT work_id
+					FROM external_identifiers
+					WHERE scheme = 'pmid' AND normalized_value = $1
+				)
+			`, testCase.pmid).Scan(&canonicalKey, &works); err != nil {
+				t.Fatalf("query shared PMID Work: %v", err)
+			}
+			if works != 1 || canonicalKey != testCase.wantCanonicalKey {
+				t.Fatalf(
+					"shared PMID Work = count %d canonical %q, want 1/%q",
+					works,
+					canonicalKey,
+					testCase.wantCanonicalKey,
+				)
+			}
+		})
+	}
+}
+
 func TestPostgresRepositoryResolvesVenueISSNAcrossStoredRoles(t *testing.T) {
 	pool := openIngestionTestPool(t)
 	repository := mustPostgresRepository(t, pool)
@@ -5627,6 +5973,72 @@ func repositoryEnvelope(
 	)
 	if err != nil {
 		t.Fatalf("NewEnvelope() error = %v", err)
+	}
+	return envelope
+}
+
+func canonicalIdentityRepositoryEnvelope(
+	t *testing.T,
+	scheme paper.Scheme,
+	value string,
+	pmid string,
+	sourceTime time.Time,
+) Envelope {
+	t.Helper()
+	raw, err := source.NewRawRecord([]byte(fmt.Sprintf(
+		`{"identity":%q,"pmid":%q,"title":"Canonical priority fixture"}`,
+		string(scheme)+":"+value,
+		pmid,
+	)))
+	if err != nil {
+		t.Fatalf("NewRawRecord(canonical priority) error = %v", err)
+	}
+	identity, err := paper.NewIdentifier(scheme, value)
+	if err != nil {
+		t.Fatalf("NewIdentifier(%s) error = %v", scheme, err)
+	}
+	var sourceScheme source.IdentifierScheme
+	switch scheme {
+	case paper.SchemeDOI:
+		sourceScheme = source.IdentifierDOI
+	case paper.SchemeArXiv:
+		sourceScheme = source.IdentifierArXiv
+	case paper.SchemeOpenAlex:
+		sourceScheme = source.IdentifierOpenAlex
+	default:
+		t.Fatalf("unsupported canonical priority fixture scheme %q", scheme)
+	}
+	recordID := string(scheme) + "-" + strings.NewReplacer(
+		"/", "-",
+		":", "-",
+		".", "-",
+	).Replace(value)
+	record := source.Record{
+		Source:         source.OpenAlex,
+		SourceRecordID: recordID,
+		Identity:       identity,
+		Identifiers: []source.Identifier{
+			{Scheme: sourceScheme, Value: identity.Value()},
+			{Scheme: source.IdentifierPMID, Value: pmid},
+		},
+		Raw:   raw,
+		Title: "Canonical priority fixture",
+		Scope: source.ScopeDecision{
+			Status: source.ScopePending,
+			Reason: source.ScopeReasonAwaitingDeterministicEvaluation,
+		},
+	}
+	envelope, err := NewEnvelope(
+		source.OpenAlex,
+		"openalex:"+recordID,
+		sourceTime,
+		"canonical-priority-"+recordID,
+		1,
+		record,
+		raw,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope(canonical priority) error = %v", err)
 	}
 	return envelope
 }

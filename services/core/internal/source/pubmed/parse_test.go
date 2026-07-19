@@ -17,7 +17,7 @@ import (
 func TestPubMedParserVersionIsExplicitAndAttachedToRecords(t *testing.T) {
 	t.Parallel()
 
-	if pubmed.ParserVersion != "pubmed/pubmed-article-v1" {
+	if pubmed.ParserVersion != "pubmed/pubmed-article-v2" {
 		t.Fatalf("ParserVersion = %q", pubmed.ParserVersion)
 	}
 	payload, err := os.ReadFile("testdata/efetch.xml")
