@@ -428,6 +428,107 @@ func TestJournalPubMedRegistryAuditRequiresNCBIConfiguration(t *testing.T) {
 	}
 }
 
+func TestJournalPubMedRegistryRunnerRejectsInvalidAuditIdentityBeforeSources(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		tool  string
+		email string
+		want  string
+	}{
+		{
+			name:  "missing tool",
+			email: "research@example.test",
+			want:  "NCBI_TOOL",
+		},
+		{
+			name:  "untrimmed tool",
+			tool:  " paper-hub-registry",
+			email: "research@example.test",
+			want:  "NCBI_TOOL",
+		},
+		{
+			name: "missing email",
+			tool: "paper-hub-registry",
+			want: "NCBI_EMAIL",
+		},
+		{
+			name:  "non-bare email",
+			tool:  "paper-hub-registry",
+			email: "Researcher <research@example.test>",
+			want:  "NCBI_EMAIL",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			directory := t.TempDir()
+			fetchCalls := 0
+			counterConstructions := 0
+			dependencies := defaultRegistryDependencies()
+			dependencies.fetchCrossref = func(
+				context.Context,
+				*http.Client,
+				venueenrich.CrossrefCatalogConfig,
+				httpclient.Dependencies,
+			) (venueenrich.CrossrefCatalog, error) {
+				fetchCalls++
+				return venueenrich.CrossrefCatalog{}, nil
+			}
+			dependencies.newPubMedCounter = func(
+				*http.Client,
+				pubmed.Config,
+				httpclient.Dependencies,
+			) (venueenrich.PubMedCoverageCounter, error) {
+				counterConstructions++
+				return &journalRegistryCounter{}, nil
+			}
+
+			_, err := (registryRunner{dependencies: dependencies}).run(
+				context.Background(),
+				registryCommand{
+					Inputs: []string{
+						filepath.Join(directory, "missing-medicine.csv"),
+						filepath.Join(directory, "missing-biology.csv"),
+						filepath.Join(directory, "missing-computer.csv"),
+					},
+					CacheDir:            filepath.Join(directory, "cache"),
+					OutputPath:          filepath.Join(directory, "registry.csv"),
+					ReportPath:          filepath.Join(directory, "registry.report.json"),
+					AuditPubMedCoverage: true,
+					NCBITool:            test.tool,
+					NCBIEmail:           test.email,
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"registryRunner.run(invalid audit identity) error = %v, want %s",
+					err,
+					test.want,
+				)
+			}
+			if strings.Contains(err.Error(), "read raw bytes") {
+				t.Fatalf(
+					"runner read source input before audit identity validation: %v",
+					err,
+				)
+			}
+			if fetchCalls != 0 || counterConstructions != 0 {
+				t.Fatalf(
+					"network dependencies called before audit identity validation: Crossref=%d counter=%d",
+					fetchCalls,
+					counterConstructions,
+				)
+			}
+		})
+	}
+}
+
 func TestJournalPubMedRegistryValidatesDependenciesByCoverageMode(t *testing.T) {
 	t.Parallel()
 

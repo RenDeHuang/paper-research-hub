@@ -409,6 +409,9 @@ func (runner registryRunner) run(
 	); err != nil {
 		return registryResult{}, err
 	}
+	if err := validateRegistryAuditIdentity(command); err != nil {
+		return registryResult{}, err
+	}
 	dependencies, err := runner.dependencies.validated(
 		command.AuditPubMedCoverage,
 	)
@@ -544,6 +547,25 @@ func (runner registryRunner) run(
 		Rows:          report.Counts.OutputRows,
 		PubMedUnknown: report.Counts.PubMed.Unknown,
 	}, nil
+}
+
+func validateRegistryAuditIdentity(command registryCommand) error {
+	if !command.AuditPubMedCoverage {
+		return nil
+	}
+	if _, err := validateRequiredTrimmed(
+		"NCBI_TOOL",
+		command.NCBITool,
+	); err != nil {
+		return err
+	}
+	if _, err := validateRequiredBareEmail(
+		"NCBI_EMAIL",
+		command.NCBIEmail,
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (dependencies registryDependencies) validated(
@@ -1977,12 +1999,10 @@ func requiredTrimmedEnvironment(
 	key string,
 ) (string, error) {
 	value, ok := lookup(key)
-	if !ok ||
-		strings.TrimSpace(value) == "" ||
-		value != strings.TrimSpace(value) {
+	if !ok {
 		return "", fmt.Errorf("%s is required and must be trimmed", key)
 	}
-	return value, nil
+	return validateRequiredTrimmed(key, value)
 }
 
 func requiredBareEmailEnvironment(
@@ -1990,7 +2010,22 @@ func requiredBareEmailEnvironment(
 	key string,
 ) (string, error) {
 	value, ok := lookup(key)
-	if !ok || strings.TrimSpace(value) == "" {
+	if !ok {
+		return "", fmt.Errorf("%s is required", key)
+	}
+	return validateRequiredBareEmail(key, value)
+}
+
+func validateRequiredTrimmed(key, value string) (string, error) {
+	if strings.TrimSpace(value) == "" ||
+		value != strings.TrimSpace(value) {
+		return "", fmt.Errorf("%s is required and must be trimmed", key)
+	}
+	return value, nil
+}
+
+func validateRequiredBareEmail(key, value string) (string, error) {
+	if strings.TrimSpace(value) == "" {
 		return "", fmt.Errorf("%s is required", key)
 	}
 	return validateBareEmail(key, value)

@@ -87,6 +87,11 @@ Required flags:
 --cache-dir <path>   Crossref journal catalog cache
 --output <path>      destination CSV
 --report <path>      destination JSON report
+```
+
+Optional flags:
+
+```text
 --audit-pubmed-coverage
                      optional historical PubMed coverage audit
 ```

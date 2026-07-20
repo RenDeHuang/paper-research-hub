@@ -75,19 +75,28 @@ go -C services/core run ./cmd/journal-pubmed-registry \
 - `counts.probes.attempted=0`；
 - 每行都有 `attempted=false`、空 `checked_at/response_sha256/error`、零 `record_count` 的完整 receipt。
 
-只有需要历史 coverage 或三年 backfill 时，才在同一命令末尾显式增加：
+只有需要历史 coverage 或三年 backfill 时，才生成独立 audited Registry。audit 模式会用每本已精确解析期刊的全部 ISSN 做一次精确 PubMed OR 查询；此时必须配置 `NCBI_TOOL` 和 bare `NCBI_EMAIL`。
 
-```text
---audit-pubmed-coverage
+```bash
+go -C services/core run ./cmd/journal-pubmed-registry \
+  --input /Users/huangrende/Documents/论文自媒体/期刊名单/2026-jcr-q1-medicine-wechat.csv \
+  --input /Users/huangrende/Documents/论文自媒体/期刊名单/2026-jcr-q1-biology-wechat.csv \
+  --input /Users/huangrende/Documents/论文自媒体/期刊名单/2026-jcr-q1-computer-science-wechat.csv \
+  --cache-dir /Users/huangrende/Documents/论文自媒体/期刊名单/enrichment-cache \
+  --output data/venues/journal-pubmed-registry.audited.v1.csv \
+  --report data/venues/journal-pubmed-registry.audited.v1.report.json \
+  --audit-pubmed-coverage
 ```
 
-audit 模式会用每本已精确解析期刊的全部 ISSN 做一次精确 PubMed OR 查询；此时必须配置 `NCBI_TOOL` 和 bare `NCBI_EMAIL`。
+发布采用 no-replace 语义，不会覆盖已存在的 final。默认 Registry 与 audited Registry 使用独立路径并同时保留，避免覆盖原始证据；若目标路径已存在，命令会明确失败。
 
 成功后应存在：
 
 ```text
 data/venues/journal-pubmed-registry.v1.csv
 data/venues/journal-pubmed-registry.v1.report.json
+data/venues/journal-pubmed-registry.audited.v1.csv
+data/venues/journal-pubmed-registry.audited.v1.report.json
 ```
 
 验收重点：
@@ -101,12 +110,12 @@ data/venues/journal-pubmed-registry.v1.report.json
 
 ## 4. 首次三年回填
 
-三年回填只读取 audited Registry 中的 `resolved + pubmed_supported=yes`。如果 Registry 是默认生成的 `unknown/unattempted` 版本，必须先使用 `--audit-pubmed-coverage` 重新生成 audited Registry，不能直接启动三年回填。
+三年回填只读取 audited Registry 中的 `resolved + pubmed_supported=yes`。如果当前只有默认生成的 `unknown/unattempted` Registry，必须先按上一节的独立路径生成 audited Registry，不能覆盖默认产物，也不能直接启动三年回填。
 
 ```bash
 go -C services/core run ./cmd/worker -- sync pubmed-journals \
   --mode backfill \
-  --registry data/venues/journal-pubmed-registry.v1.csv
+  --registry data/venues/journal-pubmed-registry.audited.v1.csv
 ```
 
 回填规划规则：
