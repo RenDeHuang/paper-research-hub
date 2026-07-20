@@ -21,6 +21,43 @@ func TestBuildDailyJournalBatchesRejectsEmptyInput(t *testing.T) {
 	}
 }
 
+func TestBuildDailyJournalBatchesRejectsJournalWithoutIdentity(t *testing.T) {
+	t.Parallel()
+
+	validISSN := dailyTestISSNs(t, 900_000, 1)
+	tests := []struct {
+		name        string
+		journal     Journal
+		errorDetail string
+	}{
+		{
+			name:        "empty key",
+			journal:     dailyTestJournal("", validISSN),
+			errorDetail: "key",
+		},
+		{
+			name:        "empty ISSNs",
+			journal:     dailyTestJournal("journal:empty-issns", nil),
+			errorDetail: "ISSN",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := BuildDailyJournalBatches([]Journal{test.journal}); err == nil ||
+				!strings.Contains(err.Error(), test.errorDetail) {
+				t.Fatalf(
+					"BuildDailyJournalBatches() error = %v, want rejection mentioning %q",
+					err,
+					test.errorDetail,
+				)
+			}
+		})
+	}
+}
+
 func TestBuildDailyJournalBatchesAcceptsExactlyMaximumISSNTerms(t *testing.T) {
 	t.Parallel()
 

@@ -56,6 +56,16 @@ func BuildDailyJournalBatches(journals []Journal) ([]DailyJournalBatch, error) {
 
 	for index := range journals {
 		journal := journals[index].clone()
+		if journal.key == "" {
+			return nil, fmt.Errorf("daily journal at index %d has an empty key", index)
+		}
+		if len(journal.issns) == 0 {
+			return nil, fmt.Errorf(
+				"daily journal %q has no ISSNs",
+				journal.key,
+			)
+		}
+
 		journalISSNs := make([]string, 0, len(journal.issns))
 		seenInJournal := make(map[string]struct{}, len(journal.issns))
 		for _, issn := range journal.issns {
