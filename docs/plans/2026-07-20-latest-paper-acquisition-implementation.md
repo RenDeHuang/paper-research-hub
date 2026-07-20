@@ -287,6 +287,29 @@ Keep the existing journal loop for backfill.
 5. preserve summary totals from each ingestion window;
 6. return non-zero error after processing remaining independent batches.
 
+Extend daily reporting without fabricating a single journal identity:
+
+```go
+type Report struct {
+    BatchesPlanned int `json:"batches_planned"`
+}
+
+type WindowReport struct {
+    BatchKey     string   `json:"batch_key,omitempty"`
+    JournalCount int      `json:"journal_count,omitempty"`
+    JournalKeys  []string `json:"journal_keys,omitempty"`
+}
+
+type FailureReport struct {
+    BatchKey    string   `json:"batch_key,omitempty"`
+    JournalKeys []string `json:"journal_keys,omitempty"`
+    ISSNs       []string `json:"issns,omitempty"`
+}
+```
+
+The existing singular journal fields remain populated only for backfill. `NoCoverage`
+continues to report the historical audit count and must not imply daily exclusion.
+
 Refactor `runWindow` into a generic helper accepting exact ISSNs, date type, date window,
 window key, and job payload. Daily job payloads contain:
 
