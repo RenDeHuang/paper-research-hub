@@ -3,6 +3,7 @@ package pubmedsync
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"iter"
 	"slices"
@@ -179,6 +180,28 @@ func TestServiceBackfillUsesFixedWindowCompleteISSNSetAndStableJobKey(t *testing
 			"yes",
 			"1",
 		),
+		validRegistryRecord(
+			"Backfill No Coverage",
+			2,
+			"9876-5434",
+			"",
+			"",
+			`["9876-5434"]`,
+			"resolved",
+			"no",
+			"0",
+		),
+		validRegistryRecord(
+			"Backfill Unknown Coverage",
+			3,
+			"1476-4687",
+			"",
+			"",
+			`["1476-4687"]`,
+			"resolved",
+			"unknown",
+			"0",
+		),
 	)
 	newRequest := func() RunRequest {
 		return RunRequest{
@@ -203,6 +226,11 @@ func TestServiceBackfillUsesFixedWindowCompleteISSNSetAndStableJobKey(t *testing
 	}
 	if second.WindowsPlanned != 1 || second.WindowsSucceeded != 1 {
 		t.Fatalf("second report = %#v", second)
+	}
+	if first.RegistryJournals != 3 || first.EligibleJournals != 1 ||
+		first.JournalsPlanned != 1 || first.NoCoverage != 1 ||
+		first.BatchesPlanned != 0 {
+		t.Fatalf("backfill registry report = %#v", first)
 	}
 	if len(searcher.calls) != 4 {
 		t.Fatalf("Search() calls = %d, want planner plus ingestion for each run", len(searcher.calls))
@@ -263,12 +291,11 @@ func TestServiceBackfillUsesFixedWindowCompleteISSNSetAndStableJobKey(t *testing
 	}
 }
 
-func TestServiceDailyUsesEDATThenMDATAndContinuesAfterWindowFailure(t *testing.T) {
+func TestServiceDailyRunsTwoBatchesInWindowOrderWithBatchReportsAndPayloads(t *testing.T) {
 	t.Parallel()
 
 	searcher := &serviceFakeSearcher{}
 	fetcher := &serviceFakeFetcher{}
-	sentinel := errors.New("window failed")
 	runner := &serviceFakeIngestion{failByKey: map[string]error{}}
 	var eventCalls int
 	service, err := NewService(
@@ -284,39 +311,25 @@ func TestServiceDailyUsesEDATThenMDATAndContinuesAfterWindowFailure(t *testing.T
 		t.Fatalf("NewService() error = %v", err)
 	}
 
+	firstISSNs := dailyTestISSNs(t, 5_000_000, MaxDailyISSNTerms-1)
+	secondISSNs := dailyTestISSNs(t, 6_000_000, 2)
 	registry := encodeRegistryCSV(
 		testRegistryHeader,
-		validRegistryRecord(
+		serviceRegistryRecordWithISSNs(
 			"First Daily Journal",
 			1,
-			"1234-5679",
-			"",
-			"",
-			`["1234-5679"]`,
-			"resolved",
+			firstISSNs,
 			"yes",
 			"1",
 		),
-		validRegistryRecord(
+		serviceRegistryRecordWithISSNs(
 			"Second Daily Journal",
 			2,
-			"9876-5434",
-			"",
-			"",
-			`["9876-5434"]`,
-			"resolved",
-			"yes",
-			"1",
+			secondISSNs,
+			"unknown",
+			"0",
 		),
 	)
-	plannedFirst, err := PlanDaily(
-		mustServiceJournal(t, "1234-5679"),
-		time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
-	)
-	if err != nil {
-		t.Fatalf("PlanDaily() error = %v", err)
-	}
-	runner.failByKey[plannedFirst[0].Key()] = sentinel
 
 	report, err := service.Run(context.Background(), RunRequest{
 		Mode:         ModeDaily,
@@ -324,15 +337,20 @@ func TestServiceDailyUsesEDATThenMDATAndContinuesAfterWindowFailure(t *testing.T
 		LookbackDays: 3,
 		Registry:     bytes.NewReader(registry),
 	})
-	if err == nil || !errors.Is(err, sentinel) {
-		t.Fatalf("Run() error = %v, want window failure", err)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if report.WindowsPlanned != 4 || report.WindowsAttempted != 4 ||
-		report.WindowsSucceeded != 3 || report.WindowsFailed != 1 {
+		report.WindowsSucceeded != 4 || report.WindowsFailed != 0 ||
+		report.BatchesPlanned != 2 {
 		t.Fatalf("report = %#v", report)
 	}
-	if report.NoCoverage != 0 {
-		t.Fatalf("NoCoverage = %d, want 0", report.NoCoverage)
+	if report.RegistryJournals != 2 || report.EligibleJournals != 2 ||
+		report.JournalsPlanned != 2 || report.JournalsFailed != 0 {
+		t.Fatalf("journal report totals = %#v", report)
+	}
+	if got := report.Result()["batches_planned"]; got != 2 {
+		t.Fatalf("Result()[batches_planned] = %#v, want 2", got)
 	}
 	if len(searcher.calls) != 4 || len(fetcher.calls) != 4 ||
 		len(runner.calls) != 4 || eventCalls != 4 {
@@ -350,29 +368,94 @@ func TestServiceDailyUsesEDATThenMDATAndContinuesAfterWindowFailure(t *testing.T
 		pubmed.DateTypeEntrez,
 		pubmed.DateTypeModification,
 	}
+	wantISSNs := [][]string{firstISSNs, firstISSNs, secondISSNs, secondISSNs}
 	for index, call := range searcher.calls {
 		if call.query.DateType != wantTypes[index] {
 			t.Errorf("Search() call %d date type = %q, want %q", index, call.query.DateType, wantTypes[index])
+		}
+		if !slices.Equal(call.query.JournalISSNs, wantISSNs[index]) {
+			t.Errorf(
+				"Search() call %d ISSNs count/content = %d/%v, want %d/%v",
+				index,
+				len(call.query.JournalISSNs),
+				call.query.JournalISSNs,
+				len(wantISSNs[index]),
+				wantISSNs[index],
+			)
 		}
 		if call.query.DateWindow.From.Format(time.DateOnly) != "2026-07-17" ||
 			call.query.DateWindow.To.Format(time.DateOnly) != "2026-07-19" {
 			t.Errorf("Search() call %d window = %s..%s", index, call.query.DateWindow.From.Format(time.DateOnly), call.query.DateWindow.To.Format(time.DateOnly))
 		}
+		if call.query.MaxResults != pubmed.MaxSearchResults {
+			t.Errorf("Search() call %d MaxResults = %d, want %d", index, call.query.MaxResults, pubmed.MaxSearchResults)
+		}
 	}
-	if got := runner.calls[0].job.Payload["journal_name"]; got != "First Daily Journal" {
-		t.Fatalf("first journal = %#v, want registry order", got)
+	if len(report.Journals) != 2 {
+		t.Fatalf("journal reports = %d, want 2", len(report.Journals))
 	}
-	if got := runner.calls[2].job.Payload["journal_name"]; got != "Second Daily Journal" {
-		t.Fatalf("second journal = %#v, want registry order", got)
+	for _, journalReport := range report.Journals {
+		if journalReport.Status != "succeeded" ||
+			journalReport.WindowsPlanned != 2 ||
+			journalReport.WindowsSucceeded != 2 ||
+			journalReport.WindowsFailed != 0 {
+			t.Errorf("journal report = %#v, want two successful windows", journalReport)
+		}
+	}
+	for index, windowReport := range report.Windows {
+		if windowReport.JournalKey != "" || windowReport.JournalName != "" {
+			t.Errorf("daily window %d has forged singular journal identity: %#v", index, windowReport)
+		}
+		if windowReport.JournalCount != 1 ||
+			len(windowReport.JournalKeys) != 1 ||
+			windowReport.BatchKey == "" {
+			t.Errorf("daily window %d batch evidence = %#v", index, windowReport)
+		}
+		if !slices.Equal(windowReport.ISSNs, wantISSNs[index]) {
+			t.Errorf("daily window %d report ISSNs = %v, want %v", index, windowReport.ISSNs, wantISSNs[index])
+		}
+	}
+	for index, call := range runner.calls {
+		windowReport := report.Windows[index]
+		payload := call.job.Payload
+		if call.job.IdempotencyKey != windowReport.WindowKey {
+			t.Errorf("job %d idempotency key = %q, want %q", index, call.job.IdempotencyKey, windowReport.WindowKey)
+		}
+		for key, want := range map[string]any{
+			"mode":          "daily",
+			"batch_key":     windowReport.BatchKey,
+			"journal_count": 1,
+			"term_count":    len(wantISSNs[index]),
+			"date_type":     string(wantTypes[index]),
+			"from_date":     "2026-07-17",
+			"to_date":       "2026-07-19",
+			"run_date":      "2026-07-19",
+			"window_key":    windowReport.WindowKey,
+		} {
+			if got := payload[key]; got != want {
+				t.Errorf("job %d payload[%q] = %#v, want %#v", index, key, got, want)
+			}
+		}
+		if _, exists := payload["journal_key"]; exists {
+			t.Errorf("job %d payload contains forbidden journal_key", index)
+		}
+		if _, exists := payload["journal_name"]; exists {
+			t.Errorf("job %d payload contains forbidden journal_name", index)
+		}
+		if !slices.Equal(payload["journal_keys"].([]string), windowReport.JournalKeys) ||
+			!slices.Equal(payload["journal_names"].([]string), []string{report.Journals[index/2].JournalName}) ||
+			!slices.Equal(payload["issns"].([]string), wantISSNs[index]) {
+			t.Errorf("job %d payload batch slices = %#v", index, payload)
+		}
 	}
 }
 
-func TestServiceSearchFailureStillRunsIndependentWindowJob(t *testing.T) {
+func TestServiceContinuesAfterDailyBatchFailuresWithoutDoubleCountingJournals(t *testing.T) {
 	t.Parallel()
 
-	sentinel := errors.New("PubMed ESearch unavailable")
-	searcher := &serviceConfiguredSearcher{err: sentinel}
+	searcher := &serviceFakeSearcher{}
 	fetcher := &serviceFakeFetcher{}
+	sentinel := errors.New("daily batch failed")
 	runner := &serviceFakeIngestion{failByKey: map[string]error{}}
 	service, err := NewService(
 		searcher,
@@ -386,62 +469,76 @@ func TestServiceSearchFailureStillRunsIndependentWindowJob(t *testing.T) {
 		t.Fatalf("NewService() error = %v", err)
 	}
 
-	journal := mustServiceJournal(t, "1234-5679")
-	windows, err := PlanDaily(
-		journal,
+	firstISSNs := dailyTestISSNs(t, 6_100_000, MaxDailyISSNTerms-1)
+	secondISSNs := dailyTestISSNs(t, 7_100_000, 2)
+	registry := encodeRegistryCSV(
+		testRegistryHeader,
+		serviceRegistryRecordWithISSNs("Failed Batch Journal", 1, firstISSNs, "yes", "1"),
+		serviceRegistryRecordWithISSNs("Later Batch Journal", 2, secondISSNs, "yes", "1"),
+	)
+	journals, err := LoadResolvedRegistry(bytes.NewReader(registry))
+	if err != nil {
+		t.Fatalf("LoadResolvedRegistry() error = %v", err)
+	}
+	windows, err := PlanDailyBatches(
+		journals,
 		time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
 	)
 	if err != nil {
-		t.Fatalf("PlanDaily() error = %v", err)
+		t.Fatalf("PlanDailyBatches() error = %v", err)
 	}
+	runner.failByKey[windows[0].Key()] = sentinel
+	runner.failByKey[windows[1].Key()] = sentinel
+
 	report, runErr := service.Run(context.Background(), RunRequest{
 		Mode:         ModeDaily,
 		RunDate:      time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
 		LookbackDays: 3,
-		Registry: bytes.NewReader(encodeRegistryCSV(
-			testRegistryHeader,
-			validRegistryRecord(
-				"Search Failure Journal",
-				1,
-				"1234-5679",
-				"",
-				"",
-				`["1234-5679"]`,
-				"resolved",
-				"yes",
-				"1",
-			),
-		)),
+		Registry:     bytes.NewReader(registry),
 	})
 	if runErr == nil || !errors.Is(runErr, sentinel) {
-		t.Fatalf("Run() error = %v, want Search error", runErr)
+		t.Fatalf("Run() error = %v, want batch failure", runErr)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("runIngestion calls = %d, want one job per failed window", len(runner.calls))
+	if len(searcher.calls) != 4 || len(runner.calls) != 4 {
+		t.Fatalf("Search/ingestion calls = %d/%d, want 4/4", len(searcher.calls), len(runner.calls))
 	}
-	if len(fetcher.calls) != 0 {
-		t.Fatalf("Fetch() calls = %d, want zero after Search failure", len(fetcher.calls))
+	if report.WindowsFailed != 2 || report.WindowsSucceeded != 2 ||
+		report.JournalsFailed != 1 {
+		t.Fatalf("failure totals = %#v", report)
 	}
-	for index, call := range runner.calls {
-		if call.job.IdempotencyKey != windows[index].Key() {
-			t.Errorf(
-				"runIngestion call %d job key = %q, want window key %q",
-				index,
-				call.job.IdempotencyKey,
-				windows[index].Key(),
-			)
+	if got := report.Journals[0]; got.Status != "failed" ||
+		got.WindowsFailed != 2 || got.WindowsSucceeded != 0 {
+		t.Fatalf("failed journal report = %#v", got)
+	}
+	if got := report.Journals[1]; got.Status != "succeeded" ||
+		got.WindowsFailed != 0 || got.WindowsSucceeded != 2 {
+		t.Fatalf("later journal report = %#v", got)
+	}
+	if len(report.Failures) != 2 {
+		t.Fatalf("failures = %d, want one per failed batch window", len(report.Failures))
+	}
+	for index, failure := range report.Failures {
+		if failure.JournalKey != "" || failure.JournalName != "" ||
+			failure.BatchKey != windows[index].BatchKey() ||
+			!slices.Equal(failure.JournalKeys, []string{journals[0].Key()}) ||
+			!slices.Equal(failure.ISSNs, firstISSNs) {
+			t.Errorf("failure %d batch evidence = %#v", index, failure)
 		}
 	}
-	if report.WindowsFailed != 2 || report.WindowsSucceeded != 0 {
-		t.Fatalf(
-			"report window status = %d/%d, want 2 failed and 0 succeeded",
-			report.WindowsFailed,
-			report.WindowsSucceeded,
-		)
+	report.Windows[0].JournalKeys[0] = "mutated-window-report"
+	report.Windows[0].ISSNs[0] = secondISSNs[0]
+	if report.Failures[0].JournalKeys[0] != journals[0].Key() ||
+		report.Failures[0].ISSNs[0] != firstISSNs[0] {
+		t.Fatal("window and failure reports share mutable batch slices")
+	}
+	payload := runner.calls[0].job.Payload
+	if payload["journal_keys"].([]string)[0] != journals[0].Key() ||
+		payload["issns"].([]string)[0] != firstISSNs[0] {
+		t.Fatal("window report mutation changed ingestion payload slices")
 	}
 }
 
-func TestServiceRejectsSearchCountAtPubMedLimitBeforeFetch(t *testing.T) {
+func TestServiceRejectsDailyBatchSearchCountAtPubMedLimitBeforeFetch(t *testing.T) {
 	t.Parallel()
 
 	searcher := &serviceConfiguredSearcher{
@@ -504,6 +601,12 @@ func TestServiceRejectsSearchCountAtPubMedLimitBeforeFetch(t *testing.T) {
 			report.WindowsSucceeded,
 		)
 	}
+	if report.BatchesPlanned != 1 || report.JournalsFailed != 1 ||
+		len(report.Failures) != 2 ||
+		report.Failures[0].BatchKey == "" ||
+		!slices.Equal(report.Failures[0].ISSNs, []string{"1234-5679"}) {
+		t.Fatalf("batch limit report = %#v", report)
+	}
 }
 
 func recordEventsForServiceTest(records source.ClientSequence) ingestion.EventSequence {
@@ -526,12 +629,12 @@ func TestServiceMergesPersistedSummaryWhenIngestionReturnsSummaryAndError(t *tes
 	searcher := &serviceFakeSearcher{}
 	fetcher := &serviceFakeFetcher{}
 	sentinel := errors.New("persisted ingestion failure")
-	firstWindow, err := PlanDaily(
-		mustServiceJournal(t, "1234-5679"),
+	firstWindows, err := PlanDailyBatches(
+		[]Journal{mustServiceJournal(t, "1234-5679")},
 		time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
 	)
 	if err != nil {
-		t.Fatalf("PlanDaily() error = %v", err)
+		t.Fatalf("PlanDailyBatches() error = %v", err)
 	}
 	failedSummary, err := ingestion.NewJobSummary(
 		"persisted-failed-job",
@@ -551,10 +654,10 @@ func TestServiceMergesPersistedSummaryWhenIngestionReturnsSummaryAndError(t *tes
 	}
 	runner := &serviceSummaryErrorIngestion{
 		summaryByKey: map[string]ingestion.JobSummary{
-			firstWindow[0].Key(): failedSummary,
+			firstWindows[0].Key(): failedSummary,
 		},
 		errorByKey: map[string]error{
-			firstWindow[0].Key(): sentinel,
+			firstWindows[0].Key(): sentinel,
 		},
 	}
 	service, err := NewService(
@@ -586,35 +689,24 @@ func TestServiceMergesPersistedSummaryWhenIngestionReturnsSummaryAndError(t *tes
 				"yes",
 				"1",
 			),
-			validRegistryRecord(
-				"Later Journal",
-				2,
-				"9876-5434",
-				"",
-				"",
-				`["9876-5434"]`,
-				"resolved",
-				"yes",
-				"1",
-			),
 		)),
 	})
 	if err == nil || !errors.Is(err, sentinel) {
 		t.Fatalf("Run() error = %v, want persisted ingestion failure", err)
 	}
-	if len(runner.calls) != 4 {
-		t.Fatalf("ingestion calls = %d, want later windows to continue", len(runner.calls))
+	if len(runner.calls) != 2 {
+		t.Fatalf("ingestion calls = %d, want later batch window to continue", len(runner.calls))
 	}
-	if report.WindowsFailed != 1 || report.WindowsSucceeded != 3 {
+	if report.WindowsFailed != 1 || report.WindowsSucceeded != 1 {
 		t.Fatalf(
-			"window status counts = %d/%d, want 1 failed and 3 succeeded",
+			"window status counts = %d/%d, want 1 failed and 1 succeeded",
 			report.WindowsFailed,
 			report.WindowsSucceeded,
 		)
 	}
-	if report.RawInserted != 5 ||
+	if report.RawInserted != 3 ||
 		report.RawReused != 3 ||
-		report.Projected != 7 ||
+		report.Projected != 5 ||
 		report.Excluded != 5 ||
 		report.Deleted != 6 ||
 		report.Unchanged != 7 ||
@@ -623,7 +715,7 @@ func TestServiceMergesPersistedSummaryWhenIngestionReturnsSummaryAndError(t *tes
 	}
 	var failedWindow *WindowReport
 	for index := range report.Windows {
-		if report.Windows[index].WindowKey == firstWindow[0].Key() {
+		if report.Windows[index].WindowKey == firstWindows[0].Key() {
 			failedWindow = &report.Windows[index]
 			break
 		}
@@ -640,7 +732,7 @@ func TestServiceMergesPersistedSummaryWhenIngestionReturnsSummaryAndError(t *tes
 	}
 }
 
-func TestServiceReportsResolvedNoCoverageWithoutProcessingIt(t *testing.T) {
+func TestServiceDailyIncludesResolvedNoAndUnknownCoverage(t *testing.T) {
 	t.Parallel()
 
 	searcher := &serviceFakeSearcher{}
@@ -686,103 +778,144 @@ func TestServiceReportsResolvedNoCoverageWithoutProcessingIt(t *testing.T) {
 				"no",
 				"0",
 			),
+			validRegistryRecord(
+				"Unknown Coverage",
+				3,
+				"1476-4687",
+				"",
+				"",
+				`["1476-4687"]`,
+				"resolved",
+				"unknown",
+				"0",
+			),
 		)),
 	})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if report.NoCoverage != 1 || report.EligibleJournals != 1 {
+	if report.NoCoverage != 1 || report.EligibleJournals != 3 ||
+		report.JournalsPlanned != 3 || report.BatchesPlanned != 1 ||
+		report.WindowsPlanned != 2 {
 		t.Fatalf("report coverage = %#v", report)
 	}
 	if len(runner.calls) != 2 {
-		t.Fatalf("ingestion calls = %d, want only covered journal windows", len(runner.calls))
+		t.Fatalf("ingestion calls = %d, want two batched daily windows", len(runner.calls))
+	}
+	if len(searcher.calls) != 2 {
+		t.Fatalf("Search() calls = %d, want two batched daily windows", len(searcher.calls))
+	}
+	wantISSNs := []string{"1234-5679", "1476-4687", "9876-5434"}
+	slices.Sort(wantISSNs)
+	for index, call := range searcher.calls {
+		if !slices.Equal(call.query.JournalISSNs, wantISSNs) {
+			t.Errorf("Search() call %d ISSNs = %v, want all resolved %v", index, call.query.JournalISSNs, wantISSNs)
+		}
+	}
+	for _, journalReport := range report.Journals {
+		if journalReport.Status != "succeeded" ||
+			journalReport.WindowsPlanned != 2 ||
+			journalReport.WindowsSucceeded != 2 {
+			t.Errorf("daily journal report = %#v", journalReport)
+		}
 	}
 }
 
-func TestServiceWindowJobKeyUsesCompleteTask4WindowIdentity(t *testing.T) {
+func TestServiceDailyBatchWindowJobUsesCompleteIdentity(t *testing.T) {
 	t.Parallel()
 
-	firstJournal := mustServiceJournal(t, "1234-5679")
-	secondJournal := mustServiceJournal(t, "9876-5434")
-	first, err := NewSyncWindow(
-		firstJournal,
-		pubmed.DateTypeEntrez,
-		dateWindow("2026-07-17", "2026-07-19"),
-	)
-	if err != nil {
-		t.Fatalf("NewSyncWindow(first) error = %v", err)
+	journals := []Journal{
+		dailyTestJournal("journal:first", []string{"1234-5679"}),
+		dailyTestJournal("journal:second", []string{"9876-5434"}),
 	}
-	same, err := NewSyncWindow(
-		firstJournal,
-		pubmed.DateTypeEntrez,
-		dateWindow("2026-07-17", "2026-07-19"),
-	)
+	windows, err := PlanDailyBatches(journals, parseTestDate("2026-07-19"))
 	if err != nil {
-		t.Fatalf("NewSyncWindow(same) error = %v", err)
+		t.Fatalf("PlanDailyBatches() error = %v", err)
 	}
-	differentISSNs, err := NewSyncWindow(
-		secondJournal,
-		pubmed.DateTypeEntrez,
-		dateWindow("2026-07-17", "2026-07-19"),
+	job, err := newDailyWindowJob(
+		RunRequest{Mode: ModeDaily, RunDate: parseTestDate("2026-07-19")},
+		windows[0],
 	)
 	if err != nil {
-		t.Fatalf("NewSyncWindow(differentISSNs) error = %v", err)
+		t.Fatalf("newDailyWindowJob() error = %v", err)
 	}
-	differentDateType, err := NewSyncWindow(
-		firstJournal,
-		pubmed.DateTypeModification,
-		dateWindow("2026-07-17", "2026-07-19"),
-	)
-	if err != nil {
-		t.Fatalf("NewSyncWindow(differentDateType) error = %v", err)
+	if job.IdempotencyKey != windows[0].Key() {
+		t.Fatalf("job idempotency key = %q, want %q", job.IdempotencyKey, windows[0].Key())
 	}
-	differentDate, err := NewSyncWindow(
-		firstJournal,
-		pubmed.DateTypeEntrez,
-		dateWindow("2026-07-16", "2026-07-19"),
+	if got := job.Payload["batch_key"]; got != windows[0].BatchKey() {
+		t.Fatalf("payload batch_key = %#v, want %q", got, windows[0].BatchKey())
+	}
+	if got := job.Payload["journal_count"]; got != 2 {
+		t.Fatalf("payload journal_count = %#v, want 2", got)
+	}
+	if got := job.Payload["term_count"]; got != 2 {
+		t.Fatalf("payload term_count = %#v, want 2", got)
+	}
+	for _, forbidden := range []string{"journal_key", "journal_name", "journal_identity", "journal_issns"} {
+		if _, exists := job.Payload[forbidden]; exists {
+			t.Errorf("daily payload contains forbidden singular key %q", forbidden)
+		}
+	}
+}
+
+func TestServiceDailyStopsImmediatelyOnContextFailure(t *testing.T) {
+	t.Parallel()
+
+	searcher := &serviceFakeSearcher{}
+	fetcher := &serviceFakeFetcher{}
+	var ingestionCalls int
+	service, err := NewService(
+		searcher,
+		fetcher,
+		func(
+			_ context.Context,
+			_ ingestion.Job,
+			events ingestion.EventSequence,
+		) (ingestion.JobSummary, error) {
+			ingestionCalls++
+			if err := consumeServiceEvents(events); err != nil {
+				return ingestion.JobSummary{}, err
+			}
+			return ingestion.JobSummary{}, context.Canceled
+		},
+		func(source.ClientSequence) ingestion.EventSequence {
+			return func(yield func(ingestion.Event, error) bool) {}
+		},
 	)
 	if err != nil {
-		t.Fatalf("NewSyncWindow(differentDate) error = %v", err)
+		t.Fatalf("NewService() error = %v", err)
 	}
 
-	firstJob, err := newWindowJob(
-		RunRequest{Mode: ModeDaily, RunDate: parseTestDate("2026-07-19")},
-		first,
-	)
-	if err != nil {
-		t.Fatalf("newWindowJob(first) error = %v", err)
+	report, runErr := service.Run(context.Background(), RunRequest{
+		Mode:         ModeDaily,
+		RunDate:      parseTestDate("2026-07-19"),
+		LookbackDays: 3,
+		Registry: bytes.NewReader(encodeRegistryCSV(
+			testRegistryHeader,
+			validRegistryRecord(
+				"Context Failure Journal",
+				1,
+				"1234-5679",
+				"",
+				"",
+				`["1234-5679"]`,
+				"resolved",
+				"yes",
+				"1",
+			),
+		)),
+	})
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", runErr)
 	}
-	sameJob, err := newWindowJob(
-		RunRequest{Mode: ModeDaily, RunDate: parseTestDate("2026-07-19")},
-		same,
-	)
-	if err != nil {
-		t.Fatalf("newWindowJob(same) error = %v", err)
-	}
-	if firstJob.IdempotencyKey != first.Key() ||
-		sameJob.IdempotencyKey != same.Key() ||
-		firstJob.IdempotencyKey != sameJob.IdempotencyKey {
+	if ingestionCalls != 1 || len(searcher.calls) != 1 ||
+		report.WindowsAttempted != 1 || report.WindowsFailed != 1 {
 		t.Fatalf(
-			"stable job keys = %q/%q, want equal Task4 key",
-			firstJob.IdempotencyKey,
-			sameJob.IdempotencyKey,
+			"context stop calls/report = ingestion:%d search:%d report:%#v",
+			ingestionCalls,
+			len(searcher.calls),
+			report,
 		)
-	}
-	for name, window := range map[string]SyncWindow{
-		"different ISSN set":  differentISSNs,
-		"different date type": differentDateType,
-		"different date":      differentDate,
-	} {
-		job, err := newWindowJob(
-			RunRequest{Mode: ModeDaily, RunDate: parseTestDate("2026-07-19")},
-			window,
-		)
-		if err != nil {
-			t.Fatalf("newWindowJob(%s) error = %v", name, err)
-		}
-		if job.IdempotencyKey == firstJob.IdempotencyKey {
-			t.Fatalf("%s did not change idempotency key %q", name, job.IdempotencyKey)
-		}
 	}
 }
 
@@ -806,6 +939,30 @@ func mustServiceJournal(t *testing.T, issn string) Journal {
 		t.Fatalf("LoadPubMedSupportedRegistry() error = %v", err)
 	}
 	return journals[0]
+}
+
+func serviceRegistryRecordWithISSNs(
+	title string,
+	sourceOrder int,
+	issns []string,
+	pubmedSupported string,
+	pubmedRecordCount string,
+) []string {
+	encodedISSNs, err := json.Marshal(issns)
+	if err != nil {
+		panic(err)
+	}
+	return validRegistryRecord(
+		title,
+		sourceOrder,
+		issns[0],
+		"",
+		"",
+		string(encodedISSNs),
+		"resolved",
+		pubmedSupported,
+		pubmedRecordCount,
+	)
 }
 
 var _ iter.Seq2[ingestion.Event, error] = func(yield func(ingestion.Event, error) bool) {}

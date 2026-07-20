@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -90,6 +91,7 @@ type Report struct {
 	NoCoverage       int             `json:"no_coverage"`
 	JournalsPlanned  int             `json:"journals_planned"`
 	JournalsFailed   int             `json:"journals_failed"`
+	BatchesPlanned   int             `json:"batches_planned"`
 	WindowsPlanned   int             `json:"windows_planned"`
 	WindowsAttempted int             `json:"windows_attempted"`
 	WindowsSucceeded int             `json:"windows_succeeded"`
@@ -118,32 +120,38 @@ type JournalReport struct {
 }
 
 type WindowReport struct {
-	JournalKey  string          `json:"journal_key"`
-	JournalName string          `json:"journal_name"`
-	ISSNs       []string        `json:"issns"`
-	Mode        Mode            `json:"mode"`
-	DateType    pubmed.DateType `json:"date_type"`
-	FromDate    string          `json:"from_date"`
-	ToDate      string          `json:"to_date"`
-	WindowKey   string          `json:"window_key"`
-	Status      string          `json:"status"`
-	Stage       string          `json:"stage,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	RawInserted int64           `json:"raw_inserted"`
-	RawReused   int64           `json:"raw_reused"`
-	Projected   int64           `json:"projected"`
-	Excluded    int64           `json:"excluded"`
-	Deleted     int64           `json:"deleted"`
-	Unchanged   int64           `json:"unchanged"`
-	Failed      int64           `json:"failed"`
+	JournalKey   string          `json:"journal_key,omitempty"`
+	JournalName  string          `json:"journal_name,omitempty"`
+	BatchKey     string          `json:"batch_key,omitempty"`
+	JournalCount int             `json:"journal_count,omitempty"`
+	JournalKeys  []string        `json:"journal_keys,omitempty"`
+	ISSNs        []string        `json:"issns"`
+	Mode         Mode            `json:"mode"`
+	DateType     pubmed.DateType `json:"date_type"`
+	FromDate     string          `json:"from_date"`
+	ToDate       string          `json:"to_date"`
+	WindowKey    string          `json:"window_key"`
+	Status       string          `json:"status"`
+	Stage        string          `json:"stage,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	RawInserted  int64           `json:"raw_inserted"`
+	RawReused    int64           `json:"raw_reused"`
+	Projected    int64           `json:"projected"`
+	Excluded     int64           `json:"excluded"`
+	Deleted      int64           `json:"deleted"`
+	Unchanged    int64           `json:"unchanged"`
+	Failed       int64           `json:"failed"`
 }
 
 type FailureReport struct {
-	JournalKey  string `json:"journal_key"`
-	JournalName string `json:"journal_name"`
-	WindowKey   string `json:"window_key,omitempty"`
-	Stage       string `json:"stage"`
-	Error       string `json:"error"`
+	JournalKey  string   `json:"journal_key,omitempty"`
+	JournalName string   `json:"journal_name,omitempty"`
+	BatchKey    string   `json:"batch_key,omitempty"`
+	JournalKeys []string `json:"journal_keys,omitempty"`
+	ISSNs       []string `json:"issns,omitempty"`
+	WindowKey   string   `json:"window_key,omitempty"`
+	Stage       string   `json:"stage"`
+	Error       string   `json:"error"`
 }
 
 func (report Report) Result() map[string]any {
@@ -157,6 +165,7 @@ func (report Report) Result() map[string]any {
 		"no_coverage":       report.NoCoverage,
 		"journals_planned":  report.JournalsPlanned,
 		"journals_failed":   report.JournalsFailed,
+		"batches_planned":   report.BatchesPlanned,
 		"windows_planned":   report.WindowsPlanned,
 		"windows_attempted": report.WindowsAttempted,
 		"windows_succeeded": report.WindowsSucceeded,
@@ -196,10 +205,20 @@ func (service *Service) Run(
 	if err != nil {
 		return report, fmt.Errorf("read PubMed journal registry: %w", err)
 	}
-	journals, err := LoadPubMedSupportedRegistry(bytes.NewReader(registryBytes))
+
+	var journals []Journal
+	switch request.Mode {
+	case ModeBackfill:
+		journals, err = LoadPubMedSupportedRegistry(bytes.NewReader(registryBytes))
+	case ModeDaily:
+		journals, err = LoadResolvedRegistry(bytes.NewReader(registryBytes))
+	default:
+		return report, fmt.Errorf("unsupported PubMed journal sync mode %q", request.Mode)
+	}
 	if err != nil {
 		return report, err
 	}
+
 	registryRows, noCoverage, err := countRegistryStats(bytes.NewReader(registryBytes))
 	if err != nil {
 		return report, err
@@ -208,6 +227,22 @@ func (service *Service) Run(
 	report.EligibleJournals = len(journals)
 	report.NoCoverage = noCoverage
 
+	switch request.Mode {
+	case ModeBackfill:
+		return service.runBackfill(ctx, request, report, journals)
+	case ModeDaily:
+		return service.runDaily(ctx, request, report, journals)
+	default:
+		return report, fmt.Errorf("unsupported PubMed journal sync mode %q", request.Mode)
+	}
+}
+
+func (service *Service) runBackfill(
+	ctx context.Context,
+	request RunRequest,
+	report Report,
+	journals []Journal,
+) (Report, error) {
 	var runErr error
 	for _, journal := range journals {
 		if err := ctx.Err(); err != nil {
@@ -324,6 +359,137 @@ func (service *Service) Run(
 	return report, runErr
 }
 
+func (service *Service) runDaily(
+	ctx context.Context,
+	request RunRequest,
+	report Report,
+	journals []Journal,
+) (Report, error) {
+	journalIndexes := make(map[string]int, len(journals))
+	for _, journal := range journals {
+		journalIndexes[journal.Key()] = len(report.Journals)
+		report.Journals = append(report.Journals, JournalReport{
+			JournalKey:     journal.Key(),
+			JournalName:    journal.SourceJournalName(),
+			ISSNs:          journal.ISSNs(),
+			Status:         "planned",
+			WindowsPlanned: 2,
+		})
+	}
+	report.JournalsPlanned = len(journals)
+
+	windows, err := PlanDailyBatches(journals, request.RunDate)
+	if err != nil {
+		journalKeys, _ := dailyJournalEvidence(journals)
+		for index := range report.Journals {
+			report.Journals[index].Status = "failed"
+			report.Journals[index].Error = err.Error()
+		}
+		report.JournalsFailed = len(report.Journals)
+		report.Failures = append(report.Failures, FailureReport{
+			JournalKeys: slices.Clone(journalKeys),
+			Stage:       "plan",
+			Error:       err.Error(),
+		})
+		return report, fmt.Errorf("plan PubMed daily batches: %w", err)
+	}
+
+	batchKeys := make(map[string]struct{}, len(windows)/2)
+	for _, window := range windows {
+		batchKeys[window.BatchKey()] = struct{}{}
+	}
+	report.BatchesPlanned = len(batchKeys)
+	report.WindowsPlanned = len(windows)
+
+	failedJournals := make(map[string]struct{}, len(journals))
+	var runErr error
+	for _, window := range windows {
+		if err := ctx.Err(); err != nil {
+			return report, errors.Join(runErr, err)
+		}
+
+		batchJournals := window.Journals()
+		journalKeys, _ := dailyJournalEvidence(batchJournals)
+		windowReport := WindowReport{
+			BatchKey:     window.BatchKey(),
+			JournalCount: len(batchJournals),
+			JournalKeys:  slices.Clone(journalKeys),
+			ISSNs:        window.ISSNs(),
+			Mode:         request.Mode,
+			DateType:     window.DateType(),
+			FromDate:     window.From().Format(time.DateOnly),
+			ToDate:       window.To().Format(time.DateOnly),
+			WindowKey:    window.Key(),
+			Status:       "planned",
+		}
+		report.Windows = append(report.Windows, windowReport)
+		windowIndex := len(report.Windows) - 1
+		report.WindowsAttempted++
+
+		summary, runWindowErr := service.runDailyWindow(ctx, request, window)
+		if summaryErr := summary.Validate(); summaryErr == nil {
+			mergeSummary(&report, &report.Windows[windowIndex], summary)
+		} else if runWindowErr == nil {
+			runWindowErr = fmt.Errorf(
+				"validate PubMed ingestion summary: %w",
+				summaryErr,
+			)
+		}
+		if runWindowErr != nil {
+			report.Windows[windowIndex].Status = "failed"
+			report.Windows[windowIndex].Stage = "search_or_ingestion"
+			report.Windows[windowIndex].Error = runWindowErr.Error()
+			report.WindowsFailed++
+
+			for _, journal := range batchJournals {
+				journalIndex := journalIndexes[journal.Key()]
+				report.Journals[journalIndex].WindowsFailed++
+				report.Journals[journalIndex].Status = "failed"
+				report.Journals[journalIndex].Error = runWindowErr.Error()
+				if _, alreadyFailed := failedJournals[journal.Key()]; !alreadyFailed {
+					failedJournals[journal.Key()] = struct{}{}
+					report.JournalsFailed++
+				}
+			}
+			report.Failures = append(report.Failures, FailureReport{
+				BatchKey:    window.BatchKey(),
+				JournalKeys: slices.Clone(journalKeys),
+				ISSNs:       window.ISSNs(),
+				WindowKey:   window.Key(),
+				Stage:       "search_or_ingestion",
+				Error:       runWindowErr.Error(),
+			})
+			if isContextError(runWindowErr) {
+				return report, errors.Join(runErr, runWindowErr)
+			}
+			runErr = errors.Join(
+				runErr,
+				fmt.Errorf(
+					"run daily batch %q window %q: %w",
+					window.BatchKey(),
+					window.Key(),
+					runWindowErr,
+				),
+			)
+			continue
+		}
+
+		report.Windows[windowIndex].Status = "succeeded"
+		report.WindowsSucceeded++
+		for _, journal := range batchJournals {
+			journalIndex := journalIndexes[journal.Key()]
+			report.Journals[journalIndex].WindowsSucceeded++
+		}
+	}
+
+	for index := range report.Journals {
+		if report.Journals[index].Status != "failed" {
+			report.Journals[index].Status = "succeeded"
+		}
+	}
+	return report, runErr
+}
+
 func validateRunRequest(ctx context.Context, request RunRequest) error {
 	if ctx == nil {
 		return errors.New("PubMed journal sync context is required")
@@ -422,6 +588,54 @@ func (service *Service) runWindow(
 	return summary, nil
 }
 
+func (service *Service) runDailyWindow(
+	ctx context.Context,
+	request RunRequest,
+	window DailyBatchWindow,
+) (ingestion.JobSummary, error) {
+	job, err := newDailyWindowJob(request, window)
+	if err != nil {
+		return ingestion.JobSummary{}, err
+	}
+
+	events := func(yield func(ingestion.Event, error) bool) {
+		history, err := service.searcher.Search(ctx, pubmed.SearchQuery{
+			JournalISSNs: window.ISSNs(),
+			DateType:     window.DateType(),
+			DateWindow:   window.DateWindow(),
+			MaxResults:   pubmed.MaxSearchResults,
+		})
+		if err != nil {
+			yield(nil, fmt.Errorf("search PubMed window: %w", err))
+			return
+		}
+		if history.Count >= pubmed.MaxSearchResults {
+			yield(
+				nil,
+				fmt.Errorf(
+					"PubMed search count %d reaches fetch limit %d for window %q; refusing truncated fetch",
+					history.Count,
+					pubmed.MaxSearchResults,
+					window.Key(),
+				),
+			)
+			return
+		}
+
+		records := service.fetcher.Fetch(ctx, history)
+		for event, err := range service.recordEvents(records) {
+			if !yield(event, err) {
+				return
+			}
+		}
+	}
+	summary, err := service.runIngestion(ctx, job, events)
+	if err != nil {
+		return summary, fmt.Errorf("ingest PubMed window: %w", err)
+	}
+	return summary, nil
+}
+
 func mergeSummary(
 	report *Report,
 	window *WindowReport,
@@ -467,6 +681,45 @@ func newWindowJob(request RunRequest, window SyncWindow) (ingestion.Job, error) 
 		window.Key(),
 		payload,
 	)
+}
+
+func newDailyWindowJob(
+	request RunRequest,
+	window DailyBatchWindow,
+) (ingestion.Job, error) {
+	journals := window.Journals()
+	journalKeys, journalNames := dailyJournalEvidence(journals)
+	issns := window.ISSNs()
+	payload := map[string]any{
+		"mode":          string(request.Mode),
+		"batch_key":     window.BatchKey(),
+		"journal_count": len(journals),
+		"journal_keys":  journalKeys,
+		"journal_names": journalNames,
+		"issns":         issns,
+		"term_count":    len(issns),
+		"date_type":     string(window.DateType()),
+		"from_date":     window.From().Format(time.DateOnly),
+		"to_date":       window.To().Format(time.DateOnly),
+		"run_date":      request.RunDate.UTC().Format(time.DateOnly),
+		"window_key":    window.Key(),
+	}
+	return ingestion.NewJob(
+		"sync/pubmed-journals/"+window.Key(),
+		source.PubMed,
+		window.Key(),
+		payload,
+	)
+}
+
+func dailyJournalEvidence(journals []Journal) ([]string, []string) {
+	journalKeys := make([]string, len(journals))
+	journalNames := make([]string, len(journals))
+	for index := range journals {
+		journalKeys[index] = journals[index].Key()
+		journalNames[index] = journals[index].SourceJournalName()
+	}
+	return journalKeys, journalNames
 }
 
 type searchCounter struct {
