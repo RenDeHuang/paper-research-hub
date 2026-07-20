@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,12 +29,23 @@ func TestSearchUsesHistoryServerIdentityDateWindowAndStableBatches(t *testing.T)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
-	var captured url.Values
+	var (
+		capturedMethod      string
+		capturedContentType string
+		capturedQuery       url.Values
+		capturedPostForm    url.Values
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/entrez/eutils/esearch.fcgi" {
 			t.Errorf("path = %q", request.URL.Path)
 		}
-		captured = request.URL.Query()
+		if err := request.ParseForm(); err != nil {
+			t.Errorf("ParseForm() error = %v", err)
+		}
+		capturedMethod = request.Method
+		capturedContentType = request.Header.Get("Content-Type")
+		capturedQuery = request.URL.Query()
+		capturedPostForm = request.PostForm
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write(fixture)
 	}))
@@ -64,24 +76,109 @@ func TestSearchUsesHistoryServerIdentityDateWindowAndStableBatches(t *testing.T)
 	if !slices.Equal(result.Batches, wantBatches) {
 		t.Fatalf("Batches = %#v, want %#v", result.Batches, wantBatches)
 	}
+	if capturedMethod != http.MethodPost {
+		t.Fatalf("method = %q, want POST", capturedMethod)
+	}
+	if capturedContentType != "application/x-www-form-urlencoded" {
+		t.Fatalf(
+			"Content-Type = %q, want application/x-www-form-urlencoded",
+			capturedContentType,
+		)
+	}
 	for key, want := range map[string]string{
 		"db":         "pubmed",
 		"retmode":    "json",
 		"retmax":     "0",
 		"usehistory": "y",
-		"tool":       "paper-hub-test",
-		"email":      "research@example.test",
-		"api_key":    "ncbi-test-secret",
 		"datetype":   "edat",
 		"mindate":    "2026/07/01",
 		"maxdate":    "2026/07/16",
 	} {
-		if got := captured.Get(key); got != want {
-			t.Errorf("%s = %q, want %q", key, got, want)
+		if got := capturedPostForm.Get(key); got != want {
+			t.Errorf("POST form %s = %q, want %q", key, got, want)
 		}
 	}
-	if got := captured.Get("term"); got != "(agents) AND (0028-0836[issn])" {
-		t.Fatalf("term = %q", got)
+	if got := capturedPostForm.Get("term"); got != "(agents) AND (0028-0836[issn])" {
+		t.Fatalf("POST form term = %q", got)
+	}
+	if len(capturedPostForm) != 8 {
+		t.Fatalf("POST form keys = %v, want only the eight search fields", capturedPostForm)
+	}
+	for key, want := range map[string]string{
+		"tool":    "paper-hub-test",
+		"email":   "research@example.test",
+		"api_key": "ncbi-test-secret",
+	} {
+		if got := capturedQuery.Get(key); got != want {
+			t.Errorf("query %s = %q, want %q", key, got, want)
+		}
+	}
+	if len(capturedQuery) != 3 {
+		t.Fatalf("query keys = %v, want only tool/email/api_key", capturedQuery)
+	}
+	for _, key := range []string{
+		"db",
+		"retmode",
+		"retmax",
+		"usehistory",
+		"term",
+		"datetype",
+		"mindate",
+		"maxdate",
+	} {
+		if capturedQuery.Has(key) {
+			t.Errorf("query unexpectedly included search field %s=%q", key, capturedQuery.Get(key))
+		}
+	}
+	for _, key := range []string{"tool", "email", "api_key"} {
+		if capturedPostForm.Has(key) {
+			t.Errorf("POST form unexpectedly repeated identity %s=%q", key, capturedPostForm.Get(key))
+		}
+	}
+}
+
+func TestSearchReplaysIdenticalFormBodyOnRetry(t *testing.T) {
+	t.Parallel()
+
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		payload, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("ReadAll(request.Body) error = %v", err)
+		}
+		bodies = append(bodies, string(payload))
+		if len(bodies) == 1 {
+			http.Error(writer, "retry", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = writer.Write([]byte(
+			`{"esearchresult":{"count":"0","querykey":"1","webenv":"history"}}`,
+		))
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxRetries = 1
+	}, httpclient.Dependencies{
+		Now: func() time.Time { return time.Unix(0, 0) },
+		Sleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+	})
+	if _, err := client.Search(context.Background(), validSearchQuery()); err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("request bodies = %d, want initial request plus one retry", len(bodies))
+	}
+	if bodies[0] == "" {
+		t.Fatal("initial POST body is empty")
+	}
+	if bodies[1] != bodies[0] {
+		t.Fatalf("retry body = %q, want exact replay of %q", bodies[1], bodies[0])
 	}
 }
 
@@ -274,6 +371,7 @@ func TestClientRejectsTimeoutAndResponseLimitThroughSharedPolicy(t *testing.T) {
 
 	t.Run("timeout", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			_, _ = io.Copy(io.Discard, request.Body)
 			<-request.Context().Done()
 		}))
 		defer server.Close()

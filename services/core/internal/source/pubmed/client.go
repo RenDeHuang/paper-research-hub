@@ -114,9 +114,10 @@ func (client *Client) Search(ctx context.Context, query SearchQuery) (SearchResu
 	values.Set("retmode", "json")
 	values.Set("retmax", "0")
 	values.Set("usehistory", "y")
-	client.addIdentity(values)
 
-	response, err := client.get(ctx, "esearch.fcgi", values)
+	identity := make(url.Values)
+	client.addIdentity(identity)
+	response, err := client.postForm(ctx, "esearch.fcgi", identity, values)
 	if err != nil {
 		return SearchResult{}, fmt.Errorf("search PubMed history: %w", err)
 	}
@@ -295,6 +296,28 @@ func (client *Client) get(
 	if err != nil {
 		return nil, fmt.Errorf("create PubMed %s request: %w", operation, err)
 	}
+	return client.httpClient.Do(request)
+}
+
+func (client *Client) postForm(
+	ctx context.Context,
+	operation string,
+	query url.Values,
+	form url.Values,
+) (*http.Response, error) {
+	endpoint := *client.baseURL
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/entrez/eutils/" + operation
+	endpoint.RawQuery = query.Encode()
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		endpoint.String(),
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create PubMed %s request: %w", operation, err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return client.httpClient.Do(request)
 }
 
