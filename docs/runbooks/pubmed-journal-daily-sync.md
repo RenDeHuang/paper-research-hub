@@ -1,10 +1,12 @@
-# PubMed 期刊三年回填与每日同步运行手册
+# PubMed 期刊注册表、三年回填与每日同步运行手册
 
 ## 1. 范围
 
-本阶段只处理期刊注册表中 `resolved + pubmed_supported=yes` 的期刊：
+本阶段的 Registry 和同步资格分开定义：
 
-- 首次回填：`2023-07-19` 至 `2026-07-19`，按 PubMed publication date；
+- Registry 默认只执行 Crossref 目录获取与严格期刊匹配，不执行历史 PubMed coverage audit；
+- 每日同步：处理所有 `resolution_status=resolved` 的期刊，不受 `pubmed_supported=yes/no/unknown` 限制；
+- 首次回填：只处理显式 audit 后的 `resolved + pubmed_supported=yes`，`2023-07-19` 至 `2026-07-19` 按 PubMed publication date；
 - 每日同步：运行日及之前两天，依次查询 `EDAT` 与 `MDAT`；
 - 论文身份：DOI 优先，无 DOI 时使用 PMID；
 - 同一窗口重复执行由 ingestion job 和 DOI/PMID identity 幂等处理。
@@ -27,7 +29,12 @@
 
 ### 2.2 NCBI 配置
 
-NCBI E-utilities 不要求付费 API key，但必须提供有效的工具名和联系邮箱：
+默认生成 Registry 不读取也不要求任何 NCBI 环境变量。只有以下操作需要 NCBI 配置：
+
+- 使用 `--audit-pubmed-coverage` 显式生成历史 coverage；
+- 执行 daily 或 backfill 同步。
+
+NCBI E-utilities 不要求付费 API key，但上述操作必须提供有效的工具名和联系邮箱：
 
 ```bash
 export NCBI_TOOL='paper-hub'
@@ -47,9 +54,9 @@ export NCBI_EMAIL='your-real-email@example.com'
 
 注册表生成命令本身不需要 `DATABASE_URL`。
 
-## 3. 生成 PubMed 覆盖注册表
+## 3. 生成期刊注册表
 
-注册表生成会复用或建立 Crossref 期刊目录缓存，并用每本已精确解析期刊的全部 ISSN 做一次精确 PubMed OR 查询。
+默认生成会复用或建立 Crossref 期刊目录缓存，严格匹配三份源名单，不构造 PubMed counter，也不发起历史 coverage 查询。
 
 ```bash
 go -C services/core run ./cmd/journal-pubmed-registry \
@@ -60,6 +67,21 @@ go -C services/core run ./cmd/journal-pubmed-registry \
   --output data/venues/journal-pubmed-registry.v1.csv \
   --report data/venues/journal-pubmed-registry.v1.report.json
 ```
+
+默认结果：
+
+- 2032 行的 `pubmed_supported` 全部为 `unknown`；
+- report 中 `counts.probes.eligible` 等于 `resolved` 数；
+- `counts.probes.attempted=0`；
+- 每行都有 `attempted=false`、空 `checked_at/response_sha256/error`、零 `record_count` 的完整 receipt。
+
+只有需要历史 coverage 或三年 backfill 时，才在同一命令末尾显式增加：
+
+```text
+--audit-pubmed-coverage
+```
+
+audit 模式会用每本已精确解析期刊的全部 ISSN 做一次精确 PubMed OR 查询；此时必须配置 `NCBI_TOOL` 和 bare `NCBI_EMAIL`。
 
 成功后应存在：
 
@@ -72,11 +94,14 @@ data/venues/journal-pubmed-registry.v1.report.json
 
 - CSV 数据行恰好 2032；
 - 每行都有 `resolved/ambiguous/unresolved` 和 `yes/no/unknown` 的明确状态；
-- `pubmed_supported=yes` 的行有正数 `pubmed_record_count`；
-- `ambiguous/unresolved` 行不会发起 PubMed 查询；
+- 默认模式全部为严格 `unknown/unattempted`，不会保留旧 `yes/no`；
+- audit 模式中 `pubmed_supported=yes` 的行有正数 `pubmed_record_count`；
+- audit 模式中 `ambiguous/unresolved` 行不会发起 PubMed 查询；
 - report 中输入 bytes、SHA256、行数、CSV 行数和状态统计相互一致。
 
 ## 4. 首次三年回填
+
+三年回填只读取 audited Registry 中的 `resolved + pubmed_supported=yes`。如果 Registry 是默认生成的 `unknown/unattempted` 版本，必须先使用 `--audit-pubmed-coverage` 重新生成 audited Registry，不能直接启动三年回填。
 
 ```bash
 go -C services/core run ./cmd/worker -- sync pubmed-journals \
@@ -108,12 +133,14 @@ go -C services/core run ./cmd/worker -- sync pubmed-journals \
   --registry data/venues/journal-pubmed-registry.v1.csv
 ```
 
-每本期刊严格生成两个窗口，顺序为：
+daily 读取所有 `resolution_status=resolved` 的期刊，不受历史 coverage 的 `yes/no/unknown` 状态限制。规划器保持一本期刊的全部 ISSN 在同一批次，每批最多包含 2048 个唯一 ISSN term；每个批次严格生成两个窗口，顺序为：
 
 ```text
 EDAT: 2026-07-17..2026-07-19
 MDAT: 2026-07-17..2026-07-19
 ```
+
+执行顺序是 `batch1 EDAT → batch1 MDAT → batch2 EDAT → batch2 MDAT`，不是“每本期刊各执行两个查询”。
 
 如果某个窗口的 PubMed count 达到 10000，任务会明确失败并报告，不会只抓取前 10000 条。
 
@@ -165,9 +192,9 @@ go -C services/core vet ./internal/paper ./internal/source/pubmed \
   ./cmd/journal-pubmed-registry ./cmd/worker
 ```
 
-真实生成注册表和真实回填还需要：
+真实运行还需要：
 
-- 有效 `NCBI_EMAIL`（`NCBI_TOOL` 可自定义）；
-- 可访问的 Crossref/NCBI 网络；
-- 生成注册表时的 Crossref cache 目录；
-- 回填时可用的 PostgreSQL。
+- 默认生成 Registry：可访问 Crossref 网络和 Crossref cache 目录；
+- 显式 coverage audit：额外需要有效 `NCBI_TOOL`、bare `NCBI_EMAIL` 和可访问的 NCBI 网络；
+- daily/backfill：需要有效 NCBI 配置和可访问的 NCBI 网络；
+- daily/backfill 时可用的 PostgreSQL。

@@ -173,6 +173,297 @@ func TestJournalPubMedRegistryCLIRequiresExactlyThreeInputsAndExplicitPaths(
 	}
 }
 
+func TestJournalPubMedRegistrySkipsCoverageAuditByDefault(t *testing.T) {
+	t.Parallel()
+
+	t.Run("flag and source configuration", func(t *testing.T) {
+		defaultCommand, err := parseRegistryCommand(validJournalRegistryArgs())
+		if err != nil {
+			t.Fatalf("parseRegistryCommand(default) error = %v", err)
+		}
+		if defaultCommand.AuditPubMedCoverage {
+			t.Fatal("default command unexpectedly enables PubMed coverage audit")
+		}
+
+		auditArgs := append(
+			slices.Clone(validJournalRegistryArgs()),
+			"--audit-pubmed-coverage",
+		)
+		auditCommand, err := parseRegistryCommand(auditArgs)
+		if err != nil {
+			t.Fatalf("parseRegistryCommand(audit) error = %v", err)
+		}
+		if !auditCommand.AuditPubMedCoverage {
+			t.Fatal("explicit audit flag did not enable PubMed coverage audit")
+		}
+
+		var stdout, stderr bytes.Buffer
+		var received registryCommand
+		ncbiLookups := 0
+		ran := false
+		code := realMain(
+			context.Background(),
+			validJournalRegistryArgs(),
+			&stdout,
+			&stderr,
+			func(key string) (string, bool) {
+				if strings.HasPrefix(key, "NCBI_") {
+					ncbiLookups++
+				}
+				return "", false
+			},
+			func(
+				_ context.Context,
+				command registryCommand,
+			) (registryResult, error) {
+				ran = true
+				received = command
+				return registryResult{
+					Rows:          journalPubMedRegistryRows,
+					PubMedUnknown: journalPubMedRegistryRows,
+				}, nil
+			},
+		)
+		if code != 0 {
+			t.Fatalf(
+				"realMain(default) code = %d, stderr = %s",
+				code,
+				stderr.String(),
+			)
+		}
+		if ncbiLookups != 0 {
+			t.Fatalf("default configuration read %d NCBI variables", ncbiLookups)
+		}
+		if !ran {
+			t.Fatal("default configuration did not call the registry runner")
+		}
+		if received.AuditPubMedCoverage ||
+			received.NCBITool != "" ||
+			received.NCBIEmail != "" ||
+			received.NCBIAPIKey != "" ||
+			received.CrossrefContactEmail != "" {
+			t.Fatalf("default source configuration = %#v", received)
+		}
+	})
+
+	t.Run("runner writes complete unknown overlay", func(t *testing.T) {
+		inputs := writeJournalRegistryInputs(t, []journalRegistryInputSpec{
+			{domain: "medicine", rows: 1546},
+			{domain: "biology", rows: 302},
+			{domain: "computer_science", rows: 184},
+		})
+		directory := t.TempDir()
+		outputPath := filepath.Join(directory, "registry.csv")
+		reportPath := filepath.Join(directory, "registry.report.json")
+		generatedAt := time.Date(
+			2026,
+			time.July,
+			20,
+			1,
+			2,
+			3,
+			4,
+			time.UTC,
+		)
+		dependencies := defaultRegistryDependencies()
+		dependencies.now = func() time.Time { return generatedAt }
+		dependencies.pubMedBaseURL = ""
+		dependencies.newPubMedCounter = nil
+		dependencies.fetchCrossref = func(
+			context.Context,
+			*http.Client,
+			venueenrich.CrossrefCatalogConfig,
+			httpclient.Dependencies,
+		) (venueenrich.CrossrefCatalog, error) {
+			return journalRegistryCatalog(generatedAt), nil
+		}
+		dependencies.matchCrossref = func(
+			sources []venueenrich.SourceRow,
+			_ venueenrich.CrossrefCatalog,
+		) ([]venueenrich.RegistryRow, error) {
+			rows := journalRegistryMatches(sources)
+			rows[0].PubMedSupported = venueenrich.SupportStatusYes
+			rows[0].PubMedRecordCount = 99
+			rows[1].PubMedSupported = venueenrich.SupportStatusNo
+			return rows, nil
+		}
+
+		result, err := (registryRunner{dependencies: dependencies}).run(
+			context.Background(),
+			registryCommand{
+				Inputs:     inputs,
+				CacheDir:   filepath.Join(directory, "cache"),
+				OutputPath: outputPath,
+				ReportPath: reportPath,
+			},
+		)
+		if err != nil {
+			t.Fatalf("registryRunner.run(default) error = %v", err)
+		}
+		if result.Rows != journalPubMedRegistryRows ||
+			result.PubMedUnknown != journalPubMedRegistryRows {
+			t.Fatalf("default registry result = %#v", result)
+		}
+
+		outputBytes, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("ReadFile(output) error = %v", err)
+		}
+		records, err := csv.NewReader(bytes.NewReader(outputBytes)).ReadAll()
+		if err != nil {
+			t.Fatalf("decode default CSV: %v", err)
+		}
+		if len(records) != journalPubMedRegistryRows+1 {
+			t.Fatalf("default CSV records = %d", len(records))
+		}
+		for index, record := range records[1:] {
+			if record[12] != "unknown" ||
+				record[13] != "0" ||
+				record[14] != "" {
+				t.Fatalf(
+					"default CSV row %d PubMed fields = %q/%q/%q",
+					index+1,
+					record[12],
+					record[13],
+					record[14],
+				)
+			}
+		}
+
+		reportBytes, err := os.ReadFile(reportPath)
+		if err != nil {
+			t.Fatalf("ReadFile(report) error = %v", err)
+		}
+		var report registryReport
+		decodeSingleJSONValue(t, bytes.NewReader(reportBytes), &report)
+		if report.Counts.Match.Resolved != 3 ||
+			report.Counts.Probes.Eligible != 3 ||
+			report.Counts.Probes.Attempted != 0 ||
+			report.Counts.PubMed.Unknown != journalPubMedRegistryRows {
+			t.Fatalf("default report counts = %#v", report.Counts)
+		}
+		if len(report.Probes) != journalPubMedRegistryRows {
+			t.Fatalf("default report probes = %d", len(report.Probes))
+		}
+		for index, probe := range report.Probes {
+			if probe.Attempted ||
+				probe.CheckedAt != "" ||
+				probe.ResponseSHA256 != "" ||
+				probe.Error != "" ||
+				probe.Status != venueenrich.SupportStatusUnknown ||
+				probe.RecordCount != 0 {
+				t.Fatalf("default probe %d = %#v", index+1, probe)
+			}
+		}
+		if !slices.Equal(
+			report.Probes[0].ISSNs,
+			[]string{"0028-0836", "2049-3630"},
+		) {
+			t.Fatalf(
+				"default resolved ISSNs = %v, want canonical exact set",
+				report.Probes[0].ISSNs,
+			)
+		}
+		if err := reconcileRegistryArtifacts(outputBytes, reportBytes); err != nil {
+			t.Fatalf("reconcileRegistryArtifacts(default) error = %v", err)
+		}
+	})
+}
+
+func TestJournalPubMedRegistryAuditRequiresNCBIConfiguration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "missing tool",
+			env:  map[string]string{},
+			want: "NCBI_TOOL",
+		},
+		{
+			name: "missing email",
+			env: map[string]string{
+				"NCBI_TOOL": "paper-hub-registry",
+			},
+			want: "NCBI_EMAIL",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var stdout, stderr bytes.Buffer
+			ran := false
+			code := realMain(
+				context.Background(),
+				validJournalRegistryAuditArgs(),
+				&stdout,
+				&stderr,
+				journalRegistryLookup(test.env),
+				func(
+					context.Context,
+					registryCommand,
+				) (registryResult, error) {
+					ran = true
+					return registryResult{}, nil
+				},
+			)
+			if code != 1 {
+				t.Fatalf("realMain(audit) code = %d, want 1", code)
+			}
+			if ran {
+				t.Fatal("audit runner called without required NCBI configuration")
+			}
+			if !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), test.want)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+		})
+	}
+}
+
+func TestJournalPubMedRegistryValidatesDependenciesByCoverageMode(t *testing.T) {
+	t.Parallel()
+
+	dependencies := defaultRegistryDependencies()
+	dependencies.pubMedBaseURL = ""
+	dependencies.newPubMedCounter = nil
+
+	if _, err := dependencies.validated(false); err != nil {
+		t.Fatalf("validated(default) error = %v", err)
+	}
+
+	t.Run("audit requires base URL", func(t *testing.T) {
+		auditDependencies := defaultRegistryDependencies()
+		auditDependencies.pubMedBaseURL = ""
+		if _, err := auditDependencies.validated(true); err == nil ||
+			!strings.Contains(err.Error(), "base URL") {
+			t.Fatalf(
+				"validated(audit missing URL) error = %v",
+				err,
+			)
+		}
+	})
+
+	t.Run("audit requires counter constructor", func(t *testing.T) {
+		auditDependencies := defaultRegistryDependencies()
+		auditDependencies.newPubMedCounter = nil
+		if _, err := auditDependencies.validated(true); err == nil ||
+			!strings.Contains(err.Error(), "counter") {
+			t.Fatalf(
+				"validated(audit missing counter) error = %v",
+				err,
+			)
+		}
+	})
+}
+
 func TestJournalPubMedRegistryCLIUsesOnlySourceConfigurationWithoutDatabase(
 	t *testing.T,
 ) {
@@ -182,7 +473,7 @@ func TestJournalPubMedRegistryCLIUsesOnlySourceConfigurationWithoutDatabase(
 	var received registryCommand
 	code := realMain(
 		context.Background(),
-		validJournalRegistryArgs(),
+		validJournalRegistryAuditArgs(),
 		&stdout,
 		&stderr,
 		journalRegistryLookup(map[string]string{
@@ -206,6 +497,7 @@ func TestJournalPubMedRegistryCLIUsesOnlySourceConfigurationWithoutDatabase(
 	if received.NCBITool != "paper-hub-registry" ||
 		received.NCBIEmail != "research@example.test" ||
 		received.NCBIAPIKey != "ncbi-registry-secret" ||
+		!received.AuditPubMedCoverage ||
 		received.CrossrefContactEmail != "research@example.test" {
 		t.Fatalf("source-only command configuration = %#v", received)
 	}
@@ -239,7 +531,7 @@ func TestJournalPubMedRegistryCLIValidatesBareEmailsAndRedactsAPIKey(
 		ran := false
 		code := realMain(
 			context.Background(),
-			validJournalRegistryArgs(),
+			validJournalRegistryAuditArgs(),
 			&stdout,
 			&stderr,
 			journalRegistryLookup(map[string]string{
@@ -268,7 +560,7 @@ func TestJournalPubMedRegistryCLIValidatesBareEmailsAndRedactsAPIKey(
 		var stdout, stderr bytes.Buffer
 		code := realMain(
 			context.Background(),
-			validJournalRegistryArgs(),
+			validJournalRegistryAuditArgs(),
 			&stdout,
 			&stderr,
 			journalRegistryLookup(map[string]string{
@@ -388,6 +680,7 @@ func TestJournalPubMedRegistryGeneratesFixedCSVReportCountsAndHashes(t *testing.
 			CacheDir:             filepath.Join(directory, "cache"),
 			OutputPath:           outputPath,
 			ReportPath:           reportPath,
+			AuditPubMedCoverage:  true,
 			NCBITool:             "paper-hub-registry",
 			NCBIEmail:            "research@example.test",
 			NCBIAPIKey:           "ncbi-registry-secret",
@@ -663,6 +956,7 @@ func TestJournalPubMedRegistryRedactsAPIKeyFromProbeReport(t *testing.T) {
 			CacheDir:             filepath.Join(directory, "cache"),
 			OutputPath:           filepath.Join(directory, "registry.csv"),
 			ReportPath:           reportPath,
+			AuditPubMedCoverage:  true,
 			NCBITool:             "paper-hub-registry",
 			NCBIEmail:            "research@example.test",
 			NCBIAPIKey:           apiKey,
@@ -720,6 +1014,7 @@ func TestJournalPubMedRegistryOutputFailureCleansTempsAndNewFinals(t *testing.T)
 			CacheDir:             filepath.Join(directory, "cache"),
 			OutputPath:           outputPath,
 			ReportPath:           reportPath,
+			AuditPubMedCoverage:  true,
 			NCBITool:             "paper-hub-registry",
 			NCBIEmail:            "research@example.test",
 			CrossrefContactEmail: "research@example.test",
@@ -1276,7 +1571,7 @@ func TestJournalPubMedRegistryReportValidationRequires2032RowsAndValidProbes(
 	})
 }
 
-func TestJournalPubMedRegistryRejectsResolvedEligibleUnattemptedOverlay(
+func TestJournalPubMedRegistryAcceptsCompleteSkippedCoverageOverlay(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -1311,13 +1606,112 @@ func TestJournalPubMedRegistryRejectsResolvedEligibleUnattemptedOverlay(
 	report.Counts.PubMed.Unknown++
 	report.ByDomain[0].Counts = report.Counts
 
-	err := validateRegistryReport(report)
-	if err == nil || !strings.Contains(err.Error(), "probe counts") {
-		t.Fatalf("validateRegistryReport() error = %v, want attempted==eligible rejection", err)
+	if err := validateRegistryReport(report); err != nil {
+		t.Fatalf(
+			"validateRegistryReport(complete skip) error = %v",
+			err,
+		)
 	}
 }
 
-func TestJournalPubMedRegistryRejectsResolvedRowWithUnattemptedReceipt(
+func TestJournalPubMedRegistryRejectsPartialCoverageAudit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("report", func(t *testing.T) {
+		report := validJournalRegistryReportForValidation()
+		report.Counts.Match.Resolved = 2
+		report.Counts.Match.Unresolved -= 2
+		report.Counts.Probes.Eligible = 2
+		report.Counts.Probes.Attempted = 1
+		report.Counts.PubMed.Unknown--
+		report.Counts.PubMed.Yes = 1
+		report.ByDomain[0].Counts = report.Counts
+		report.Probes[0] = venueenrich.PubMedProbeReceipt{
+			Domain:         "all",
+			SourceOrder:    1,
+			ISSNs:          []string{"0028-0836"},
+			Attempted:      true,
+			CheckedAt:      "2026-07-19T01:02:03Z",
+			Status:         venueenrich.SupportStatusYes,
+			RecordCount:    1,
+			ResponseSHA256: journalRegistryHashOne,
+		}
+
+		err := validateRegistryReport(report)
+		if err == nil || !strings.Contains(err.Error(), "probe counts") {
+			t.Fatalf(
+				"validateRegistryReport(partial audit) error = %v",
+				err,
+			)
+		}
+	})
+
+	t.Run("by domain", func(t *testing.T) {
+		counts := registryCounts{
+			InputRows:  journalPubMedRegistryRows,
+			OutputRows: journalPubMedRegistryRows,
+			Match: registryMatchCounts{
+				Resolved:   2,
+				Unresolved: journalPubMedRegistryRows - 2,
+			},
+			Probes: registryProbeCounts{
+				Eligible:  2,
+				Attempted: 2,
+			},
+			PubMed: registrySupportCounts{
+				Yes:     2,
+				Unknown: journalPubMedRegistryRows - 2,
+			},
+		}
+		byDomain := []registryDomainCounts{
+			{
+				Domain: "medicine",
+				Counts: registryCounts{
+					InputRows:  1,
+					OutputRows: 1,
+					Match: registryMatchCounts{
+						Resolved: 1,
+					},
+					Probes: registryProbeCounts{
+						Eligible: 1,
+					},
+					PubMed: registrySupportCounts{
+						Unknown: 1,
+					},
+				},
+			},
+			{
+				Domain: "biology",
+				Counts: registryCounts{
+					InputRows:  journalPubMedRegistryRows - 1,
+					OutputRows: journalPubMedRegistryRows - 1,
+					Match: registryMatchCounts{
+						Resolved:   1,
+						Unresolved: journalPubMedRegistryRows - 2,
+					},
+					Probes: registryProbeCounts{
+						Eligible:  1,
+						Attempted: 2,
+					},
+					PubMed: registrySupportCounts{
+						Yes:     2,
+						Unknown: journalPubMedRegistryRows - 3,
+					},
+				},
+			},
+		}
+
+		err := validateRegistryCounts(counts, byDomain)
+		if err == nil || !strings.Contains(err.Error(), "by_domain") {
+			t.Fatalf(
+				"validateRegistryCounts(partial domain audit) error = %v",
+				err,
+			)
+		}
+	})
+}
+
+func TestJournalPubMedRegistryAcceptsResolvedRowWithStrictSkippedReceipt(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -1339,9 +1733,8 @@ func TestJournalPubMedRegistryRejectsResolvedRowWithUnattemptedReceipt(
 		Status:      venueenrich.SupportStatusUnknown,
 	}
 
-	err := validateProbeForRow(row, probe)
-	if err == nil || !strings.Contains(err.Error(), "resolved") {
-		t.Fatalf("validateProbeForRow() error = %v, want resolved row attempt requirement", err)
+	if err := validateProbeForRow(row, probe); err != nil {
+		t.Fatalf("validateProbeForRow(strict skip) error = %v", err)
 	}
 }
 
@@ -1677,16 +2070,31 @@ func assertJournalRegistryCountsReconcile(t *testing.T, report registryReport) {
 	t.Helper()
 
 	counts := report.Counts
+	completeProbeMode := counts.Probes.Attempted == 0 ||
+		counts.Probes.Attempted == counts.Probes.Eligible
 	if counts.InputRows != counts.OutputRows ||
 		counts.Match.Resolved+counts.Match.Ambiguous+counts.Match.Unresolved != counts.InputRows ||
 		counts.Probes.Eligible != counts.Match.Resolved ||
-		counts.Probes.Attempted != counts.Probes.Eligible ||
+		!completeProbeMode ||
 		counts.PubMed.Yes+counts.PubMed.No+counts.PubMed.Unknown != counts.OutputRows {
 		t.Fatalf("top-level counts do not reconcile: %#v", counts)
+	}
+	if counts.Probes.Attempted == 0 &&
+		(counts.PubMed.Yes != 0 ||
+			counts.PubMed.No != 0 ||
+			counts.PubMed.Unknown != counts.OutputRows) {
+		t.Fatalf("skipped probe counts are contradictory: %#v", counts)
 	}
 
 	var aggregate registryCounts
 	for _, domain := range report.ByDomain {
+		expectedAttempts := domain.Counts.Probes.Eligible
+		if counts.Probes.Attempted == 0 {
+			expectedAttempts = 0
+		}
+		if domain.Counts.Probes.Attempted != expectedAttempts {
+			t.Fatalf("by_domain probe mode is partial: %#v", domain)
+		}
 		aggregate.InputRows += domain.Counts.InputRows
 		aggregate.OutputRows += domain.Counts.OutputRows
 		aggregate.Match.Resolved += domain.Counts.Match.Resolved
@@ -1864,6 +2272,13 @@ func validJournalRegistryArgs() []string {
 		"--output", "registry.csv",
 		"--report", "registry.report.json",
 	}
+}
+
+func validJournalRegistryAuditArgs() []string {
+	return append(
+		validJournalRegistryArgs(),
+		"--audit-pubmed-coverage",
+	)
 }
 
 func journalRegistryLookup(values map[string]string) envLookup {

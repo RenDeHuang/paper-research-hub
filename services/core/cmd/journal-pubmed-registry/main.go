@@ -83,6 +83,7 @@ type registryCommand struct {
 	CacheDir             string
 	OutputPath           string
 	ReportPath           string
+	AuditPubMedCoverage  bool
 	NCBITool             string
 	NCBIEmail            string
 	NCBIAPIKey           string
@@ -280,6 +281,12 @@ func parseRegistryCommand(args []string) (registryCommand, error) {
 	set.StringVar(&command.CacheDir, "cache-dir", "", "Crossref catalog cache directory")
 	set.StringVar(&command.OutputPath, "output", "", "output registry CSV")
 	set.StringVar(&command.ReportPath, "report", "", "output report JSON")
+	set.BoolVar(
+		&command.AuditPubMedCoverage,
+		"audit-pubmed-coverage",
+		false,
+		"probe historical PubMed coverage for resolved journals",
+	)
 	if err := set.Parse(args); err != nil {
 		return registryCommand{}, err
 	}
@@ -328,21 +335,27 @@ func loadRegistrySourceConfig(
 	if lookup == nil {
 		return registryCommand{}, errors.New("environment lookup is required")
 	}
-	tool, err := requiredTrimmedEnvironment(lookup, "NCBI_TOOL")
-	if err != nil {
-		return registryCommand{}, err
+	crossrefEmail := ""
+	if command.AuditPubMedCoverage {
+		tool, err := requiredTrimmedEnvironment(lookup, "NCBI_TOOL")
+		if err != nil {
+			return registryCommand{}, err
+		}
+		email, err := requiredBareEmailEnvironment(lookup, "NCBI_EMAIL")
+		if err != nil {
+			return registryCommand{}, err
+		}
+		apiKey := ""
+		if raw, ok := lookup("NCBI_API_KEY"); ok {
+			apiKey = strings.TrimSpace(raw)
+		}
+		command.NCBITool = tool
+		command.NCBIEmail = email
+		command.NCBIAPIKey = apiKey
+		crossrefEmail = email
 	}
-	email, err := requiredBareEmailEnvironment(lookup, "NCBI_EMAIL")
-	if err != nil {
-		return registryCommand{}, err
-	}
-	apiKey := ""
-	if raw, ok := lookup("NCBI_API_KEY"); ok {
-		apiKey = strings.TrimSpace(raw)
-	}
-	crossrefEmail := email
-	if raw, ok := lookup("CROSSREF_CONTACT_EMAIL"); ok &&
-		strings.TrimSpace(raw) != "" {
+	if raw, ok := lookup("CROSSREF_CONTACT_EMAIL"); ok && raw != "" {
+		var err error
 		crossrefEmail, err = validateBareEmail(
 			"CROSSREF_CONTACT_EMAIL",
 			raw,
@@ -351,9 +364,6 @@ func loadRegistrySourceConfig(
 			return registryCommand{}, err
 		}
 	}
-	command.NCBITool = tool
-	command.NCBIEmail = email
-	command.NCBIAPIKey = apiKey
 	command.CrossrefContactEmail = crossrefEmail
 	return command, nil
 }
@@ -399,7 +409,9 @@ func (runner registryRunner) run(
 	); err != nil {
 		return registryResult{}, err
 	}
-	dependencies, err := runner.dependencies.validated()
+	dependencies, err := runner.dependencies.validated(
+		command.AuditPubMedCoverage,
+	)
 	if err != nil {
 		return registryResult{}, err
 	}
@@ -444,22 +456,36 @@ func (runner registryRunner) run(
 		)
 	}
 
-	counter, err := dependencies.newPubMedCounter(
-		dependencies.httpClient,
-		pubMedClientConfig(command, dependencies.pubMedBaseURL),
-		httpDependencies,
-	)
-	if err != nil {
-		return registryResult{}, fmt.Errorf("create PubMed coverage client: %w", err)
-	}
-	rows, probes, err := venueenrich.ProbePubMedCoverage(
-		ctx,
-		rows,
-		counter,
-		dependencies.now,
-	)
-	if err != nil {
-		return registryResult{}, fmt.Errorf("probe PubMed coverage: %w", err)
+	var probes []venueenrich.PubMedProbeReceipt
+	if command.AuditPubMedCoverage {
+		counter, err := dependencies.newPubMedCounter(
+			dependencies.httpClient,
+			pubMedClientConfig(command, dependencies.pubMedBaseURL),
+			httpDependencies,
+		)
+		if err != nil {
+			return registryResult{}, fmt.Errorf(
+				"create PubMed coverage client: %w",
+				err,
+			)
+		}
+		rows, probes, err = venueenrich.ProbePubMedCoverage(
+			ctx,
+			rows,
+			counter,
+			dependencies.now,
+		)
+		if err != nil {
+			return registryResult{}, fmt.Errorf(
+				"probe PubMed coverage: %w",
+				err,
+			)
+		}
+	} else {
+		rows, probes, err = overlaySkippedPubMedCoverage(rows)
+		if err != nil {
+			return registryResult{}, err
+		}
 	}
 	if len(rows) != journalPubMedRegistryRows ||
 		len(probes) != journalPubMedRegistryRows {
@@ -520,7 +546,9 @@ func (runner registryRunner) run(
 	}, nil
 }
 
-func (dependencies registryDependencies) validated() (registryDependencies, error) {
+func (dependencies registryDependencies) validated(
+	auditPubMedCoverage bool,
+) (registryDependencies, error) {
 	if dependencies.httpClient == nil {
 		return registryDependencies{}, errors.New(
 			"registry base HTTP client is required",
@@ -534,17 +562,23 @@ func (dependencies registryDependencies) validated() (registryDependencies, erro
 			"registry Crossref base URL is required",
 		)
 	}
-	if strings.TrimSpace(dependencies.pubMedBaseURL) == "" {
+	if dependencies.fetchCrossref == nil ||
+		dependencies.matchCrossref == nil {
 		return registryDependencies{}, errors.New(
-			"registry PubMed base URL is required",
+			"registry Crossref source dependencies are required",
 		)
 	}
-	if dependencies.fetchCrossref == nil ||
-		dependencies.matchCrossref == nil ||
-		dependencies.newPubMedCounter == nil {
-		return registryDependencies{}, errors.New(
-			"registry source dependencies are required",
-		)
+	if auditPubMedCoverage {
+		if strings.TrimSpace(dependencies.pubMedBaseURL) == "" {
+			return registryDependencies{}, errors.New(
+				"registry PubMed base URL is required for coverage audit",
+			)
+		}
+		if dependencies.newPubMedCounter == nil {
+			return registryDependencies{}, errors.New(
+				"registry PubMed counter dependency is required for coverage audit",
+			)
+		}
 	}
 	defaultOps := defaultRegistryFileOps()
 	if dependencies.fileOps.before == nil {
@@ -560,6 +594,82 @@ func (dependencies registryDependencies) validated() (registryDependencies, erro
 		dependencies.fileOps.syncDir = defaultOps.syncDir
 	}
 	return dependencies, nil
+}
+
+func overlaySkippedPubMedCoverage(
+	rows []venueenrich.RegistryRow,
+) ([]venueenrich.RegistryRow, []venueenrich.PubMedProbeReceipt, error) {
+	overlaid := make([]venueenrich.RegistryRow, len(rows))
+	probes := make([]venueenrich.PubMedProbeReceipt, len(rows))
+	for index, row := range rows {
+		if err := row.Validate(); err != nil {
+			return nil, nil, fmt.Errorf(
+				"row %d: invalid registry row before skipped PubMed coverage audit: %w",
+				index+1,
+				err,
+			)
+		}
+		issns, err := canonicalRegistryISSNs(row.AllISSNs)
+		if err != nil {
+			return nil, nil, fmt.Errorf(
+				"row %d: canonicalize PubMed coverage ISSNs: %w",
+				index+1,
+				err,
+			)
+		}
+		if row.MatchStatus == venueenrich.MatchStatusResolved &&
+			len(issns) == 0 {
+			return nil, nil, fmt.Errorf(
+				"row %d: resolved registry row requires at least one valid ISSN",
+				index+1,
+			)
+		}
+		row.AllISSNs = issns
+		row.PubMedSupported = venueenrich.SupportStatusUnknown
+		row.PubMedRecordCount = 0
+		if err := row.Validate(); err != nil {
+			return nil, nil, fmt.Errorf(
+				"row %d: invalid skipped PubMed coverage result: %w",
+				index+1,
+				err,
+			)
+		}
+		overlaid[index] = row
+		probes[index] = venueenrich.PubMedProbeReceipt{
+			Domain:      row.Domain,
+			SourceOrder: row.SourceOrder,
+			ISSNs:       slices.Clone(row.AllISSNs),
+			Status:      venueenrich.SupportStatusUnknown,
+		}
+	}
+	return overlaid, probes, nil
+}
+
+func canonicalRegistryISSNs(values []string) ([]string, error) {
+	canonical := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for index, raw := range values {
+		parsed, err := venue.ParseISSN(venue.ISSNRoleLinking, raw)
+		if err != nil {
+			return nil, fmt.Errorf("all_issns[%d] %q: %w", index, raw, err)
+		}
+		value := parsed.String()
+		if value != raw {
+			return nil, fmt.Errorf(
+				"all_issns[%d] %q must use canonical form %q",
+				index,
+				raw,
+				value,
+			)
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		canonical = append(canonical, value)
+	}
+	slices.Sort(canonical)
+	return canonical, nil
 }
 
 func crossrefCatalogConfig(
@@ -1011,7 +1121,8 @@ func validateRegistryCounts(
 		return errors.New("registry match counts do not reconcile")
 	}
 	if counts.Probes.Eligible != counts.Match.Resolved ||
-		counts.Probes.Attempted != counts.Probes.Eligible {
+		(counts.Probes.Attempted != 0 &&
+			counts.Probes.Attempted != counts.Probes.Eligible) {
 		return errors.New("registry probe counts do not reconcile")
 	}
 	if counts.PubMed.Yes+
@@ -1019,23 +1130,45 @@ func validateRegistryCounts(
 		counts.PubMed.Unknown != counts.OutputRows {
 		return errors.New("registry PubMed counts do not reconcile")
 	}
+	skippedCoverageAudit := counts.Probes.Attempted == 0
+	if skippedCoverageAudit &&
+		(counts.PubMed.Yes != 0 ||
+			counts.PubMed.No != 0 ||
+			counts.PubMed.Unknown != counts.OutputRows) {
+		return errors.New(
+			"registry skipped probe counts require all PubMed statuses unknown",
+		)
+	}
 	var aggregate registryCounts
 	for _, domain := range byDomain {
 		if strings.TrimSpace(domain.Domain) == "" {
 			return errors.New("registry by_domain requires non-empty domain")
 		}
 		domainCounts := domain.Counts
+		expectedAttempts := domainCounts.Probes.Eligible
+		if skippedCoverageAudit {
+			expectedAttempts = 0
+		}
 		if domainCounts.InputRows != domainCounts.OutputRows ||
 			domainCounts.Match.Resolved+
 				domainCounts.Match.Ambiguous+
 				domainCounts.Match.Unresolved != domainCounts.InputRows ||
 			domainCounts.Probes.Eligible != domainCounts.Match.Resolved ||
-			domainCounts.Probes.Attempted != domainCounts.Probes.Eligible ||
+			domainCounts.Probes.Attempted != expectedAttempts ||
 			domainCounts.PubMed.Yes+
 				domainCounts.PubMed.No+
 				domainCounts.PubMed.Unknown != domainCounts.OutputRows {
 			return fmt.Errorf(
 				"registry by_domain %q counts do not reconcile",
+				domain.Domain,
+			)
+		}
+		if skippedCoverageAudit &&
+			(domainCounts.PubMed.Yes != 0 ||
+				domainCounts.PubMed.No != 0 ||
+				domainCounts.PubMed.Unknown != domainCounts.OutputRows) {
+			return fmt.Errorf(
+				"registry by_domain %q skipped probes require all PubMed statuses unknown",
 				domain.Domain,
 			)
 		}
@@ -1186,6 +1319,9 @@ func validateProbeForRow(
 	row venueenrich.RegistryRow,
 	probe venueenrich.PubMedProbeReceipt,
 ) error {
+	if err := validateReportProbe(probe); err != nil {
+		return fmt.Errorf("invalid PubMed probe receipt: %w", err)
+	}
 	if probe.Domain != row.Domain ||
 		probe.SourceOrder != row.SourceOrder ||
 		!slices.Equal(probe.ISSNs, row.AllISSNs) ||
@@ -1205,12 +1341,6 @@ func validateProbeForRow(
 		probe.Error != "" {
 		return errors.New(
 			"unattempted PubMed probe requires empty checked_at, response_sha256, and error",
-		)
-	}
-	if row.MatchStatus == venueenrich.MatchStatusResolved &&
-		!probe.Attempted {
-		return errors.New(
-			"resolved row requires an attempted PubMed probe",
 		)
 	}
 	if row.MatchStatus != venueenrich.MatchStatusResolved &&

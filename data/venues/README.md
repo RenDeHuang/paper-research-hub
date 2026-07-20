@@ -87,9 +87,16 @@ Required flags:
 --cache-dir <path>   Crossref journal catalog cache
 --output <path>      destination CSV
 --report <path>      destination JSON report
+--audit-pubmed-coverage
+                     optional historical PubMed coverage audit
 ```
 
-Required environment:
+The default command does not read or require `NCBI_TOOL`, `NCBI_EMAIL`, or
+`NCBI_API_KEY`. `CROSSREF_CONTACT_EMAIL` is optional; when set, it must be a
+bare email address. The standalone command never reads or requires
+`DATABASE_URL`.
+
+`--audit-pubmed-coverage` additionally requires:
 
 ```text
 NCBI_TOOL
@@ -98,7 +105,6 @@ NCBI_EMAIL
 
 `NCBI_EMAIL` must be a bare email address. `NCBI_API_KEY` is optional.
 `CROSSREF_CONTACT_EMAIL` is optional and otherwise reuses `NCBI_EMAIL`.
-The standalone command does not read or require `DATABASE_URL`.
 
 The CSV has this exact field order:
 
@@ -122,12 +128,25 @@ source_url
 verification_status
 ```
 
-Only uniquely resolved Crossref rows with at least one valid ISSN are queried.
-All known ISSNs for one journal are sent in one exact PubMed OR query, using one
-shared bounded client and sequential request order. A positive count is `yes`,
-a successful zero count is `no`, and a request or protocol failure is recorded
-as explicit `unknown` in the report. Ambiguous and unresolved rows are not
-queried.
+By default, the command stops after exact Crossref matching and writes a
+deterministic complete skip overlay: all 2032 rows are
+`pubmed_supported=unknown`, `pubmed_record_count=0`, and every report receipt
+is `attempted=false` with empty check/hash/error evidence. It never constructs
+a PubMed counter or performs an NCBI request.
+
+With `--audit-pubmed-coverage`, only uniquely resolved Crossref rows with at
+least one valid ISSN are queried. All known ISSNs for one journal are sent in
+one exact PubMed OR query, using one shared bounded client and sequential
+request order. A positive count is `yes`, a successful zero count is `no`, and
+a request or protocol failure is recorded as explicit `unknown` in the report.
+Ambiguous and unresolved rows are not queried. Reports accept only the two
+complete modes: zero attempted probes or every eligible probe attempted;
+partial coverage audits are invalid.
+
+Daily PubMed synchronization includes every `resolution_status=resolved`
+journal regardless of `pubmed_supported=yes/no/unknown`. Historical coverage
+is not a daily eligibility gate. Backfill remains restricted to an explicitly
+audited Registry's `resolved + pubmed_supported=yes` rows.
 
 The command fully encodes and reconciles the CSV and typed JSON report in
 memory before publishing. Each artifact is written to a temporary file in its
