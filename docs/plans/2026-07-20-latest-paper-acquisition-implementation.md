@@ -81,7 +81,7 @@ Add a client test whose server asserts:
 ```text
 method = POST
 Content-Type = application/x-www-form-urlencoded
-query string does not contain term/tool/email/api_key
+query string contains only tool/email/api_key identity
 form body contains db, term, datetype, mindate, maxdate, usehistory
 ```
 
@@ -98,20 +98,26 @@ Expected: FAIL because `Search` currently sends GET.
 
 **Step 3: Implement the minimal POST helper**
 
-Add a request helper that:
+Add a request helper that keeps the small NCBI identity parameters in the URL so the
+existing HTTP policy can extract and redact sensitive query values, while posting the
+potentially large search form:
 
 ```go
-body := strings.NewReader(values.Encode())
+identity := url.Values{}
+client.addIdentity(identity)
+body := strings.NewReader(searchValues.Encode())
 request, err := http.NewRequestWithContext(
     ctx,
     http.MethodPost,
-    endpoint.String(),
+    endpointWithIdentity.String(),
     body,
 )
 request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 ```
 
-Use it only from `Search`. Keep `CountCoverage` on the existing GET path. Ensure the request body is replayable for the existing retry policy.
+Use it only from `Search`. Keep `CountCoverage` on the existing GET path. Do not duplicate
+identity parameters in the form body. Ensure the request body is replayable for the existing
+retry policy.
 
 **Step 4: Verify retry and redaction behavior**
 
