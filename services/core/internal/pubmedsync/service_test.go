@@ -280,6 +280,9 @@ func TestServiceBackfillUsesFixedWindowCompleteISSNSetAndStableJobKey(t *testing
 	if payload["window_key"] != runner.calls[0].job.IdempotencyKey {
 		t.Fatalf("payload window_key = %#v, want idempotency key %q", payload["window_key"], runner.calls[0].job.IdempotencyKey)
 	}
+	if _, exists := payload["batch_index"]; exists {
+		t.Fatal("backfill payload contains daily-only batch_index")
+	}
 	if !slices.Equal(
 		payload["journal_issns"].([]string),
 		[]string{"1234-5679", "2049-3630"},
@@ -424,6 +427,7 @@ func TestServiceDailyRunsTwoBatchesInWindowOrderWithBatchReportsAndPayloads(t *t
 		for key, want := range map[string]any{
 			"mode":          "daily",
 			"batch_key":     windowReport.BatchKey,
+			"batch_index":   index/2 + 1,
 			"journal_count": 1,
 			"term_count":    len(wantISSNs[index]),
 			"date_type":     string(wantTypes[index]),
@@ -835,6 +839,7 @@ func TestServiceDailyBatchWindowJobUsesCompleteIdentity(t *testing.T) {
 	job, err := newDailyWindowJob(
 		RunRequest{Mode: ModeDaily, RunDate: parseTestDate("2026-07-19")},
 		windows[0],
+		1,
 	)
 	if err != nil {
 		t.Fatalf("newDailyWindowJob() error = %v", err)

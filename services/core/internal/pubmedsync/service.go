@@ -402,12 +402,18 @@ func (service *Service) runDaily(
 	report.WindowsPlanned = len(windows)
 
 	failedJournals := make(map[string]struct{}, len(journals))
+	batchIndexes := make(map[string]int, report.BatchesPlanned)
 	var runErr error
 	for _, window := range windows {
 		if err := ctx.Err(); err != nil {
 			return report, errors.Join(runErr, err)
 		}
 
+		batchIndex, exists := batchIndexes[window.BatchKey()]
+		if !exists {
+			batchIndex = len(batchIndexes) + 1
+			batchIndexes[window.BatchKey()] = batchIndex
+		}
 		batchJournals := window.Journals()
 		journalKeys, _ := dailyJournalEvidence(batchJournals)
 		windowReport := WindowReport{
@@ -426,7 +432,12 @@ func (service *Service) runDaily(
 		windowIndex := len(report.Windows) - 1
 		report.WindowsAttempted++
 
-		summary, runWindowErr := service.runDailyWindow(ctx, request, window)
+		summary, runWindowErr := service.runDailyWindow(
+			ctx,
+			request,
+			window,
+			batchIndex,
+		)
 		if summaryErr := summary.Validate(); summaryErr == nil {
 			mergeSummary(&report, &report.Windows[windowIndex], summary)
 		} else if runWindowErr == nil {
@@ -545,12 +556,49 @@ func (service *Service) runWindow(
 	if err != nil {
 		return ingestion.JobSummary{}, err
 	}
+	return service.runExactISSNWindow(
+		ctx,
+		window.Journal().ISSNs(),
+		window.DateType(),
+		window.DateWindow(),
+		window.Key(),
+		job,
+	)
+}
 
+func (service *Service) runDailyWindow(
+	ctx context.Context,
+	request RunRequest,
+	window DailyBatchWindow,
+	batchIndex int,
+) (ingestion.JobSummary, error) {
+	job, err := newDailyWindowJob(request, window, batchIndex)
+	if err != nil {
+		return ingestion.JobSummary{}, err
+	}
+	return service.runExactISSNWindow(
+		ctx,
+		window.ISSNs(),
+		window.DateType(),
+		window.DateWindow(),
+		window.Key(),
+		job,
+	)
+}
+
+func (service *Service) runExactISSNWindow(
+	ctx context.Context,
+	issns []string,
+	dateType pubmed.DateType,
+	dateWindow pubmed.DateWindow,
+	windowKey string,
+	job ingestion.Job,
+) (ingestion.JobSummary, error) {
 	events := func(yield func(ingestion.Event, error) bool) {
 		history, err := service.searcher.Search(ctx, pubmed.SearchQuery{
-			JournalISSNs: window.Journal().ISSNs(),
-			DateType:     window.DateType(),
-			DateWindow:   window.DateWindow(),
+			JournalISSNs: slices.Clone(issns),
+			DateType:     dateType,
+			DateWindow:   dateWindow,
 			MaxResults:   pubmed.MaxSearchResults,
 		})
 		if err != nil {
@@ -564,7 +612,7 @@ func (service *Service) runWindow(
 					"PubMed search count %d reaches fetch limit %d for window %q; refusing truncated fetch",
 					history.Count,
 					pubmed.MaxSearchResults,
-					window.Key(),
+					windowKey,
 				),
 			)
 			return
@@ -582,54 +630,6 @@ func (service *Service) runWindow(
 		job,
 		events,
 	)
-	if err != nil {
-		return summary, fmt.Errorf("ingest PubMed window: %w", err)
-	}
-	return summary, nil
-}
-
-func (service *Service) runDailyWindow(
-	ctx context.Context,
-	request RunRequest,
-	window DailyBatchWindow,
-) (ingestion.JobSummary, error) {
-	job, err := newDailyWindowJob(request, window)
-	if err != nil {
-		return ingestion.JobSummary{}, err
-	}
-
-	events := func(yield func(ingestion.Event, error) bool) {
-		history, err := service.searcher.Search(ctx, pubmed.SearchQuery{
-			JournalISSNs: window.ISSNs(),
-			DateType:     window.DateType(),
-			DateWindow:   window.DateWindow(),
-			MaxResults:   pubmed.MaxSearchResults,
-		})
-		if err != nil {
-			yield(nil, fmt.Errorf("search PubMed window: %w", err))
-			return
-		}
-		if history.Count >= pubmed.MaxSearchResults {
-			yield(
-				nil,
-				fmt.Errorf(
-					"PubMed search count %d reaches fetch limit %d for window %q; refusing truncated fetch",
-					history.Count,
-					pubmed.MaxSearchResults,
-					window.Key(),
-				),
-			)
-			return
-		}
-
-		records := service.fetcher.Fetch(ctx, history)
-		for event, err := range service.recordEvents(records) {
-			if !yield(event, err) {
-				return
-			}
-		}
-	}
-	summary, err := service.runIngestion(ctx, job, events)
 	if err != nil {
 		return summary, fmt.Errorf("ingest PubMed window: %w", err)
 	}
@@ -686,6 +686,7 @@ func newWindowJob(request RunRequest, window SyncWindow) (ingestion.Job, error) 
 func newDailyWindowJob(
 	request RunRequest,
 	window DailyBatchWindow,
+	batchIndex int,
 ) (ingestion.Job, error) {
 	journals := window.Journals()
 	journalKeys, journalNames := dailyJournalEvidence(journals)
@@ -693,6 +694,7 @@ func newDailyWindowJob(
 	payload := map[string]any{
 		"mode":          string(request.Mode),
 		"batch_key":     window.BatchKey(),
+		"batch_index":   batchIndex,
 		"journal_count": len(journals),
 		"journal_keys":  journalKeys,
 		"journal_names": journalNames,
