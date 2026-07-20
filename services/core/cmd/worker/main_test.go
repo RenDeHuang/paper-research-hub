@@ -24,9 +24,17 @@ import (
 func TestLegacyPubMedSyncUsesExplicitEntrezDateType(t *testing.T) {
 	t.Parallel()
 
-	var captured string
+	var (
+		capturedMethod      string
+		capturedContentType string
+		capturedDateType    string
+		parseFormErr        error
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		captured = request.URL.Query().Get("datetype")
+		capturedMethod = request.Method
+		capturedContentType = request.Header.Get("Content-Type")
+		parseFormErr = request.ParseForm()
+		capturedDateType = request.PostForm.Get("datetype")
 		_, _ = writer.Write([]byte(
 			`{"esearchresult":{"count":"0","querykey":"1","webenv":"empty-history"}}`,
 		))
@@ -62,8 +70,20 @@ func TestLegacyPubMedSyncUsesExplicitEntrezDateType(t *testing.T) {
 	if sourceName != source.PubMed {
 		t.Fatalf("source = %q, want %q", sourceName, source.PubMed)
 	}
-	if captured != "edat" {
-		t.Fatalf("datetype = %q, want legacy sync to remain Entrez date mode", captured)
+	if parseFormErr != nil {
+		t.Fatalf("ParseForm() error = %v", parseFormErr)
+	}
+	if capturedMethod != http.MethodPost {
+		t.Fatalf("method = %q, want POST", capturedMethod)
+	}
+	if capturedContentType != "application/x-www-form-urlencoded" {
+		t.Fatalf(
+			"Content-Type = %q, want application/x-www-form-urlencoded",
+			capturedContentType,
+		)
+	}
+	if capturedDateType != "edat" {
+		t.Fatalf("datetype = %q, want legacy sync to remain Entrez date mode", capturedDateType)
 	}
 }
 
