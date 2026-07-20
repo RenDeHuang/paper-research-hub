@@ -196,7 +196,7 @@ func (service *Service) Run(
 	if err != nil {
 		return report, fmt.Errorf("read PubMed journal registry: %w", err)
 	}
-	journals, err := LoadRegistry(bytes.NewReader(registryBytes))
+	journals, err := LoadPubMedSupportedRegistry(bytes.NewReader(registryBytes))
 	if err != nil {
 		return report, err
 	}

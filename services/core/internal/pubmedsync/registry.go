@@ -68,12 +68,13 @@ func (journal Journal) clone() Journal {
 	return journal
 }
 
-// LoadRegistry returns resolved journals with confirmed PubMed support for backfill.
-func LoadRegistry(source io.Reader) ([]Journal, error) {
+// LoadPubMedSupportedRegistry returns resolved journals with confirmed PubMed support for backfill.
+func LoadPubMedSupportedRegistry(source io.Reader) ([]Journal, error) {
 	return loadRegistry(source, false)
 }
 
-// LoadResolvedRegistry returns every resolved journal for daily discovery.
+// LoadResolvedRegistry returns each distinct resolved journal identity for daily
+// discovery; rows with the same exact ISSN set are folded into one identity.
 func LoadResolvedRegistry(source io.Reader) ([]Journal, error) {
 	return loadRegistry(source, true)
 }

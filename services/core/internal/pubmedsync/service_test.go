@@ -788,7 +788,7 @@ func TestServiceWindowJobKeyUsesCompleteTask4WindowIdentity(t *testing.T) {
 
 func mustServiceJournal(t *testing.T, issn string) Journal {
 	t.Helper()
-	journals, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(
+	journals, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(
 		testRegistryHeader,
 		validRegistryRecord(
 			"Service Journal",
@@ -803,7 +803,7 @@ func mustServiceJournal(t *testing.T, issn string) Journal {
 		),
 	)))
 	if err != nil {
-		t.Fatalf("LoadRegistry() error = %v", err)
+		t.Fatalf("LoadPubMedSupportedRegistry() error = %v", err)
 	}
 	return journals[0]
 }

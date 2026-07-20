@@ -335,7 +335,7 @@ func TestSyncWindowKeyIsStableCompleteAndJournalSliceIsImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSyncWindow() to date error = %v", err)
 	}
-	differentJournal, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(
+	differentJournal, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(
 		testRegistryHeader,
 		validRegistryRecord(
 			"Different ISSN Set",
@@ -350,7 +350,7 @@ func TestSyncWindowKeyIsStableCompleteAndJournalSliceIsImmutable(t *testing.T) {
 		),
 	)))
 	if err != nil {
-		t.Fatalf("LoadRegistry() different journal error = %v", err)
+		t.Fatalf("LoadPubMedSupportedRegistry() different journal error = %v", err)
 	}
 	changedJournal, err := NewSyncWindow(
 		differentJournal[0],
@@ -430,7 +430,7 @@ func assertContiguous(t *testing.T, windows []SyncWindow) {
 func testJournal(t *testing.T) Journal {
 	t.Helper()
 
-	journals, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(
+	journals, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(
 		testRegistryHeader,
 		validRegistryRecord(
 			"Planner Journal",

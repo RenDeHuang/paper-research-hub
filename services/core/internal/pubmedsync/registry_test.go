@@ -29,7 +29,7 @@ var testRegistryHeader = []string{
 	"verification_status",
 }
 
-func TestLoadRegistryRequiresExactHeaderAndRecordWidth(t *testing.T) {
+func TestLoadPubMedSupportedRegistryRequiresExactHeaderAndRecordWidth(t *testing.T) {
 	t.Parallel()
 
 	valid := validRegistryRecord(
@@ -97,14 +97,14 @@ func TestLoadRegistryRequiresExactHeaderAndRecordWidth(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if _, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(tt.header, tt.record))); err == nil {
-				t.Fatal("LoadRegistry() succeeded for malformed header/record width")
+			if _, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(tt.header, tt.record))); err == nil {
+				t.Fatal("LoadPubMedSupportedRegistry() succeeded for malformed header/record width")
 			}
 		})
 	}
 }
 
-func TestLoadRegistryReturnsOnlyResolvedPubMedSupportedRows(t *testing.T) {
+func TestLoadPubMedSupportedRegistryReturnsOnlyResolvedPubMedSupportedRows(t *testing.T) {
 	t.Parallel()
 
 	records := [][]string{
@@ -165,12 +165,12 @@ func TestLoadRegistryReturnsOnlyResolvedPubMedSupportedRows(t *testing.T) {
 		),
 	}
 
-	journals, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, records...)))
+	journals, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, records...)))
 	if err != nil {
-		t.Fatalf("LoadRegistry() error = %v", err)
+		t.Fatalf("LoadPubMedSupportedRegistry() error = %v", err)
 	}
 	if len(journals) != 1 {
-		t.Fatalf("LoadRegistry() returned %d journals, want 1", len(journals))
+		t.Fatalf("LoadPubMedSupportedRegistry() returned %d journals, want 1", len(journals))
 	}
 	if got := journals[0].SourceJournalName(); got != "resolved yes" {
 		t.Fatalf("SourceJournalName() = %q, want %q", got, "resolved yes")
@@ -258,6 +258,66 @@ func TestLoadResolvedRegistryReturnsEveryResolvedRowRegardlessOfPubMedSupport(t 
 	}
 }
 
+func TestRegistryViewsFoldMixedSupportForExactISSNSet(t *testing.T) {
+	t.Parallel()
+
+	records := [][]string{
+		validRegistryRecord(
+			"resolved no",
+			1,
+			"1234-5679",
+			"",
+			"2049-3630",
+			`["1234-5679","2049-3630"]`,
+			"resolved",
+			"no",
+			"0",
+		),
+		validRegistryRecord(
+			"resolved unknown",
+			2,
+			"1234-5679",
+			"",
+			"2049-3630",
+			`["1234-5679","2049-3630"]`,
+			"resolved",
+			"unknown",
+			"0",
+		),
+		validRegistryRecord(
+			"resolved yes",
+			3,
+			"1234-5679",
+			"",
+			"2049-3630",
+			`["1234-5679","2049-3630"]`,
+			"resolved",
+			"yes",
+			"7",
+		),
+	}
+	registryCSV := encodeRegistryCSV(testRegistryHeader, records...)
+
+	supported, err := LoadPubMedSupportedRegistry(bytes.NewReader(registryCSV))
+	if err != nil {
+		t.Fatalf("LoadPubMedSupportedRegistry() error = %v", err)
+	}
+	if len(supported) != 1 {
+		t.Fatalf("LoadPubMedSupportedRegistry() returned %d journals, want 1", len(supported))
+	}
+	if got := supported[0].SourceJournalName(); got != "resolved yes" {
+		t.Fatalf("supported SourceJournalName() = %q, want %q", got, "resolved yes")
+	}
+
+	resolved, err := LoadResolvedRegistry(bytes.NewReader(registryCSV))
+	if err != nil {
+		t.Fatalf("LoadResolvedRegistry() error = %v", err)
+	}
+	if len(resolved) != 1 {
+		t.Fatalf("LoadResolvedRegistry() returned %d journals, want 1 identity", len(resolved))
+	}
+}
+
 func TestLoadResolvedRegistryPreservesStrictValidation(t *testing.T) {
 	t.Parallel()
 
@@ -340,7 +400,7 @@ func TestLoadResolvedRegistryPreservesStrictValidation(t *testing.T) {
 	}
 }
 
-func TestLoadRegistryValidatesAllISSNsBeforeFilteringNonEligibleRows(t *testing.T) {
+func TestLoadPubMedSupportedRegistryValidatesAllISSNsBeforeFilteringNonEligibleRows(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -447,18 +507,18 @@ func TestLoadRegistryValidatesAllISSNsBeforeFilteringNonEligibleRows(t *testing.
 				tt.supported,
 				tt.count,
 			)
-			_, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
+			_, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
 			if tt.wantError && err == nil {
-				t.Fatal("LoadRegistry() returned nil error for invalid all_issns")
+				t.Fatal("LoadPubMedSupportedRegistry() returned nil error for invalid all_issns")
 			}
 			if !tt.wantError && err != nil {
-				t.Fatalf("LoadRegistry() error = %v, want valid non-eligible row", err)
+				t.Fatalf("LoadPubMedSupportedRegistry() error = %v, want valid non-eligible row", err)
 			}
 		})
 	}
 }
 
-func TestLoadRegistryRejectsPubMedNoForNonResolvedRows(t *testing.T) {
+func TestLoadPubMedSupportedRegistryRejectsPubMedNoForNonResolvedRows(t *testing.T) {
 	t.Parallel()
 
 	for _, resolution := range []string{"ambiguous", "unresolved"} {
@@ -477,9 +537,9 @@ func TestLoadRegistryRejectsPubMedNoForNonResolvedRows(t *testing.T) {
 				"no",
 				"0",
 			)
-			if _, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record))); err == nil {
+			if _, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record))); err == nil {
 				t.Fatalf(
-					"LoadRegistry() accepted %s + pubmed_supported=no + count=0",
+					"LoadPubMedSupportedRegistry() accepted %s + pubmed_supported=no + count=0",
 					resolution,
 				)
 			}
@@ -487,7 +547,7 @@ func TestLoadRegistryRejectsPubMedNoForNonResolvedRows(t *testing.T) {
 	}
 }
 
-func TestLoadRegistryValidatesResolvedISSNFieldsWhenPubMedIsNotYes(t *testing.T) {
+func TestLoadPubMedSupportedRegistryValidatesResolvedISSNFieldsWhenPubMedIsNotYes(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -528,18 +588,18 @@ func TestLoadRegistryValidatesResolvedISSNFieldsWhenPubMedIsNotYes(t *testing.T)
 				"no",
 				"0",
 			)
-			_, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
+			_, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
 			if tt.wantOK && err != nil {
-				t.Fatalf("LoadRegistry() error = %v, want resolved non-eligible row", err)
+				t.Fatalf("LoadPubMedSupportedRegistry() error = %v, want resolved non-eligible row", err)
 			}
 			if !tt.wantOK && err == nil {
-				t.Fatal("LoadRegistry() accepted invalid resolved ISSN evidence")
+				t.Fatal("LoadPubMedSupportedRegistry() accepted invalid resolved ISSN evidence")
 			}
 		})
 	}
 }
 
-func TestLoadRegistryValidatesStrictISSNArrayAndNamedISSNs(t *testing.T) {
+func TestLoadPubMedSupportedRegistryValidatesStrictISSNArrayAndNamedISSNs(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -627,14 +687,14 @@ func TestLoadRegistryValidatesStrictISSNArrayAndNamedISSNs(t *testing.T) {
 				"yes",
 				"1",
 			)
-			if _, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record))); err == nil {
-				t.Fatal("LoadRegistry() accepted invalid eligible ISSN evidence")
+			if _, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record))); err == nil {
+				t.Fatal("LoadPubMedSupportedRegistry() accepted invalid eligible ISSN evidence")
 			}
 		})
 	}
 }
 
-func TestLoadRegistryRejectsStatusAndCountContradictions(t *testing.T) {
+func TestLoadPubMedSupportedRegistryRejectsStatusAndCountContradictions(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -668,14 +728,14 @@ func TestLoadRegistryRejectsStatusAndCountContradictions(t *testing.T) {
 				tt.supported,
 				tt.count,
 			)
-			if _, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record))); err == nil {
-				t.Fatal("LoadRegistry() accepted contradictory status/count evidence")
+			if _, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record))); err == nil {
+				t.Fatal("LoadPubMedSupportedRegistry() accepted contradictory status/count evidence")
 			}
 		})
 	}
 }
 
-func TestLoadRegistryFoldsExactISSNSetsWithoutTitleMatching(t *testing.T) {
+func TestLoadPubMedSupportedRegistryFoldsExactISSNSetsWithoutTitleMatching(t *testing.T) {
 	t.Parallel()
 
 	records := [][]string{
@@ -714,12 +774,12 @@ func TestLoadRegistryFoldsExactISSNSetsWithoutTitleMatching(t *testing.T) {
 		),
 	}
 
-	journals, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, records...)))
+	journals, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, records...)))
 	if err != nil {
-		t.Fatalf("LoadRegistry() error = %v", err)
+		t.Fatalf("LoadPubMedSupportedRegistry() error = %v", err)
 	}
 	if len(journals) != 2 {
-		t.Fatalf("LoadRegistry() returned %d journals, want exact-set fold to 2", len(journals))
+		t.Fatalf("LoadPubMedSupportedRegistry() returned %d journals, want exact-set fold to 2", len(journals))
 	}
 	if journals[0].SourceJournalName() != "Same Title" || journals[0].SourceOrder() != 1 {
 		t.Fatalf("first folded journal = %#v, want first source row", journals[0])
@@ -729,7 +789,7 @@ func TestLoadRegistryFoldsExactISSNSetsWithoutTitleMatching(t *testing.T) {
 	}
 }
 
-func TestLoadRegistryRejectsDistinctISSNSetsThatShareAnyISSN(t *testing.T) {
+func TestLoadPubMedSupportedRegistryRejectsDistinctISSNSetsThatShareAnyISSN(t *testing.T) {
 	t.Parallel()
 
 	records := [][]string{
@@ -757,9 +817,9 @@ func TestLoadRegistryRejectsDistinctISSNSetsThatShareAnyISSN(t *testing.T) {
 		),
 	}
 
-	if _, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, records...))); err == nil ||
+	if _, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, records...))); err == nil ||
 		!strings.Contains(strings.ToLower(err.Error()), "conflict") {
-		t.Fatalf("LoadRegistry() error = %v, want explicit ISSN conflict", err)
+		t.Fatalf("LoadPubMedSupportedRegistry() error = %v, want explicit ISSN conflict", err)
 	}
 }
 
@@ -777,9 +837,9 @@ func TestJournalAccessorsDoNotExposeInternalISSNSlice(t *testing.T) {
 		"yes",
 		"1",
 	)
-	journals, err := LoadRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
+	journals, err := LoadPubMedSupportedRegistry(bytes.NewReader(encodeRegistryCSV(testRegistryHeader, record)))
 	if err != nil {
-		t.Fatalf("LoadRegistry() error = %v", err)
+		t.Fatalf("LoadPubMedSupportedRegistry() error = %v", err)
 	}
 
 	got := journals[0].ISSNs()
