@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Make resolved ISSNs the daily eligibility boundary
+### Task 1: Add a resolved-only daily Registry view
 
 **Files:**
 - Modify: `services/core/internal/pubmedsync/registry.go`
@@ -18,7 +18,7 @@
 
 **Step 1: Write the failing test**
 
-Replace the existing yes-only expectation with a test that supplies three resolved rows:
+Keep the existing yes-only backfill test. Add a daily-view test that supplies three resolved rows:
 
 ```go
 resolved + pubmed yes
@@ -26,30 +26,37 @@ resolved + pubmed no
 resolved + pubmed unknown
 ```
 
-Assert that `LoadRegistry` returns all three, while ambiguous and unresolved rows remain excluded.
+Assert that:
+
+- existing `LoadRegistry` still returns only `resolved + pubmed yes`;
+- new `LoadResolvedRegistry` returns all three resolved rows;
+- ambiguous and unresolved rows remain excluded from both.
+
 Keep the existing status/count contradiction tests unchanged.
 
 **Step 2: Run the focused test and verify RED**
 
 ```bash
 go -C services/core test ./internal/pubmedsync \
-  -run 'TestLoadRegistryReturnsAllResolvedRowsRegardlessOfHistoricalPubMedCoverage' \
+  -run 'TestLoadResolvedRegistryReturnsAllResolvedRowsRegardlessOfHistoricalPubMedCoverage' \
   -count=1
 ```
 
-Expected: FAIL because `parseRegistryRecord` currently requires `pubmed_supported=yes`.
+Expected: FAIL because `LoadResolvedRegistry` does not exist.
 
 **Step 3: Implement the minimal eligibility change**
 
-In `parseRegistryRecord`, retain all validation, then change only the final eligibility condition:
+Refactor the internal parser to accept an explicit view predicate while retaining every validation.
+Expose:
 
 ```go
-if resolutionStatus != venueenrich.MatchStatusResolved {
-    return Journal{}, false, nil
-}
+func LoadRegistry(source io.Reader) ([]Journal, error)
+func LoadResolvedRegistry(source io.Reader) ([]Journal, error)
 ```
 
-Do not weaken ISSN validation or status/count consistency.
+`LoadRegistry` keeps its current `resolved + pubmed_supported=yes` behavior for backfill.
+`LoadResolvedRegistry` accepts every resolved row for daily mode. Do not weaken ISSN
+validation, status/count consistency, exact-set folding, or intersection conflicts.
 
 **Step 4: Run registry tests and verify GREEN**
 
@@ -65,7 +72,7 @@ Expected: PASS.
 ```bash
 git add services/core/internal/pubmedsync/registry.go \
   services/core/internal/pubmedsync/registry_test.go
-git commit -m "fix(pubmed): sync every resolved journal"
+git commit -m "fix(pubmed): expose resolved daily registry"
 ```
 
 ### Task 2: Send PubMed ESearch through POST
@@ -257,11 +264,14 @@ Expected: FAIL because the service currently loops over journals.
 
 **Step 3: Add a daily-specific service path**
 
-At the start of `Service.Run`, after Registry loading and report counts:
+At the start of `Service.Run`, select the Registry view explicitly:
 
 ```go
-if request.Mode == ModeDaily {
-    return service.runDaily(ctx, request, journals, report)
+switch request.Mode {
+case ModeBackfill:
+    journals, err = LoadRegistry(bytes.NewReader(registryBytes))
+case ModeDaily:
+    journals, err = LoadResolvedRegistry(bytes.NewReader(registryBytes))
 }
 ```
 
