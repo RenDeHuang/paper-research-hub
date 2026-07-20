@@ -30,6 +30,14 @@ func (batch DailyJournalBatch) ISSNs() []string {
 	return slices.Clone(batch.issns)
 }
 
+func (batch DailyJournalBatch) clone() DailyJournalBatch {
+	return DailyJournalBatch{
+		key:      batch.key,
+		journals: cloneDailyJournals(batch.journals),
+		issns:    slices.Clone(batch.issns),
+	}
+}
+
 func BuildDailyJournalBatches(journals []Journal) ([]DailyJournalBatch, error) {
 	if len(journals) == 0 {
 		return nil, errors.New("daily journal batching requires at least one journal")

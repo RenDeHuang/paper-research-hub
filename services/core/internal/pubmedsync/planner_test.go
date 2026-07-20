@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -287,6 +288,197 @@ func TestPlanDailyRejectsZeroRunDate(t *testing.T) {
 	}
 }
 
+func TestPlanDailyBatchesEmitsEDATThenMDATForEveryBatch(t *testing.T) {
+	t.Parallel()
+
+	first := dailyTestJournal(
+		"journal:first",
+		dailyTestISSNs(t, 3_000_000, MaxDailyISSNTerms-1),
+	)
+	second := dailyTestJournal(
+		"journal:second",
+		dailyTestISSNs(t, 4_000_000, 2),
+	)
+	batches, err := BuildDailyJournalBatches([]Journal{first, second})
+	if err != nil {
+		t.Fatalf("BuildDailyJournalBatches() error = %v", err)
+	}
+	if len(batches) != 2 {
+		t.Fatalf("test batches = %d, want 2", len(batches))
+	}
+
+	runDate := time.Date(2026, 7, 20, 1, 30, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	windows, err := PlanDailyBatches([]Journal{first, second}, runDate)
+	if err != nil {
+		t.Fatalf("PlanDailyBatches() error = %v", err)
+	}
+
+	want := []struct {
+		batchKey string
+		dateType pubmed.DateType
+	}{
+		{batchKey: batches[0].Key(), dateType: pubmed.DateTypeEntrez},
+		{batchKey: batches[0].Key(), dateType: pubmed.DateTypeModification},
+		{batchKey: batches[1].Key(), dateType: pubmed.DateTypeEntrez},
+		{batchKey: batches[1].Key(), dateType: pubmed.DateTypeModification},
+	}
+	if len(windows) != len(want) {
+		t.Fatalf("windows = %d, want %d", len(windows), len(want))
+	}
+	for index := range want {
+		window := windows[index]
+		if window.BatchKey() != want[index].batchKey ||
+			window.DateType() != want[index].dateType ||
+			window.From().Format("2006-01-02") != "2026-07-17" ||
+			window.To().Format("2006-01-02") != "2026-07-19" {
+			t.Fatalf(
+				"window %d = batch %q %q %s..%s, want batch %q %q 2026-07-17..2026-07-19",
+				index,
+				window.BatchKey(),
+				window.DateType(),
+				window.From().Format("2006-01-02"),
+				window.To().Format("2006-01-02"),
+				want[index].batchKey,
+				want[index].dateType,
+			)
+		}
+		if !window.DateWindow().From.Equal(window.From()) ||
+			!window.DateWindow().To.Equal(window.To()) {
+			t.Fatalf("window %d DateWindow() disagrees with From()/To()", index)
+		}
+	}
+}
+
+func TestPlanDailyBatchesRejectsZeroRunDate(t *testing.T) {
+	t.Parallel()
+
+	journals := []Journal{
+		dailyTestJournal("journal:zero-date", dailyTestISSNs(t, 4_100_000, 1)),
+	}
+	if _, err := PlanDailyBatches(journals, time.Time{}); err == nil {
+		t.Fatal("PlanDailyBatches() accepted zero runDate")
+	}
+}
+
+func TestPlanDailyBatchesProducesStableContentWindowKeys(t *testing.T) {
+	t.Parallel()
+
+	prefix := dailyTestJournal(
+		"journal:prefix",
+		dailyTestISSNs(t, 4_200_000, MaxDailyISSNTerms-1),
+	)
+	targetISSNs := dailyTestISSNs(t, 5_200_000, 2)
+	target := dailyTestJournal(
+		"journal:target",
+		[]string{targetISSNs[1], targetISSNs[0]},
+	)
+	runDate := dateAtUTC(2026, time.July, 20)
+
+	firstPlan, err := PlanDailyBatches([]Journal{prefix, target}, runDate)
+	if err != nil {
+		t.Fatalf("PlanDailyBatches() first error = %v", err)
+	}
+	repeatedPlan, err := PlanDailyBatches([]Journal{prefix, target}, runDate)
+	if err != nil {
+		t.Fatalf("PlanDailyBatches() repeated error = %v", err)
+	}
+	targetOnlyPlan, err := PlanDailyBatches([]Journal{target}, runDate)
+	if err != nil {
+		t.Fatalf("PlanDailyBatches() target-only error = %v", err)
+	}
+
+	for offset := 0; offset < 2; offset++ {
+		targetWindow := firstPlan[2+offset]
+		if targetWindow.Key() != repeatedPlan[2+offset].Key() {
+			t.Fatalf(
+				"repeated planning produced keys %q and %q",
+				targetWindow.Key(),
+				repeatedPlan[2+offset].Key(),
+			)
+		}
+		if targetWindow.Key() != targetOnlyPlan[offset].Key() {
+			t.Fatalf(
+				"same batch content at different indexes produced keys %q and %q",
+				targetWindow.Key(),
+				targetOnlyPlan[offset].Key(),
+			)
+		}
+	}
+	if firstPlan[2].Key() == firstPlan[3].Key() {
+		t.Fatalf("EDAT and MDAT windows share key %q", firstPlan[2].Key())
+	}
+}
+
+func TestPlanDailyBatchesClonesWindowAccessors(t *testing.T) {
+	t.Parallel()
+
+	issns := dailyTestISSNs(t, 5_300_000, 3)
+	journals := []Journal{
+		dailyTestJournal("journal:first", []string{issns[2], issns[0]}),
+		dailyTestJournal("journal:second", []string{issns[1]}),
+	}
+	windows, err := PlanDailyBatches(journals, dateAtUTC(2026, time.July, 20))
+	if err != nil {
+		t.Fatalf("PlanDailyBatches() error = %v", err)
+	}
+	window := windows[0]
+	wantBatchKey := window.BatchKey()
+	wantWindowKey := window.Key()
+	wantJournalKeys := []string{journals[0].Key(), journals[1].Key()}
+	wantISSNs := slices.Clone(issns)
+	slices.Sort(wantISSNs)
+
+	journals[0].key = "mutated-input"
+	journals[0].issns[0] = dailyTestISSNs(t, 5_400_000, 1)[0]
+
+	returnedBatch := window.Batch()
+	returnedBatch.key = "mutated-batch"
+	returnedBatch.journals[0].key = "mutated-batch-journal"
+	returnedBatch.journals[0].issns[0] = dailyTestISSNs(t, 5_400_001, 1)[0]
+	returnedBatch.issns[0] = dailyTestISSNs(t, 5_400_002, 1)[0]
+
+	returnedJournals := window.Journals()
+	returnedJournals[0].key = "mutated-journal-accessor"
+	returnedJournals[0].issns[0] = dailyTestISSNs(t, 5_400_003, 1)[0]
+	returnedISSNs := window.ISSNs()
+	returnedISSNs[0] = dailyTestISSNs(t, 5_400_004, 1)[0]
+	returnedDateWindow := window.DateWindow()
+	returnedDateWindow.From = dateAtUTC(1999, time.January, 1)
+	returnedDateWindow.To = dateAtUTC(1999, time.January, 2)
+
+	if window.BatchKey() != wantBatchKey || window.Batch().Key() != wantBatchKey {
+		t.Fatalf(
+			"Batch() exposed mutable identity: BatchKey=%q Batch.Key=%q want %q",
+			window.BatchKey(),
+			window.Batch().Key(),
+			wantBatchKey,
+		)
+	}
+	if window.Key() != wantWindowKey {
+		t.Fatalf("accessor mutation changed window key to %q", window.Key())
+	}
+	if got := dailyJournalKeys(window.Journals()); !slices.Equal(got, wantJournalKeys) {
+		t.Fatalf("Journals() exposed mutable storage: got %v want %v", got, wantJournalKeys)
+	}
+	if got := window.ISSNs(); !slices.Equal(got, wantISSNs) {
+		t.Fatalf("ISSNs() exposed mutable storage: got %v want %v", got, wantISSNs)
+	}
+	if got := dailyJournalKeys(window.Batch().Journals()); !slices.Equal(got, wantJournalKeys) {
+		t.Fatalf("Batch() journals changed to %v, want %v", got, wantJournalKeys)
+	}
+	if got := window.Batch().ISSNs(); !slices.Equal(got, wantISSNs) {
+		t.Fatalf("Batch() ISSNs changed to %v, want %v", got, wantISSNs)
+	}
+	if window.From().Format("2006-01-02") != "2026-07-18" ||
+		window.To().Format("2006-01-02") != "2026-07-20" {
+		t.Fatalf(
+			"DateWindow() exposed mutable storage: got %s..%s",
+			window.From().Format("2006-01-02"),
+			window.To().Format("2006-01-02"),
+		)
+	}
+}
+
 func TestSyncWindowKeyIsStableCompleteAndJournalSliceIsImmutable(t *testing.T) {
 	t.Parallel()
 
@@ -370,6 +562,24 @@ func TestSyncWindowKeyIsStableCompleteAndJournalSliceIsImmutable(t *testing.T) {
 		if window.Key() == first.Key() {
 			t.Fatalf("%s change did not change SyncWindow key %q", name, window.Key())
 		}
+	}
+}
+
+func TestSyncWindowKeyPreservesBackfillGoldenIdentity(t *testing.T) {
+	t.Parallel()
+
+	window, err := NewSyncWindow(
+		testJournal(t),
+		pubmed.DateTypePublication,
+		dateWindow("2023-07-19", "2026-07-19"),
+	)
+	if err != nil {
+		t.Fatalf("NewSyncWindow() error = %v", err)
+	}
+
+	const want = "sync-window-sha256:bd10e13c406867e8b5f4e0f3f59ddca25f932410af962abe01cfcf0719c1bac6"
+	if window.Key() != want {
+		t.Fatalf("backfill window key = %q, want golden %q", window.Key(), want)
 	}
 }
 

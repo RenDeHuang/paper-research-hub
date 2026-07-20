@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/pubmed"
@@ -18,6 +19,13 @@ type Counter interface {
 
 type SyncWindow struct {
 	journal    Journal
+	dateType   pubmed.DateType
+	dateWindow pubmed.DateWindow
+	key        string
+}
+
+type DailyBatchWindow struct {
+	batch      DailyJournalBatch
 	dateType   pubmed.DateType
 	dateWindow pubmed.DateWindow
 	key        string
@@ -81,6 +89,42 @@ func (window SyncWindow) To() time.Time {
 }
 
 func (window SyncWindow) Key() string {
+	return window.key
+}
+
+func (window DailyBatchWindow) Batch() DailyJournalBatch {
+	return window.batch.clone()
+}
+
+func (window DailyBatchWindow) BatchKey() string {
+	return window.batch.Key()
+}
+
+func (window DailyBatchWindow) Journals() []Journal {
+	return window.batch.Journals()
+}
+
+func (window DailyBatchWindow) ISSNs() []string {
+	return window.batch.ISSNs()
+}
+
+func (window DailyBatchWindow) DateType() pubmed.DateType {
+	return window.dateType
+}
+
+func (window DailyBatchWindow) DateWindow() pubmed.DateWindow {
+	return window.dateWindow
+}
+
+func (window DailyBatchWindow) From() time.Time {
+	return window.dateWindow.From
+}
+
+func (window DailyBatchWindow) To() time.Time {
+	return window.dateWindow.To
+}
+
+func (window DailyBatchWindow) Key() string {
 	return window.key
 }
 
@@ -195,6 +239,47 @@ func PlanDaily(journal Journal, runDate time.Time) ([]SyncWindow, error) {
 	return result, nil
 }
 
+func PlanDailyBatches(
+	journals []Journal,
+	runDate time.Time,
+) ([]DailyBatchWindow, error) {
+	if runDate.IsZero() {
+		return nil, errors.New("daily batch plan runDate is required")
+	}
+	batches, err := BuildDailyJournalBatches(journals)
+	if err != nil {
+		return nil, err
+	}
+
+	runTo := utcCivilDate(runDate)
+	runFrom := runTo.AddDate(0, 0, -2)
+	dateWindow := pubmed.DateWindow{From: runFrom, To: runTo}
+	result := make([]DailyBatchWindow, 0, len(batches)*2)
+	for _, batch := range batches {
+		for _, dateType := range []pubmed.DateType{
+			pubmed.DateTypeEntrez,
+			pubmed.DateTypeModification,
+		} {
+			key, err := syncWindowKeyForISSNs(
+				batch.ISSNs(),
+				dateType,
+				runFrom,
+				runTo,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("derive daily batch window key: %w", err)
+			}
+			result = append(result, DailyBatchWindow{
+				batch:      batch.clone(),
+				dateType:   dateType,
+				dateWindow: dateWindow,
+				key:        key,
+			})
+		}
+	}
+	return result, nil
+}
+
 func makeSyncWindows(
 	journal Journal,
 	dateType pubmed.DateType,
@@ -285,9 +370,20 @@ func syncWindowKey(
 	from time.Time,
 	to time.Time,
 ) (string, error) {
+	return syncWindowKeyForISSNs(journal.ISSNs(), dateType, from, to)
+}
+
+func syncWindowKeyForISSNs(
+	issns []string,
+	dateType pubmed.DateType,
+	from time.Time,
+	to time.Time,
+) (string, error) {
+	sortedISSNs := slices.Clone(issns)
+	slices.Sort(sortedISSNs)
 	payload, err := json.Marshal(syncWindowKeyPayload{
 		Version:  1,
-		ISSNs:    journal.ISSNs(),
+		ISSNs:    sortedISSNs,
 		DateType: dateType,
 		From:     formatDate(from),
 		To:       formatDate(to),
