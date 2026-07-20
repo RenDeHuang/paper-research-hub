@@ -583,6 +583,51 @@ func TestSyncWindowKeyPreservesBackfillGoldenIdentity(t *testing.T) {
 	}
 }
 
+func TestSyncWindowKeyForISSNsSortsWithoutMutatingInput(t *testing.T) {
+	t.Parallel()
+
+	unsorted := []string{"2049-3630", "1234-5679"}
+	original := slices.Clone(unsorted)
+	sorted := slices.Clone(unsorted)
+	slices.Sort(sorted)
+	from := dateAtUTC(2026, time.July, 18)
+	to := dateAtUTC(2026, time.July, 20)
+
+	unsortedKey, err := syncWindowKeyForISSNs(
+		unsorted,
+		pubmed.DateTypeEntrez,
+		from,
+		to,
+	)
+	if err != nil {
+		t.Fatalf("syncWindowKeyForISSNs() unsorted error = %v", err)
+	}
+	sortedKey, err := syncWindowKeyForISSNs(
+		sorted,
+		pubmed.DateTypeEntrez,
+		from,
+		to,
+	)
+	if err != nil {
+		t.Fatalf("syncWindowKeyForISSNs() sorted error = %v", err)
+	}
+
+	if unsortedKey != sortedKey {
+		t.Fatalf(
+			"equivalent ISSN sets produced keys %q and %q",
+			unsortedKey,
+			sortedKey,
+		)
+	}
+	if !slices.Equal(unsorted, original) {
+		t.Fatalf(
+			"syncWindowKeyForISSNs() mutated input to %v, want %v",
+			unsorted,
+			original,
+		)
+	}
+}
+
 type expectedWindow struct {
 	dateType pubmed.DateType
 	from     string
