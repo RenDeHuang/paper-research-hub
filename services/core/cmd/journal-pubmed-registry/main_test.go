@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/httpclient"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/nlmcatalog"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/pubmed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venueenrich"
 )
@@ -199,19 +200,17 @@ func TestJournalPubMedRegistrySkipsCoverageAuditByDefault(t *testing.T) {
 
 		var stdout, stderr bytes.Buffer
 		var received registryCommand
-		ncbiLookups := 0
 		ran := false
 		code := realMain(
 			context.Background(),
 			validJournalRegistryArgs(),
 			&stdout,
 			&stderr,
-			func(key string) (string, bool) {
-				if strings.HasPrefix(key, "NCBI_") {
-					ncbiLookups++
-				}
-				return "", false
-			},
+			journalRegistryLookup(map[string]string{
+				"NCBI_TOOL":    "paper-hub",
+				"NCBI_EMAIL":   "research@example.test",
+				"NCBI_API_KEY": "nlm-identity-key",
+			}),
 			func(
 				_ context.Context,
 				command registryCommand,
@@ -231,18 +230,52 @@ func TestJournalPubMedRegistrySkipsCoverageAuditByDefault(t *testing.T) {
 				stderr.String(),
 			)
 		}
-		if ncbiLookups != 0 {
-			t.Fatalf("default configuration read %d NCBI variables", ncbiLookups)
-		}
 		if !ran {
 			t.Fatal("default configuration did not call the registry runner")
 		}
 		if received.AuditPubMedCoverage ||
-			received.NCBITool != "" ||
-			received.NCBIEmail != "" ||
-			received.NCBIAPIKey != "" ||
+			received.NCBITool != "paper-hub" ||
+			received.NCBIEmail != "research@example.test" ||
+			received.NCBIAPIKey != "nlm-identity-key" ||
 			received.CrossrefContactEmail != "" {
 			t.Fatalf("default source configuration = %#v", received)
+		}
+	})
+
+	t.Run("explicit Crossref contact overrides default isolation", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		var received registryCommand
+		code := realMain(
+			context.Background(),
+			validJournalRegistryArgs(),
+			&stdout,
+			&stderr,
+			journalRegistryLookup(map[string]string{
+				"NCBI_TOOL":              "paper-hub",
+				"NCBI_EMAIL":             "research@example.test",
+				"CROSSREF_CONTACT_EMAIL": "crossref@example.test",
+			}),
+			func(
+				_ context.Context,
+				command registryCommand,
+			) (registryResult, error) {
+				received = command
+				return registryResult{
+					Rows:          journalPubMedRegistryRows,
+					PubMedUnknown: journalPubMedRegistryRows,
+				}, nil
+			},
+		)
+		if code != 0 {
+			t.Fatalf(
+				"realMain(explicit Crossref contact) code = %d, stderr = %s",
+				code,
+				stderr.String(),
+			)
+		}
+		if received.NCBIEmail != "research@example.test" ||
+			received.CrossrefContactEmail != "crossref@example.test" {
+			t.Fatalf("explicit source configuration = %#v", received)
 		}
 	})
 
@@ -269,6 +302,15 @@ func TestJournalPubMedRegistrySkipsCoverageAuditByDefault(t *testing.T) {
 		dependencies.now = func() time.Time { return generatedAt }
 		dependencies.pubMedBaseURL = ""
 		dependencies.newPubMedCounter = nil
+		nlmConstructions := 0
+		dependencies.newNLMCatalogResolver = func(
+			*http.Client,
+			nlmcatalog.Config,
+			httpclient.Dependencies,
+		) (venueenrich.NLMCatalogResolver, error) {
+			nlmConstructions++
+			return nil, errors.New("NLM resolver must not be constructed without conflicts")
+		}
 		dependencies.fetchCrossref = func(
 			context.Context,
 			*http.Client,
@@ -295,10 +337,18 @@ func TestJournalPubMedRegistrySkipsCoverageAuditByDefault(t *testing.T) {
 				CacheDir:   filepath.Join(directory, "cache"),
 				OutputPath: outputPath,
 				ReportPath: reportPath,
+				NCBITool:   "paper-hub",
+				NCBIEmail:  "research@example.test",
 			},
 		)
 		if err != nil {
 			t.Fatalf("registryRunner.run(default) error = %v", err)
+		}
+		if nlmConstructions != 0 {
+			t.Fatalf(
+				"default no-conflict run constructed %d NLM resolvers",
+				nlmConstructions,
+			)
 		}
 		if result.Rows != journalPubMedRegistryRows ||
 			result.PubMedUnknown != journalPubMedRegistryRows {
@@ -370,9 +420,213 @@ func TestJournalPubMedRegistrySkipsCoverageAuditByDefault(t *testing.T) {
 	})
 }
 
-func TestJournalPubMedRegistryAuditRequiresNCBIConfiguration(t *testing.T) {
+func TestJournalPubMedRegistryDefaultModeReconcilesOnlyConflictsWithNLM(
+	t *testing.T,
+) {
 	t.Parallel()
 
+	inputs := writeJournalRegistryInputs(t, []journalRegistryInputSpec{
+		{domain: "medicine", rows: 1546},
+		{domain: "biology", rows: 302},
+		{domain: "computer_science", rows: 184},
+	})
+	directory := t.TempDir()
+	outputPath := filepath.Join(directory, "registry.csv")
+	reportPath := filepath.Join(directory, "registry.report.json")
+	generatedAt := time.Date(
+		2026,
+		time.July,
+		20,
+		2,
+		3,
+		4,
+		5,
+		time.UTC,
+	)
+	resolver := &journalRegistryNLMResolver{
+		results: map[string]nlmcatalog.Result{
+			"medicine Journal 0001": journalRegistryNLMResult(
+				"501",
+				"medicine Journal 0001",
+				"1474-1776",
+				"1474-1784",
+			),
+			"medicine Journal 0002": journalRegistryNLMResult(
+				"502",
+				"medicine Journal 0002",
+				"1474-175X",
+				"1474-1768",
+			),
+		},
+	}
+
+	dependencies := defaultRegistryDependencies()
+	dependencies.now = func() time.Time { return generatedAt }
+	dependencies.pubMedBaseURL = ""
+	pubMedConstructions := 0
+	dependencies.newPubMedCounter = func(
+		*http.Client,
+		pubmed.Config,
+		httpclient.Dependencies,
+	) (venueenrich.PubMedCoverageCounter, error) {
+		pubMedConstructions++
+		return nil, errors.New("coverage counter must remain disabled")
+	}
+	dependencies.fetchCrossref = func(
+		context.Context,
+		*http.Client,
+		venueenrich.CrossrefCatalogConfig,
+		httpclient.Dependencies,
+	) (venueenrich.CrossrefCatalog, error) {
+		return journalRegistryCatalog(generatedAt.Add(-time.Hour)), nil
+	}
+	dependencies.matchCrossref = func(
+		sources []venueenrich.SourceRow,
+		_ venueenrich.CrossrefCatalog,
+	) ([]venueenrich.RegistryRow, error) {
+		rows := make([]venueenrich.RegistryRow, len(sources))
+		for index, source := range sources {
+			rows[index] = journalRegistryUnresolvedRow(
+				source,
+				venueenrich.MatchStatusUnresolved,
+			)
+		}
+		rows[0] = journalRegistryResolvedRow(
+			sources[0],
+			[]string{"1474-1776", "1474-1784"},
+		)
+		rows[0].EISSN = "1474-1784"
+		rows[1] = journalRegistryResolvedRow(
+			sources[1],
+			[]string{"1474-175X", "1474-1768", "1474-1776", "1474-1784"},
+		)
+		rows[1].PrintISSN = "1474-1768"
+		rows[1].EISSN = "1474-1768"
+		return rows, nil
+	}
+	nlmConstructions := 0
+	dependencies.newNLMCatalogResolver = func(
+		_ *http.Client,
+		config nlmcatalog.Config,
+		_ httpclient.Dependencies,
+	) (venueenrich.NLMCatalogResolver, error) {
+		nlmConstructions++
+		if config.BaseURL != dependencies.nlmCatalogBaseURL ||
+			config.Tool != "paper-hub" ||
+			config.Email != "huangrd5@gmail.com" ||
+			config.APIKey != "" {
+			t.Fatalf("NLM Catalog config = %#v", config)
+		}
+		return resolver, nil
+	}
+
+	result, err := (registryRunner{dependencies: dependencies}).run(
+		context.Background(),
+		registryCommand{
+			Inputs:     inputs,
+			CacheDir:   filepath.Join(directory, "cache"),
+			OutputPath: outputPath,
+			ReportPath: reportPath,
+			NCBITool:   "paper-hub",
+			NCBIEmail:  "huangrd5@gmail.com",
+		},
+	)
+	if err != nil {
+		t.Fatalf("registryRunner.run(default conflict) error = %v", err)
+	}
+	if result.Rows != journalPubMedRegistryRows ||
+		result.PubMedUnknown != journalPubMedRegistryRows {
+		t.Fatalf("registry result = %#v", result)
+	}
+	if nlmConstructions != 1 || pubMedConstructions != 0 {
+		t.Fatalf(
+			"NLM/PubMed constructions = %d/%d, want 1/0",
+			nlmConstructions,
+			pubMedConstructions,
+		)
+	}
+	if len(resolver.calls) != 2 ||
+		resolver.calls[0].Title != "medicine Journal 0001" ||
+		!slices.Equal(
+			resolver.calls[0].CandidateISSNs,
+			[]string{"1474-1776", "1474-1784"},
+		) ||
+		resolver.calls[1].Title != "medicine Journal 0002" ||
+		!slices.Equal(
+			resolver.calls[1].CandidateISSNs,
+			[]string{"1474-175X", "1474-1768", "1474-1776", "1474-1784"},
+		) {
+		t.Fatalf("NLM resolver calls = %#v", resolver.calls)
+	}
+
+	outputBytes, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile(output) error = %v", err)
+	}
+	records, err := csv.NewReader(bytes.NewReader(outputBytes)).ReadAll()
+	if err != nil {
+		t.Fatalf("decode output CSV: %v", err)
+	}
+	if !slices.Equal(records[0], journalPubMedRegistryHeader) {
+		t.Fatalf("CSV header changed: %v", records[0])
+	}
+	if records[2][7] != "1474-175X" ||
+		records[2][8] != "1474-1768" ||
+		records[2][9] != `["1474-175X","1474-1768"]` ||
+		records[2][11] != "resolved" ||
+		records[2][12] != "unknown" {
+		t.Fatalf("corrected CSV row = %#v", records[2])
+	}
+
+	reportBytes, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("ReadFile(report) error = %v", err)
+	}
+	var report registryReport
+	decodeSingleJSONValue(t, bytes.NewReader(reportBytes), &report)
+	if report.SchemaVersion != "journal-pubmed-registry-report/v2" {
+		t.Fatalf("report schema_version = %q, want v2", report.SchemaVersion)
+	}
+	if len(report.NLMCatalogIdentities) != 2 {
+		t.Fatalf(
+			"report NLM identities = %d, want 2",
+			len(report.NLMCatalogIdentities),
+		)
+	}
+	receipt := report.NLMCatalogIdentities[1]
+	if receipt.Domain != "medicine" ||
+		receipt.SourceOrder != 2 ||
+		receipt.SourceJournalName != "medicine Journal 0002" ||
+		receipt.NLMUID != "502" ||
+		receipt.NLMTitle != "medicine Journal 0002" ||
+		receipt.DateRevised != "2026-05-08" ||
+		!slices.Equal(
+			receipt.OriginalISSNs,
+			[]string{"1474-175X", "1474-1768", "1474-1776", "1474-1784"},
+		) ||
+		!slices.Equal(
+			receipt.AuthorityISSNs,
+			[]string{"1474-175X", "1474-1768"},
+		) ||
+		receipt.ESearchSHA256 != journalRegistryHashOne ||
+		receipt.ESummarySHA256 != journalRegistryHashTwo {
+		t.Fatalf("report NLM receipt = %#v", receipt)
+	}
+	if err := reconcileRegistryArtifacts(outputBytes, reportBytes); err != nil {
+		t.Fatalf("reconcileRegistryArtifacts() error = %v", err)
+	}
+}
+
+func TestJournalPubMedRegistryRequiresNCBIConfigurationInEveryMode(t *testing.T) {
+	t.Parallel()
+
+	modes := []struct {
+		name string
+		args []string
+	}{
+		{name: "default", args: validJournalRegistryArgs()},
+		{name: "coverage audit", args: validJournalRegistryAuditArgs()},
+	}
 	tests := []struct {
 		name string
 		env  map[string]string
@@ -391,44 +645,50 @@ func TestJournalPubMedRegistryAuditRequiresNCBIConfiguration(t *testing.T) {
 			want: "NCBI_EMAIL",
 		},
 	}
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
+	for _, mode := range modes {
+		mode := mode
+		t.Run(mode.name, func(t *testing.T) {
 			t.Parallel()
+			for _, test := range tests {
+				test := test
+				t.Run(test.name, func(t *testing.T) {
+					t.Parallel()
 
-			var stdout, stderr bytes.Buffer
-			ran := false
-			code := realMain(
-				context.Background(),
-				validJournalRegistryAuditArgs(),
-				&stdout,
-				&stderr,
-				journalRegistryLookup(test.env),
-				func(
-					context.Context,
-					registryCommand,
-				) (registryResult, error) {
-					ran = true
-					return registryResult{}, nil
-				},
-			)
-			if code != 1 {
-				t.Fatalf("realMain(audit) code = %d, want 1", code)
-			}
-			if ran {
-				t.Fatal("audit runner called without required NCBI configuration")
-			}
-			if !strings.Contains(stderr.String(), test.want) {
-				t.Fatalf("stderr = %q, want %q", stderr.String(), test.want)
-			}
-			if stdout.Len() != 0 {
-				t.Fatalf("stdout = %q, want empty", stdout.String())
+					var stdout, stderr bytes.Buffer
+					ran := false
+					code := realMain(
+						context.Background(),
+						mode.args,
+						&stdout,
+						&stderr,
+						journalRegistryLookup(test.env),
+						func(
+							context.Context,
+							registryCommand,
+						) (registryResult, error) {
+							ran = true
+							return registryResult{}, nil
+						},
+					)
+					if code != 1 {
+						t.Fatalf("realMain() code = %d, want 1", code)
+					}
+					if ran {
+						t.Fatal("runner called without required NCBI configuration")
+					}
+					if !strings.Contains(stderr.String(), test.want) {
+						t.Fatalf("stderr = %q, want %q", stderr.String(), test.want)
+					}
+					if stdout.Len() != 0 {
+						t.Fatalf("stdout = %q, want empty", stdout.String())
+					}
+				})
 			}
 		})
 	}
 }
 
-func TestJournalPubMedRegistryRunnerRejectsInvalidAuditIdentityBeforeSources(
+func TestJournalPubMedRegistryRunnerRejectsInvalidNCBIIdentityBeforeSources(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -497,12 +757,11 @@ func TestJournalPubMedRegistryRunnerRejectsInvalidAuditIdentityBeforeSources(
 						filepath.Join(directory, "missing-biology.csv"),
 						filepath.Join(directory, "missing-computer.csv"),
 					},
-					CacheDir:            filepath.Join(directory, "cache"),
-					OutputPath:          filepath.Join(directory, "registry.csv"),
-					ReportPath:          filepath.Join(directory, "registry.report.json"),
-					AuditPubMedCoverage: true,
-					NCBITool:            test.tool,
-					NCBIEmail:           test.email,
+					CacheDir:   filepath.Join(directory, "cache"),
+					OutputPath: filepath.Join(directory, "registry.csv"),
+					ReportPath: filepath.Join(directory, "registry.report.json"),
+					NCBITool:   test.tool,
+					NCBIEmail:  test.email,
 				},
 			)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
@@ -529,7 +788,9 @@ func TestJournalPubMedRegistryRunnerRejectsInvalidAuditIdentityBeforeSources(
 	}
 }
 
-func TestJournalPubMedRegistryValidatesDependenciesByCoverageMode(t *testing.T) {
+func TestJournalPubMedRegistryValidatesNLMAndCoverageDependenciesSeparately(
+	t *testing.T,
+) {
 	t.Parallel()
 
 	dependencies := defaultRegistryDependencies()
@@ -539,6 +800,30 @@ func TestJournalPubMedRegistryValidatesDependenciesByCoverageMode(t *testing.T) 
 	if _, err := dependencies.validated(false); err != nil {
 		t.Fatalf("validated(default) error = %v", err)
 	}
+
+	t.Run("default requires NLM base URL", func(t *testing.T) {
+		defaultDependencies := defaultRegistryDependencies()
+		defaultDependencies.nlmCatalogBaseURL = ""
+		if _, err := defaultDependencies.validated(false); err == nil ||
+			!strings.Contains(err.Error(), "NLM Catalog base URL") {
+			t.Fatalf(
+				"validated(default missing NLM URL) error = %v",
+				err,
+			)
+		}
+	})
+
+	t.Run("default requires NLM resolver constructor", func(t *testing.T) {
+		defaultDependencies := defaultRegistryDependencies()
+		defaultDependencies.newNLMCatalogResolver = nil
+		if _, err := defaultDependencies.validated(false); err == nil ||
+			!strings.Contains(err.Error(), "NLM Catalog resolver") {
+			t.Fatalf(
+				"validated(default missing NLM resolver) error = %v",
+				err,
+			)
+		}
+	})
 
 	t.Run("audit requires base URL", func(t *testing.T) {
 		auditDependencies := defaultRegistryDependencies()
@@ -735,6 +1020,7 @@ func TestJournalPubMedRegistryGeneratesFixedCSVReportCountsAndHashes(t *testing.
 	fetchCalls := 0
 	matchCalls := 0
 	clientConstructions := 0
+	nlmConstructions := 0
 	dependencies.now = func() time.Time { return generatedAt }
 	dependencies.fetchCrossref = func(
 		_ context.Context,
@@ -758,6 +1044,14 @@ func TestJournalPubMedRegistryGeneratesFixedCSVReportCountsAndHashes(t *testing.
 			t.Fatalf("match catalog = %#v, want fetched catalog", gotCatalog)
 		}
 		return journalRegistryMatches(sources), nil
+	}
+	dependencies.newNLMCatalogResolver = func(
+		_ *http.Client,
+		_ nlmcatalog.Config,
+		_ httpclient.Dependencies,
+	) (venueenrich.NLMCatalogResolver, error) {
+		nlmConstructions++
+		return nil, errors.New("NLM resolver must not be constructed without conflicts")
 	}
 	dependencies.newPubMedCounter = func(
 		_ *http.Client,
@@ -795,11 +1089,15 @@ func TestJournalPubMedRegistryGeneratesFixedCSVReportCountsAndHashes(t *testing.
 		result.PubMedUnknown != journalPubMedRegistryRows-2 {
 		t.Fatalf("registry result = %#v", result)
 	}
-	if fetchCalls != 1 || matchCalls != 1 || clientConstructions != 1 {
+	if fetchCalls != 1 ||
+		matchCalls != 1 ||
+		nlmConstructions != 0 ||
+		clientConstructions != 1 {
 		t.Fatalf(
-			"pipeline calls = fetch %d, match %d, PubMed clients %d; want one each",
+			"pipeline calls = fetch %d, match %d, NLM %d, PubMed %d",
 			fetchCalls,
 			matchCalls,
+			nlmConstructions,
 			clientConstructions,
 		)
 	}
@@ -876,6 +1174,12 @@ func TestJournalPubMedRegistryGeneratesFixedCSVReportCountsAndHashes(t *testing.
 	if report.SchemaVersion != journalPubMedRegistryReportSchemaVersion ||
 		report.GeneratedAt != generatedAt.UTC().Format(time.RFC3339Nano) {
 		t.Fatalf("report identity = %#v", report)
+	}
+	if len(report.NLMCatalogIdentities) != 0 {
+		t.Fatalf(
+			"no-conflict report NLM identities = %#v, want empty",
+			report.NLMCatalogIdentities,
+		)
 	}
 	if len(report.Inputs) != 3 {
 		t.Fatalf("report inputs = %d, want 3", len(report.Inputs))
@@ -1670,6 +1974,63 @@ func TestJournalPubMedRegistryReportValidationRequires2032RowsAndValidProbes(
 			t.Fatalf("validateRegistryReport() error = %v, want invalid probe receipt", err)
 		}
 	})
+
+	t.Run("NLM identity receipts use schema v2 and strict hashes", func(t *testing.T) {
+		report := validJournalRegistryReportForValidation()
+		report.Counts.Match.Resolved = 1
+		report.Counts.Match.Unresolved--
+		report.Counts.Probes.Eligible = 1
+		report.ByDomain[0].Counts = report.Counts
+		report.Probes[0].ISSNs = []string{"0028-0836"}
+		normalized, err := venueenrich.NormalizeTitle("Authority Journal")
+		if err != nil {
+			t.Fatalf("NormalizeTitle() error = %v", err)
+		}
+		report.NLMCatalogIdentities = []venueenrich.NLMCatalogIdentityReceipt{
+			{
+				Domain:                "all",
+				SourceOrder:           1,
+				SourceJournalName:     "Authority Journal",
+				NormalizedSourceTitle: normalized,
+				NLMUID:                "501",
+				NLMUniqueID:           "501",
+				NLMTitle:              "Authority Journal",
+				NLMTitleMainSort:      normalized,
+				DateRevised:           "2026-05-08",
+				EndYear:               "9999",
+				CurrentIndexingStatus: "Y",
+				OriginalPrintISSN:     "0028-0836",
+				OriginalISSNs:         []string{"0028-0836"},
+				AuthorityPrintISSN:    "0028-0836",
+				AuthorityISSNs:        []string{"0028-0836"},
+				ESearchSHA256:         journalRegistryHashOne,
+				ESummarySHA256:        journalRegistryHashTwo,
+			},
+		}
+		if err := validateRegistryReport(report); err != nil {
+			t.Fatalf("validateRegistryReport(valid NLM receipt) error = %v", err)
+		}
+
+		report.NLMCatalogIdentities[0].ESearchSHA256 = "invalid"
+		if err := validateRegistryReport(report); err == nil ||
+			!strings.Contains(err.Error(), "NLM") {
+			t.Fatalf(
+				"validateRegistryReport(invalid NLM receipt) error = %v",
+				err,
+			)
+		}
+
+		report.NLMCatalogIdentities[0].ESearchSHA256 = journalRegistryHashOne
+		report.Probes[0].ISSNs = []string{"2049-3630"}
+		if err := validateRegistryReport(report); err == nil ||
+			!strings.Contains(err.Error(), "NLM") ||
+			!strings.Contains(err.Error(), "probe") {
+			t.Fatalf(
+				"validateRegistryReport(NLM/probe mismatch) error = %v",
+				err,
+			)
+		}
+	})
 }
 
 func TestJournalPubMedRegistryAcceptsCompleteSkippedCoverageOverlay(
@@ -2102,6 +2463,66 @@ func journalRegistryUnresolvedRow(
 		OpenAlexSupported: venueenrich.SupportStatusUnknown,
 		PubMedSupported:   venueenrich.SupportStatusUnknown,
 		MatchStatus:       status,
+	}
+}
+
+type journalRegistryNLMResolver struct {
+	results map[string]nlmcatalog.Result
+	errs    map[string]error
+	calls   []nlmcatalog.Query
+}
+
+func (resolver *journalRegistryNLMResolver) Resolve(
+	_ context.Context,
+	query nlmcatalog.Query,
+) (nlmcatalog.Result, error) {
+	resolver.calls = append(resolver.calls, nlmcatalog.Query{
+		Title:          query.Title,
+		CandidateISSNs: slices.Clone(query.CandidateISSNs),
+	})
+	if err := resolver.errs[query.Title]; err != nil {
+		return nlmcatalog.Result{}, err
+	}
+	result, exists := resolver.results[query.Title]
+	if !exists {
+		return nlmcatalog.Result{}, fmt.Errorf(
+			"missing NLM fixture for %q",
+			query.Title,
+		)
+	}
+	return result, nil
+}
+
+func journalRegistryNLMResult(
+	uid string,
+	title string,
+	printISSN string,
+	electronicISSN string,
+) nlmcatalog.Result {
+	normalized, err := venueenrich.NormalizeTitle(title)
+	if err != nil {
+		panic(err)
+	}
+	allISSNs := []string{printISSN}
+	if electronicISSN != "" {
+		allISSNs = append(allISSNs, electronicISSN)
+	}
+	slices.Sort(allISSNs)
+	return nlmcatalog.Result{
+		UID:           uid,
+		NLMUniqueID:   uid,
+		TitleMainSort: normalized,
+		TitleMainList: []nlmcatalog.TitleMain{
+			{Title: title, SortTitle: normalized},
+		},
+		PrintISSN:             printISSN,
+		ElectronicISSN:        electronicISSN,
+		AllISSNs:              allISSNs,
+		DateRevised:           "2026-05-08",
+		EndYear:               "9999",
+		CurrentIndexingStatus: "Y",
+		ESearchSHA256:         journalRegistryHashOne,
+		ESummarySHA256:        journalRegistryHashTwo,
 	}
 }
 

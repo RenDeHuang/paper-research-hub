@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/httpclient"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/nlmcatalog"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/pubmed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venue"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venueenrich"
@@ -31,9 +32,10 @@ import (
 
 const (
 	journalPubMedRegistryRows                = 2032
-	journalPubMedRegistryReportSchemaVersion = "journal-pubmed-registry-report/v1"
+	journalPubMedRegistryReportSchemaVersion = "journal-pubmed-registry-report/v2"
 	journalPubMedRegistryUserAgent           = "paper-research-hub-journal-pubmed-registry/1.0"
 	officialCrossrefBaseURL                  = "https://api.crossref.org"
+	officialNLMCatalogBaseURL                = "https://eutils.ncbi.nlm.nih.gov"
 	officialPubMedBaseURL                    = "https://eutils.ncbi.nlm.nih.gov"
 
 	pubMedRegistryTimeout          = 30 * time.Second
@@ -118,16 +120,24 @@ type newPubMedCounterFunc func(
 	httpclient.Dependencies,
 ) (venueenrich.PubMedCoverageCounter, error)
 
+type newNLMCatalogResolverFunc func(
+	*http.Client,
+	nlmcatalog.Config,
+	httpclient.Dependencies,
+) (venueenrich.NLMCatalogResolver, error)
+
 type registryDependencies struct {
-	httpClient       *http.Client
-	now              func() time.Time
-	httpDependencies httpclient.Dependencies
-	crossrefBaseURL  string
-	pubMedBaseURL    string
-	fetchCrossref    fetchCrossrefFunc
-	matchCrossref    matchCrossrefFunc
-	newPubMedCounter newPubMedCounterFunc
-	fileOps          registryFileOps
+	httpClient            *http.Client
+	now                   func() time.Time
+	httpDependencies      httpclient.Dependencies
+	crossrefBaseURL       string
+	nlmCatalogBaseURL     string
+	pubMedBaseURL         string
+	fetchCrossref         fetchCrossrefFunc
+	matchCrossref         matchCrossrefFunc
+	newNLMCatalogResolver newNLMCatalogResolverFunc
+	newPubMedCounter      newPubMedCounterFunc
+	fileOps               registryFileOps
 }
 
 type registryRunner struct {
@@ -191,14 +201,15 @@ type registryOutputReceipt struct {
 }
 
 type registryReport struct {
-	SchemaVersion   string                           `json:"schema_version"`
-	GeneratedAt     string                           `json:"generated_at"`
-	Inputs          []registryInputReceipt           `json:"inputs"`
-	CrossrefCatalog registryCrossrefReceipt          `json:"crossref_catalog"`
-	Counts          registryCounts                   `json:"counts"`
-	ByDomain        []registryDomainCounts           `json:"by_domain"`
-	Probes          []venueenrich.PubMedProbeReceipt `json:"probes"`
-	OutputCSV       registryOutputReceipt            `json:"output_csv"`
+	SchemaVersion        string                                  `json:"schema_version"`
+	GeneratedAt          string                                  `json:"generated_at"`
+	Inputs               []registryInputReceipt                  `json:"inputs"`
+	CrossrefCatalog      registryCrossrefReceipt                 `json:"crossref_catalog"`
+	Counts               registryCounts                          `json:"counts"`
+	ByDomain             []registryDomainCounts                  `json:"by_domain"`
+	NLMCatalogIdentities []venueenrich.NLMCatalogIdentityReceipt `json:"nlm_catalog_identities"`
+	Probes               []venueenrich.PubMedProbeReceipt        `json:"probes"`
+	OutputCSV            registryOutputReceipt                   `json:"output_csv"`
 }
 
 type registryFileOps struct {
@@ -335,23 +346,23 @@ func loadRegistrySourceConfig(
 	if lookup == nil {
 		return registryCommand{}, errors.New("environment lookup is required")
 	}
+	tool, err := requiredTrimmedEnvironment(lookup, "NCBI_TOOL")
+	if err != nil {
+		return registryCommand{}, err
+	}
+	email, err := requiredBareEmailEnvironment(lookup, "NCBI_EMAIL")
+	if err != nil {
+		return registryCommand{}, err
+	}
+	apiKey := ""
+	if raw, ok := lookup("NCBI_API_KEY"); ok {
+		apiKey = strings.TrimSpace(raw)
+	}
+	command.NCBITool = tool
+	command.NCBIEmail = email
+	command.NCBIAPIKey = apiKey
 	crossrefEmail := ""
 	if command.AuditPubMedCoverage {
-		tool, err := requiredTrimmedEnvironment(lookup, "NCBI_TOOL")
-		if err != nil {
-			return registryCommand{}, err
-		}
-		email, err := requiredBareEmailEnvironment(lookup, "NCBI_EMAIL")
-		if err != nil {
-			return registryCommand{}, err
-		}
-		apiKey := ""
-		if raw, ok := lookup("NCBI_API_KEY"); ok {
-			apiKey = strings.TrimSpace(raw)
-		}
-		command.NCBITool = tool
-		command.NCBIEmail = email
-		command.NCBIAPIKey = apiKey
 		crossrefEmail = email
 	}
 	if raw, ok := lookup("CROSSREF_CONTACT_EMAIL"); ok && raw != "" {
@@ -371,12 +382,20 @@ func loadRegistrySourceConfig(
 func defaultRegistryDependencies() registryDependencies {
 	fileOps := defaultRegistryFileOps()
 	return registryDependencies{
-		httpClient:      &http.Client{},
-		now:             time.Now,
-		crossrefBaseURL: officialCrossrefBaseURL,
-		pubMedBaseURL:   officialPubMedBaseURL,
-		fetchCrossref:   venueenrich.FetchCrossrefCatalog,
-		matchCrossref:   venueenrich.MatchCrossrefCatalog,
+		httpClient:        &http.Client{},
+		now:               time.Now,
+		crossrefBaseURL:   officialCrossrefBaseURL,
+		nlmCatalogBaseURL: officialNLMCatalogBaseURL,
+		pubMedBaseURL:     officialPubMedBaseURL,
+		fetchCrossref:     venueenrich.FetchCrossrefCatalog,
+		matchCrossref:     venueenrich.MatchCrossrefCatalog,
+		newNLMCatalogResolver: func(
+			base *http.Client,
+			config nlmcatalog.Config,
+			dependencies httpclient.Dependencies,
+		) (venueenrich.NLMCatalogResolver, error) {
+			return nlmcatalog.NewClient(base, config, dependencies)
+		},
 		newPubMedCounter: func(
 			base *http.Client,
 			config pubmed.Config,
@@ -409,7 +428,7 @@ func (runner registryRunner) run(
 	); err != nil {
 		return registryResult{}, err
 	}
-	if err := validateRegistryAuditIdentity(command); err != nil {
+	if err := validateRegistryNCBIIdentity(command); err != nil {
 		return registryResult{}, err
 	}
 	dependencies, err := runner.dependencies.validated(
@@ -456,6 +475,27 @@ func (runner registryRunner) run(
 			"Crossref match rows = %d, source rows = %d",
 			len(rows),
 			len(sourceRows),
+		)
+	}
+
+	rows, nlmIdentities, err := venueenrich.ReconcileConflictingISSNsWithNLMCatalog(
+		ctx,
+		rows,
+		func() (venueenrich.NLMCatalogResolver, error) {
+			return dependencies.newNLMCatalogResolver(
+				dependencies.httpClient,
+				nlmCatalogClientConfig(
+					command,
+					dependencies.nlmCatalogBaseURL,
+				),
+				httpDependencies,
+			)
+		},
+	)
+	if err != nil {
+		return registryResult{}, fmt.Errorf(
+			"reconcile conflicting ISSNs with NLM Catalog: %w",
+			err,
 		)
 	}
 
@@ -521,6 +561,7 @@ func (runner registryRunner) run(
 		inputs,
 		catalog,
 		rows,
+		nlmIdentities,
 		probes,
 		output,
 	)
@@ -549,10 +590,7 @@ func (runner registryRunner) run(
 	}, nil
 }
 
-func validateRegistryAuditIdentity(command registryCommand) error {
-	if !command.AuditPubMedCoverage {
-		return nil
-	}
+func validateRegistryNCBIIdentity(command registryCommand) error {
 	if _, err := validateRequiredTrimmed(
 		"NCBI_TOOL",
 		command.NCBITool,
@@ -588,6 +626,16 @@ func (dependencies registryDependencies) validated(
 		dependencies.matchCrossref == nil {
 		return registryDependencies{}, errors.New(
 			"registry Crossref source dependencies are required",
+		)
+	}
+	if strings.TrimSpace(dependencies.nlmCatalogBaseURL) == "" {
+		return registryDependencies{}, errors.New(
+			"registry NLM Catalog base URL is required",
+		)
+	}
+	if dependencies.newNLMCatalogResolver == nil {
+		return registryDependencies{}, errors.New(
+			"registry NLM Catalog resolver dependency is required",
 		)
 	}
 	if auditPubMedCoverage {
@@ -727,6 +775,25 @@ func pubMedClientConfig(
 		APIKey:           command.NCBIAPIKey,
 		UserAgent:        journalPubMedRegistryUserAgent,
 		BatchSize:        1000,
+		Timeout:          pubMedRegistryTimeout,
+		MaxRetries:       pubMedRegistryMaxRetries,
+		MaxWait:          pubMedRegistryMaxWait,
+		InitialBackoff:   pubMedRegistryInitialBackoff,
+		MaxBackoff:       pubMedRegistryMaxBackoff,
+		MaxResponseBytes: pubMedRegistryMaxResponseBytes,
+	}
+}
+
+func nlmCatalogClientConfig(
+	command registryCommand,
+	baseURL string,
+) nlmcatalog.Config {
+	return nlmcatalog.Config{
+		BaseURL:          baseURL,
+		Tool:             command.NCBITool,
+		Email:            command.NCBIEmail,
+		APIKey:           command.NCBIAPIKey,
+		UserAgent:        journalPubMedRegistryUserAgent,
 		Timeout:          pubMedRegistryTimeout,
 		MaxRetries:       pubMedRegistryMaxRetries,
 		MaxWait:          pubMedRegistryMaxWait,
@@ -925,6 +992,7 @@ func buildRegistryReport(
 	inputs []registryInputReceipt,
 	catalog venueenrich.CrossrefCatalog,
 	rows []venueenrich.RegistryRow,
+	nlmIdentities []venueenrich.NLMCatalogIdentityReceipt,
 	probes []venueenrich.PubMedProbeReceipt,
 	output registryOutputReceipt,
 ) (registryReport, error) {
@@ -948,10 +1016,11 @@ func buildRegistryReport(
 			Replayed: catalog.Replayed,
 			Resumed:  catalog.Resumed,
 		},
-		Counts:    counts,
-		ByDomain:  byDomain,
-		Probes:    slices.Clone(probes),
-		OutputCSV: output,
+		Counts:               counts,
+		ByDomain:             byDomain,
+		NLMCatalogIdentities: slices.Clone(nlmIdentities),
+		Probes:               slices.Clone(probes),
+		OutputCSV:            output,
 	}
 	if err := validateRegistryReport(report); err != nil {
 		return registryReport{}, err
@@ -1079,6 +1148,32 @@ func validateRegistryReport(report registryReport) error {
 	); err != nil {
 		return err
 	}
+	if len(report.NLMCatalogIdentities) > report.Counts.Match.Resolved {
+		return errors.New(
+			"registry report NLM identity receipts exceed resolved rows",
+		)
+	}
+	seenNLMSourceRows := make(
+		map[string]struct{},
+		len(report.NLMCatalogIdentities),
+	)
+	for index, receipt := range report.NLMCatalogIdentities {
+		if err := receipt.Validate(); err != nil {
+			return fmt.Errorf(
+				"registry report NLM identity receipt %d: %w",
+				index+1,
+				err,
+			)
+		}
+		key := receipt.Domain + "\x00" + strconv.Itoa(receipt.SourceOrder)
+		if _, duplicate := seenNLMSourceRows[key]; duplicate {
+			return fmt.Errorf(
+				"registry report NLM identity receipt %d duplicates source row",
+				index+1,
+			)
+		}
+		seenNLMSourceRows[key] = struct{}{}
+	}
 	if len(report.Probes) != report.Counts.OutputRows {
 		return fmt.Errorf(
 			"registry report probes=%d output_rows=%d",
@@ -1088,6 +1183,10 @@ func validateRegistryReport(report registryReport) error {
 	}
 	var attempted int
 	var support registrySupportCounts
+	probesBySourceRow := make(
+		map[string]venueenrich.PubMedProbeReceipt,
+		len(report.Probes),
+	)
 	for index, probe := range report.Probes {
 		if err := validateReportProbe(probe); err != nil {
 			return fmt.Errorf(
@@ -1096,6 +1195,14 @@ func validateRegistryReport(report registryReport) error {
 				err,
 			)
 		}
+		key := probe.Domain + "\x00" + strconv.Itoa(probe.SourceOrder)
+		if _, duplicate := probesBySourceRow[key]; duplicate {
+			return fmt.Errorf(
+				"registry report probe %d duplicates source row",
+				index+1,
+			)
+		}
+		probesBySourceRow[key] = probe
 		if probe.Attempted {
 			attempted++
 		}
@@ -1113,6 +1220,17 @@ func validateRegistryReport(report registryReport) error {
 		return errors.New(
 			"registry report probe receipts do not reconcile with counts",
 		)
+	}
+	for index, receipt := range report.NLMCatalogIdentities {
+		key := receipt.Domain + "\x00" + strconv.Itoa(receipt.SourceOrder)
+		probe, exists := probesBySourceRow[key]
+		if !exists ||
+			!slices.Equal(receipt.AuthorityISSNs, probe.ISSNs) {
+			return fmt.Errorf(
+				"registry report NLM identity receipt %d does not match final probe ISSNs",
+				index+1,
+			)
+		}
 	}
 	if strings.TrimSpace(report.OutputCSV.Path) == "" ||
 		report.OutputCSV.Rows != report.Counts.OutputRows ||
