@@ -259,7 +259,7 @@ func (service *Service) runBackfill(
 		journalIndex := len(report.Journals) - 1
 		report.JournalsPlanned++
 
-		windows, planErr := service.plan(ctx, request, journal)
+		windows, planErr := service.planBackfill(ctx, journal)
 		if planErr != nil {
 			report.Journals[journalIndex].Status = "failed"
 			report.Journals[journalIndex].Error = planErr.Error()
@@ -303,11 +303,7 @@ func (service *Service) runBackfill(
 			windowIndex := len(report.Windows) - 1
 			report.WindowsAttempted++
 
-			summary, runWindowErr := service.runWindow(
-				ctx,
-				request,
-				window,
-			)
+			summary, runWindowErr := service.runBackfillWindow(ctx, window)
 			if summaryErr := summary.Validate(); summaryErr == nil {
 				mergeSummary(&report, &report.Windows[windowIndex], summary)
 			} else if runWindowErr == nil {
@@ -532,27 +528,18 @@ func validateRunRequest(ctx context.Context, request RunRequest) error {
 	return nil
 }
 
-func (service *Service) plan(
+func (service *Service) planBackfill(
 	ctx context.Context,
-	request RunRequest,
 	journal Journal,
 ) ([]SyncWindow, error) {
-	switch request.Mode {
-	case ModeBackfill:
-		return PlanBackfill(ctx, searchCounter{searcher: service.searcher}, journal)
-	case ModeDaily:
-		return PlanDaily(journal, request.RunDate)
-	default:
-		return nil, fmt.Errorf("unsupported PubMed journal sync mode %q", request.Mode)
-	}
+	return PlanBackfill(ctx, searchCounter{searcher: service.searcher}, journal)
 }
 
-func (service *Service) runWindow(
+func (service *Service) runBackfillWindow(
 	ctx context.Context,
-	request RunRequest,
 	window SyncWindow,
 ) (ingestion.JobSummary, error) {
-	job, err := newWindowJob(request, window)
+	job, err := newBackfillWindowJob(window)
 	if err != nil {
 		return ingestion.JobSummary{}, err
 	}
@@ -657,11 +644,11 @@ func mergeSummary(
 	report.IngestionFailed += summary.Failed
 }
 
-func newWindowJob(request RunRequest, window SyncWindow) (ingestion.Job, error) {
+func newBackfillWindowJob(window SyncWindow) (ingestion.Job, error) {
 	journal := window.Journal()
 	issns := journal.ISSNs()
 	payload := map[string]any{
-		"mode":             string(request.Mode),
+		"mode":             string(ModeBackfill),
 		"journal_key":      journal.Key(),
 		"journal_identity": journal.Key(),
 		"journal_name":     journal.SourceJournalName(),
@@ -671,9 +658,6 @@ func newWindowJob(request RunRequest, window SyncWindow) (ingestion.Job, error) 
 		"from_date":        window.From().Format(time.DateOnly),
 		"to_date":          window.To().Format(time.DateOnly),
 		"window_key":       window.Key(),
-	}
-	if request.Mode == ModeDaily {
-		payload["run_date"] = request.RunDate.UTC().Format(time.DateOnly)
 	}
 	return ingestion.NewJob(
 		"sync/pubmed-journals/"+window.Key(),

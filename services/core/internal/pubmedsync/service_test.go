@@ -542,6 +542,174 @@ func TestServiceContinuesAfterDailyBatchFailuresWithoutDoubleCountingJournals(t 
 	}
 }
 
+func TestServiceFansOutSingleDailyBatchWindowFailureToEveryJournal(t *testing.T) {
+	t.Parallel()
+
+	searcher := &serviceFakeSearcher{}
+	fetcher := &serviceFakeFetcher{}
+	sentinel := errors.New("first multi-journal batch window failed")
+	runner := &serviceFakeIngestion{failByKey: map[string]error{}}
+	service, err := NewService(
+		searcher,
+		fetcher,
+		runner.Run,
+		func(records source.ClientSequence) ingestion.EventSequence {
+			return recordEventsForServiceTest(records)
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	firstISSNs := dailyTestISSNs(t, 7_300_000, MaxDailyISSNTerms-2)
+	secondISSNs := dailyTestISSNs(t, 8_300_000, 2)
+	thirdISSNs := dailyTestISSNs(t, 8_400_000, 1)
+	registry := encodeRegistryCSV(
+		testRegistryHeader,
+		serviceRegistryRecordWithISSNs("First Shared Batch Journal", 1, firstISSNs, "yes", "1"),
+		serviceRegistryRecordWithISSNs("Second Shared Batch Journal", 2, secondISSNs, "no", "0"),
+		serviceRegistryRecordWithISSNs("Second Batch Journal", 3, thirdISSNs, "unknown", "0"),
+	)
+	journals, err := LoadResolvedRegistry(bytes.NewReader(registry))
+	if err != nil {
+		t.Fatalf("LoadResolvedRegistry() error = %v", err)
+	}
+	windows, err := PlanDailyBatches(journals, parseTestDate("2026-07-19"))
+	if err != nil {
+		t.Fatalf("PlanDailyBatches() error = %v", err)
+	}
+	if len(windows) != 4 {
+		t.Fatalf("planned windows = %d, want 4", len(windows))
+	}
+	if windows[0].BatchKey() != windows[1].BatchKey() ||
+		windows[2].BatchKey() != windows[3].BatchKey() ||
+		windows[0].BatchKey() == windows[2].BatchKey() {
+		t.Fatalf("daily batch window grouping is not two windows per distinct batch")
+	}
+	runner.failByKey[windows[0].Key()] = sentinel
+
+	report, runErr := service.Run(context.Background(), RunRequest{
+		Mode:         ModeDaily,
+		RunDate:      parseTestDate("2026-07-19"),
+		LookbackDays: 3,
+		Registry:     bytes.NewReader(registry),
+	})
+	if runErr == nil || !errors.Is(runErr, sentinel) {
+		t.Fatalf("Run() error = %v, want first batch window failure", runErr)
+	}
+	if len(searcher.calls) != 4 || len(fetcher.calls) != 4 ||
+		len(runner.calls) != 4 {
+		t.Fatalf(
+			"Search/Fetch/ingestion calls = %d/%d/%d, want 4/4/4",
+			len(searcher.calls),
+			len(fetcher.calls),
+			len(runner.calls),
+		)
+	}
+	if report.WindowsFailed != 1 || report.WindowsSucceeded != 3 ||
+		report.JournalsFailed != 2 {
+		t.Fatalf("failure totals = %#v", report)
+	}
+	if report.Windows[0].Status != "failed" ||
+		report.Windows[1].Status != "succeeded" {
+		t.Fatalf(
+			"first batch window statuses = %q/%q, want failed/succeeded",
+			report.Windows[0].Status,
+			report.Windows[1].Status,
+		)
+	}
+	for index := 0; index < 2; index++ {
+		got := report.Journals[index]
+		if got.Status != "failed" ||
+			got.WindowsFailed != 1 ||
+			got.WindowsSucceeded != 1 {
+			t.Errorf("first batch journal %d report = %#v", index, got)
+		}
+	}
+	if got := report.Journals[2]; got.Status != "succeeded" ||
+		got.WindowsFailed != 0 || got.WindowsSucceeded != 2 {
+		t.Fatalf("second batch journal report = %#v", got)
+	}
+
+	firstBatchKeys := []string{journals[0].Key(), journals[1].Key()}
+	firstBatchISSNs := append(slices.Clone(firstISSNs), secondISSNs...)
+	slices.Sort(firstBatchISSNs)
+	if len(firstBatchISSNs) != MaxDailyISSNTerms {
+		t.Fatalf(
+			"first batch ISSN terms = %d, want exact limit %d",
+			len(firstBatchISSNs),
+			MaxDailyISSNTerms,
+		)
+	}
+	for index := 0; index < 2; index++ {
+		windowReport := report.Windows[index]
+		if windowReport.JournalCount != 2 {
+			t.Errorf(
+				"first batch window %d JournalCount = %d, want 2",
+				index,
+				windowReport.JournalCount,
+			)
+		}
+		if !slices.Equal(windowReport.JournalKeys, firstBatchKeys) {
+			t.Errorf(
+				"first batch window %d JournalKeys = %v, want %v",
+				index,
+				windowReport.JournalKeys,
+				firstBatchKeys,
+			)
+		}
+		if !slices.Equal(windowReport.ISSNs, firstBatchISSNs) {
+			t.Errorf(
+				"first batch window %d ISSN count = %d, want complete %d-term batch",
+				index,
+				len(windowReport.ISSNs),
+				len(firstBatchISSNs),
+			)
+		}
+		payload := runner.calls[index].job.Payload
+		if payload["journal_count"] != 2 {
+			t.Errorf(
+				"first batch job %d journal_count = %#v, want 2",
+				index,
+				payload["journal_count"],
+			)
+		}
+		if !slices.Equal(payload["journal_keys"].([]string), firstBatchKeys) {
+			t.Errorf(
+				"first batch job %d journal_keys = %v, want %v",
+				index,
+				payload["journal_keys"],
+				firstBatchKeys,
+			)
+		}
+		if payloadISSNs := payload["issns"].([]string); !slices.Equal(payloadISSNs, firstBatchISSNs) {
+			t.Errorf(
+				"first batch job %d ISSN count = %d, want complete %d-term batch",
+				index,
+				len(payloadISSNs),
+				len(firstBatchISSNs),
+			)
+		}
+	}
+	if len(report.Failures) != 1 {
+		t.Fatalf("failures = %d, want 1", len(report.Failures))
+	}
+	failure := report.Failures[0]
+	if failure.BatchKey != windows[0].BatchKey() {
+		t.Errorf("failure BatchKey = %q, want %q", failure.BatchKey, windows[0].BatchKey())
+	}
+	if !slices.Equal(failure.JournalKeys, firstBatchKeys) {
+		t.Errorf("failure JournalKeys = %v, want %v", failure.JournalKeys, firstBatchKeys)
+	}
+	if !slices.Equal(failure.ISSNs, firstBatchISSNs) {
+		t.Errorf(
+			"failure ISSN count = %d, want complete %d-term batch",
+			len(failure.ISSNs),
+			len(firstBatchISSNs),
+		)
+	}
+}
+
 func TestServiceRejectsDailyBatchSearchCountAtPubMedLimitBeforeFetch(t *testing.T) {
 	t.Parallel()
 
