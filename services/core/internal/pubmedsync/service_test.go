@@ -72,6 +72,25 @@ func (fetcher *serviceFakeFetcher) Fetch(
 	return func(yield func(source.Record, error) bool) {}
 }
 
+type serviceSequenceFetcher struct {
+	calls     []pubmed.SearchResult
+	sequences []source.ClientSequence
+}
+
+func (fetcher *serviceSequenceFetcher) Fetch(
+	_ context.Context,
+	result pubmed.SearchResult,
+) source.ClientSequence {
+	fetcher.calls = append(fetcher.calls, result)
+	index := len(fetcher.calls) - 1
+	if index >= len(fetcher.sequences) {
+		return func(yield func(source.Record, error) bool) {
+			yield(source.Record{}, errors.New("unexpected service Fetch call"))
+		}
+	}
+	return fetcher.sequences[index]
+}
+
 type serviceRunCall struct {
 	job ingestion.Job
 }
@@ -793,6 +812,345 @@ func recordEventsForServiceTest(records source.ClientSequence) ingestion.EventSe
 			_ = record
 		}
 	}
+}
+
+func TestValidateFetchedRecordISSNScopeAcceptsExactVenueAssertions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		venue *source.Venue
+	}{
+		{
+			name:  "ISSN",
+			venue: &source.Venue{ISSN: []string{"1234-5679"}},
+		},
+		{
+			name:  "ISSNL",
+			venue: &source.Venue{ISSNL: "1234-5679"},
+		},
+		{
+			name: "ISSNDetails",
+			venue: &source.Venue{
+				ISSNDetails: []source.VenueISSN{{Value: "1234-5679"}},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			record := source.Record{
+				SourceRecordID: "12345678",
+				Venue:          test.venue,
+			}
+			records, errs := collectServiceRecords(validateFetchedRecordISSNScope(
+				serviceRecordSequence(record),
+				[]string{"1234-5679", "2049-3630"},
+				"daily-window-key",
+			))
+
+			if len(errs) != 0 {
+				t.Fatalf("validation errors = %v, want none", errs)
+			}
+			if len(records) != 1 || records[0].SourceRecordID != record.SourceRecordID {
+				t.Fatalf("validated records = %#v, want original record", records)
+			}
+			if records[0].Venue != record.Venue {
+				t.Fatal("validation replaced or copied the accepted Venue")
+			}
+		})
+	}
+}
+
+func TestValidateFetchedRecordISSNScopeRejectsMissingOrUnrelatedAssertions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		venue      *source.Venue
+		wantReason string
+	}{
+		{
+			name:       "missing venue",
+			venue:      nil,
+			wantReason: "venue",
+		},
+		{
+			name: "unrelated ISSN",
+			venue: &source.Venue{
+				ISSNL:       "1111-1111",
+				ISSN:        []string{"2222-2222"},
+				ISSNDetails: []source.VenueISSN{{Value: "3333-3333"}},
+			},
+			wantReason: "intersect",
+		},
+		{
+			name:       "no ISSN assertion",
+			venue:      &source.Venue{DisplayName: "Journal without identifiers"},
+			wantReason: "assertion",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			records, errs := collectServiceRecords(validateFetchedRecordISSNScope(
+				serviceRecordSequence(
+					source.Record{
+						SourceRecordID: "87654321",
+						Venue:          test.venue,
+					},
+					source.Record{
+						SourceRecordID: "must-not-pass-after-invalid-record",
+						Venue:          &source.Venue{ISSN: []string{"1234-5679"}},
+					},
+				),
+				[]string{"1234-5679", "2049-3630"},
+				"requested-window-key",
+			))
+
+			if len(records) != 0 {
+				t.Fatalf("validated records = %#v, want invalid record withheld", records)
+			}
+			if len(errs) != 1 {
+				t.Fatalf("validation errors = %v, want one explicit error", errs)
+			}
+			for _, evidence := range []string{
+				"PMID=87654321",
+				"requested-window-key",
+				"1234-5679",
+				"2049-3630",
+				test.wantReason,
+			} {
+				if !strings.Contains(errs[0].Error(), evidence) {
+					t.Errorf("validation error %q missing %q", errs[0], evidence)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateFetchedRecordISSNScopePreservesUpstreamFetchError(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("upstream PubMed EFetch failed")
+	records, errs := collectServiceRecords(validateFetchedRecordISSNScope(
+		func(yield func(source.Record, error) bool) {
+			yield(source.Record{SourceRecordID: "must-not-be-validated"}, sentinel)
+		},
+		[]string{"1234-5679"},
+		"requested-window-key",
+	))
+
+	if len(records) != 0 {
+		t.Fatalf("validated records = %#v, want none after upstream error", records)
+	}
+	if len(errs) != 1 || !errors.Is(errs[0], sentinel) {
+		t.Fatalf("validation errors = %v, want upstream sentinel", errs)
+	}
+	if strings.Contains(errs[0].Error(), "ISSN") ||
+		strings.Contains(errs[0].Error(), "requested-window-key") {
+		t.Fatalf("upstream error was rewritten as ISSN validation: %v", errs[0])
+	}
+}
+
+func TestServiceDailyRejectsFetchedRecordOutsideRequestedISSNs(t *testing.T) {
+	t.Parallel()
+
+	searcher := &serviceFakeSearcher{}
+	fetcher := &serviceSequenceFetcher{
+		sequences: []source.ClientSequence{
+			serviceRecordSequence(source.Record{
+				SourceRecordID: "daily-unrelated-pmid",
+				Venue:          &source.Venue{ISSN: []string{"9999-9999"}},
+			}),
+			serviceRecordSequence(source.Record{
+				SourceRecordID: "daily-valid-pmid",
+				Venue:          &source.Venue{ISSNL: "1234-5679"},
+			}),
+		},
+	}
+	runner := &serviceFakeIngestion{failByKey: map[string]error{}}
+	var receivedPMIDs []string
+	service, err := NewService(
+		searcher,
+		fetcher,
+		runner.Run,
+		captureServiceRecordPMIDs(&receivedPMIDs),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	report, runErr := service.Run(context.Background(), RunRequest{
+		Mode:         ModeDaily,
+		RunDate:      parseTestDate("2026-07-19"),
+		LookbackDays: 3,
+		Registry: bytes.NewReader(encodeRegistryCSV(
+			testRegistryHeader,
+			validRegistryRecord(
+				"Daily Scope Journal",
+				1,
+				"1234-5679",
+				"",
+				"",
+				`["1234-5679"]`,
+				"resolved",
+				"yes",
+				"1",
+			),
+		)),
+	})
+
+	if runErr == nil {
+		t.Fatal("Run() error = nil, want explicit fetched-record ISSN scope failure")
+	}
+	if len(report.Windows) != 2 ||
+		report.WindowsFailed != 1 ||
+		report.WindowsSucceeded != 1 {
+		t.Fatalf("daily window report = %#v, want one failed and one succeeded", report)
+	}
+	for _, evidence := range []string{
+		"daily-unrelated-pmid",
+		report.Windows[0].WindowKey,
+		"1234-5679",
+	} {
+		if !strings.Contains(runErr.Error(), evidence) {
+			t.Errorf("Run() error %q missing %q", runErr, evidence)
+		}
+	}
+	if !slices.Equal(receivedPMIDs, []string{"daily-valid-pmid"}) {
+		t.Fatalf(
+			"recordEvents received PMIDs = %v, want only the valid record",
+			receivedPMIDs,
+		)
+	}
+	if len(fetcher.calls) != 2 || len(runner.calls) != 2 {
+		t.Fatalf(
+			"Fetch/ingestion calls = %d/%d, want both daily windows attempted",
+			len(fetcher.calls),
+			len(runner.calls),
+		)
+	}
+}
+
+func TestServiceBackfillRejectsFetchedRecordOutsideRequestedISSNs(t *testing.T) {
+	t.Parallel()
+
+	searcher := &serviceFakeSearcher{}
+	fetcher := &serviceSequenceFetcher{
+		sequences: []source.ClientSequence{
+			serviceRecordSequence(source.Record{
+				SourceRecordID: "backfill-unrelated-pmid",
+				Venue:          &source.Venue{ISSN: []string{"9999-9999"}},
+			}),
+		},
+	}
+	runner := &serviceFakeIngestion{failByKey: map[string]error{}}
+	var receivedPMIDs []string
+	service, err := NewService(
+		searcher,
+		fetcher,
+		runner.Run,
+		captureServiceRecordPMIDs(&receivedPMIDs),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	report, runErr := service.Run(context.Background(), RunRequest{
+		Mode:         ModeBackfill,
+		LookbackDays: 3,
+		Registry: bytes.NewReader(encodeRegistryCSV(
+			testRegistryHeader,
+			validRegistryRecord(
+				"Backfill Scope Journal",
+				1,
+				"1234-5679",
+				"",
+				"",
+				`["1234-5679"]`,
+				"resolved",
+				"yes",
+				"1",
+			),
+		)),
+	})
+
+	if runErr == nil {
+		t.Fatal("Run() error = nil, want explicit fetched-record ISSN scope failure")
+	}
+	if len(report.Windows) != 1 ||
+		report.WindowsFailed != 1 ||
+		report.WindowsSucceeded != 0 {
+		t.Fatalf("backfill window report = %#v, want one failed window", report)
+	}
+	for _, evidence := range []string{
+		"backfill-unrelated-pmid",
+		report.Windows[0].WindowKey,
+		"1234-5679",
+	} {
+		if !strings.Contains(runErr.Error(), evidence) {
+			t.Errorf("Run() error %q missing %q", runErr, evidence)
+		}
+	}
+	if len(receivedPMIDs) != 0 {
+		t.Fatalf("recordEvents received unrelated PMIDs = %v, want none", receivedPMIDs)
+	}
+	if len(fetcher.calls) != 1 || len(runner.calls) != 1 {
+		t.Fatalf(
+			"Fetch/ingestion calls = %d/%d, want one backfill window",
+			len(fetcher.calls),
+			len(runner.calls),
+		)
+	}
+}
+
+func serviceRecordSequence(records ...source.Record) source.ClientSequence {
+	return func(yield func(source.Record, error) bool) {
+		for _, record := range records {
+			if !yield(record, nil) {
+				return
+			}
+		}
+	}
+}
+
+func captureServiceRecordPMIDs(
+	receivedPMIDs *[]string,
+) RecordEventsFunc {
+	return func(records source.ClientSequence) ingestion.EventSequence {
+		return func(yield func(ingestion.Event, error) bool) {
+			for record, err := range records {
+				if err != nil {
+					yield(nil, err)
+					return
+				}
+				*receivedPMIDs = append(*receivedPMIDs, record.SourceRecordID)
+				if !yield(nil, nil) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func collectServiceRecords(
+	records source.ClientSequence,
+) ([]source.Record, []error) {
+	var collected []source.Record
+	var errs []error
+	for record, err := range records {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		collected = append(collected, record)
+	}
+	return collected, errs
 }
 
 func TestServiceMergesPersistedSummaryWhenIngestionReturnsSummaryAndError(t *testing.T) {

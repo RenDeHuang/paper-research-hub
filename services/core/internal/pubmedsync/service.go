@@ -605,7 +605,11 @@ func (service *Service) runExactISSNWindow(
 			return
 		}
 
-		records := service.fetcher.Fetch(ctx, history)
+		records := validateFetchedRecordISSNScope(
+			service.fetcher.Fetch(ctx, history),
+			issns,
+			windowKey,
+		)
 		for event, err := range service.recordEvents(records) {
 			if !yield(event, err) {
 				return
@@ -621,6 +625,91 @@ func (service *Service) runExactISSNWindow(
 		return summary, fmt.Errorf("ingest PubMed window: %w", err)
 	}
 	return summary, nil
+}
+
+func validateFetchedRecordISSNScope(
+	records source.ClientSequence,
+	requestedISSNs []string,
+	windowKey string,
+) source.ClientSequence {
+	requestedISSNs = slices.Clone(requestedISSNs)
+	requested := make(map[string]struct{}, len(requestedISSNs))
+	for _, issn := range requestedISSNs {
+		requested[issn] = struct{}{}
+	}
+
+	return func(yield func(source.Record, error) bool) {
+		for record, err := range records {
+			if err != nil {
+				yield(record, err)
+				return
+			}
+			if record.Venue == nil {
+				yield(
+					source.Record{},
+					fmt.Errorf(
+						"PubMed fetched record PMID=%s has no venue for window %q; requested ISSNs=%v",
+						record.SourceRecordID,
+						windowKey,
+						requestedISSNs,
+					),
+				)
+				return
+			}
+
+			assertions := make([]string, 0, 1+len(record.Venue.ISSN)+len(record.Venue.ISSNDetails))
+			if record.Venue.ISSNL != "" {
+				assertions = append(assertions, record.Venue.ISSNL)
+			}
+			for _, issn := range record.Venue.ISSN {
+				if issn != "" {
+					assertions = append(assertions, issn)
+				}
+			}
+			for _, detail := range record.Venue.ISSNDetails {
+				if detail.Value != "" {
+					assertions = append(assertions, detail.Value)
+				}
+			}
+			if len(assertions) == 0 {
+				yield(
+					source.Record{},
+					fmt.Errorf(
+						"PubMed fetched record PMID=%s has no venue ISSN assertion for window %q; requested ISSNs=%v",
+						record.SourceRecordID,
+						windowKey,
+						requestedISSNs,
+					),
+				)
+				return
+			}
+
+			matched := false
+			for _, assertion := range assertions {
+				if _, exists := requested[assertion]; exists {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				yield(
+					source.Record{},
+					fmt.Errorf(
+						"PubMed fetched record PMID=%s venue ISSN assertions %v do not intersect requested ISSNs %v for window %q",
+						record.SourceRecordID,
+						assertions,
+						requestedISSNs,
+						windowKey,
+					),
+				)
+				return
+			}
+
+			if !yield(record, nil) {
+				return
+			}
+		}
+	}
 }
 
 func mergeSummary(
