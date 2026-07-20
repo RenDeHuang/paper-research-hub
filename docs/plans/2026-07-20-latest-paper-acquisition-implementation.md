@@ -199,11 +199,12 @@ type DailyBatchWindow struct {
 Pack journals greedily in stable Registry order. Before appending a journal, count only
 new unique ISSNs. Flush the current batch when the next whole journal would exceed 2048.
 
-Generalize the existing window-key helper to hash:
+Generalize the existing window-key helper to hash an exact ISSN slice while preserving
+the current payload version:
 
 ```json
 {
-  "version": 2,
+  "version": 1,
   "issns": ["..."],
   "date_type": "entrez",
   "from": "2026-07-18",
@@ -211,7 +212,7 @@ Generalize the existing window-key helper to hash:
 }
 ```
 
-Keep the existing version-1 journal backfill key unchanged.
+The existing singleton journal wrapper must produce byte-identical backfill keys.
 
 **Step 4: Run the planner tests and verify GREEN**
 
