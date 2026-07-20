@@ -109,30 +109,52 @@ func TestLoadRegistryReturnsOnlyResolvedPubMedSupportedRows(t *testing.T) {
 
 	records := [][]string{
 		validRegistryRecord(
-			"eligible",
+			"resolved yes",
 			1,
 			"1234-5679",
 			"",
-			"2049-3630",
-			`["1234-5679","2049-3630"]`,
+			"",
+			`["1234-5679"]`,
 			"resolved",
 			"yes",
 			"7",
 		),
 		validRegistryRecord(
-			"resolved but no PubMed",
+			"resolved no",
 			2,
-			"1234-5679",
-			"",
 			"2049-3630",
-			`["1234-5679","2049-3630"]`,
+			"",
+			"",
+			`["2049-3630"]`,
 			"resolved",
 			"no",
 			"0",
 		),
 		validRegistryRecord(
-			"unresolved",
+			"resolved unknown",
 			3,
+			"9876-5434",
+			"",
+			"",
+			`["9876-5434"]`,
+			"resolved",
+			"unknown",
+			"0",
+		),
+		validRegistryRecord(
+			"ambiguous",
+			4,
+			"",
+			"",
+			"",
+			"[]",
+			"ambiguous",
+			"unknown",
+			"0",
+		),
+		validRegistryRecord(
+			"unresolved",
+			5,
 			"",
 			"",
 			"",
@@ -150,8 +172,171 @@ func TestLoadRegistryReturnsOnlyResolvedPubMedSupportedRows(t *testing.T) {
 	if len(journals) != 1 {
 		t.Fatalf("LoadRegistry() returned %d journals, want 1", len(journals))
 	}
-	if got := journals[0].SourceJournalName(); got != "eligible" {
-		t.Fatalf("SourceJournalName() = %q, want eligible", got)
+	if got := journals[0].SourceJournalName(); got != "resolved yes" {
+		t.Fatalf("SourceJournalName() = %q, want %q", got, "resolved yes")
+	}
+}
+
+func TestLoadResolvedRegistryReturnsEveryResolvedRowRegardlessOfPubMedSupport(t *testing.T) {
+	t.Parallel()
+
+	records := [][]string{
+		validRegistryRecord(
+			"resolved yes",
+			1,
+			"1234-5679",
+			"",
+			"",
+			`["1234-5679"]`,
+			"resolved",
+			"yes",
+			"7",
+		),
+		validRegistryRecord(
+			"resolved no",
+			2,
+			"2049-3630",
+			"",
+			"",
+			`["2049-3630"]`,
+			"resolved",
+			"no",
+			"0",
+		),
+		validRegistryRecord(
+			"resolved unknown",
+			3,
+			"9876-5434",
+			"",
+			"",
+			`["9876-5434"]`,
+			"resolved",
+			"unknown",
+			"0",
+		),
+		validRegistryRecord(
+			"ambiguous",
+			4,
+			"",
+			"",
+			"",
+			"[]",
+			"ambiguous",
+			"unknown",
+			"0",
+		),
+		validRegistryRecord(
+			"unresolved",
+			5,
+			"",
+			"",
+			"",
+			"[]",
+			"unresolved",
+			"unknown",
+			"0",
+		),
+	}
+
+	journals, err := LoadResolvedRegistry(
+		bytes.NewReader(encodeRegistryCSV(testRegistryHeader, records...)),
+	)
+	if err != nil {
+		t.Fatalf("LoadResolvedRegistry() error = %v", err)
+	}
+	if len(journals) != 3 {
+		t.Fatalf("LoadResolvedRegistry() returned %d journals, want 3", len(journals))
+	}
+	gotNames := []string{
+		journals[0].SourceJournalName(),
+		journals[1].SourceJournalName(),
+		journals[2].SourceJournalName(),
+	}
+	wantNames := []string{"resolved yes", "resolved no", "resolved unknown"}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("SourceJournalName() values = %q, want %q", gotNames, wantNames)
+	}
+}
+
+func TestLoadResolvedRegistryPreservesStrictValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		records [][]string
+	}{
+		{
+			name: "status and count contradiction",
+			records: [][]string{
+				validRegistryRecord(
+					"contradictory",
+					1,
+					"1234-5679",
+					"",
+					"",
+					`["1234-5679"]`,
+					"resolved",
+					"no",
+					"1",
+				),
+			},
+		},
+		{
+			name: "invalid ISSN",
+			records: [][]string{
+				validRegistryRecord(
+					"invalid ISSN",
+					1,
+					"1234-5678",
+					"",
+					"",
+					`["1234-5678"]`,
+					"resolved",
+					"unknown",
+					"0",
+				),
+			},
+		},
+		{
+			name: "ISSN identity conflict",
+			records: [][]string{
+				validRegistryRecord(
+					"first",
+					1,
+					"1234-5679",
+					"",
+					"2049-3630",
+					`["1234-5679","2049-3630"]`,
+					"resolved",
+					"no",
+					"0",
+				),
+				validRegistryRecord(
+					"second",
+					2,
+					"1234-5679",
+					"",
+					"9876-5434",
+					`["1234-5679","9876-5434"]`,
+					"resolved",
+					"unknown",
+					"0",
+				),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := LoadResolvedRegistry(
+				bytes.NewReader(encodeRegistryCSV(testRegistryHeader, tt.records...)),
+			); err == nil {
+				t.Fatal("LoadResolvedRegistry() accepted invalid registry evidence")
+			}
+		})
 	}
 }
 

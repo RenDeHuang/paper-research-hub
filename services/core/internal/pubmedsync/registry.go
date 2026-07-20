@@ -68,7 +68,20 @@ func (journal Journal) clone() Journal {
 	return journal
 }
 
+// LoadRegistry returns resolved journals with confirmed PubMed support for backfill.
 func LoadRegistry(source io.Reader) ([]Journal, error) {
+	return loadRegistry(source, false)
+}
+
+// LoadResolvedRegistry returns every resolved journal for daily discovery.
+func LoadResolvedRegistry(source io.Reader) ([]Journal, error) {
+	return loadRegistry(source, true)
+}
+
+func loadRegistry(
+	source io.Reader,
+	includeResolvedWithoutPubMedSupport bool,
+) ([]Journal, error) {
 	if source == nil {
 		return nil, errors.New("registry CSV reader is required")
 	}
@@ -117,7 +130,11 @@ func LoadRegistry(source io.Reader) ([]Journal, error) {
 			)
 		}
 
-		journal, eligible, err := parseRegistryRecord(rowNumber, record)
+		journal, eligible, err := parseRegistryRecord(
+			rowNumber,
+			record,
+			includeResolvedWithoutPubMedSupport,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -146,6 +163,7 @@ func LoadRegistry(source io.Reader) ([]Journal, error) {
 func parseRegistryRecord(
 	rowNumber int,
 	record []string,
+	includeResolvedWithoutPubMedSupport bool,
 ) (Journal, bool, error) {
 	sourceOrder, err := strconv.Atoi(record[1])
 	if err != nil || sourceOrder <= 0 {
@@ -232,7 +250,8 @@ func parseRegistryRecord(
 	}
 
 	if resolutionStatus != venueenrich.MatchStatusResolved ||
-		pubmedSupported != venueenrich.SupportStatusYes {
+		(!includeResolvedWithoutPubMedSupport &&
+			pubmedSupported != venueenrich.SupportStatusYes) {
 		return Journal{}, false, nil
 	}
 
