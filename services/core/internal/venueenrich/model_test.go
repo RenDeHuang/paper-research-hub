@@ -198,9 +198,9 @@ func TestRegistryRowRejectsContradictorySupportEvidenceAndCounts(t *testing.T) {
 			want: "crossref_title",
 		},
 		{
-			name: "Crossref yes without publisher",
+			name: "Crossref yes with untrimmed publisher",
 			mutate: func(row *RegistryRow) {
-				row.CrossrefPublisher = ""
+				row.CrossrefPublisher = " Publisher "
 			},
 			want: "crossref_publisher",
 		},

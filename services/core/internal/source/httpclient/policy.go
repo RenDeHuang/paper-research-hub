@@ -129,6 +129,22 @@ func New(base *http.Client, config Config, dependencies Dependencies) (*Client, 
 }
 
 func (client *Client) Do(request *http.Request) (*http.Response, error) {
+	return client.do(request, nil, nil)
+}
+
+func (client *Client) DoValidated(
+	request *http.Request,
+	validate func([]byte) error,
+	retryableValidationError func(error) bool,
+) (*http.Response, error) {
+	return client.do(request, validate, retryableValidationError)
+}
+
+func (client *Client) do(
+	request *http.Request,
+	validate func([]byte) error,
+	retryableValidationError func(error) bool,
+) (*http.Response, error) {
 	if client == nil {
 		return nil, errors.New("HTTP policy client is nil")
 	}
@@ -174,6 +190,15 @@ func (client *Client) Do(request *http.Request) (*http.Response, error) {
 		body, err := readBounded(response.Body, client.config.MaxResponseBytes)
 		closeErr := response.Body.Close()
 		if err != nil {
+			if contextError := request.Context().Err(); contextError != nil {
+				return nil, contextError
+			}
+			if errors.Is(err, context.Canceled) {
+				return nil, context.Canceled
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, context.DeadlineExceeded
+			}
 			if errors.Is(err, ErrResponseTooLarge) {
 				return nil, fmt.Errorf(
 					"%w: HTTP %s %s",
@@ -203,13 +228,27 @@ func (client *Client) Do(request *http.Request) (*http.Response, error) {
 		response.Body = io.NopCloser(bytes.NewReader(body))
 		response.ContentLength = int64(len(body))
 
+		var retryErr error
 		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-			return response, nil
-		}
-
-		statusErr := client.statusError(request, response.StatusCode, body, secrets)
-		if !retryableStatus(response.StatusCode) || attempt >= client.config.MaxRetries {
-			return nil, statusErr
+			if validate == nil {
+				return response, nil
+			}
+			validationErr := validate(body)
+			if validationErr == nil {
+				return response, nil
+			}
+			if retryableValidationError == nil ||
+				!retryableValidationError(validationErr) ||
+				attempt >= client.config.MaxRetries {
+				return nil, client.redactedError(validationErr, request, secrets)
+			}
+			retryErr = client.redactedError(validationErr, request, secrets)
+		} else {
+			statusErr := client.statusError(request, response.StatusCode, body, secrets)
+			if !retryableStatus(response.StatusCode) || attempt >= client.config.MaxRetries {
+				return nil, statusErr
+			}
+			retryErr = statusErr
 		}
 
 		delay := client.retryDelay(response, attempt)
@@ -220,7 +259,7 @@ func (client *Client) Do(request *http.Request) (*http.Response, error) {
 				ErrRetryBudgetExceeded,
 				delay,
 				remaining,
-				statusErr,
+				retryErr,
 			)
 		}
 		if err := client.sleep(request.Context(), delay); err != nil {

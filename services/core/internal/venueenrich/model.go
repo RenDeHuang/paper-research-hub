@@ -152,6 +152,13 @@ func validateRequiredTrimmed(field, value string) error {
 	return nil
 }
 
+func validateOptionalTrimmed(field, value string) error {
+	if value != strings.TrimSpace(value) {
+		return fmt.Errorf("%s must be trimmed", field)
+	}
+	return nil
+}
+
 func validateOptionalISSN(
 	field string,
 	role venue.ISSNRole,
@@ -195,7 +202,7 @@ func validateCrossrefEvidence(row RegistryRow) error {
 		); err != nil {
 			return err
 		}
-		return validateRequiredTrimmed(
+		return validateOptionalTrimmed(
 			"crossref_publisher",
 			row.CrossrefPublisher,
 		)

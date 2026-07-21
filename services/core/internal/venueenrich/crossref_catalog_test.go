@@ -173,14 +173,91 @@ func TestCrossrefCatalogFetchesTwoPagesAndRecordsHashes(t *testing.T) {
 	assertNoCrossrefCatalogTempFiles(t, config.CacheDir)
 }
 
-func TestCrossrefCatalogRejectsDuplicateCursor(t *testing.T) {
+func TestCrossrefCatalogAcceptsStatefulCursor(t *testing.T) {
+	t.Parallel()
+
+	pages := [][]byte{
+		crossrefJournalEnvelope(
+			t,
+			3,
+			"stateful-scroll",
+			validCrossrefJournalItem("First Journal", "0028-0836"),
+		),
+		crossrefJournalEnvelope(
+			t,
+			3,
+			"stateful-scroll",
+			validCrossrefJournalItem("Second Journal", "1476-4687"),
+		),
+		crossrefJournalEnvelope(
+			t,
+			3,
+			"stateful-scroll",
+			validCrossrefJournalItem("Third Journal", "2049-3630"),
+		),
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		request *http.Request,
+	) {
+		index := int(requests.Add(1)) - 1
+		if index >= len(pages) {
+			t.Errorf("unexpected request %d", index+1)
+			http.Error(writer, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		wantCursor := "stateful-scroll"
+		if index == 0 {
+			wantCursor = "*"
+		}
+		if got := request.URL.Query().Get("cursor"); got != wantCursor {
+			t.Errorf("request %d cursor = %q, want %q", index+1, got, wantCursor)
+		}
+		_, _ = writer.Write(pages[index])
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
+	}
+	if requests.Load() != 3 ||
+		!result.Manifest.Complete ||
+		result.Manifest.RecordCount != 3 ||
+		len(result.Manifest.Pages) != 3 {
+		t.Fatalf(
+			"requests=%d manifest=%#v",
+			requests.Load(),
+			result.Manifest,
+		)
+	}
+	for index, receipt := range result.Manifest.Pages {
+		wantCursorIn := "stateful-scroll"
+		if index == 0 {
+			wantCursorIn = "*"
+		}
+		if receipt.CursorIn != wantCursorIn ||
+			receipt.CursorOut != "stateful-scroll" {
+			t.Fatalf("page %d receipt = %#v", index+1, receipt)
+		}
+	}
+}
+
+func TestCrossrefCatalogRejectsDuplicatePagePayload(t *testing.T) {
 	t.Parallel()
 
 	payload := crossrefJournalEnvelope(
 		t,
 		2,
-		"*",
-		validCrossrefJournalItem("Loop Journal", "0028-0836"),
+		"stateful-scroll",
+		validCrossrefJournalItem("Repeated Journal", "0028-0836"),
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
@@ -197,10 +274,62 @@ func TestCrossrefCatalogRejectsDuplicateCursor(t *testing.T) {
 		config,
 		httpclient.Dependencies{},
 	)
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "duplicate") {
-		t.Fatalf("FetchCrossrefCatalog() error = %v, want duplicate cursor", err)
+	if err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate page payload") {
+		t.Fatalf(
+			"FetchCrossrefCatalog() error = %v, want duplicate page payload",
+			err,
+		)
 	}
 	assertCrossrefCatalogIncomplete(t, config.CacheDir)
+}
+
+func TestCrossrefCatalogManifestRejectsDuplicatePagePayload(t *testing.T) {
+	t.Parallel()
+
+	totalResults := int64(2)
+	pageHash := strings.Repeat("a", sha256.Size*2)
+	manifest := CrossrefCatalogManifest{
+		SchemaVersion: CrossrefCatalogSchemaVersion,
+		SourceURL:     "https://api.crossref.test/journals",
+		FetchedAt:     time.Unix(1, 0).UTC(),
+		CheckpointAt:  time.Unix(2, 0).UTC(),
+		Rows:          CrossrefCatalogRows,
+		Pages: []CrossrefCatalogPageReceipt{
+			{
+				Ordinal:     1,
+				CursorIn:    "*",
+				CursorOut:   "stateful-scroll",
+				RecordCount: 1,
+				PageFile:    "pages/page-000001.json",
+				PageBytes:   1,
+				PageSHA256:  pageHash,
+			},
+			{
+				Ordinal:     2,
+				CursorIn:    "stateful-scroll",
+				CursorOut:   "stateful-scroll",
+				RecordCount: 1,
+				PageFile:    "pages/page-000002.json",
+				PageBytes:   1,
+				PageSHA256:  pageHash,
+			},
+		},
+		CatalogSHA256: strings.Repeat("b", sha256.Size*2),
+		CatalogBytes:  2,
+		RecordCount:   2,
+		TotalResults:  &totalResults,
+		Complete:      true,
+	}
+
+	err := validateCrossrefCatalogManifest(manifest, manifest.SourceURL)
+	if err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "duplicate page payload") {
+		t.Fatalf(
+			"validateCrossrefCatalogManifest() error = %v, want duplicate page payload",
+			err,
+		)
+	}
 }
 
 func TestCrossrefCatalogRejectsMalformedEnvelopeItemsAndFraming(t *testing.T) {
@@ -334,8 +463,15 @@ func TestCrossrefCatalogRejectsMalformedEnvelopeItemsAndFraming(t *testing.T) {
 			payload: []byte(`{
 				"status":"ok","message-type":"journal-list","message-version":"1.0.0",
 				"message":{
-					"total-results":0,"items-per-page":1,"next-cursor":"",
-					"query":{"start-index":0,"search-terms":null},"items":[]
+					"total-results":1,"items-per-page":0,"next-cursor":"",
+					"query":{"start-index":0,"search-terms":null},
+					"items":[{
+						"title":"Capacity Overflow Journal",
+						"ISSN":["0028-0836"],
+						"issn-type":[{"value":"0028-0836","type":"print"}],
+						"publisher":"Publisher",
+						"counts":{"total-dois":1}
+					}]
 				}
 			}`),
 			want: "actual items",
@@ -561,6 +697,48 @@ func TestCrossrefCatalogAcceptsObservedJournalISSNVariants(t *testing.T) {
 	}
 }
 
+func TestCrossrefCatalogAcceptsShortTerminalPageCapacity(t *testing.T) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"stateful-scroll",
+		validCrossrefJournalItem("Terminal Journal", "0028-0836"),
+	)
+	var envelope map[string]any
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		t.Fatalf("Unmarshal(envelope) error = %v", err)
+	}
+	envelope["message"].(map[string]any)["items-per-page"] = CrossrefCatalogRows
+	payload, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal(envelope) error = %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
+	}
+	if !result.Manifest.Complete || result.Manifest.RecordCount != 1 {
+		t.Fatalf("manifest = %#v", result.Manifest)
+	}
+}
+
 func TestCrossrefCatalogAcceptsObservedEmptyISSNArrays(t *testing.T) {
 	t.Parallel()
 
@@ -599,6 +777,191 @@ func TestCrossrefCatalogAcceptsObservedEmptyISSNArrays(t *testing.T) {
 		len(journals[0].ISSNs) != 0 ||
 		len(journals[0].ISSNTypes) != 0 {
 		t.Fatalf("journal = %#v, want parsed empty ISSN arrays", journals)
+	}
+}
+
+func TestCrossrefCatalogAcceptsObservedBlankISSNEntries(t *testing.T) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		json.RawMessage(`{
+			"title":"Observed Journal With Blank ISSN Entries",
+			"ISSN":["","0028-0836",""],
+			"issn-type":[
+				{"value":"","type":"print"},
+				{"value":"0028-0836","type":"print"}
+			],
+			"publisher":"",
+			"counts":{"total-dois":1}
+		}`),
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
+	}
+	journals := readCrossrefCatalogJournals(t, result.CatalogPath)
+	if len(journals) != 1 ||
+		!slices.Equal(journals[0].ISSNs, []string{"0028-0836"}) ||
+		journals[0].PrintISSN != "0028-0836" ||
+		!slices.Equal(
+			journals[0].ISSNTypes,
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		) {
+		t.Fatalf("journal ISSN parsing = %#v", journals)
+	}
+}
+
+func TestCrossrefCatalogAcceptsObservedBlankOnlyISSNWithoutTypedValue(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		json.RawMessage(`{
+			"title":"Observed Journal Without ISSN Identity",
+			"ISSN":[""],
+			"issn-type":[{"type":"print"}],
+			"publisher":"",
+			"counts":{"total-dois":0}
+		}`),
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
+	}
+	journals := readCrossrefCatalogJournals(t, result.CatalogPath)
+	if len(journals) != 1 ||
+		len(journals[0].ISSNs) != 0 ||
+		len(journals[0].ISSNTypes) != 0 {
+		t.Fatalf("journal = %#v, want no ISSN identity", journals)
+	}
+}
+
+func TestCrossrefCatalogAcceptsObservedISSNTypeWithoutValue(t *testing.T) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		json.RawMessage(`{
+			"title":"Observed Journal With Incomplete ISSN Role",
+			"ISSN":["0028-0836"],
+			"issn-type":[
+				{"type":"electronic"},
+				{"value":"0028-0836","type":"print"}
+			],
+			"publisher":"Publisher",
+			"counts":{"total-dois":1}
+		}`),
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("FetchCrossrefCatalog() error = %v", err)
+	}
+	journals := readCrossrefCatalogJournals(t, result.CatalogPath)
+	if len(journals) != 1 ||
+		!slices.Equal(journals[0].ISSNs, []string{"0028-0836"}) ||
+		journals[0].PrintISSN != "0028-0836" ||
+		journals[0].ElectronicISSN != "" ||
+		!slices.Equal(
+			journals[0].ISSNTypes,
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		) {
+		t.Fatalf("journal ISSN parsing = %#v", journals)
+	}
+}
+
+func TestCrossrefCatalogRejectsNonEmptyInvalidISSNTypeWithoutIdentity(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	payload := crossrefJournalEnvelope(
+		t,
+		1,
+		"terminal",
+		json.RawMessage(`{
+			"title":"Invalid Typed ISSN Without Identity",
+			"ISSN":[""],
+			"issn-type":[{"value":"not-an-issn","type":"print"}],
+			"publisher":"",
+			"counts":{"total-dois":0}
+		}`),
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	_, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "invalid") {
+		t.Fatalf(
+			"FetchCrossrefCatalog() error = %v, want invalid typed ISSN",
+			err,
+		)
 	}
 }
 
@@ -1052,7 +1415,7 @@ func TestCrossrefCatalogReplaysOnlyVerifiedCompleteCache(t *testing.T) {
 	}
 }
 
-func TestCrossrefCatalogResumesOnlyVerifiedIncompleteCache(t *testing.T) {
+func TestCrossrefCatalogRestartsOnlyVerifiedIncompleteCache(t *testing.T) {
 	t.Parallel()
 
 	pageOne := readCrossrefCatalogFixture(t, "crossref-journals-page-1.json")
@@ -1135,7 +1498,7 @@ func TestCrossrefCatalogResumesOnlyVerifiedIncompleteCache(t *testing.T) {
 		httpclient.Dependencies{},
 	)
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "page sha") {
-		t.Fatalf("tampered partial resume error = %v, want page SHA verification failure", err)
+		t.Fatalf("tampered partial restart error = %v, want page SHA verification failure", err)
 	}
 	mu.Lock()
 	requestCountAfterVerify := len(cursors)
@@ -1148,28 +1511,163 @@ func TestCrossrefCatalogResumesOnlyVerifiedIncompleteCache(t *testing.T) {
 	}
 
 	failSecond.Store(false)
-	resumed, err := FetchCrossrefCatalog(
+	restarted, err := FetchCrossrefCatalog(
 		context.Background(),
 		server.Client(),
 		config,
 		httpclient.Dependencies{},
 	)
 	if err != nil {
-		t.Fatalf("resumed FetchCrossrefCatalog() error = %v", err)
+		t.Fatalf("restarted FetchCrossrefCatalog() error = %v", err)
 	}
-	if resumed.Replayed || !resumed.Resumed || !resumed.Manifest.Complete {
+	if restarted.Replayed || restarted.Resumed || !restarted.Manifest.Complete {
 		t.Fatalf(
-			"resumed flags/manifest = replayed:%t resumed:%t complete:%t",
-			resumed.Replayed,
-			resumed.Resumed,
-			resumed.Manifest.Complete,
+			"restarted flags/manifest = replayed:%t resumed:%t complete:%t",
+			restarted.Replayed,
+			restarted.Resumed,
+			restarted.Manifest.Complete,
 		)
 	}
 	mu.Lock()
 	gotCursors := append([]string(nil), cursors...)
 	mu.Unlock()
-	if !slices.Equal(gotCursors, []string{"*", "page-2-cursor", "page-2-cursor"}) {
-		t.Fatalf("request cursors = %v, want resume from last verified cursor", gotCursors)
+	if !slices.Equal(
+		gotCursors,
+		[]string{"*", "page-2-cursor", "*", "page-2-cursor"},
+	) {
+		t.Fatalf("request cursors = %v, want restart from first cursor", gotCursors)
+	}
+}
+
+func TestCrossrefCatalogRestartsStatefulCursorAfterCheckpointFailure(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	oldPageOne := crossrefJournalEnvelope(
+		t,
+		3,
+		"old-stateful-scroll",
+		validCrossrefJournalItem("First Journal", "0028-0836"),
+	)
+	oldPageTwo := crossrefJournalEnvelope(
+		t,
+		3,
+		"old-stateful-scroll",
+		validCrossrefJournalItem("Second Journal", "1476-4687"),
+	)
+	newPageOne := crossrefJournalEnvelope(
+		t,
+		3,
+		"new-stateful-scroll",
+		validCrossrefJournalItem("First Journal", "0028-0836"),
+	)
+	newPageTwo := crossrefJournalEnvelope(
+		t,
+		3,
+		"new-stateful-scroll",
+		validCrossrefJournalItem("Second Journal", "1476-4687"),
+	)
+	newPageThree := crossrefJournalEnvelope(
+		t,
+		3,
+		"new-stateful-scroll",
+		validCrossrefJournalItem("Third Journal", "2049-3630"),
+	)
+	var (
+		mu      sync.Mutex
+		cursors []string
+		request atomic.Int32
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		requestValue *http.Request,
+	) {
+		index := int(request.Add(1))
+		mu.Lock()
+		cursors = append(cursors, requestValue.URL.Query().Get("cursor"))
+		mu.Unlock()
+		switch index {
+		case 1:
+			_, _ = writer.Write(oldPageOne)
+		case 2:
+			_, _ = writer.Write(oldPageTwo)
+		case 3:
+			_, _ = writer.Write(newPageOne)
+		case 4:
+			_, _ = writer.Write(newPageTwo)
+		case 5:
+			_, _ = writer.Write(newPageThree)
+		default:
+			t.Errorf("unexpected request %d", index)
+			http.Error(writer, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	config := validCrossrefCatalogConfig(server.URL, t.TempDir())
+	config.MaxRetries = 0
+	var checkpoints atomic.Int32
+	ops := defaultCrossrefCatalogFileOps()
+	ops.before = func(stage string) error {
+		if stage == crossrefCatalogStageManifestCheckpoint &&
+			checkpoints.Add(1) == 2 {
+			return errors.New("injected checkpoint failure")
+		}
+		return nil
+	}
+	config.fileOps = &ops
+	if _, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	); err == nil || !strings.Contains(err.Error(), "injected checkpoint failure") {
+		t.Fatalf("checkpoint failure error = %v", err)
+	}
+	partial := readCrossrefCatalogManifest(t, config.CacheDir)
+	if partial.Complete ||
+		partial.RecordCount != 1 ||
+		len(partial.Pages) != 1 ||
+		partial.Pages[0].CursorOut != "old-stateful-scroll" {
+		t.Fatalf("partial manifest = %#v", partial)
+	}
+
+	config.fileOps = nil
+	result, err := FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		httpclient.Dependencies{},
+	)
+	if err != nil {
+		t.Fatalf("restarted FetchCrossrefCatalog() error = %v", err)
+	}
+	if result.Replayed ||
+		result.Resumed ||
+		!result.Manifest.Complete ||
+		result.Manifest.RecordCount != 3 {
+		t.Fatalf(
+			"restarted result = replayed:%t resumed:%t manifest:%#v",
+			result.Replayed,
+			result.Resumed,
+			result.Manifest,
+		)
+	}
+	mu.Lock()
+	gotCursors := append([]string(nil), cursors...)
+	mu.Unlock()
+	if !slices.Equal(
+		gotCursors,
+		[]string{
+			"*",
+			"old-stateful-scroll",
+			"*",
+			"new-stateful-scroll",
+			"new-stateful-scroll",
+		},
+	) {
+		t.Fatalf("request cursors = %v, want safe restart from *", gotCursors)
 	}
 }
 
@@ -1276,7 +1774,47 @@ func TestCrossrefCatalogStalePartialRestartsFromFirstCursor(t *testing.T) {
 
 	mu.Lock()
 	now = now.Add(CrossrefCatalogPartialTTL + time.Second)
+	requestsBeforeValidation := len(cursors)
 	mu.Unlock()
+	partialPagePath := filepath.Join(
+		config.CacheDir,
+		crossrefCatalogPartialDirectoryName,
+		partial.Pages[0].PageFile,
+	)
+	partialPage, err := os.ReadFile(partialPagePath)
+	if err != nil {
+		t.Fatalf("ReadFile(stale partial page) error = %v", err)
+	}
+	if err := os.WriteFile(
+		partialPagePath,
+		append(partialPage, '\n'),
+		0o600,
+	); err != nil {
+		t.Fatalf("WriteFile(tampered stale partial page) error = %v", err)
+	}
+
+	_, err = FetchCrossrefCatalog(
+		context.Background(),
+		server.Client(),
+		config,
+		dependencies,
+	)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "page sha") {
+		t.Fatalf(
+			"tampered stale partial error = %v, want page SHA verification failure",
+			err,
+		)
+	}
+	mu.Lock()
+	requestsAfterValidation := len(cursors)
+	mu.Unlock()
+	if requestsAfterValidation != requestsBeforeValidation {
+		t.Fatal("tampered stale partial triggered network before verification")
+	}
+	if err := os.WriteFile(partialPagePath, partialPage, 0o600); err != nil {
+		t.Fatalf("restore stale partial page error = %v", err)
+	}
+
 	recovery.Store(true)
 	result, err := FetchCrossrefCatalog(
 		context.Background(),
@@ -1303,7 +1841,7 @@ func TestCrossrefCatalogStalePartialRestartsFromFirstCursor(t *testing.T) {
 	}
 }
 
-func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
+func TestCrossrefCatalogFreshPartialRestartsFromFirstCursor(t *testing.T) {
 	t.Parallel()
 
 	pageOne := readCrossrefCatalogFixture(t, "crossref-journals-page-1.json")
@@ -1312,10 +1850,8 @@ func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
 		mu            sync.Mutex
 		cursors       []string
 		interruptOnce atomic.Bool
-		expireOnce    atomic.Bool
 	)
 	interruptOnce.Store(true)
-	expireOnce.Store(true)
 	server := httptest.NewServer(http.HandlerFunc(func(
 		writer http.ResponseWriter,
 		request *http.Request,
@@ -1330,22 +1866,6 @@ func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
 		case "page-2-cursor":
 			if interruptOnce.CompareAndSwap(true, false) {
 				http.Error(writer, "interrupted", http.StatusInternalServerError)
-				return
-			}
-			if expireOnce.CompareAndSwap(true, false) {
-				writer.Header().Set("Content-Type", "application/json")
-				writer.WriteHeader(http.StatusNotFound)
-				_, _ = writer.Write([]byte(
-					`{
-						"status":"failed",
-						"message-type":"resource-failure",
-						"message":[{
-							"type":"cursor-invalid",
-							"value":"page-2-cursor",
-							"message":"Cursor is invalid or expired"
-						}]
-					}`,
-				))
 				return
 			}
 			_, _ = writer.Write(pageTwo)
@@ -1371,10 +1891,10 @@ func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
 		httpclient.Dependencies{},
 	)
 	if err != nil {
-		t.Fatalf("expired cursor recovery error = %v", err)
+		t.Fatalf("fresh partial restart error = %v", err)
 	}
 	if result.Resumed {
-		t.Fatal("expired cursor recovery reported resumed result")
+		t.Fatal("fresh partial restart reported resumed result")
 	}
 	mu.Lock()
 	got := append([]string(nil), cursors...)
@@ -1382,191 +1902,10 @@ func TestCrossrefCatalogExpiredCursorRestartsFromFirstCursor(t *testing.T) {
 	if !slices.Equal(got, []string{
 		"*",
 		"page-2-cursor",
-		"page-2-cursor",
 		"*",
 		"page-2-cursor",
 	}) {
-		t.Fatalf("request cursors = %v, want cursor reset flow", got)
-	}
-}
-
-func TestCrossrefCatalogRecognizesOnlyTypedCursorFailures(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name       string
-		statusCode int
-		payload    string
-		want       bool
-	}{
-		{
-			name:       "real cursor invalid response",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"cursor-invalid",
-					"value":"review-provided-invalid-cursor",
-					"message":"Cursor specified but no cursor is associated with the request"
-				}]
-			}`,
-			want: true,
-		},
-		{
-			name:       "explicit cursor expired type",
-			statusCode: http.StatusGone,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"cursor-expired",
-					"value":"expired-cursor-token",
-					"message":"Cursor lifetime elapsed"
-				}]
-			}`,
-			want: true,
-		},
-		{
-			name:       "legacy string message is unsupported",
-			statusCode: http.StatusBadRequest,
-			payload: `{
-				"status":"failed",
-				"message":"Cursor is invalid or expired"
-			}`,
-			want: false,
-		},
-		{
-			name:       "message text alone is insufficient",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"resource-not-found",
-					"value":"page-2-cursor",
-					"message":"Cursor is invalid or expired"
-				}]
-			}`,
-			want: false,
-		},
-		{
-			name:       "cursor substring type is insufficient",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"possibly-cursor-invalid",
-					"value":"page-2-cursor",
-					"message":"Cursor rejected"
-				}]
-			}`,
-			want: false,
-		},
-		{
-			name:       "unexpected top level field is rejected",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"cursor-invalid",
-					"value":"page-2-cursor",
-					"message":"Cursor rejected"
-				}],
-				"unexpected":true
-			}`,
-			want: false,
-		},
-		{
-			name:       "unexpected additional failure item field is rejected",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"cursor-invalid",
-					"value":"page-2-cursor",
-					"message":"Cursor rejected",
-					"unexpected":true
-				}]
-			}`,
-			want: false,
-		},
-		{
-			name:       "missing value is rejected",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"cursor-invalid",
-					"message":"Cursor rejected"
-				}]
-			}`,
-			want: false,
-		},
-		{
-			name:       "non string value is rejected",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"cursor-invalid",
-					"value":404,
-					"message":"Cursor rejected"
-				}]
-			}`,
-			want: false,
-		},
-		{
-			name:       "wrong message type is rejected",
-			statusCode: http.StatusNotFound,
-			payload: `{
-				"status":"failed",
-				"message-type":"work-list",
-				"message":[{
-					"type":"cursor-invalid",
-					"value":"page-2-cursor",
-					"message":"Cursor rejected"
-				}]
-			}`,
-			want: false,
-		},
-		{
-			name:       "non error status is rejected",
-			statusCode: http.StatusOK,
-			payload: `{
-				"status":"failed",
-				"message-type":"resource-failure",
-				"message":[{
-					"type":"cursor-invalid",
-					"value":"page-2-cursor",
-					"message":"Cursor rejected"
-				}]
-			}`,
-			want: false,
-		},
-	}
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
-			observer := &crossrefResponseObserver{
-				statusCode: test.statusCode,
-				body:       []byte(test.payload),
-			}
-			if got := observer.explicitCursorInvalidOrExpired(); got != test.want {
-				t.Fatalf(
-					"explicitCursorInvalidOrExpired() = %t, want %t",
-					got,
-					test.want,
-				)
-			}
-		})
+		t.Fatalf("request cursors = %v, want fresh restart from *", got)
 	}
 }
 

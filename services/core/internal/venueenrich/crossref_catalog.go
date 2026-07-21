@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -43,7 +42,6 @@ const (
 	crossrefCatalogStagePublish            = "publish"
 
 	maxCrossrefCatalogManifestBytes = 8 << 20
-	maxCrossrefCursorErrorBytes     = 64 << 10
 )
 
 var ErrCrossrefCatalogLocked = errors.New(
@@ -142,22 +140,6 @@ type crossrefCatalogLock struct {
 	file *os.File
 }
 
-type crossrefResponseObserver struct {
-	mu         sync.Mutex
-	statusCode int
-	body       []byte
-}
-
-type crossrefObservingRoundTripper struct {
-	base     http.RoundTripper
-	observer *crossrefResponseObserver
-}
-
-type crossrefObservingBody struct {
-	io.ReadCloser
-	observer *crossrefResponseObserver
-}
-
 func acquireCrossrefCatalogLock(
 	cacheDirectory string,
 ) (*crossrefCatalogLock, error) {
@@ -196,183 +178,6 @@ func (lock *crossrefCatalogLock) release() error {
 	return errors.Join(unlockErr, closeErr)
 }
 
-func observeCrossrefResponses(
-	base *http.Client,
-) (*crossrefResponseObserver, *http.Client) {
-	observer := &crossrefResponseObserver{}
-	cloned := *base
-	transport := base.Transport
-	if transport == nil {
-		transport = http.DefaultTransport
-	}
-	cloned.Transport = crossrefObservingRoundTripper{
-		base:     transport,
-		observer: observer,
-	}
-	return observer, &cloned
-}
-
-func (transport crossrefObservingRoundTripper) RoundTrip(
-	request *http.Request,
-) (*http.Response, error) {
-	response, err := transport.base.RoundTrip(request)
-	transport.observer.reset()
-	if err != nil || response == nil {
-		return response, err
-	}
-	transport.observer.setStatus(response.StatusCode)
-	if response.Body != nil {
-		response.Body = &crossrefObservingBody{
-			ReadCloser: response.Body,
-			observer:   transport.observer,
-		}
-	}
-	return response, nil
-}
-
-func (body *crossrefObservingBody) Read(payload []byte) (int, error) {
-	count, err := body.ReadCloser.Read(payload)
-	if count > 0 {
-		body.observer.appendBody(payload[:count])
-	}
-	return count, err
-}
-
-func (observer *crossrefResponseObserver) reset() {
-	observer.mu.Lock()
-	defer observer.mu.Unlock()
-	observer.statusCode = 0
-	observer.body = observer.body[:0]
-}
-
-func (observer *crossrefResponseObserver) setStatus(statusCode int) {
-	observer.mu.Lock()
-	defer observer.mu.Unlock()
-	observer.statusCode = statusCode
-}
-
-func (observer *crossrefResponseObserver) appendBody(payload []byte) {
-	observer.mu.Lock()
-	defer observer.mu.Unlock()
-	remaining := maxCrossrefCursorErrorBytes - len(observer.body)
-	if remaining <= 0 {
-		return
-	}
-	if len(payload) > remaining {
-		payload = payload[:remaining]
-	}
-	observer.body = append(observer.body, payload...)
-}
-
-func (observer *crossrefResponseObserver) explicitCursorInvalidOrExpired() bool {
-	observer.mu.Lock()
-	statusCode := observer.statusCode
-	payload := append([]byte(nil), observer.body...)
-	observer.mu.Unlock()
-	switch statusCode {
-	case http.StatusBadRequest, http.StatusNotFound, http.StatusGone:
-	default:
-		return false
-	}
-	if err := validateSingleUniqueJSONValue(
-		payload,
-		"Crossref cursor error",
-	); err != nil {
-		return false
-	}
-	fields, err := decodeJSONObject(payload, "Crossref cursor error")
-	if err != nil {
-		return false
-	}
-	if err := rejectUnexpectedJSONFields(
-		fields,
-		"Crossref cursor error",
-		"status",
-		"message-type",
-		"message",
-	); err != nil {
-		return false
-	}
-	status, err := requiredJSONString(
-		fields,
-		"status",
-		"Crossref cursor error",
-	)
-	if err != nil || status != "failed" {
-		return false
-	}
-	messageType, err := requiredJSONString(
-		fields,
-		"message-type",
-		"Crossref cursor error",
-	)
-	if err != nil || messageType != "resource-failure" {
-		return false
-	}
-	rawMessage, exists := fields["message"]
-	if !exists || isJSONNull(rawMessage) {
-		return false
-	}
-	var failures []json.RawMessage
-	if err := json.Unmarshal(rawMessage, &failures); err != nil ||
-		len(failures) == 0 {
-		return false
-	}
-
-	cursorFailure := false
-	for index, rawFailure := range failures {
-		path := fmt.Sprintf("Crossref cursor error message[%d]", index)
-		failure, err := decodeJSONObject(rawFailure, path)
-		if err != nil {
-			return false
-		}
-		if err := rejectUnexpectedJSONFields(
-			failure,
-			path,
-			"type",
-			"value",
-			"message",
-		); err != nil {
-			return false
-		}
-		failureType, err := requiredJSONString(
-			failure,
-			"type",
-			path,
-		)
-		if err != nil ||
-			failureType != strings.TrimSpace(failureType) ||
-			failureType == "" {
-			return false
-		}
-		value, err := requiredJSONString(
-			failure,
-			"value",
-			path,
-		)
-		if err != nil ||
-			value != strings.TrimSpace(value) ||
-			value == "" {
-			return false
-		}
-		message, err := requiredJSONString(
-			failure,
-			"message",
-			path,
-		)
-		if err != nil ||
-			message != strings.TrimSpace(message) ||
-			message == "" {
-			return false
-		}
-		switch failureType {
-		case "cursor-invalid", "cursor-expired":
-			cursorFailure = true
-		}
-	}
-	return cursorFailure
-}
-
 func FetchCrossrefCatalog(
 	ctx context.Context,
 	base *http.Client,
@@ -392,8 +197,7 @@ func FetchCrossrefCatalog(
 			"Crossref catalog base HTTP client is required",
 		)
 	}
-	observer, observedBase := observeCrossrefResponses(base)
-	policy, err := httpclient.New(observedBase, httpclient.Config{
+	policy, err := httpclient.New(base, httpclient.Config{
 		Timeout:                  config.Timeout,
 		UserAgent:                config.UserAgent,
 		RateLimit:                config.RateLimit,
@@ -481,6 +285,22 @@ func FetchCrossrefCatalog(
 		); err != nil {
 			return CrossrefCatalog{}, err
 		}
+		if err := cleanupUncommittedCrossrefPages(
+			partialDirectory,
+			manifest,
+			ops,
+		); err != nil {
+			return CrossrefCatalog{}, err
+		}
+		cache, err = loadCrossrefCatalogCache(
+			partialDirectory,
+			endpoint.String(),
+			config.MaxResponseBytes,
+			false,
+		)
+		if err != nil {
+			return CrossrefCatalog{}, err
+		}
 		if staleCrossrefCatalogPartial(manifest, now().UTC()) {
 			if err := discardCrossrefCatalogPartial(
 				partialDirectory,
@@ -489,24 +309,20 @@ func FetchCrossrefCatalog(
 			); err != nil {
 				return CrossrefCatalog{}, err
 			}
-		} else {
-			if err := cleanupUncommittedCrossrefPages(
-				partialDirectory,
-				manifest,
-				ops,
-			); err != nil {
-				return CrossrefCatalog{}, err
-			}
-			cache, err = loadCrossrefCatalogCache(
-				partialDirectory,
-				endpoint.String(),
-				config.MaxResponseBytes,
-				false,
-			)
-			if err != nil {
-				return CrossrefCatalog{}, err
-			}
+			cache = crossrefCatalogCache{}
 		}
+	}
+	if cache.exists &&
+		(cache.manifest.TotalResults == nil ||
+			cache.manifest.RecordCount < *cache.manifest.TotalResults) {
+		if err := discardCrossrefCatalogPartial(
+			partialDirectory,
+			config.CacheDir,
+			ops,
+		); err != nil {
+			return CrossrefCatalog{}, err
+		}
+		cache = crossrefCatalogCache{}
 	}
 	resumed := cache.exists
 	if !cache.exists {
@@ -540,11 +356,8 @@ func FetchCrossrefCatalog(
 		), nil
 	}
 
-	cursor, seenCursors, err := crossrefCatalogResumeCursor(cache.manifest)
-	if err != nil {
-		return CrossrefCatalog{}, err
-	}
-	restartedExpiredCursor := false
+	cursor := "*"
+	seenPageHashes := map[string]struct{}{}
 	for {
 		if err := ctx.Err(); err != nil {
 			return CrossrefCatalog{}, err
@@ -569,31 +382,6 @@ func FetchCrossrefCatalog(
 		}
 		response, err := policy.Do(request)
 		if err != nil {
-			if resumed &&
-				!restartedExpiredCursor &&
-				observer.explicitCursorInvalidOrExpired() {
-				if err := discardCrossrefCatalogPartial(
-					partialDirectory,
-					config.CacheDir,
-					ops,
-				); err != nil {
-					return CrossrefCatalog{}, err
-				}
-				cache, err = initializeCrossrefCatalogCache(
-					partialDirectory,
-					endpoint.String(),
-					now().UTC(),
-					ops,
-				)
-				if err != nil {
-					return CrossrefCatalog{}, err
-				}
-				cursor = "*"
-				seenCursors = map[string]struct{}{"*": {}}
-				resumed = false
-				restartedExpiredCursor = true
-				continue
-			}
 			return CrossrefCatalog{}, fmt.Errorf(
 				"fetch Crossref journals page: %w",
 				err,
@@ -658,13 +446,13 @@ func FetchCrossrefCatalog(
 				*cache.manifest.TotalResults,
 			)
 		}
-		if page.nextCursor != "" {
-			if _, duplicate := seenCursors[page.nextCursor]; duplicate {
-				return CrossrefCatalog{}, fmt.Errorf(
-					"Crossref journal catalog protocol error: duplicate cursor %q",
-					page.nextCursor,
-				)
-			}
+		pageHash := sha256.Sum256(payload)
+		pageHashHex := hex.EncodeToString(pageHash[:])
+		if _, duplicate := seenPageHashes[pageHashHex]; duplicate {
+			return CrossrefCatalog{}, fmt.Errorf(
+				"Crossref journal catalog protocol error: duplicate page payload %q",
+				pageHashHex,
+			)
 		}
 		if nextRecordCount < *cache.manifest.TotalResults &&
 			page.nextCursor == "" {
@@ -692,7 +480,6 @@ func FetchCrossrefCatalog(
 			)
 		}
 
-		pageHash := sha256.Sum256(payload)
 		cache.manifest.Pages = append(
 			cache.manifest.Pages,
 			CrossrefCatalogPageReceipt{
@@ -702,7 +489,7 @@ func FetchCrossrefCatalog(
 				RecordCount: len(page.journals),
 				PageFile:    pageFile,
 				PageBytes:   int64(len(payload)),
-				PageSHA256:  hex.EncodeToString(pageHash[:]),
+				PageSHA256:  pageHashHex,
 			},
 		)
 		cache.manifest.RecordCount = nextRecordCount
@@ -735,7 +522,7 @@ func FetchCrossrefCatalog(
 			), nil
 		}
 
-		seenCursors[page.nextCursor] = struct{}{}
+		seenPageHashes[pageHashHex] = struct{}{}
 		cursor = page.nextCursor
 	}
 }
@@ -1365,7 +1152,7 @@ func validateCrossrefCatalogManifest(
 
 	var receiptRecords int64
 	expectedCursor := "*"
-	seenCursors := map[string]struct{}{expectedCursor: {}}
+	seenPageHashes := map[string]struct{}{}
 	for index, receipt := range manifest.Pages {
 		if receipt.Ordinal != index+1 {
 			return fmt.Errorf(
@@ -1424,15 +1211,13 @@ func validateCrossrefCatalogManifest(
 			return err
 		}
 		receiptRecords += int64(receipt.RecordCount)
-		if receipt.CursorOut != "" {
-			if _, duplicate := seenCursors[receipt.CursorOut]; duplicate {
-				return fmt.Errorf(
-					"Crossref catalog manifest contains duplicate cursor %q",
-					receipt.CursorOut,
-				)
-			}
-			seenCursors[receipt.CursorOut] = struct{}{}
+		if _, duplicate := seenPageHashes[receipt.PageSHA256]; duplicate {
+			return fmt.Errorf(
+				"Crossref catalog manifest contains duplicate page payload %q",
+				receipt.PageSHA256,
+			)
 		}
+		seenPageHashes[receipt.PageSHA256] = struct{}{}
 		expectedCursor = receipt.CursorOut
 	}
 	if receiptRecords != manifest.RecordCount {
@@ -1878,40 +1663,6 @@ func maxScannerToken(maxRecordBytes int64) int {
 	return int(maxRecordBytes) + 1
 }
 
-func crossrefCatalogResumeCursor(
-	manifest CrossrefCatalogManifest,
-) (string, map[string]struct{}, error) {
-	cursor := "*"
-	seen := map[string]struct{}{cursor: {}}
-	for _, receipt := range manifest.Pages {
-		if receipt.CursorIn != cursor {
-			return "", nil, fmt.Errorf(
-				"Crossref catalog resume cursor chain breaks at page %d",
-				receipt.Ordinal,
-			)
-		}
-		if receipt.CursorOut != "" {
-			if _, duplicate := seen[receipt.CursorOut]; duplicate {
-				return "", nil, fmt.Errorf(
-					"Crossref catalog resume contains duplicate cursor %q",
-					receipt.CursorOut,
-				)
-			}
-			seen[receipt.CursorOut] = struct{}{}
-		}
-		cursor = receipt.CursorOut
-	}
-	if manifest.RecordCount > 0 &&
-		manifest.TotalResults != nil &&
-		manifest.RecordCount < *manifest.TotalResults &&
-		cursor == "" {
-		return "", nil, errors.New(
-			"Crossref catalog resume requires a verified continuation cursor",
-		)
-	}
-	return cursor, seen, nil
-}
-
 func decodeCrossrefJournalPage(
 	payload []byte,
 ) (crossrefJournalPage, error) {
@@ -2060,7 +1811,7 @@ func decodeCrossrefJournalPage(
 	}
 	if itemsPerPage < 0 ||
 		itemsPerPage > CrossrefCatalogRows ||
-		itemsPerPage != int64(len(rawItems)) {
+		int64(len(rawItems)) > itemsPerPage {
 		return crossrefJournalPage{}, fmt.Errorf(
 			"Crossref journal page items-per-page = %d, actual items = %d, rows = %d",
 			itemsPerPage,
@@ -2173,11 +1924,6 @@ func decodeCrossrefJournal(raw []byte) (CrossrefJournal, error) {
 		return CrossrefJournal{}, err
 	}
 	publisher = strings.TrimSpace(publisher)
-	if publisher == "" {
-		return CrossrefJournal{}, errors.New(
-			"Crossref journal item publisher must not be blank",
-		)
-	}
 
 	rawISSNs, exists := fields["ISSN"]
 	if !exists || isJSONNull(rawISSNs) {
@@ -2195,6 +1941,9 @@ func decodeCrossrefJournal(raw []byte) (CrossrefJournal, error) {
 	issns := make([]string, 0, len(sourceISSNs))
 	issnSet := make(map[string]struct{}, len(sourceISSNs))
 	for index, sourceISSN := range sourceISSNs {
+		if sourceISSN == "" {
+			continue
+		}
 		if !validCrossrefISSNSyntax(sourceISSN) {
 			return CrossrefJournal{}, fmt.Errorf(
 				"Crossref journal item ISSN[%d] is invalid: %q",
@@ -2240,13 +1989,26 @@ func decodeCrossrefJournal(raw []byte) (CrossrefJournal, error) {
 		); err != nil {
 			return CrossrefJournal{}, err
 		}
-		value, err := requiredJSONString(
-			typeFields,
-			"value",
-			fmt.Sprintf("Crossref journal item issn-type[%d]", index),
+		rawValue, exists := typeFields["value"]
+		if !exists || isJSONNull(rawValue) {
+			continue
+		}
+		value, err := decodeJSONString(
+			rawValue,
+			fmt.Sprintf("Crossref journal item issn-type[%d] value", index),
 		)
 		if err != nil {
 			return CrossrefJournal{}, err
+		}
+		if value == "" {
+			continue
+		}
+		if !validCrossrefISSNSyntax(value) {
+			return CrossrefJournal{}, fmt.Errorf(
+				"Crossref journal item issn-type[%d] value is invalid: %q",
+				index,
+				value,
+			)
 		}
 		if _, exists := issnSet[value]; !exists {
 			return CrossrefJournal{}, fmt.Errorf(

@@ -179,14 +179,34 @@ func (client *Client) CountCoverage(
 	values.Set("retmax", "0")
 	client.addIdentity(values)
 
-	response, err := client.get(ctx, "esearch.fcgi", values)
+	response, err := client.getValidated(
+		ctx,
+		"esearch.fcgi",
+		values,
+		func(payload []byte) error {
+			_, validationErr := decodeESearch(payload)
+			return validationErr
+		},
+		func(validationErr error) bool {
+			return errors.Is(validationErr, errESearchMissingCount)
+		},
+	)
 	if err != nil {
 		return CoverageResult{}, fmt.Errorf("count PubMed coverage: %w", err)
 	}
-	defer response.Body.Close()
-	payload, err := io.ReadAll(response.Body)
-	if err != nil {
-		return CoverageResult{}, fmt.Errorf("read PubMed coverage ESearch response: %w", err)
+	payload, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		return CoverageResult{}, fmt.Errorf(
+			"read PubMed coverage ESearch response: %w",
+			readErr,
+		)
+	}
+	if closeErr != nil {
+		return CoverageResult{}, fmt.Errorf(
+			"close PubMed coverage ESearch response: %w",
+			closeErr,
+		)
 	}
 	responseSHA256 := sha256.Sum256(payload)
 
@@ -289,12 +309,9 @@ func (client *Client) get(
 	operation string,
 	values url.Values,
 ) (*http.Response, error) {
-	endpoint := *client.baseURL
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/entrez/eutils/" + operation
-	endpoint.RawQuery = values.Encode()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	request, err := client.newGETRequest(ctx, operation, values)
 	if err != nil {
-		return nil, fmt.Errorf("create PubMed %s request: %w", operation, err)
+		return nil, err
 	}
 	return client.httpClient.Do(request)
 }
@@ -319,6 +336,39 @@ func (client *Client) postForm(
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return client.httpClient.Do(request)
+}
+
+func (client *Client) getValidated(
+	ctx context.Context,
+	operation string,
+	values url.Values,
+	validate func([]byte) error,
+	retryableValidationError func(error) bool,
+) (*http.Response, error) {
+	request, err := client.newGETRequest(ctx, operation, values)
+	if err != nil {
+		return nil, err
+	}
+	return client.httpClient.DoValidated(
+		request,
+		validate,
+		retryableValidationError,
+	)
+}
+
+func (client *Client) newGETRequest(
+	ctx context.Context,
+	operation string,
+	values url.Values,
+) (*http.Request, error) {
+	endpoint := *client.baseURL
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/entrez/eutils/" + operation
+	endpoint.RawQuery = values.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create PubMed %s request: %w", operation, err)
+	}
+	return request, nil
 }
 
 func (client *Client) addIdentity(values url.Values) {

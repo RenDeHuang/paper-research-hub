@@ -16,6 +16,10 @@ type eSearchResult struct {
 	QueryKey string
 }
 
+var errESearchMissingCount = errors.New(
+	"PubMed ESearch JSON requires exact count field",
+)
+
 func decodeESearch(payload []byte) (eSearchResult, error) {
 	var envelope map[string]json.RawMessage
 	if err := decodeStrictJSON(payload, &envelope); err != nil {
@@ -34,15 +38,15 @@ func decodeESearch(payload []byte) (eSearchResult, error) {
 			err,
 		)
 	}
+	if fields == nil {
+		return eSearchResult{}, errors.New(
+			"PubMed ESearch exact esearchresult field must be a JSON object",
+		)
+	}
 
 	count, exists, err := exactJSONString(fields, "count")
 	if err != nil {
 		return eSearchResult{}, err
-	}
-	if !exists {
-		return eSearchResult{}, errors.New(
-			"PubMed ESearch JSON requires exact count field",
-		)
 	}
 	webEnv, _, err := exactJSONString(fields, "webenv")
 	if err != nil {
@@ -51,6 +55,9 @@ func decodeESearch(payload []byte) (eSearchResult, error) {
 	queryKey, _, err := exactJSONString(fields, "querykey")
 	if err != nil {
 		return eSearchResult{}, err
+	}
+	if !exists {
+		return eSearchResult{}, errESearchMissingCount
 	}
 	return eSearchResult{
 		Count:    count,
@@ -67,8 +74,16 @@ func exactJSONString(
 	if !exists {
 		return "", false, nil
 	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return "", true, fmt.Errorf(
+			"decode PubMed ESearch exact %s field: %w",
+			key,
+			err,
+		)
+	}
+	value, ok := decoded.(string)
+	if !ok {
 		return "", true, fmt.Errorf(
 			"PubMed ESearch exact %s field must be a JSON string",
 			key,

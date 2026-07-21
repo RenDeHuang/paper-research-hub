@@ -24,17 +24,28 @@ const (
 )
 
 type crossrefMatchCandidate struct {
-	title          string
-	publisher      string
-	totalDOIs      int64
-	allISSNs       []string
-	printISSN      string
-	electronicISSN string
-	recordNumber   int
+	title                    string
+	titleConflicted          bool
+	publisher                string
+	publisherConflicted      bool
+	totalDOIs                int64
+	totalDOIsConflicted      bool
+	allISSNs                 []string
+	printISSN                string
+	printISSNConflicted      bool
+	electronicISSN           string
+	electronicISSNConflicted bool
+	recordNumber             int
 }
 
 type crossrefTitleMatch struct {
 	status      MatchStatus
+	identityKey string
+	candidate   crossrefMatchCandidate
+	components  []crossrefIdentityComponent
+}
+
+type crossrefIdentityComponent struct {
 	identityKey string
 	candidate   crossrefMatchCandidate
 }
@@ -339,6 +350,9 @@ func processCrossrefMatchRecord(
 			err,
 		)
 	}
+	if len(journal.ISSNs) == 0 {
+		return nil
+	}
 	normalizedTitle, err := NormalizeTitle(journal.Title)
 	if err != nil {
 		return fmt.Errorf(
@@ -355,6 +369,9 @@ func processCrossrefMatchRecord(
 			recordNumber,
 		)
 	}
+	if _, targeted := targetTitles[normalizedTitle]; !targeted {
+		return nil
+	}
 
 	candidate, identityKey, err := canonicalCrossrefMatchCandidate(
 		journal,
@@ -368,7 +385,7 @@ func processCrossrefMatchRecord(
 			err,
 		)
 	}
-	if _, targeted := targetTitles[normalizedTitle]; !targeted {
+	if len(candidate.allISSNs) == 0 {
 		return nil
 	}
 
@@ -396,30 +413,112 @@ func (match *crossrefTitleMatch) observe(
 	identityKey string,
 	candidate crossrefMatchCandidate,
 ) (existingRecord int, conflict string) {
-	switch match.status {
-	case "":
-		match.status = MatchStatusResolved
-		match.identityKey = identityKey
-		match.candidate = candidate
-	case MatchStatusResolved:
-		if match.identityKey != identityKey {
-			match.status = MatchStatusAmbiguous
-			match.identityKey = ""
-			match.candidate = crossrefMatchCandidate{}
+	for index := range match.components {
+		component := &match.components[index]
+		if component.identityKey == identityKey {
+			component.candidate = mergeCrossrefMatchCandidateEvidence(
+				component.candidate,
+				candidate,
+			)
+			match.refreshResolution()
 			return 0, ""
 		}
-		conflict = crossrefMatchEvidenceConflict(match.candidate, candidate)
-		if conflict != "" {
-			return match.candidate.recordNumber, conflict
-		}
-	case MatchStatusAmbiguous:
+	}
+
+	match.components = append(match.components, crossrefIdentityComponent{
+		identityKey: identityKey,
+		candidate:   candidate,
+	})
+	match.refreshResolution()
+	return 0, ""
+}
+
+func (match *crossrefTitleMatch) refreshResolution() {
+	switch len(match.components) {
+	case 0:
+		match.status = ""
+		match.identityKey = ""
+		match.candidate = crossrefMatchCandidate{}
+	case 1:
+		match.status = MatchStatusResolved
+		match.identityKey = match.components[0].identityKey
+		match.candidate = match.components[0].candidate
 	default:
-		return 0, fmt.Sprintf(
-			"internal Crossref title match state %q is invalid",
-			match.status,
+		candidate, compatible := mergeCompatibleCrossrefIdentityComponents(
+			match.components,
+		)
+		if compatible {
+			match.status = MatchStatusResolved
+			match.identityKey = strings.Join(candidate.allISSNs, "\x00")
+			match.candidate = candidate
+			return
+		}
+		match.status = MatchStatusAmbiguous
+		match.identityKey = ""
+		match.candidate = crossrefMatchCandidate{}
+	}
+}
+
+func mergeCompatibleCrossrefIdentityComponents(
+	components []crossrefIdentityComponent,
+) (crossrefMatchCandidate, bool) {
+	if len(components) < 2 {
+		return crossrefMatchCandidate{}, false
+	}
+	baseline := components[0].candidate
+	if baseline.titleConflicted ||
+		baseline.publisherConflicted ||
+		baseline.publisher == "" ||
+		baseline.totalDOIsConflicted ||
+		baseline.totalDOIs <= 0 {
+		return crossrefMatchCandidate{}, false
+	}
+	for _, component := range components[1:] {
+		candidate := component.candidate
+		if candidate.titleConflicted ||
+			candidate.publisherConflicted ||
+			candidate.totalDOIsConflicted ||
+			candidate.title != baseline.title ||
+			candidate.publisher != baseline.publisher ||
+			candidate.totalDOIs != baseline.totalDOIs {
+			return crossrefMatchCandidate{}, false
+		}
+	}
+	for left := 0; left < len(components); left++ {
+		for right := left + 1; right < len(components); right++ {
+			leftISSNs := components[left].candidate.allISSNs
+			rightISSNs := components[right].candidate.allISSNs
+			if !crossrefISSNSetSubset(leftISSNs, rightISSNs) &&
+				!crossrefISSNSetSubset(rightISSNs, leftISSNs) {
+				return crossrefMatchCandidate{}, false
+			}
+		}
+	}
+
+	merged := baseline
+	for _, component := range components[1:] {
+		merged = mergeCrossrefMatchCandidateEvidence(
+			merged,
+			component.candidate,
 		)
 	}
-	return 0, ""
+	return merged, true
+}
+
+func crossrefISSNSetSubset(subset, superset []string) bool {
+	left, right := 0, 0
+	for left < len(subset) && right < len(superset) {
+		switch {
+		case subset[left] == superset[right]:
+			left++
+			right++
+		case subset[left] > superset[right]:
+			right++
+		default:
+			return false
+		}
+	}
+	return left == len(subset)
 }
 
 func canonicalCrossrefMatchCandidate(
@@ -437,12 +536,7 @@ func canonicalCrossrefMatchCandidate(
 	for index, raw := range journal.ISSNs {
 		parsed, err := venue.ParseISSN(venue.ISSNRoleLinking, raw)
 		if err != nil {
-			return crossrefMatchCandidate{}, "", fmt.Errorf(
-				"ISSN[%d] %q: %w",
-				index,
-				raw,
-				err,
-			)
+			continue
 		}
 		canonical := parsed.String()
 		if canonical != raw {
@@ -460,17 +554,12 @@ func canonicalCrossrefMatchCandidate(
 		allISSNs = append(allISSNs, canonical)
 	}
 	sort.Strings(allISSNs)
+	if len(allISSNs) == 0 {
+		return crossrefMatchCandidate{}, "", nil
+	}
 
 	var printISSN, electronicISSN string
 	for index, typed := range journal.ISSNTypes {
-		if _, exists := seen[typed.Value]; !exists {
-			return crossrefMatchCandidate{}, "", fmt.Errorf(
-				"issn-type[%d] value %q is absent from canonical ISSN set",
-				index,
-				typed.Value,
-			)
-		}
-
 		var (
 			role    venue.ISSNRole
 			current *string
@@ -492,13 +581,7 @@ func canonicalCrossrefMatchCandidate(
 
 		parsed, err := venue.ParseISSN(role, typed.Value)
 		if err != nil {
-			return crossrefMatchCandidate{}, "", fmt.Errorf(
-				"issn-type[%d] %s value %q: %w",
-				index,
-				typed.Type,
-				typed.Value,
-				err,
-			)
+			continue
 		}
 		canonical := parsed.String()
 		if canonical != typed.Value {
@@ -507,6 +590,13 @@ func canonicalCrossrefMatchCandidate(
 				index,
 				typed.Type,
 				typed.Value,
+				canonical,
+			)
+		}
+		if _, exists := seen[canonical]; !exists {
+			return crossrefMatchCandidate{}, "", fmt.Errorf(
+				"issn-type[%d] value %q is absent from canonical ISSN set",
+				index,
 				canonical,
 			)
 		}
@@ -533,34 +623,66 @@ func canonicalCrossrefMatchCandidate(
 	return candidate, strings.Join(allISSNs, "\x00"), nil
 }
 
-func crossrefMatchEvidenceConflict(
+func mergeCrossrefMatchCandidateEvidence(
 	first crossrefMatchCandidate,
 	second crossrefMatchCandidate,
-) string {
+) crossrefMatchCandidate {
+	merged := first
+	merged.allISSNs = append(
+		slices.Clone(first.allISSNs),
+		second.allISSNs...,
+	)
+	sort.Strings(merged.allISSNs)
+	merged.allISSNs = slices.Compact(merged.allISSNs)
+	if first.titleConflicted ||
+		second.titleConflicted ||
+		first.title != second.title {
+		merged.titleConflicted = true
+	}
+	merged.publisher, merged.publisherConflicted = mergeOptionalCrossrefEvidence(
+		first.publisher,
+		first.publisherConflicted,
+		second.publisher,
+		second.publisherConflicted,
+	)
+	merged.printISSN, merged.printISSNConflicted = mergeOptionalCrossrefEvidence(
+		first.printISSN,
+		first.printISSNConflicted,
+		second.printISSN,
+		second.printISSNConflicted,
+	)
+	merged.electronicISSN, merged.electronicISSNConflicted = mergeOptionalCrossrefEvidence(
+		first.electronicISSN,
+		first.electronicISSNConflicted,
+		second.electronicISSN,
+		second.electronicISSNConflicted,
+	)
+	if first.totalDOIsConflicted ||
+		second.totalDOIsConflicted ||
+		first.totalDOIs != second.totalDOIs {
+		merged.totalDOIs = 0
+		merged.totalDOIsConflicted = true
+	}
+	return merged
+}
+
+func mergeOptionalCrossrefEvidence(
+	first string,
+	firstConflicted bool,
+	second string,
+	secondConflicted bool,
+) (string, bool) {
 	switch {
-	case first.publisher != second.publisher:
-		return fmt.Sprintf(
-			"publisher evidence differs: %q versus %q",
-			first.publisher,
-			second.publisher,
-		)
-	case first.printISSN != second.printISSN ||
-		first.electronicISSN != second.electronicISSN:
-		return fmt.Sprintf(
-			"ISSN role evidence differs: print %q/%q, electronic %q/%q",
-			first.printISSN,
-			second.printISSN,
-			first.electronicISSN,
-			second.electronicISSN,
-		)
-	case first.totalDOIs != second.totalDOIs:
-		return fmt.Sprintf(
-			"DOI count evidence differs: %d versus %d",
-			first.totalDOIs,
-			second.totalDOIs,
-		)
+	case firstConflicted || secondConflicted:
+		return "", true
+	case first == "":
+		return second, false
+	case second == "":
+		return first, false
+	case first == second:
+		return first, false
 	default:
-		return ""
+		return "", true
 	}
 }
 

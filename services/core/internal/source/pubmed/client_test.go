@@ -967,6 +967,228 @@ func TestClientCountCoverageUsesSharedBoundedRetryPolicy(t *testing.T) {
 	}
 }
 
+func TestClientCountCoverageRetriesMissingCountProtocolResponse(t *testing.T) {
+	t.Parallel()
+
+	missingPayload := []byte(`{"esearchresult":{}}`)
+	successPayload := []byte(`{"esearchresult":{"count":"7"}}`)
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		attempts++
+		if attempts == 1 {
+			_, _ = writer.Write(missingPayload)
+			return
+		}
+		_, _ = writer.Write(successPayload)
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxRetries = 1
+	}, httpclient.Dependencies{
+		Now: func() time.Time { return time.Unix(0, 0) },
+		Sleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+	})
+
+	result, err := client.CountCoverage(
+		context.Background(),
+		pubmed.CoverageQuery{JournalISSNs: []string{"0028-0836"}},
+	)
+	if err != nil {
+		t.Fatalf("CountCoverage() error = %v", err)
+	}
+	wantSHA := fmt.Sprintf("%x", sha256.Sum256(successPayload))
+	if result.Count != 7 ||
+		result.ResponseSHA256 != wantSHA ||
+		attempts != 2 {
+		t.Fatalf(
+			"CountCoverage() = %#v after %d attempts, want final successful response after one protocol retry",
+			result,
+			attempts,
+		)
+	}
+}
+
+func TestClientCountCoverageSharesRetryBudgetAcrossHTTPAndProtocolFailures(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		attempts++
+		switch attempts {
+		case 1, 3:
+			http.Error(writer, "retry", http.StatusServiceUnavailable)
+		case 2:
+			_, _ = writer.Write([]byte(`{"esearchresult":{}}`))
+		default:
+			_, _ = writer.Write([]byte(`{"esearchresult":{"count":"7"}}`))
+		}
+	}))
+	defer server.Close()
+
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxRetries = 2
+	}, httpclient.Dependencies{
+		Now: func() time.Time { return time.Unix(0, 0) },
+		Sleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+	})
+
+	_, err := client.CountCoverage(
+		context.Background(),
+		pubmed.CoverageQuery{JournalISSNs: []string{"0028-0836"}},
+	)
+	if err == nil {
+		t.Fatal("CountCoverage() error = nil, want shared retry budget exhaustion")
+	}
+	if attempts != 3 {
+		t.Fatalf("physical requests = %d, want MaxRetries+1 = 3", attempts)
+	}
+}
+
+func TestClientCountCoverageSharesWaitBudgetAcrossHTTPAndProtocolFailures(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		attempts++
+		switch attempts {
+		case 1:
+			http.Error(writer, "retry", http.StatusServiceUnavailable)
+		case 2:
+			_, _ = writer.Write([]byte(`{"esearchresult":{}}`))
+		default:
+			_, _ = writer.Write([]byte(`{"esearchresult":{"count":"7"}}`))
+		}
+	}))
+	defer server.Close()
+
+	nowCalls := 0
+	sleeps := make([]time.Duration, 0)
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxRetries = 3
+		config.MaxWait = 3 * time.Millisecond
+		config.InitialBackoff = 2 * time.Millisecond
+		config.MaxBackoff = 4 * time.Millisecond
+	}, httpclient.Dependencies{
+		Now: func() time.Time {
+			nowCalls++
+			return time.Unix(int64(nowCalls), 0)
+		},
+		Sleep: func(_ context.Context, delay time.Duration) error {
+			sleeps = append(sleeps, delay)
+			return nil
+		},
+	})
+
+	_, err := client.CountCoverage(
+		context.Background(),
+		pubmed.CoverageQuery{JournalISSNs: []string{"0028-0836"}},
+	)
+	if !errors.Is(err, httpclient.ErrRetryBudgetExceeded) {
+		t.Fatalf(
+			"CountCoverage() error = %v, want shared ErrRetryBudgetExceeded",
+			err,
+		)
+	}
+	if attempts != 2 {
+		t.Fatalf("physical requests = %d, want no request beyond shared wait budget", attempts)
+	}
+	if len(sleeps) != 1 || sleeps[0] != 2*time.Millisecond {
+		t.Fatalf("retry sleeps = %v, want only first 2ms delay", sleeps)
+	}
+}
+
+func TestClientCountCoverageDoesNotRetryMalformedESearchStructure(t *testing.T) {
+	t.Parallel()
+
+	for _, payload := range []string{
+		`{"esearchresult":null}`,
+		`{"esearchresult":{"webenv":1}}`,
+		`{"esearchresult":{"webenv":null}}`,
+		`{"esearchresult":{"querykey":null}}`,
+	} {
+		payload := payload
+		t.Run(payload, func(t *testing.T) {
+			var attempts int
+			server := httptest.NewServer(http.HandlerFunc(func(
+				writer http.ResponseWriter,
+				_ *http.Request,
+			) {
+				attempts++
+				_, _ = writer.Write([]byte(payload))
+			}))
+			defer server.Close()
+
+			client := newClient(t, server, nil, httpclient.Dependencies{})
+			_, err := client.CountCoverage(
+				context.Background(),
+				pubmed.CoverageQuery{JournalISSNs: []string{"0028-0836"}},
+			)
+			if err == nil {
+				t.Fatal("CountCoverage() error = nil, want strict structure error")
+			}
+			if attempts != 1 {
+				t.Fatalf("physical requests = %d, want no protocol retry", attempts)
+			}
+		})
+	}
+}
+
+func TestClientCountCoverageProtocolRetryHonorsContextCancellation(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		attempts++
+		_, _ = writer.Write([]byte(`{"esearchresult":{}}`))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client := newClient(t, server, func(config *pubmed.Config) {
+		config.MaxRetries = 1
+	}, httpclient.Dependencies{
+		Now: func() time.Time { return time.Unix(0, 0) },
+		Sleep: func(context.Context, time.Duration) error {
+			cancel()
+			return context.Canceled
+		},
+	})
+
+	_, err := client.CountCoverage(
+		ctx,
+		pubmed.CoverageQuery{JournalISSNs: []string{"0028-0836"}},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CountCoverage() error = %v, want context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("physical requests = %d, want cancellation before retry", attempts)
+	}
+}
+
 func TestClientCountCoverageRedactsAPIKeyAndEmailFromErrors(t *testing.T) {
 	t.Parallel()
 

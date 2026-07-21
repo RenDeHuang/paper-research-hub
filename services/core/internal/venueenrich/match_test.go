@@ -68,6 +68,182 @@ func TestMatchCrossrefCatalogResolvesUniqueNormalizedTitleAndCanonicalizesISSNs(
 	}
 }
 
+func TestMatchCrossrefCatalogAllowsBlankPublisherEvidence(t *testing.T) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Journal Without Publisher",
+			"",
+			7,
+			[]string{"0028-0836"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Journal Without Publisher")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 ||
+		rows[0].MatchStatus != MatchStatusResolved ||
+		rows[0].CrossrefPublisher != "" {
+		t.Fatalf("rows = %#v, want resolved row with blank publisher", rows)
+	}
+	if err := rows[0].Validate(); err != nil {
+		t.Fatalf("resolved RegistryRow.Validate() error = %v", err)
+	}
+}
+
+func TestMatchCrossrefCatalogIgnoresRecordsWithoutISSNs(t *testing.T) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Deleted",
+			"",
+			0,
+			[]string{},
+			[]CrossrefJournalISSNType{},
+		),
+		matchCatalogRecord(
+			t,
+			"Journal With Identity",
+			"Publisher",
+			11,
+			[]string{"0028-0836"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{
+			matchSourceRow(1, "Deleted"),
+			matchSourceRow(2, "Journal With Identity"),
+		},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 2 ||
+		rows[0].MatchStatus != MatchStatusUnresolved ||
+		rows[1].MatchStatus != MatchStatusResolved {
+		t.Fatalf("rows = %#v, want unresolved no-ISSN row and resolved identity", rows)
+	}
+}
+
+func TestMatchCrossrefCatalogIgnoresNonTargetInvalidISSNChecksum(t *testing.T) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Fortschritte der Physik",
+			"Wiley",
+			4586,
+			[]string{"0015-8208", "1521-3978", "1521-3979"},
+			[]CrossrefJournalISSNType{
+				{Value: "0015-8208", Type: "print"},
+				{Value: "1521-3978", Type: "electronic"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"Journal With Identity",
+			"Publisher",
+			11,
+			[]string{"0028-0836"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Journal With Identity")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].MatchStatus != MatchStatusResolved {
+		t.Fatalf("rows = %#v, want resolved target", rows)
+	}
+}
+
+func TestMatchCrossrefCatalogFiltersInvalidChecksumWhenValidIdentityRemains(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"European Journal of Epidemiology",
+			"Springer-Verlag",
+			5041,
+			[]string{"0393-2990", "1573-7284", "0392-2990"},
+			[]CrossrefJournalISSNType{
+				{Value: "0393-2990", Type: "print"},
+				{Value: "1573-7284", Type: "electronic"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "European Journal of Epidemiology")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 ||
+		rows[0].MatchStatus != MatchStatusResolved ||
+		!slices.Equal(rows[0].AllISSNs, []string{"0393-2990", "1573-7284"}) ||
+		rows[0].PrintISSN != "0393-2990" ||
+		rows[0].EISSN != "1573-7284" {
+		t.Fatalf("rows = %#v, want only checksum-valid ISSN identity", rows)
+	}
+}
+
+func TestMatchCrossrefCatalogLeavesAllInvalidChecksumUnresolved(t *testing.T) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Journal Without Valid Checksum",
+			"Publisher",
+			1,
+			[]string{"1234-5678"},
+			[]CrossrefJournalISSNType{
+				{Value: "1234-5678", Type: "print"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Journal Without Valid Checksum")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].MatchStatus != MatchStatusUnresolved {
+		t.Fatalf("rows = %#v, want unresolved row", rows)
+	}
+}
+
 func TestMatchCrossrefCatalogCollapsesDuplicateRowsWithTheSameIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -109,6 +285,149 @@ func TestMatchCrossrefCatalogCollapsesDuplicateRowsWithTheSameIdentity(t *testin
 	if !slices.Equal(rows[0].AllISSNs, []string{"0028-0836", "2049-3630"}) {
 		t.Fatalf("AllISSNs = %v, want canonical sorted set", rows[0].AllISSNs)
 	}
+}
+
+func TestMatchCrossrefCatalogMergesOverlappingISSNSetsIntoOneIdentity(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Overlapping Identity Journal",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"Overlapping Identity Journal",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+				{Value: "2049-3630", Type: "electronic"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Overlapping Identity Journal")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].MatchStatus != MatchStatusResolved {
+		t.Fatalf("rows = %#v, want one resolved overlapping identity", rows)
+	}
+	if !slices.Equal(rows[0].AllISSNs, []string{"0028-0836", "2049-3630"}) {
+		t.Fatalf("AllISSNs = %v, want union of overlapping identity", rows[0].AllISSNs)
+	}
+	if rows[0].PrintISSN != "0028-0836" ||
+		rows[0].EISSN != "2049-3630" {
+		t.Fatalf(
+			"ISSN roles = print %q electronic %q, want missing evidence not to erase known roles",
+			rows[0].PrintISSN,
+			rows[0].EISSN,
+		)
+	}
+}
+
+func TestMatchCrossrefCatalogRejectsBridgeBetweenDisjointISSNSets(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Transitive Identity Journal",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"Transitive Identity Journal",
+			"Stable Publisher",
+			19,
+			[]string{"3141-592X"},
+			[]CrossrefJournalISSNType{
+				{Value: "3141-592X", Type: "electronic"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"Transitive Identity Journal",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836", "3141-592X"},
+			[]CrossrefJournalISSNType{},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Transitive Identity Journal")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].MatchStatus != MatchStatusAmbiguous {
+		t.Fatalf("rows = %#v, want bridge across disjoint identities to remain ambiguous", rows)
+	}
+	assertMatchHasNoCrossrefEvidence(t, rows[0])
+}
+
+func TestMatchCrossrefCatalogRejectsNestedISSNSetsWithoutMatchingEvidence(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Polluted Superset Journal",
+			"First Publisher",
+			19,
+			[]string{"0028-0836"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"Polluted Superset Journal",
+			"Second Publisher",
+			19,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+				{Value: "2049-3630", Type: "electronic"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Polluted Superset Journal")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].MatchStatus != MatchStatusAmbiguous {
+		t.Fatalf("rows = %#v, want unmatched publisher evidence to remain ambiguous", rows)
+	}
+	assertMatchHasNoCrossrefEvidence(t, rows[0])
 }
 
 func TestMatchCrossrefCatalogCollapsesEquivalentNormalizedDuplicateTitles(
@@ -630,10 +949,11 @@ func TestMatchCrossrefCatalogRejectsInvalidCatalogRecordsWithLocation(t *testing
 		},
 	)
 	tests := []struct {
-		name    string
-		record  []byte
-		want    string
-		recordN int
+		name        string
+		record      []byte
+		sourceTitle string
+		want        string
+		recordN     int
 	}{
 		{
 			name:    "malformed JSON",
@@ -682,21 +1002,6 @@ func TestMatchCrossrefCatalogRejectsInvalidCatalogRecordsWithLocation(t *testing
 			recordN: 2,
 		},
 		{
-			name: "invalid ISSN checksum",
-			record: matchCatalogRecord(
-				t,
-				"Bad Checksum Journal",
-				"Publisher",
-				1,
-				[]string{"1234-5678"},
-				[]CrossrefJournalISSNType{
-					{Value: "1234-5678", Type: "print"},
-				},
-			),
-			want:    "checksum",
-			recordN: 2,
-		},
-		{
 			name: "non-canonical ISSN",
 			record: matchCatalogRecord(
 				t,
@@ -712,19 +1017,6 @@ func TestMatchCrossrefCatalogRejectsInvalidCatalogRecordsWithLocation(t *testing
 			recordN: 2,
 		},
 		{
-			name: "empty ISSN set",
-			record: matchCatalogRecord(
-				t,
-				"Empty Identity Journal",
-				"Publisher",
-				1,
-				[]string{},
-				[]CrossrefJournalISSNType{},
-			),
-			want:    "at least one ISSN",
-			recordN: 2,
-		},
-		{
 			name: "conflicting print roles",
 			record: matchCatalogRecord(
 				t,
@@ -737,8 +1029,9 @@ func TestMatchCrossrefCatalogRejectsInvalidCatalogRecordsWithLocation(t *testing
 					{Value: "2049-3630", Type: "print"},
 				},
 			),
-			want:    "print",
-			recordN: 2,
+			sourceTitle: "Role Conflict Journal",
+			want:        "print",
+			recordN:     2,
 		},
 	}
 
@@ -748,8 +1041,12 @@ func TestMatchCrossrefCatalogRejectsInvalidCatalogRecordsWithLocation(t *testing
 			t.Parallel()
 
 			catalog := writeMatchCatalog(t, valid, test.record)
+			sourceTitle := test.sourceTitle
+			if sourceTitle == "" {
+				sourceTitle = "Valid Journal"
+			}
 			_, err := MatchCrossrefCatalog(
-				[]SourceRow{matchSourceRow(1, "Valid Journal")},
+				[]SourceRow{matchSourceRow(1, sourceTitle)},
 				catalog,
 			)
 			if err == nil {
@@ -831,7 +1128,7 @@ func TestMatchCrossrefCatalogRejectsOversizedAndUnterminatedRecords(t *testing.T
 	}
 }
 
-func TestMatchCrossrefCatalogRejectsConflictingDuplicateEvidence(t *testing.T) {
+func TestMatchCrossrefCatalogKeepsOnlyConsistentDuplicateEvidence(t *testing.T) {
 	t.Parallel()
 
 	type evidence struct {
@@ -850,9 +1147,12 @@ func TestMatchCrossrefCatalogRejectsConflictingDuplicateEvidence(t *testing.T) {
 		},
 	}
 	tests := []struct {
-		name   string
-		second evidence
-		want   string
+		name           string
+		second         evidence
+		wantPublisher  string
+		wantTotalDOIs  int64
+		wantPrintISSN  string
+		wantElectronic string
 	}{
 		{
 			name: "publisher",
@@ -862,7 +1162,9 @@ func TestMatchCrossrefCatalogRejectsConflictingDuplicateEvidence(t *testing.T) {
 				totalDOIs: base.totalDOIs,
 				roles:     base.roles,
 			},
-			want: "publisher",
+			wantTotalDOIs:  base.totalDOIs,
+			wantPrintISSN:  "0028-0836",
+			wantElectronic: "2049-3630",
 		},
 		{
 			name: "DOI count",
@@ -872,7 +1174,9 @@ func TestMatchCrossrefCatalogRejectsConflictingDuplicateEvidence(t *testing.T) {
 				totalDOIs: 10,
 				roles:     base.roles,
 			},
-			want: "DOI",
+			wantPublisher:  base.publisher,
+			wantPrintISSN:  "0028-0836",
+			wantElectronic: "2049-3630",
 		},
 		{
 			name: "ISSN roles",
@@ -885,7 +1189,8 @@ func TestMatchCrossrefCatalogRejectsConflictingDuplicateEvidence(t *testing.T) {
 					{Value: "0028-0836", Type: "electronic"},
 				},
 			},
-			want: "role",
+			wantPublisher: base.publisher,
+			wantTotalDOIs: base.totalDOIs,
 		},
 	}
 
@@ -912,22 +1217,130 @@ func TestMatchCrossrefCatalogRejectsConflictingDuplicateEvidence(t *testing.T) {
 					test.second.roles,
 				),
 			)
-			_, err := MatchCrossrefCatalog(
+			rows, err := MatchCrossrefCatalog(
 				[]SourceRow{matchSourceRow(1, base.title)},
 				catalog,
 			)
-			if err == nil ||
-				!strings.Contains(err.Error(), "record 1") ||
-				!strings.Contains(err.Error(), "record 2") ||
-				!strings.Contains(err.Error(), test.want) {
-				t.Fatalf(
-					"MatchCrossrefCatalog() error = %v, want located %s conflict",
-					err,
-					test.want,
-				)
+			if err != nil {
+				t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+			}
+			if len(rows) != 1 ||
+				rows[0].MatchStatus != MatchStatusResolved ||
+				rows[0].CrossrefPublisher != test.wantPublisher ||
+				rows[0].CrossrefTotalDOIs != test.wantTotalDOIs ||
+				rows[0].PrintISSN != test.wantPrintISSN ||
+				rows[0].EISSN != test.wantElectronic ||
+				!slices.Equal(
+					rows[0].AllISSNs,
+					[]string{"0028-0836", "2049-3630"},
+				) {
+				t.Fatalf("rows = %#v, want conservative merged evidence", rows)
 			}
 		})
 	}
+}
+
+func TestMatchCrossrefCatalogDoesNotRestoreConflictingDuplicateEvidence(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Sticky Conflict Journal",
+			"Publisher A",
+			9,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+				{Value: "2049-3630", Type: "electronic"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"Sticky Conflict Journal",
+			"Publisher B",
+			10,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{
+				{Value: "2049-3630", Type: "print"},
+				{Value: "0028-0836", Type: "electronic"},
+			},
+		),
+		matchCatalogRecord(
+			t,
+			"Sticky Conflict Journal",
+			"Publisher A",
+			9,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{
+				{Value: "0028-0836", Type: "print"},
+				{Value: "2049-3630", Type: "electronic"},
+			},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Sticky Conflict Journal")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 ||
+		rows[0].MatchStatus != MatchStatusResolved ||
+		rows[0].CrossrefPublisher != "" ||
+		rows[0].CrossrefTotalDOIs != 0 ||
+		rows[0].PrintISSN != "" ||
+		rows[0].EISSN != "" {
+		t.Fatalf("rows = %#v, want conflicting evidence to remain cleared", rows)
+	}
+}
+
+func TestMatchCrossrefCatalogExactTitleConflictBlocksISSNSetExpansion(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	catalog := writeMatchCatalog(t,
+		matchCatalogRecord(
+			t,
+			"Title Conflict Journal",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{},
+		),
+		matchCatalogRecord(
+			t,
+			"TITLE CONFLICT JOURNAL",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836", "2049-3630"},
+			[]CrossrefJournalISSNType{},
+		),
+		matchCatalogRecord(
+			t,
+			"Title Conflict Journal",
+			"Stable Publisher",
+			19,
+			[]string{"0028-0836"},
+			[]CrossrefJournalISSNType{},
+		),
+	)
+
+	rows, err := MatchCrossrefCatalog(
+		[]SourceRow{matchSourceRow(1, "Title Conflict Journal")},
+		catalog,
+	)
+	if err != nil {
+		t.Fatalf("MatchCrossrefCatalog() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].MatchStatus != MatchStatusAmbiguous {
+		t.Fatalf("rows = %#v, want exact title conflict to block set expansion", rows)
+	}
+	assertMatchHasNoCrossrefEvidence(t, rows[0])
 }
 
 func TestMatchCrossrefCatalogRejectsInvalidSourceRowsBeforeReadingCatalog(t *testing.T) {

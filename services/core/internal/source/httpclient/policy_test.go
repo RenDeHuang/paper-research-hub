@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -538,6 +539,36 @@ func TestClientHonorsContextCancellationDuringRetryWait(t *testing.T) {
 	}
 }
 
+func TestClientPreservesContextCancellationWhileReadingResponseBody(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	base := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(readerFunc(func([]byte) (int, error) {
+				cancel()
+				return 0, context.Canceled
+			})),
+			Request: request,
+		}, nil
+	})}
+	client, err := httpclient.New(base, validConfig(), httpclient.Dependencies{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.test", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+
+	_, err = client.Do(request)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Do() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestClientRejectsResponsesAboveConfiguredBodyLimit(t *testing.T) {
 	t.Parallel()
 
@@ -952,4 +983,10 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+type readerFunc func([]byte) (int, error)
+
+func (function readerFunc) Read(buffer []byte) (int, error) {
+	return function(buffer)
 }
