@@ -181,6 +181,8 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 		[]string{
 			"publish",
 			"catalog",
+			"--mode",
+			"analysis",
 			"--formula-version",
 			"public-catalog/v1",
 			"--generated-at",
@@ -199,6 +201,12 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 			"00000000-0000-0000-0000-000000000501",
 			"--citation-source",
 			"openalex",
+			"--analysis-cutoff",
+			"2026-07-16T07:00:00Z",
+			"--classifier-version",
+			catalog.CatalogClassifierVersion,
+			"--abstract-route-revision",
+			catalog.CatalogAbstractRouteRevision,
 			"--citation-analysis-run-id",
 			"00000000-0000-0000-0000-000000000701",
 			"--trend-analysis-run-id",
@@ -237,7 +245,20 @@ func TestRealMainParsesCatalogPublishAndOutputsGenerationJSON(t *testing.T) {
 	if !received.GeneratedAt.Equal(generatedAt) {
 		t.Fatalf("GeneratedAt = %s, want %s", received.GeneratedAt, generatedAt)
 	}
-	if received.MetricYear != 2025 ||
+	if received.PublishMode != string(catalog.PublishAnalysis) ||
+		!received.AnalysisCutoff.Equal(time.Date(
+			2026,
+			time.July,
+			16,
+			7,
+			0,
+			0,
+			0,
+			time.UTC,
+		)) ||
+		received.ClassifierVersion != catalog.CatalogClassifierVersion ||
+		received.AbstractRouteRevision != catalog.CatalogAbstractRouteRevision ||
+		received.MetricYear != 2025 ||
 		received.VenuePolicyName != "journal-all-q1" ||
 		received.VenuePolicyVersion != 2 ||
 		received.EligibilityPolicyVersion !=
@@ -322,6 +343,7 @@ func TestRealMainRejectsInvalidOrUnboundedCommandsBeforeMutation(t *testing.T) {
 			name: "catalog publish missing formula version",
 			args: []string{
 				"publish", "catalog",
+				"--mode", "analysis",
 				"--generated-at", "2026-07-16T08:09:10.123456789Z",
 			},
 			want: "formula-version",
@@ -330,6 +352,7 @@ func TestRealMainRejectsInvalidOrUnboundedCommandsBeforeMutation(t *testing.T) {
 			name: "catalog publish formula version is not trimmed",
 			args: []string{
 				"publish", "catalog",
+				"--mode", "analysis",
 				"--formula-version", " public-catalog/v1",
 				"--generated-at", "2026-07-16T08:09:10.123456789Z",
 			},
@@ -339,6 +362,7 @@ func TestRealMainRejectsInvalidOrUnboundedCommandsBeforeMutation(t *testing.T) {
 			name: "catalog publish missing generated at",
 			args: []string{
 				"publish", "catalog",
+				"--mode", "analysis",
 				"--formula-version", "public-catalog/v1",
 			},
 			want: "generated-at",
@@ -347,6 +371,7 @@ func TestRealMainRejectsInvalidOrUnboundedCommandsBeforeMutation(t *testing.T) {
 			name: "catalog publish generated at is not RFC3339Nano",
 			args: []string{
 				"publish", "catalog",
+				"--mode", "analysis",
 				"--formula-version", "public-catalog/v1",
 				"--generated-at", "2026-07-16 08:09:10",
 			},

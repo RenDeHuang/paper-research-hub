@@ -662,10 +662,10 @@ export interface components {
         HomeCoverage: {
             analysis: components["schemas"]["AnalysisMetadata"];
             citation_coverage_ratio: components["schemas"]["RatioCatalogValue"];
-            jcr_metric_year: number;
+            jcr_metric_year: number | components["schemas"]["MissingCatalogValue"];
             mesh_coverage_ratio: components["schemas"]["RatioCatalogValue"];
             publication_type_coverage_ratio: components["schemas"]["RatioCatalogValue"];
-            taxonomy_version: string;
+            taxonomy_version: string | components["schemas"]["MissingCatalogValue"];
         };
         HomePublicationUpdates: {
             /** Format: date */
@@ -689,8 +689,8 @@ export interface components {
             publication_updates: components["schemas"]["HomePublicationUpdates"];
             research_opportunities: components["schemas"]["ResearchOpportunityAnalysisCollection"];
             scope: {
-                jcr_metric_year: number;
-                taxonomy_version: string;
+                jcr_metric_year: number | components["schemas"]["MissingCatalogValue"];
+                taxonomy_version: string | components["schemas"]["MissingCatalogValue"];
             };
             /** @constant */
             snapshot_schema: "home-snapshot/v2";
@@ -821,6 +821,22 @@ export interface components {
             state: "known";
             value: number;
         } | components["schemas"]["UnknownCatalogValue"] | components["schemas"]["MissingCatalogValue"];
+        OfficialLink: {
+            /** @enum {string} */
+            content_channel: "journal_published" | "accepted_early" | "preprint" | "conference_proceeding";
+            /** Format: date-time */
+            expires_at: string;
+            /** @enum {string} */
+            link_role: "official_article" | "doi_url" | "official_preprint" | "official_proceeding";
+            policy_version: string;
+            /** Format: uri */
+            url: string;
+            /** Format: uuid */
+            verification_id: string;
+            /** Format: date-time */
+            verified_at: string;
+            verifier_version: string;
+        };
         Pagination: {
             has_more: boolean;
             limit: number;
@@ -836,6 +852,7 @@ export interface components {
         PaperDetail: {
             abstract?: components["schemas"]["StringCatalogValue"];
             abstract_snippet?: components["schemas"]["StringCatalogValue"];
+            analysis_ready: boolean;
             article_usage: components["schemas"]["MissingCatalogValue"];
             authors?: components["schemas"]["AuthorReference"][];
             canonical_key?: string;
@@ -855,15 +872,21 @@ export interface components {
             journal?: components["schemas"]["JournalReference"];
             mesh_headings: components["schemas"]["MeshHeadingsCatalogValue"];
             methods?: components["schemas"]["TaxonomyReference"][];
+            /** @enum {string} */
+            methods_state: "known" | "missing" | "not_ready";
+            official_link: components["schemas"]["OfficialLink"];
             open_fulltext: components["schemas"]["MissingCatalogValue"];
             publication_types?: string[];
             publication_types_state: components["schemas"]["PublicationTypesCatalogValue"];
+            publicly_visible: boolean;
             published_at: components["schemas"]["DateTimeCatalogValue"];
             source_provenance?: components["schemas"]["SourceProvenanceCatalogValue"];
             status: components["schemas"]["PaperStatus"];
             subjects?: components["schemas"]["TaxonomyReference"][];
             title: string;
             topics?: components["schemas"]["TaxonomyReference"][];
+            /** @enum {string} */
+            topics_state: "known" | "missing" | "not_ready";
             trend_score?: components["schemas"]["NumberCatalogValue"];
             type: components["schemas"]["PaperTypeCatalogValue"];
         };
@@ -877,6 +900,7 @@ export interface components {
         PaperSummary: {
             abstract?: components["schemas"]["StringCatalogValue"];
             abstract_snippet?: components["schemas"]["StringCatalogValue"];
+            analysis_ready: boolean;
             article_usage: components["schemas"]["MissingCatalogValue"];
             authors?: components["schemas"]["AuthorReference"][];
             canonical_key?: string;
@@ -896,15 +920,21 @@ export interface components {
             journal?: components["schemas"]["JournalReference"];
             mesh_headings: components["schemas"]["MeshHeadingsCatalogValue"];
             methods?: components["schemas"]["TaxonomyReference"][];
+            /** @enum {string} */
+            methods_state: "known" | "missing" | "not_ready";
+            official_link: components["schemas"]["OfficialLink"];
             open_fulltext: components["schemas"]["MissingCatalogValue"];
             publication_types?: string[];
             publication_types_state: components["schemas"]["PublicationTypesCatalogValue"];
+            publicly_visible: boolean;
             published_at: components["schemas"]["DateTimeCatalogValue"];
             source_provenance?: components["schemas"]["SourceProvenanceCatalogValue"];
             status: components["schemas"]["PaperStatus"];
             subjects?: components["schemas"]["TaxonomyReference"][];
             title: string;
             topics?: components["schemas"]["TaxonomyReference"][];
+            /** @enum {string} */
+            topics_state: "known" | "missing" | "not_ready";
             trend_score?: components["schemas"]["NumberCatalogValue"];
             type: components["schemas"]["PaperTypeCatalogValue"];
         };

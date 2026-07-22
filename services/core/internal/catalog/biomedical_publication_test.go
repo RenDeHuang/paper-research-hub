@@ -1019,6 +1019,7 @@ func TestPublisherPublicationUpdatesRespectSingleEligibilityGates(t *testing.T) 
 		input.TrendAnalysisRunID,
 		control,
 	)
+	insertCatalogSucceededAbstractRouteRun(t, pool, input, control)
 
 	if _, err := mustPublisher(t, pool).PublishCurrent(
 		context.Background(),
@@ -1687,6 +1688,61 @@ func TestSnapshotRevisionIncludesOpportunityRows(t *testing.T) {
 	}
 }
 
+func TestSnapshotRevisionIncludesPublishModeAndAnalysisBindings(t *testing.T) {
+	input := catalogCurationInput()
+	snapshot := catalogSnapshot{}
+	baseline, err := snapshotRevision(input, snapshot)
+	if err != nil {
+		t.Fatalf("snapshotRevision(baseline) error = %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*PublishInput)
+	}{
+		{
+			name: "publish mode",
+			mutate: func(changed *PublishInput) {
+				changed.Mode = PublishFacts
+			},
+		},
+		{
+			name: "analysis cutoff",
+			mutate: func(changed *PublishInput) {
+				changed.AnalysisCutoff = changed.AnalysisCutoff.Add(-time.Minute)
+			},
+		},
+		{
+			name: "classifier version",
+			mutate: func(changed *PublishInput) {
+				changed.ClassifierVersion = "structured-source-mapping/v2"
+			},
+		},
+		{
+			name: "abstract route revision",
+			mutate: func(changed *PublishInput) {
+				changed.AbstractRouteRevision = strings.Repeat("a", 64)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := input
+			test.mutate(&changed)
+			revision, err := snapshotRevision(changed, snapshot)
+			if err != nil {
+				t.Fatalf("snapshotRevision(%s) error = %v", test.name, err)
+			}
+			if revision == baseline {
+				t.Fatalf(
+					"snapshot revision ignored %s: %s",
+					test.name,
+					revision,
+				)
+			}
+		})
+	}
+}
+
 func preparePublisherAcceptedCurationWithoutBiomedicalRuns(
 	t *testing.T,
 	pool *pgxpool.Pool,
@@ -1694,6 +1750,9 @@ func preparePublisherAcceptedCurationWithoutBiomedicalRuns(
 	fixtures ...publisherWorkFixture,
 ) string {
 	t.Helper()
+	if input.Mode == PublishAnalysis {
+		ensurePublisherClassifierAssertions(t, pool, fixtures...)
+	}
 	_, subjectRuleID := insertCatalogSubjectVersion(t, pool, input.SubjectVersion)
 	venueIDs := make([]uuid.UUID, 0, len(fixtures))
 	jcrFixtures := make([]catalogJCRVenueFixture, 0, len(fixtures))
@@ -1718,6 +1777,11 @@ func preparePublisherAcceptedCurationWithoutBiomedicalRuns(
 	assessCatalogVenuePolicy(t, pool, input)
 	for _, fixture := range fixtures {
 		assessCatalogBiomedicalEligibility(t, pool, fixture.workID, input)
+	}
+	if input.Mode == PublishAnalysis {
+		for _, fixture := range fixtures {
+			insertCatalogSucceededAbstractRouteRun(t, pool, input, fixture)
+		}
 	}
 	return catalogBiomedicalCohortRevisionForFixtures(t, pool, input, fixtures)
 }
@@ -1799,6 +1863,10 @@ func insertCatalogBiomedicalPublicationFixturesWithOptions(
 	}
 
 	asOf := input.GeneratedAt.Add(-3 * time.Minute).UTC()
+	if !input.AnalysisCutoff.IsZero() &&
+		input.AnalysisCutoff.Before(asOf) {
+		asOf = input.AnalysisCutoff.UTC()
+	}
 	startedAt := input.GeneratedAt.Add(-2 * time.Minute).UTC()
 	completedAt := input.GeneratedAt.Add(-time.Minute).UTC()
 	common := map[string]any{

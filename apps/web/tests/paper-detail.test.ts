@@ -107,8 +107,20 @@ const paper = {
       source_path: "/PubmedArticle/MeshHeading[1]/DescriptorName",
     },
   ]),
+  analysis_ready: false,
+  official_link: {
+    content_channel: "journal_published" as const,
+    expires_at: "2026-07-20T08:00:00Z",
+    link_role: "official_article" as const,
+    policy_version: "official-url/v1",
+    url: "https://publisher.example.test/articles/citation-evidence",
+    verification_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    verified_at: "2026-07-19T08:00:00Z",
+    verifier_version: "official-url-verifier/v1",
+  },
   publication_types: ["Randomized Controlled Trial"],
   publication_types_state: known(["Randomized Controlled Trial"]),
+  publicly_visible: true,
   published_at: known("2026-07-15T06:00:00Z"),
   source_provenance: known([]),
   status: "active",
@@ -183,6 +195,20 @@ describe("paper citation evidence", () => {
 
     expect(wrapper.findAll("h1")).toHaveLength(1)
     expect(wrapper.get("h1").text()).toBe(paper.title)
+  })
+
+  it("opens only the persisted verified official URL", async () => {
+    const PaperDetailPage = await loadPaperDetailPage()
+    const wrapper = await mountSuspended(PaperDetailPage, {
+      route: `/papers/${paper.id}`,
+    })
+
+    const link = wrapper.get('[data-official-paper-link="true"]')
+    expect(link.text()).toBe("查看原文")
+    expect(link.attributes("href")).toBe(paper.official_link.url)
+    expect(link.attributes("target")).toBe("_blank")
+    expect(link.attributes("rel")).toBe("noopener noreferrer")
+    expect(link.attributes("href")).not.toContain("doi.org")
   })
 
   it("renders complete MeSH and Publication Type evidence", async () => {

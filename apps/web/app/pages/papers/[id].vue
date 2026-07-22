@@ -85,6 +85,16 @@ useHead(() => ({
       <NuxtLink class="button button--secondary" to="/papers">
         返回论文目录
       </NuxtLink>
+      <a
+        v-if="paper"
+        class="button"
+        :href="paper.official_link.url"
+        target="_blank"
+        rel="noopener noreferrer"
+        data-official-paper-link="true"
+      >
+        查看原文
+      </a>
     </div>
 
     <CatalogState
@@ -219,6 +229,8 @@ useHead(() => ({
 
 .page-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
 }
 
 .detail-section {

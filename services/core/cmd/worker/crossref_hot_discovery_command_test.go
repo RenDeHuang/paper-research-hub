@@ -309,6 +309,16 @@ func TestExecuteCrossrefConnectorRunPersistsPagesAndAdvancesExclusiveWatermarkLa
 	}
 	store := &fakeConnectorRunStore{}
 	record := crossrefWorkerRecord(t)
+	observedAt := time.Date(
+		2026,
+		time.July,
+		19,
+		8,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
 	fetch := func(
 		ctx context.Context,
 		query crossref.Query,
@@ -325,6 +335,7 @@ func TestExecuteCrossrefConnectorRunPersistsPagesAndAdvancesExclusiveWatermarkLa
 				CursorOut:     "",
 				ContentSHA256: strings.Repeat("a", 64),
 				RecordCount:   1,
+				ObservedAt:    observedAt,
 			}); err != nil {
 				yield(source.Record{}, err)
 				return
@@ -342,9 +353,23 @@ func TestExecuteCrossrefConnectorRunPersistsPagesAndAdvancesExclusiveWatermarkLa
 			t.Fatalf("pending job = %#v", pending)
 		}
 		count := 0
-		for _, eventErr := range events {
+		for event, eventErr := range events {
 			if eventErr != nil {
 				return ingestion.JobSummary{}, eventErr
+			}
+			envelope, ok := event.(ingestion.Envelope)
+			if !ok {
+				t.Fatalf("event type = %T, want ingestion.Envelope", event)
+			}
+			if envelope.RawObservation == nil ||
+				envelope.RawObservation.ConnectorRunID != store.run.ID ||
+				envelope.RawObservation.PageOrdinal != 1 ||
+				envelope.RawObservation.RecordOrdinal != 1 ||
+				!envelope.RawObservation.ObservedAt.Equal(observedAt) {
+				t.Fatalf(
+					"event RawObservation = %#v",
+					envelope.RawObservation,
+				)
 			}
 			count++
 		}

@@ -64,10 +64,12 @@ func buildBiomedicalSnapshots(
 	subjectPapers := make(map[uuid.UUID][]publishedPaper)
 	subjectsByID := make(map[uuid.UUID]taxonomyReference)
 	for _, paper := range papers {
-		journalPapers[paper.biomedical.Journal.ID] = append(
-			journalPapers[paper.biomedical.Journal.ID],
-			paper,
-		)
+		if paper.biomedical.Journal.ID != uuid.Nil {
+			journalPapers[paper.biomedical.Journal.ID] = append(
+				journalPapers[paper.biomedical.Journal.ID],
+				paper,
+			)
+		}
 		for _, subject := range paper.biomedical.Subjects {
 			existing, found := subjectsByID[subject.ID]
 			if found && existing != subject {
@@ -167,6 +169,58 @@ func buildBiomedicalSnapshots(
 		return nil, nil, nil, nil, nil, err
 	}
 	return home, subjectListMetadata, journalListMetadata, subjects, journals, nil
+}
+
+func buildFactsSnapshots(
+	input PublishInput,
+	papers []publishedPaper,
+	citationMomentum map[string]any,
+) (
+	json.RawMessage,
+	json.RawMessage,
+	json.RawMessage,
+	[]publishedBiomedicalResource,
+	[]publishedBiomedicalResource,
+	error,
+) {
+	sources := paperAnalysisSources(papers)
+	missingScope := catalogValue{State: "missing"}
+	listMetadata := map[string]any{
+		"analysis": analysisMetadata(
+			input,
+			biomedicalDetailWindowDays,
+			0,
+			missingScope,
+			sources,
+			[]string{"journal_profile_not_published"},
+		),
+		"jcr_metric_year":  missingScope,
+		"taxonomy_version": missingScope,
+	}
+	subjectListMetadata, err := marshalCatalogPayload(listMetadata)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	journalListMetadata, err := marshalCatalogPayload(listMetadata)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	home, err := buildHomeSnapshot(
+		input,
+		papers,
+		map[uuid.UUID]journalSnapshotProfile{},
+		sources,
+		citationMomentum,
+	)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	return home,
+		subjectListMetadata,
+		journalListMetadata,
+		[]publishedBiomedicalResource{},
+		[]publishedBiomedicalResource{},
+		nil
 }
 
 func loadJCRReceiptSource(
@@ -708,9 +762,12 @@ func buildHomeSnapshot(
 	if err != nil {
 		return nil, err
 	}
-	activeJournals, err := journalActivityItems(recentPapers, journals)
-	if err != nil {
-		return nil, err
+	activeJournals := []map[string]any{}
+	if input.Mode == PublishAnalysis {
+		activeJournals, err = journalActivityItems(recentPapers, journals)
+		if err != nil {
+			return nil, err
+		}
 	}
 	publicationUpdates, err := buildPublicationUpdates(input, papers)
 	if err != nil {
@@ -755,6 +812,12 @@ func buildHomeSnapshot(
 			[]string{signal},
 		)
 	}
+	var jcrMetricYear any = input.JCRMetricYear
+	var taxonomyVersion any = input.SubjectVersion
+	if input.Mode == PublishFacts {
+		jcrMetricYear = catalogValue{State: "missing"}
+		taxonomyVersion = catalogValue{State: "missing"}
+	}
 	payload, err := marshalCatalogPayload(map[string]any{
 		"active_journals": map[string]any{
 			"analysis": analysisMetadata(
@@ -774,7 +837,7 @@ func buildHomeSnapshot(
 				knownCitations,
 				len(coveragePapers),
 			),
-			"jcr_metric_year": input.JCRMetricYear,
+			"jcr_metric_year": jcrMetricYear,
 			"mesh_coverage_ratio": ratioCatalogValue(
 				knownMeSH,
 				len(coveragePapers),
@@ -783,7 +846,7 @@ func buildHomeSnapshot(
 				knownPublicationTypes,
 				len(coveragePapers),
 			),
-			"taxonomy_version": input.SubjectVersion,
+			"taxonomy_version": taxonomyVersion,
 		},
 		"entity_momentum": map[string]any{
 			"analysis": unavailableAnalysis(
@@ -813,8 +876,8 @@ func buildHomeSnapshot(
 			"items": []any{},
 		},
 		"scope": map[string]any{
-			"jcr_metric_year":  input.JCRMetricYear,
-			"taxonomy_version": input.SubjectVersion,
+			"jcr_metric_year":  jcrMetricYear,
+			"taxonomy_version": taxonomyVersion,
 		},
 		"subject_momentum": map[string]any{
 			"analysis": unavailableAnalysis(
@@ -1194,6 +1257,9 @@ func journalActivityItems(
 ) ([]map[string]any, error) {
 	counts := make(map[uuid.UUID]int64)
 	for _, paper := range papers {
+		if paper.biomedical.Journal.ID == uuid.Nil {
+			continue
+		}
 		counts[paper.biomedical.Journal.ID]++
 	}
 	type activity struct {
@@ -1347,6 +1413,21 @@ func biomedicalAnalysisSources(
 	jcrSource string,
 ) []string {
 	unique := map[string]struct{}{jcrSource: {}}
+	for _, paper := range papers {
+		for _, source := range paper.SourceNames {
+			unique[source] = struct{}{}
+		}
+	}
+	values := make([]string, 0, len(unique))
+	for source := range unique {
+		values = append(values, source)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func paperAnalysisSources(papers []publishedPaper) []string {
+	unique := make(map[string]struct{})
 	for _, paper := range papers {
 		for _, source := range paper.SourceNames {
 			unique[source] = struct{}{}

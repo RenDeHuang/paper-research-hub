@@ -206,6 +206,24 @@ describe("SyncStatus", () => {
       "JCR 2025 · 全部 Q1",
     ])
   })
+
+  it("renders an explicit not-ready scope when JCR facts are missing", async () => {
+    const wrapper = await mountSuspended(SyncStatus, {
+      props: {
+        calendarDate: "2026-07-19",
+        calendarTimezone: "UTC",
+        generatedAt: "2026-07-19T08:30:00Z",
+        jcrMetricYear: { state: "missing" },
+      },
+    })
+
+    expect(wrapper.findAll("dd").map((item) => item.text())).toEqual([
+      "2026-07-19",
+      "2026-07-19 08:30 UTC",
+      "UTC",
+      "未就绪",
+    ])
+  })
 })
 
 const publicationPaper = {

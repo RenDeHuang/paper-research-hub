@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
 )
 
@@ -42,14 +44,61 @@ type Event interface {
 	cloneEvent() Event
 }
 
+type RawObservationBoundary struct {
+	ConnectorRunID string
+	ObservedAt     time.Time
+	PageOrdinal    int
+	RecordOrdinal  int
+}
+
+func NewRawObservationBoundary(
+	connectorRunID string,
+	observedAt time.Time,
+	pageOrdinal int,
+	recordOrdinal int,
+) (RawObservationBoundary, error) {
+	boundary := RawObservationBoundary{
+		ConnectorRunID: strings.TrimSpace(connectorRunID),
+		ObservedAt:     observedAt.UTC().Truncate(time.Microsecond),
+		PageOrdinal:    pageOrdinal,
+		RecordOrdinal:  recordOrdinal,
+	}
+	if err := boundary.Validate(); err != nil {
+		return RawObservationBoundary{}, err
+	}
+	return boundary, nil
+}
+
+func (boundary RawObservationBoundary) Validate() error {
+	if _, err := uuid.Parse(boundary.ConnectorRunID); err != nil {
+		return errors.New("raw observation connector run ID must be a UUID")
+	}
+	if boundary.ObservedAt.IsZero() {
+		return errors.New("raw observation observed_at is required")
+	}
+	if boundary.ObservedAt != boundary.ObservedAt.UTC().Truncate(time.Microsecond) {
+		return errors.New(
+			"raw observation observed_at requires UTC PostgreSQL microsecond precision",
+		)
+	}
+	if boundary.PageOrdinal < 1 {
+		return errors.New("raw observation page ordinal must be positive")
+	}
+	if boundary.RecordOrdinal < 1 {
+		return errors.New("raw observation record ordinal must be positive")
+	}
+	return nil
+}
+
 type Envelope struct {
-	LogicalSource string
-	EventKey      string
-	SourceTime    time.Time
-	TieBreakKey   string
-	Position      int64
-	Record        source.Record
-	Raw           source.RawRecord
+	LogicalSource  string
+	EventKey       string
+	SourceTime     time.Time
+	TieBreakKey    string
+	Position       int64
+	Record         source.Record
+	Raw            source.RawRecord
+	RawObservation *RawObservationBoundary
 }
 
 func NewEnvelope(
@@ -116,11 +165,39 @@ func (envelope Envelope) Validate() error {
 		!bytes.Equal(envelope.Record.Raw.Payload, envelope.Raw.Payload) {
 		return errors.New("record raw payload conflicts with envelope raw payload")
 	}
+	if envelope.RawObservation != nil {
+		if err := envelope.RawObservation.Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
+func (envelope Envelope) WithRawObservation(
+	boundary RawObservationBoundary,
+) (Envelope, error) {
+	if err := envelope.Validate(); err != nil {
+		return Envelope{}, err
+	}
+	normalized, err := NewRawObservationBoundary(
+		boundary.ConnectorRunID,
+		boundary.ObservedAt,
+		boundary.PageOrdinal,
+		boundary.RecordOrdinal,
+	)
+	if err != nil {
+		return Envelope{}, err
+	}
+	observed := envelope.Clone()
+	observed.RawObservation = &normalized
+	if err := observed.Validate(); err != nil {
+		return Envelope{}, err
+	}
+	return observed, nil
+}
+
 func (envelope Envelope) Clone() Envelope {
-	return Envelope{
+	cloned := Envelope{
 		LogicalSource: envelope.LogicalSource,
 		EventKey:      envelope.EventKey,
 		SourceTime:    envelope.SourceTime,
@@ -129,6 +206,11 @@ func (envelope Envelope) Clone() Envelope {
 		Record:        cloneSourceRecord(envelope.Record),
 		Raw:           cloneRawRecord(envelope.Raw),
 	}
+	if envelope.RawObservation != nil {
+		observation := *envelope.RawObservation
+		cloned.RawObservation = &observation
+	}
+	return cloned
 }
 
 func (envelope Envelope) cloneEvent() Event {
@@ -279,6 +361,7 @@ func cloneSourceRecord(record source.Record) source.Record {
 		AnyRepositoryHasFulltext: clonePointer(record.OpenAccess.AnyRepositoryHasFulltext),
 	}
 	cloned.Licenses = slices.Clone(record.Licenses)
+	cloned.URLCandidates = slices.Clone(record.URLCandidates)
 	cloned.Retracted = clonePointer(record.Retracted)
 	cloned.CodeURLs = slices.Clone(record.CodeURLs)
 	cloned.Scope = source.ScopeDecision{

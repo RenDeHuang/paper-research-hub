@@ -176,6 +176,7 @@ func TestPublisherRequiresAcceptedBiomedicalJCRAssessment(t *testing.T) {
 	_ = subjectVersionID
 
 	workIDs := make(map[string]uuid.UUID, len(fixtures))
+	workFixtures := make(map[string]publisherWorkFixture, len(fixtures))
 	type preparedFixture struct {
 		spec    int
 		venueID uuid.UUID
@@ -186,6 +187,9 @@ func TestPublisherRequiresAcceptedBiomedicalJCRAssessment(t *testing.T) {
 			eventKey:          "pubmed:curation-" + strings.ReplaceAll(spec.name, " ", "-"),
 			canonicalKey:      fmt.Sprintf("doi:10.1000/curation-%02d", index),
 			title:             "Curation " + spec.name,
+			topicNames:        []string{"Curation Topic " + spec.name},
+			methodNames:       []string{"Curation Method " + spec.name},
+			publishedAt:       input.AnalysisCutoff.Add(-time.Hour),
 			scopeStatus:       "included",
 			includeWorkLink:   true,
 			includeWorkID:     true,
@@ -203,6 +207,7 @@ func TestPublisherRequiresAcceptedBiomedicalJCRAssessment(t *testing.T) {
 			),
 		})
 		workIDs[spec.name] = fixture.workID
+		workFixtures[spec.name] = fixture
 		venueID := catalogWorkVenueID(t, pool, fixture.workID)
 		if _, err := pool.Exec(context.Background(), `
 			UPDATE works
@@ -278,6 +283,12 @@ func TestPublisherRequiresAcceptedBiomedicalJCRAssessment(t *testing.T) {
 		),
 		input.TrendAnalysisRunID,
 	)
+	insertCatalogSucceededAbstractRouteRun(
+		t,
+		pool,
+		input,
+		workFixtures["accepted"],
+	)
 
 	publisher := mustPublisher(t, pool)
 	generation, err := publisher.PublishCurrent(context.Background(), input)
@@ -313,6 +324,10 @@ func TestPublisherRequiresAcceptedBiomedicalJCRAssessment(t *testing.T) {
 		t.Fatalf("decode Catalog generation metadata: %v", err)
 	}
 	for key, want := range map[string]any{
+		"mode":                        string(input.Mode),
+		"analysis_cutoff":             input.AnalysisCutoff.Format(time.RFC3339Nano),
+		"classifier_version":          input.ClassifierVersion,
+		"abstract_route_revision":     input.AbstractRouteRevision,
 		"jcr_metric_year":             float64(input.JCRMetricYear),
 		"venue_policy_name":           input.VenuePolicyName,
 		"venue_policy_version":        float64(input.VenuePolicyVersion),
@@ -349,6 +364,40 @@ func TestValidatePublishInputRequiresExplicitBiomedicalEligibilityPolicyVersion(
 		!strings.Contains(err.Error(), "unsupported biomedical eligibility policy") {
 		t.Fatalf(
 			"validatePublishInput(unsupported eligibility policy) error = %v",
+			err,
+		)
+	}
+}
+
+func TestValidatePublishInputAcceptsFactsModeWithoutAnalysisRuns(t *testing.T) {
+	t.Parallel()
+
+	input := catalogCurationInput()
+	input.Mode = PublishFacts
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	input.CitationAnalysisRunID = uuid.Nil
+	input.TrendAnalysisRunID = uuid.Nil
+	input.JournalAnalysisRunID = uuid.Nil
+	input.OpportunityAnalysisRunID = uuid.Nil
+	if err := validatePublishInput(input); err != nil {
+		t.Fatalf(
+			"validatePublishInput(facts without analysis runs) error = %v",
+			err,
+		)
+	}
+}
+
+func TestValidatePublishInputRejectsFactsModeWithAnalysisRuns(t *testing.T) {
+	t.Parallel()
+
+	input := catalogCurationInput()
+	input.Mode = PublishFacts
+	if err := validatePublishInput(input); err == nil ||
+		!strings.Contains(err.Error(), "must not include analysis runs") {
+		t.Fatalf(
+			"validatePublishInput(facts with analysis runs) error = %v",
 			err,
 		)
 	}
@@ -613,6 +662,22 @@ func TestPublisherReturnsEmptyDomainWhenNoWorkPassesCurationGate(t *testing.T) {
 	assertNoCatalogWrites(t, pool)
 }
 
+func TestValidatePublishInputAnalysisRequiresReadinessBindings(t *testing.T) {
+	t.Parallel()
+
+	input := catalogCurationInput()
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	err := validatePublishInput(input)
+	if err == nil || !strings.Contains(err.Error(), "analysis cutoff") {
+		t.Fatalf(
+			"validatePublishInput(analysis without readiness bindings) error = %v, want analysis cutoff",
+			err,
+		)
+	}
+}
+
 func catalogCurationInput() PublishInput {
 	return catalogCurationInputAt(
 		time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC),
@@ -621,8 +686,12 @@ func catalogCurationInput() PublishInput {
 
 func catalogCurationInputAt(generatedAt time.Time) PublishInput {
 	return PublishInput{
+		Mode:                     PublishAnalysis,
 		FormulaVersion:           "public-catalog/biomedical-v1",
 		GeneratedAt:              generatedAt,
+		AnalysisCutoff:           generatedAt.Add(-time.Hour),
+		ClassifierVersion:        CatalogClassifierVersion,
+		AbstractRouteRevision:    CatalogAbstractRouteRevision,
 		JCRMetricYear:            2025,
 		VenuePolicyName:          "journal-all-q1",
 		VenuePolicyVersion:       2,
@@ -658,6 +727,11 @@ func preparePublisherAcceptedCuration(
 		analysisWorkIDs = append(analysisWorkIDs, fixture.workID)
 	}
 	insertCatalogCitationAnalysisRun(t, pool, input, analysisWorkIDs...)
+	if input.Mode == PublishAnalysis {
+		for _, fixture := range fixtures {
+			insertCatalogSucceededAbstractRouteRun(t, pool, input, fixture)
+		}
+	}
 }
 
 func preparePublisherAcceptedCurationReferences(
@@ -667,6 +741,9 @@ func preparePublisherAcceptedCurationReferences(
 	fixtures ...publisherWorkFixture,
 ) {
 	t.Helper()
+	if input.Mode == PublishAnalysis {
+		ensurePublisherClassifierAssertions(t, pool, fixtures...)
+	}
 	_, subjectRuleID := insertCatalogSubjectVersion(t, pool, input.SubjectVersion)
 	jcrFixtures := make([]catalogJCRVenueFixture, 0, len(fixtures))
 	venueIDs := make([]uuid.UUID, 0, len(fixtures))
@@ -891,6 +968,10 @@ func insertCatalogCitationAnalysisRunWithOptions(
 	t.Helper()
 	ctx := context.Background()
 	asOf := input.GeneratedAt.Add(-2 * time.Minute).UTC()
+	if !input.AnalysisCutoff.IsZero() &&
+		input.AnalysisCutoff.Before(asOf) {
+		asOf = input.AnalysisCutoff.UTC()
+	}
 	completedAt := input.GeneratedAt.Add(-time.Minute).UTC()
 	tx, err := pool.Begin(ctx)
 	if err != nil {

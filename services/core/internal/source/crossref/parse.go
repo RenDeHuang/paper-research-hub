@@ -14,6 +14,7 @@ import (
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/urlverify"
 )
 
 type workPayload struct {
@@ -31,6 +32,7 @@ type workPayload struct {
 	Created             *timestampPayload   `json:"created"`
 	Deposited           *timestampPayload   `json:"deposited"`
 	Indexed             *timestampPayload   `json:"indexed"`
+	URL                 string              `json:"URL"`
 	Abstract            string              `json:"abstract"`
 	Licenses            []licensePayload    `json:"license"`
 	UpdateTo            []updateToPayload   `json:"update-to"`
@@ -167,6 +169,10 @@ func Parse(raw json.RawMessage) (source.Record, error) {
 	if err != nil {
 		return source.Record{}, err
 	}
+	urlCandidates, err := parseURLCandidates(work, identity)
+	if err != nil {
+		return source.Record{}, err
+	}
 
 	scope, err := source.NewScopeDecision(
 		source.ScopePending,
@@ -200,10 +206,55 @@ func Parse(raw json.RawMessage) (source.Record, error) {
 		Relations:                 relations,
 		Venue:                     venue,
 		Licenses:                  licenses,
+		URLCandidates:             urlCandidates,
 		Scope:                     scope,
 	}
 	record.Evidence = buildEvidence(record, venueEvidence, indexedAt != nil)
 	return record, nil
+}
+
+func parseURLCandidates(
+	work workPayload,
+	identity paper.Identifier,
+) ([]source.URLCandidate, error) {
+	if work.URL == "" {
+		return nil, nil
+	}
+	if work.URL != strings.TrimSpace(work.URL) {
+		return nil, errors.New(
+			"Crossref $.URL must be exact and trimmed",
+		)
+	}
+	if err := urlverify.ValidateSourceHTTPSURL(work.URL); err != nil {
+		return nil, fmt.Errorf(
+			"Crossref $.URL is outside the accepted HTTP(S) URL subset: %w",
+			err,
+		)
+	}
+
+	var channel string
+	switch strings.TrimSpace(work.Type) {
+	case "journal-article":
+		channel = "journal_published"
+	case "posted-content":
+		channel = "preprint"
+	case "proceedings-article":
+		channel = "conference_proceeding"
+	default:
+		return nil, nil
+	}
+
+	return []source.URLCandidate{{
+		URL:            work.URL,
+		SourcePath:     "$.URL",
+		ContentChannel: channel,
+		LinkRole:       source.URLLinkRoleDOIURL,
+		ParserVersion:  ParserVersion,
+		Identifier: source.Identifier{
+			Scheme: source.IdentifierDOI,
+			Value:  identity.Value(),
+		},
+	}}, nil
 }
 
 func parseAuthors(values []authorPayload) ([]source.Author, error) {
@@ -746,6 +797,7 @@ func buildEvidence(
 	add("created_at", "$.created.date-time", record.CreatedAt != nil)
 	add("updated_at", "$.deposited.date-time", record.UpdatedAt != nil)
 	add("crossref_indexed_at", "$.indexed.date-time", hasIndexedAt)
+	add("url_candidates", "$.URL", len(record.URLCandidates) > 0)
 	for _, license := range record.Licenses {
 		add("licenses", license.SourcePath, true)
 	}

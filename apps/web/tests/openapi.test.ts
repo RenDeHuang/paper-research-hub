@@ -267,6 +267,76 @@ describe("OpenAPI contract", () => {
     })
   })
 
+  it("allows Facts Home scope fields to report missing instead of fabricated JCR values", () => {
+    const missingRef = {
+      $ref: "#/components/schemas/MissingCatalogValue",
+    }
+    const yearOrMissing = {
+      oneOf: [
+        {
+          type: "integer",
+          minimum: 1900,
+          maximum: 3000,
+        },
+        missingRef,
+      ],
+    }
+    const stringOrMissing = {
+      oneOf: [
+        {
+          type: "string",
+          minLength: 1,
+        },
+        missingRef,
+      ],
+    }
+
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "HomeCoverage",
+        "properties",
+        "jcr_metric_year",
+      ),
+    ).toEqual(yearOrMissing)
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "HomeCoverage",
+        "properties",
+        "taxonomy_version",
+      ),
+    ).toEqual(stringOrMissing)
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "HomeResponse",
+        "properties",
+        "scope",
+        "properties",
+        "jcr_metric_year",
+      ),
+    ).toEqual(yearOrMissing)
+    expect(
+      getRecord(
+        document,
+        "components",
+        "schemas",
+        "HomeResponse",
+        "properties",
+        "scope",
+        "properties",
+        "taxonomy_version",
+      ),
+    ).toEqual(stringOrMissing)
+  })
+
   it("declares every biomedical field emitted by the paper publisher", () => {
     const emittedFields = {
       mesh_headings:
@@ -300,6 +370,128 @@ describe("OpenAPI contract", () => {
           $ref: reference,
         })
       }
+    }
+  })
+
+  it("defines the strict verified official link contract", () => {
+    expect(
+      getRecord(document, "components", "schemas", "OfficialLink"),
+    ).toEqual({
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "url",
+        "verification_id",
+        "link_role",
+        "content_channel",
+        "verified_at",
+        "expires_at",
+        "verifier_version",
+        "policy_version",
+      ],
+      properties: {
+        url: {
+          type: "string",
+          format: "uri",
+          pattern: "^https://",
+        },
+        verification_id: {
+          type: "string",
+          format: "uuid",
+        },
+        link_role: {
+          type: "string",
+          enum: [
+            "official_article",
+            "doi_url",
+            "official_preprint",
+            "official_proceeding",
+          ],
+        },
+        content_channel: {
+          type: "string",
+          enum: [
+            "journal_published",
+            "accepted_early",
+            "preprint",
+            "conference_proceeding",
+          ],
+        },
+        verified_at: {
+          type: "string",
+          format: "date-time",
+        },
+        expires_at: {
+          type: "string",
+          format: "date-time",
+        },
+        verifier_version: {
+          type: "string",
+          minLength: 1,
+        },
+        policy_version: {
+          type: "string",
+          minLength: 1,
+        },
+      },
+    })
+  })
+
+  it("requires server-provided visibility state on paper payloads", () => {
+    for (const schemaName of ["PaperSummary", "PaperDetail"]) {
+      const paper = getRecord(
+        document,
+        "components",
+        "schemas",
+        schemaName,
+      )
+      expect(paper).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+        required: expect.arrayContaining([
+          "official_link",
+          "publicly_visible",
+          "analysis_ready",
+        ]),
+        properties: {
+          official_link: {
+            $ref: "#/components/schemas/OfficialLink",
+          },
+          publicly_visible: {
+            type: "boolean",
+          },
+          analysis_ready: {
+            type: "boolean",
+          },
+        },
+      })
+    }
+  })
+
+  it("requires explicit taxonomy readiness on paper payloads", () => {
+    for (const schemaName of ["PaperSummary", "PaperDetail"]) {
+      const paper = getRecord(
+        document,
+        "components",
+        "schemas",
+        schemaName,
+      )
+      expect(paper).toMatchObject({
+        required: expect.arrayContaining([
+          "topics_state",
+          "methods_state",
+        ]),
+        properties: {
+          topics_state: {
+            type: "string",
+            enum: ["known", "missing", "not_ready"],
+          },
+          methods_state: {
+            type: "string",
+            enum: ["known", "missing", "not_ready"],
+          },
+        },
+      })
     }
   })
 

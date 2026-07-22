@@ -18,9 +18,23 @@ var (
 	ErrCatalogNotReady     = errors.New("public catalog source state is not ready")
 )
 
+type PublishMode string
+
+const (
+	PublishFacts    PublishMode = "facts"
+	PublishAnalysis PublishMode = "analysis"
+
+	CatalogClassifierVersion     = "structured-source-mapping/v1"
+	CatalogAbstractRouteRevision = "d07268e9700db5187b368db49780d436c1cd200cade23fe02019b66f1f1a5039"
+)
+
 type PublishInput struct {
+	Mode                     PublishMode
 	FormulaVersion           string
 	GeneratedAt              time.Time
+	AnalysisCutoff           time.Time
+	ClassifierVersion        string
+	AbstractRouteRevision    string
 	JCRMetricYear            int
 	VenuePolicyName          string
 	VenuePolicyVersion       int

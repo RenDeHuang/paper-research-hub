@@ -3,7 +3,7 @@ const props = defineProps<{
   calendarDate: string
   calendarTimezone: "UTC"
   generatedAt: string
-  jcrMetricYear: number
+  jcrMetricYear: number | { state: "missing" }
 }>()
 
 const updatedAt = computed(() => {
@@ -32,7 +32,9 @@ const items = computed(() => [
   { label: "时区", value: props.calendarTimezone },
   {
     label: "收录范围",
-    value: `JCR ${props.jcrMetricYear} · 全部 Q1`,
+    value: typeof props.jcrMetricYear === "number"
+      ? `JCR ${props.jcrMetricYear} · 全部 Q1`
+      : "未就绪",
   },
 ])
 </script>

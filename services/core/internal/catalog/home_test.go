@@ -287,6 +287,7 @@ func TestHomeSnapshotUsesApprovedAnalysisWindows(t *testing.T) {
 		homeWindowPaper(uuid.New(), journalID, "Stale paper", staleAt),
 	}
 	input := PublishInput{
+		Mode:           PublishAnalysis,
 		FormulaVersion: "public-catalog/biomedical-v1",
 		GeneratedAt:    generatedAt,
 		JCRMetricYear:  2025,

@@ -8,7 +8,39 @@ import (
 
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/paper"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/source/crossref"
 )
+
+func TestNormalizedPayloadV4DoesNotPersistUnsupportedCrossrefURLCandidate(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	record, err := crossref.Parse([]byte(`{
+		"DOI":"10.1000/v4-book-chapter",
+		"type":"book-chapter",
+		"URL":"https://publisher.example.test/v4-book-chapter"
+	}`))
+	if err != nil {
+		t.Fatalf("crossref.Parse() error = %v", err)
+	}
+	payload, err := json.Marshal(recordPayload(record))
+	if err != nil {
+		t.Fatalf("json.Marshal(recordPayload()) error = %v", err)
+	}
+	var decoded struct {
+		URLCandidates []json.RawMessage `json:"url_candidates"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(v4 payload) error = %v", err)
+	}
+	if len(decoded.URLCandidates) != 0 {
+		t.Fatalf(
+			"normalized v4 URL candidates = %s, want empty",
+			payload,
+		)
+	}
+}
 
 func TestNormalizedPayloadV4PreservesCompleteSourceAssertion(t *testing.T) {
 	t.Parallel()
@@ -109,6 +141,17 @@ func TestNormalizedPayloadV4PreservesCompleteSourceAssertion(t *testing.T) {
 			URL:        "https://creativecommons.org/licenses/by/4.0/",
 			SourcePath: "/PubmedArticle/PubmedData/License",
 		}},
+		URLCandidates: []source.URLCandidate{{
+			URL:            "https://publisher.example.test/article",
+			SourcePath:     "/PubmedArticle/PubmedData/ArticleIdList/ArticleId[1]",
+			ContentChannel: "journal_published",
+			LinkRole:       source.URLLinkRoleOfficialArticle,
+			ParserVersion:  "pubmed/pubmed-article-v1",
+			Identifier: source.Identifier{
+				Scheme: source.IdentifierDOI,
+				Value:  "10.1000/normalized-v4",
+			},
+		}},
 		CodeURLs: []string{"https://github.com/example/normalized-v4"},
 		Evidence: []source.FieldEvidence{{
 			Field:      "abstract",
@@ -152,6 +195,7 @@ func TestNormalizedPayloadV4PreservesCompleteSourceAssertion(t *testing.T) {
 		"venue",
 		"open_access",
 		"licenses",
+		"url_candidates",
 		"code_urls",
 		"evidence",
 	}
@@ -169,6 +213,10 @@ func TestNormalizedPayloadV4PreservesCompleteSourceAssertion(t *testing.T) {
 	if got := firstNestedString(payload, "licenses", "source_path"); got !=
 		record.Licenses[0].SourcePath {
 		t.Errorf("licenses[0].source_path = %q", got)
+	}
+	if got := firstNestedString(payload, "url_candidates", "url"); got !=
+		record.URLCandidates[0].URL {
+		t.Errorf("url_candidates[0].url = %q", got)
 	}
 	if got := firstNestedString(payload, "evidence", "SourcePath"); got !=
 		record.Evidence[0].SourcePath {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -68,6 +69,180 @@ func TestParseRequiresAndNormalizesDOIAsCrossrefIdentity(t *testing.T) {
 		SourcePath: "$.DOI",
 	}) {
 		t.Fatalf("Evidence = %#v, want only mapped DOI evidence", record.Evidence)
+	}
+	if len(record.URLCandidates) != 0 {
+		t.Fatalf(
+			"URLCandidates = %#v, DOI must not be converted into a guessed URL",
+			record.URLCandidates,
+		)
+	}
+}
+
+func TestParsePreservesSourceProvidedDOIResolverURLCandidate(t *testing.T) {
+	t.Parallel()
+
+	record, err := crossref.Parse([]byte(`{
+		"DOI":"10.1000/official-url",
+		"type":"journal-article",
+		"URL":"https://publisher.example.test/articles/official-url"
+	}`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	want := []source.URLCandidate{{
+		URL:            "https://publisher.example.test/articles/official-url",
+		SourcePath:     "$.URL",
+		ContentChannel: "journal_published",
+		LinkRole:       source.URLLinkRoleDOIURL,
+		ParserVersion:  crossref.ParserVersion,
+		Identifier: source.Identifier{
+			Scheme: source.IdentifierDOI,
+			Value:  "10.1000/official-url",
+		},
+	}}
+	if !slices.Equal(record.URLCandidates, want) {
+		t.Fatalf("URLCandidates = %#v, want %#v", record.URLCandidates, want)
+	}
+	if !slices.Contains(record.Evidence, source.FieldEvidence{
+		Field:      "url_candidates",
+		SourcePath: "$.URL",
+	}) {
+		t.Fatalf("Evidence = %#v, want exact URL source path", record.Evidence)
+	}
+}
+
+func TestParseRejectsCrossrefURLFragment(t *testing.T) {
+	t.Parallel()
+
+	_, err := crossref.Parse([]byte(`{
+		"DOI":"10.1000/fragment",
+		"type":"journal-article",
+		"URL":"https://publisher.example.test/article#abstract"
+	}`))
+	if err == nil ||
+		!strings.Contains(err.Error(), "Crossref $.URL") ||
+		!strings.Contains(err.Error(), "fragment") {
+		t.Fatalf("Parse(fragment) error = %v", err)
+	}
+}
+
+func TestParseRejectsNonExactOrMalformedCrossrefURL(t *testing.T) {
+	t.Parallel()
+
+	for _, rawURL := range []string{
+		" https://publisher.example.test/article",
+		"https://publisher.example.test/article ",
+		"http://doi.org/10.1000/exact-url",
+		"https://publisher.example.test/article?view=%zz",
+		"https://publisher.example.test/article?view=%",
+	} {
+		rawURL := rawURL
+		t.Run(rawURL, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := crossref.Parse([]byte(fmt.Sprintf(`{
+				"DOI":"10.1000/exact-url",
+				"type":"journal-article",
+				"URL":%q
+			}`, rawURL)))
+			if err == nil ||
+				!strings.Contains(err.Error(), "Crossref $.URL") {
+				t.Fatalf("Parse(URL=%q) error = %v", rawURL, err)
+			}
+		})
+	}
+}
+
+func TestParsePreservesValidPercentEncodedCrossrefURL(t *testing.T) {
+	t.Parallel()
+
+	const rawURL = "https://publisher.example.test/article%2Fpart?view=%2Ffull"
+	record, err := crossref.Parse([]byte(fmt.Sprintf(`{
+		"DOI":"10.1000/encoded-url",
+		"type":"journal-article",
+		"URL":%q
+	}`, rawURL)))
+	if err != nil {
+		t.Fatalf("Parse(valid percent encoding) error = %v", err)
+	}
+	if len(record.URLCandidates) != 1 ||
+		record.URLCandidates[0].URL != rawURL {
+		t.Fatalf(
+			"URLCandidates = %#v, want exact URL %q",
+			record.URLCandidates,
+			rawURL,
+		)
+	}
+}
+
+func TestParseDoesNotEmitURLCandidateForUnsupportedCrossrefType(t *testing.T) {
+	t.Parallel()
+
+	record, err := crossref.Parse([]byte(`{
+		"DOI":"10.1000/book-chapter",
+		"type":"book-chapter",
+		"URL":"https://publisher.example.test/book-chapter"
+	}`))
+	if err != nil {
+		t.Fatalf("Parse(unsupported type) error = %v", err)
+	}
+	if len(record.URLCandidates) != 0 {
+		t.Fatalf(
+			"URLCandidates(unsupported type) = %#v, want empty",
+			record.URLCandidates,
+		)
+	}
+}
+
+func TestParseKeepsChannelsAndUsesDOIResolverRoleForSupportedTypes(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		typ     string
+		channel string
+	}{
+		{
+			name:    "journal article",
+			typ:     "journal-article",
+			channel: "journal_published",
+		},
+		{
+			name:    "posted content",
+			typ:     "posted-content",
+			channel: "preprint",
+		},
+		{
+			name:    "proceedings article",
+			typ:     "proceedings-article",
+			channel: "conference_proceeding",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			record, err := crossref.Parse([]byte(fmt.Sprintf(`{
+				"DOI":"10.1000/supported-%s",
+				"type":%q,
+				"URL":"https://publisher.example.test/supported"
+			}`, test.typ, test.typ)))
+			if err != nil {
+				t.Fatalf("Parse() error = %v", err)
+			}
+			if len(record.URLCandidates) != 1 ||
+				record.URLCandidates[0].ContentChannel != test.channel ||
+				record.URLCandidates[0].LinkRole != source.URLLinkRoleDOIURL {
+				t.Fatalf(
+					"URLCandidates(%s) = %#v",
+					test.name,
+					record.URLCandidates,
+				)
+			}
+		})
 	}
 }
 

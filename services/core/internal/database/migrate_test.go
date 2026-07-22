@@ -105,7 +105,19 @@ var expectedSchemaTables = []string{
 	"work_lifecycle_states",
 	"work_channel_admission_decisions",
 	"connector_runs",
+	"work_families",
+	"work_relation_assertions",
+	"work_relation_decisions",
+	"work_family_memberships",
+	"work_family_canonical_decisions",
+	"work_url_candidates",
+	"work_url_candidate_import_rejections",
+	"work_url_verifications",
+	"current_work_official_links",
+	"work_visibility_assessments",
 	"abstract_route_analysis_runs",
+	"catalog_analysis_snapshots",
+	"catalog_analysis_work_snapshots",
 }
 
 var expectedSchemaTablesWithoutGeneratedID = []string{
@@ -117,6 +129,9 @@ var expectedSchemaTablesWithoutGeneratedID = []string{
 	"content_channels",
 	"connector_watermarks",
 	"connector_run_pages",
+	"work_family_canonical_states",
+	"catalog_analysis_work_topic_assertions",
+	"catalog_analysis_work_method_assertions",
 }
 
 var expectedScopeAndChannelConstraints = []string{
@@ -294,7 +309,28 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		"conference_official_hosts_parent_unsealed",
 		"work_domain_assertions_immutable",
 		"connector_run_pages_immutable",
+		"work_families_immutable",
+		"work_relation_assertions_immutable",
+		"work_relation_decisions_chain_guard",
+		"work_relation_decisions_exactly_one_current",
+		"work_relation_decisions_immutable",
+		"work_family_memberships_history_guard",
+		"work_family_canonical_decisions_immutable",
+		"works_create_singleton_work_family",
+		"work_url_candidates_exact_source",
+		"work_url_candidates_immutable",
+		"work_url_candidate_rejections_exact_source",
+		"work_url_candidate_rejections_immutable",
+		"work_url_verifications_candidate_consistency",
+		"work_url_verifications_immutable",
+		"current_work_official_links_projection",
+		"current_work_official_links_immutable",
+		"work_visibility_assessments_immutable",
 		"abstract_route_analysis_runs_terminal_immutable",
+		"catalog_analysis_snapshots_immutable",
+		"catalog_analysis_work_snapshots_immutable",
+		"catalog_analysis_work_topic_assertions_immutable",
+		"catalog_analysis_work_method_assertions_immutable",
 	})
 
 	rows, err = pool.Query(ctx, `
@@ -333,8 +369,13 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 		{version: 21, name: "scope_registry_sealing"},
 		{version: 22, name: "scope_registry_serialization_and_missing_admissions"},
 		{version: 23, name: "connector_runs"},
+		{version: 24, name: "work_families"},
+		{version: 25, name: "official_urls"},
+		{version: 26, name: "visibility_states"},
 		{version: 27, name: "abstract_route_analysis"},
 		{version: 28, name: "pmid_canonical_identity"},
+		{version: 29, name: "catalog_analysis_readiness"},
+		{version: 30, name: "content_observation_version_truth"},
 	}
 	var migrationIndex int
 	for rows.Next() {
@@ -370,6 +411,71 @@ func TestMigrationFromEmptyDatabaseCreatesExpectedSchema(t *testing.T) {
 	}
 }
 
+func TestWorkFamilyHistoryIndexesSupportProjectionRebuilds(t *testing.T) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	for _, index := range []struct {
+		name    string
+		columns []string
+	}{
+		{
+			name: "idx_work_family_canonical_decisions_work_history",
+			columns: []string{
+				"canonical_work_id",
+				"decided_at",
+				"id",
+			},
+		},
+		{
+			name: "idx_work_family_canonical_states_canonical_work",
+			columns: []string{
+				"canonical_work_id",
+				"work_family_id",
+			},
+		},
+		{
+			name: "idx_work_family_memberships_family_history",
+			columns: []string{
+				"work_family_id",
+				"started_at",
+				"id",
+			},
+		},
+	} {
+		var actualColumns []string
+		if err := pool.QueryRow(ctx, `
+			SELECT array_agg(
+				attribute.attname
+				ORDER BY indexed_column.ordinality
+			)
+			FROM pg_class AS index_relation
+			JOIN pg_namespace AS index_namespace
+			  ON index_namespace.oid = index_relation.relnamespace
+			JOIN pg_index AS index_metadata
+			  ON index_metadata.indexrelid = index_relation.oid
+			JOIN unnest(index_metadata.indkey)
+			     WITH ORDINALITY AS indexed_column(attnum, ordinality)
+			  ON true
+			JOIN pg_attribute AS attribute
+			  ON attribute.attrelid = index_metadata.indrelid
+			 AND attribute.attnum = indexed_column.attnum
+			WHERE index_namespace.nspname = 'public'
+			  AND index_relation.relname = $1
+		`, index.name).Scan(&actualColumns); err != nil {
+			t.Fatalf("query Work Family index %s: %v", index.name, err)
+		}
+		if !slices.Equal(actualColumns, index.columns) {
+			t.Fatalf(
+				"Work Family index %s columns = %v, want %v",
+				index.name,
+				actualColumns,
+				index.columns,
+			)
+		}
+	}
+}
+
 func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrations(t *testing.T) {
 	migrations, err := EmbeddedMigrations()
 	if err != nil {
@@ -378,8 +484,8 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 25 {
-		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
+	if len(migrations) != 30 {
+		t.Fatalf("embedded migration count = %d, want 30", len(migrations))
 	}
 	if migrations[0].Version != 1 || migrations[0].Name != "initial" {
 		t.Fatalf("first migration = %#v, want 000001_initial", migrations[0])
@@ -512,13 +618,197 @@ func TestEmbeddedMigrationsPreservePriorChecksumsAndIncludeCurrentCatalogMigrati
 			migrations[21],
 		)
 	}
-	if migrations[24].Version != 28 ||
-		migrations[24].Name != "pmid_canonical_identity" {
+	if migrations[22].Version != 23 ||
+		migrations[22].Name != "connector_runs" {
 		t.Fatalf(
-			"last migration = %#v, want 000028_pmid_canonical_identity",
+			"twenty-third migration = %#v, want 000023_connector_runs",
+			migrations[22],
+		)
+	}
+	if migrations[23].Version != 24 ||
+		migrations[23].Name != "work_families" {
+		t.Fatalf(
+			"twenty-fourth migration = %#v, want 000024_work_families",
+			migrations[23],
+		)
+	}
+	if migrations[24].Version != 25 ||
+		migrations[24].Name != "official_urls" {
+		t.Fatalf(
+			"twenty-fifth migration = %#v, want 000025_official_urls",
 			migrations[24],
 		)
 	}
+	if migrations[25].Version != 26 ||
+		migrations[25].Name != "visibility_states" {
+		t.Fatalf(
+			"twenty-sixth migration = %#v, want 000026_visibility_states",
+			migrations[25],
+		)
+	}
+	if migrations[26].Version != 27 ||
+		migrations[26].Name != "abstract_route_analysis" {
+		t.Fatalf(
+			"twenty-seventh migration = %#v, want 000027_abstract_route_analysis",
+			migrations[26],
+		)
+	}
+	if migrations[27].Version != 28 ||
+		migrations[27].Name != "pmid_canonical_identity" {
+		t.Fatalf(
+			"twenty-eighth migration = %#v, want 000028_pmid_canonical_identity",
+			migrations[27],
+		)
+	}
+	if migrations[28].Version != 29 ||
+		migrations[28].Name != "catalog_analysis_readiness" {
+		t.Fatalf(
+			"twenty-ninth migration = %#v, want 000029_catalog_analysis_readiness",
+			migrations[28],
+		)
+	}
+	if migrations[29].Version != 30 ||
+		migrations[29].Name != "content_observation_version_truth" {
+		t.Fatalf(
+			"thirtieth embedded migration = %#v, want 000030_content_observation_version_truth",
+			migrations[29],
+		)
+	}
+}
+
+func TestVisibilityAssessmentsAreImmutableAndExposeLatestPolicyProjection(
+	t *testing.T,
+) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	var workID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO works (canonical_key, status, title)
+		VALUES ('doi:10.1000/visibility-schema', 'active', 'Visibility schema')
+		RETURNING id
+	`), &workID)
+
+	firstEvaluatedAt := time.Date(
+		2026,
+		time.July,
+		18,
+		8,
+		0,
+		0,
+		0,
+		time.UTC,
+	)
+	var firstAssessmentID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_visibility_assessments (
+			work_id,
+			policy_version,
+			publicly_visible,
+			analysis_ready,
+			analysis_cutoff,
+			reasons,
+			evaluated_at
+		) VALUES (
+			$1,
+			'catalog-visibility/v1',
+			true,
+			false,
+			NULL,
+			'{}'::text[],
+			$2
+		)
+		RETURNING id
+	`, workID, firstEvaluatedAt), &firstAssessmentID)
+
+	secondEvaluatedAt := firstEvaluatedAt.Add(time.Hour)
+	analysisCutoff := firstEvaluatedAt.Add(30 * time.Minute)
+	var secondAssessmentID string
+	mustScanID(t, pool.QueryRow(ctx, `
+		INSERT INTO work_visibility_assessments (
+			work_id,
+			policy_version,
+			publicly_visible,
+			analysis_ready,
+			analysis_cutoff,
+			reasons,
+			evaluated_at
+		) VALUES (
+			$1,
+			'catalog-visibility/v1',
+			true,
+			true,
+			$2,
+			'{}'::text[],
+			$3
+		)
+		RETURNING id
+	`, workID, analysisCutoff, secondEvaluatedAt), &secondAssessmentID)
+
+	var (
+		currentAssessmentID string
+		publiclyVisible     bool
+		analysisReady       bool
+		currentCutoff       time.Time
+		currentEvaluatedAt  time.Time
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			assessment_id,
+			publicly_visible,
+			analysis_ready,
+			analysis_cutoff,
+			evaluated_at
+		FROM current_work_visibility_states
+		WHERE work_id = $1
+		  AND policy_version = 'catalog-visibility/v1'
+	`, workID).Scan(
+		&currentAssessmentID,
+		&publiclyVisible,
+		&analysisReady,
+		&currentCutoff,
+		&currentEvaluatedAt,
+	); err != nil {
+		t.Fatalf("query current visibility projection: %v", err)
+	}
+	if currentAssessmentID != secondAssessmentID ||
+		!publiclyVisible ||
+		!analysisReady ||
+		!currentCutoff.Equal(analysisCutoff) ||
+		!currentEvaluatedAt.Equal(secondEvaluatedAt) {
+		t.Fatalf(
+			"current visibility = (%s, %t, %t, %s, %s), want latest assessment %s",
+			currentAssessmentID,
+			publiclyVisible,
+			analysisReady,
+			currentCutoff,
+			currentEvaluatedAt,
+			secondAssessmentID,
+		)
+	}
+
+	_, updateErr := pool.Exec(ctx, `
+		UPDATE work_visibility_assessments
+		SET publicly_visible = false
+		WHERE id = $1
+	`, firstAssessmentID)
+	assertPostgresError(
+		t,
+		updateErr,
+		"55000",
+		"",
+	)
+
+	_, deleteErr := pool.Exec(ctx, `
+		DELETE FROM work_visibility_assessments
+		WHERE id = $1
+	`, firstAssessmentID)
+	assertPostgresError(
+		t,
+		deleteErr,
+		"55000",
+		"",
+	)
 }
 
 func TestScopeRegistrySealingArticleDomainAndAdmissionSchema(t *testing.T) {
@@ -2971,8 +3261,8 @@ func TestNormalizedAssertionSchemaUpgradeFromV11RetainsLegacyAndAllowsNewSchema(
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 25 {
-		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
+	if len(migrations) != 30 {
+		t.Fatalf("embedded migration count = %d, want 30", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -4393,8 +4683,8 @@ func TestBiomedicalSemanticSchemaUpgradeFromV10PreservesProvenance(t *testing.T)
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	if len(migrations) != 25 {
-		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
+	if len(migrations) != 30 {
+		t.Fatalf("embedded migration count = %d, want 30", len(migrations))
 	}
 
 	pool := openTestPool(t)
@@ -6150,17 +6440,20 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EmbeddedMigrations() error = %v", err)
 	}
-	last := migrations[len(migrations)-1]
-	if last.Version != 28 || last.Name != "pmid_canonical_identity" {
-		t.Fatalf("last migration = %#v, want 000028_pmid_canonical_identity", last)
+	pmidMigration := migrations[27]
+	if pmidMigration.Version != 28 || pmidMigration.Name != "pmid_canonical_identity" {
+		t.Fatalf(
+			"twenty-eighth migration = %#v, want 000028_pmid_canonical_identity",
+			pmidMigration,
+		)
 	}
-	if !strings.Contains(last.SQL, "NOT VALID") ||
+	if !strings.Contains(pmidMigration.SQL, "NOT VALID") ||
 		!strings.Contains(
-			last.SQL,
+			pmidMigration.SQL,
 			"VALIDATE CONSTRAINT works_canonical_key_check",
 		) ||
 		!strings.Contains(
-			last.SQL,
+			pmidMigration.SQL,
 			"VALIDATE CONSTRAINT external_identifiers_normalized_value_check",
 		) {
 		t.Fatal("PMID migration must validate both replacement identifier constraints")
@@ -6168,7 +6461,7 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 
 	pool := openTestPool(t)
 	ctx := testContext(t)
-	if err := UpMigrations(ctx, pool, migrations[:len(migrations)-1]); err != nil {
+	if err := UpMigrations(ctx, pool, migrations[:27]); err != nil {
 		t.Fatalf("apply migrations before 000028: %v", err)
 	}
 	_, err = pool.Exec(ctx, `
@@ -6185,7 +6478,7 @@ func TestMigratePMIDCanonicalIdentity(t *testing.T) {
 		t.Fatalf("insert valid historical PMID before v28: %v", err)
 	}
 
-	if err := UpMigrations(ctx, pool, migrations); err != nil {
+	if err := UpMigrations(ctx, pool, migrations[:28]); err != nil {
 		t.Fatalf("apply 000028_pmid_canonical_identity: %v", err)
 	}
 	var normalizedPMID, normalizedCanonicalKey *string
@@ -6312,7 +6605,7 @@ func TestMigratePMIDCanonicalIdentityRejectsInvalidHistoricalExternalIdentifiers
 			if err := UpMigrations(
 				ctx,
 				pool,
-				migrations[:len(migrations)-1],
+				migrations[:27],
 			); err != nil {
 				t.Fatalf("apply migrations before 000028: %v", err)
 			}
@@ -6329,7 +6622,7 @@ func TestMigratePMIDCanonicalIdentityRejectsInvalidHistoricalExternalIdentifiers
 				t.Fatalf("insert historical PMID %q before v28: %v", invalidPMID, err)
 			}
 
-			err := UpMigrations(ctx, pool, migrations)
+			err := UpMigrations(ctx, pool, migrations[:28])
 			assertPostgresError(
 				t,
 				err,
@@ -6537,6 +6830,31 @@ func TestPMIDNormalizationMatchesPaperDomainRules(t *testing.T) {
 	}
 }
 
+func TestCatalogAnalysisWorkSnapshotStoresClassifierAssertionRevision(
+	t *testing.T,
+) {
+	pool := openMigratedTestPool(t)
+	ctx := testContext(t)
+
+	var columns int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		  AND table_name = 'catalog_analysis_work_snapshots'
+		  AND column_name = 'classifier_assertion_revision'
+		  AND is_nullable = 'NO'
+	`).Scan(&columns); err != nil {
+		t.Fatalf("query classifier assertion revision column: %v", err)
+	}
+	if columns != 1 {
+		t.Fatalf(
+			"classifier assertion revision columns = %d, want one immutable non-null binding",
+			columns,
+		)
+	}
+}
+
 func TestConcurrentMigratorsExecuteMigrationOnce(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := testContext(t)
@@ -6605,8 +6923,8 @@ func TestMigrationUpgradesAppliedInitialSchemaWithoutChecksumMismatch(t *testing
 	if got := migrationChecksum(migrations[0].SQL); got != initialMigrationChecksum {
 		t.Fatalf("000001_initial checksum = %s, want immutable %s", got, initialMigrationChecksum)
 	}
-	if len(migrations) != 25 {
-		t.Fatalf("embedded migration count = %d, want 25", len(migrations))
+	if len(migrations) != 30 {
+		t.Fatalf("embedded migration count = %d, want 30", len(migrations))
 	}
 
 	pool := openTestPool(t)

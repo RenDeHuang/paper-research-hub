@@ -8,15 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/abstractanalysis"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/analysis"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/biomed"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/citation"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/contenttruth"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/scope"
 	"github.com/RenDeHuang/paper-research-hub/services/core/internal/venue"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -24,9 +29,17 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const publicCatalogPublisherLockID int64 = 0x50434154414c4f47
+const (
+	publicCatalogPublisherLockID              int64 = 0x50434154414c4f47
+	catalogClassifierProjectionPolicyVersion        = "projection/latest-source-revision/v1"
+	catalogClassifierAssertionPolicyVersion         = "catalog-classifier-assertion/v1"
+	catalogCanonicalChannelEventPolicyVersion       = "canonical-channel-event/v1"
+)
 
-var slugSeparatorPattern = regexp.MustCompile(`[^a-z0-9]+`)
+var (
+	slugSeparatorPattern = regexp.MustCompile(`[^a-z0-9]+`)
+	sha256HexPattern     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
 
 type Publisher struct {
 	database transactionBeginner
@@ -46,6 +59,7 @@ type catalogSnapshot struct {
 	opportunities       []publishedResearchOpportunity
 	sources             []sourceRevisionFact
 	curations           []curationRevisionFact
+	analysisRevision    string
 }
 
 type sourceRevisionFact struct {
@@ -119,6 +133,20 @@ type publishedPaper struct {
 	CitationTrend      citationTrendEvidence
 	PublicationState   *publishedPublicationState
 	biomedical         biomedicalPaperPayload
+}
+
+type publishedOfficialLink struct {
+	URL             string    `json:"url"`
+	VerificationID  uuid.UUID `json:"verification_id"`
+	LinkRole        string    `json:"link_role"`
+	ContentChannel  string    `json:"content_channel"`
+	VerifiedAt      time.Time `json:"-"`
+	ProjectedAt     time.Time `json:"-"`
+	VerifiedAtText  string    `json:"verified_at"`
+	ExpiresAt       time.Time `json:"-"`
+	ExpiresAtText   string    `json:"expires_at"`
+	VerifierVersion string    `json:"verifier_version"`
+	PolicyVersion   string    `json:"policy_version"`
 }
 
 type publishedPublicationState struct {
@@ -485,6 +513,32 @@ func (publisher *Publisher) PublishCurrent(
 }
 
 func validatePublishInput(input PublishInput) error {
+	switch input.Mode {
+	case PublishFacts:
+		if input.CitationAnalysisRunID != uuid.Nil ||
+			input.TrendAnalysisRunID != uuid.Nil ||
+			input.JournalAnalysisRunID != uuid.Nil ||
+			input.OpportunityAnalysisRunID != uuid.Nil {
+			return fmt.Errorf(
+				"%w: facts mode must not include analysis runs",
+				ErrCatalogNotReady,
+			)
+		}
+		if !input.AnalysisCutoff.IsZero() ||
+			input.ClassifierVersion != "" ||
+			input.AbstractRouteRevision != "" {
+			return fmt.Errorf(
+				"%w: facts mode must not include analysis readiness bindings",
+				ErrCatalogNotReady,
+			)
+		}
+	case PublishAnalysis:
+	default:
+		return fmt.Errorf(
+			"%w: publish mode must be facts or analysis",
+			ErrCatalogNotReady,
+		)
+	}
 	if input.FormulaVersion == "" ||
 		input.FormulaVersion != strings.TrimSpace(input.FormulaVersion) {
 		return fmt.Errorf("%w: formula version must be non-empty and trimmed", ErrCatalogNotReady)
@@ -492,78 +546,105 @@ func validatePublishInput(input PublishInput) error {
 	if input.GeneratedAt.IsZero() {
 		return fmt.Errorf("%w: generated_at is required", ErrCatalogNotReady)
 	}
-	if input.JCRMetricYear < 1900 || input.JCRMetricYear > 3000 {
-		return fmt.Errorf(
-			"%w: JCR metric year must be between 1900 and 3000",
-			ErrCatalogNotReady,
-		)
-	}
-	if input.VenuePolicyName != venue.JournalAllQ1PolicyName {
-		return fmt.Errorf(
-			"%w: Venue policy name must equal %s",
-			ErrCatalogNotReady,
-			venue.JournalAllQ1PolicyName,
-		)
-	}
-	if input.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
-		return fmt.Errorf(
-			"%w: Venue policy version must equal version %d",
-			ErrCatalogNotReady,
-			venue.JournalAllQ1PolicyRevision,
-		)
-	}
-	if input.EligibilityPolicyVersion !=
-		biomed.BiomedicalPublicEligibilityPolicyVersion {
-		return fmt.Errorf(
-			"%w: unsupported biomedical eligibility policy version %q; expected %s",
-			ErrCatalogNotReady,
-			input.EligibilityPolicyVersion,
-			biomed.BiomedicalPublicEligibilityPolicyVersion,
-		)
-	}
-	if input.SubjectVersion == "" ||
-		input.SubjectVersion != strings.TrimSpace(input.SubjectVersion) {
-		return fmt.Errorf(
-			"%w: Subject version must be non-empty and trimmed",
-			ErrCatalogNotReady,
-		)
-	}
-	if input.JCRImportReceipt == uuid.Nil {
-		return fmt.Errorf(
-			"%w: JCR import receipt is required",
-			ErrCatalogNotReady,
-		)
-	}
-	if input.CitationSource == "" ||
-		input.CitationSource != strings.TrimSpace(input.CitationSource) {
-		return fmt.Errorf(
-			"%w: citation source must be non-empty and trimmed",
-			ErrCatalogNotReady,
-		)
-	}
-	if input.CitationAnalysisRunID == uuid.Nil {
-		return fmt.Errorf(
-			"%w: citation analysis run is required",
-			ErrCatalogNotReady,
-		)
-	}
-	if input.TrendAnalysisRunID == uuid.Nil {
-		return fmt.Errorf(
-			"%w: trend analysis run is required",
-			ErrCatalogNotReady,
-		)
-	}
-	if input.JournalAnalysisRunID == uuid.Nil {
-		return fmt.Errorf(
-			"%w: journal analysis run is required",
-			ErrCatalogNotReady,
-		)
-	}
-	if input.OpportunityAnalysisRunID == uuid.Nil {
-		return fmt.Errorf(
-			"%w: opportunity analysis run is required",
-			ErrCatalogNotReady,
-		)
+	if input.Mode == PublishAnalysis {
+		if input.JCRMetricYear < 1900 || input.JCRMetricYear > 3000 {
+			return fmt.Errorf(
+				"%w: JCR metric year must be between 1900 and 3000",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.VenuePolicyName != venue.JournalAllQ1PolicyName {
+			return fmt.Errorf(
+				"%w: Venue policy name must equal %s",
+				ErrCatalogNotReady,
+				venue.JournalAllQ1PolicyName,
+			)
+		}
+		if input.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
+			return fmt.Errorf(
+				"%w: Venue policy version must equal version %d",
+				ErrCatalogNotReady,
+				venue.JournalAllQ1PolicyRevision,
+			)
+		}
+		if input.EligibilityPolicyVersion !=
+			biomed.BiomedicalPublicEligibilityPolicyVersion {
+			return fmt.Errorf(
+				"%w: unsupported biomedical eligibility policy version %q; expected %s",
+				ErrCatalogNotReady,
+				input.EligibilityPolicyVersion,
+				biomed.BiomedicalPublicEligibilityPolicyVersion,
+			)
+		}
+		if input.SubjectVersion == "" ||
+			input.SubjectVersion != strings.TrimSpace(input.SubjectVersion) {
+			return fmt.Errorf(
+				"%w: Subject version must be non-empty and trimmed",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.JCRImportReceipt == uuid.Nil {
+			return fmt.Errorf(
+				"%w: JCR import receipt is required",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.AnalysisCutoff.IsZero() {
+			return fmt.Errorf(
+				"%w: analysis cutoff is required",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.AnalysisCutoff.After(input.GeneratedAt) {
+			return fmt.Errorf(
+				"%w: analysis cutoff must not follow generated_at",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.ClassifierVersion != CatalogClassifierVersion {
+			return fmt.Errorf(
+				"%w: classifier version must equal %s",
+				ErrCatalogNotReady,
+				CatalogClassifierVersion,
+			)
+		}
+		if !sha256HexPattern.MatchString(input.AbstractRouteRevision) {
+			return fmt.Errorf(
+				"%w: abstract route revision must be a lowercase SHA-256 digest",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.CitationSource == "" ||
+			input.CitationSource != strings.TrimSpace(input.CitationSource) {
+			return fmt.Errorf(
+				"%w: citation source must be non-empty and trimmed",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.CitationAnalysisRunID == uuid.Nil {
+			return fmt.Errorf(
+				"%w: citation analysis run is required",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.TrendAnalysisRunID == uuid.Nil {
+			return fmt.Errorf(
+				"%w: trend analysis run is required",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.JournalAnalysisRunID == uuid.Nil {
+			return fmt.Errorf(
+				"%w: journal analysis run is required",
+				ErrCatalogNotReady,
+			)
+		}
+		if input.OpportunityAnalysisRunID == uuid.Nil {
+			return fmt.Errorf(
+				"%w: opportunity analysis run is required",
+				ErrCatalogNotReady,
+			)
+		}
 	}
 	return nil
 }
@@ -701,9 +782,9 @@ func validateCitationAnalysisRun(
 		payload.VelocityWindowDays < 1 ||
 		payload.VelocityWindowDays > 3650 ||
 		payload.MinimumCohortSize < 2 ||
-		asOf.After(input.GeneratedAt) {
+		asOf.After(input.AnalysisCutoff) {
 		return citationAnalysisRun{}, fmt.Errorf(
-			"%w: citation analysis run %s scope does not match this catalog publication",
+			"%w: citation analysis run %s scope does not match this catalog publication or analysis cutoff",
 			ErrCatalogNotReady,
 			input.CitationAnalysisRunID,
 		)
@@ -728,12 +809,20 @@ func buildCurrentSnapshot(
 	tx pgx.Tx,
 	input PublishInput,
 ) (catalogSnapshot, string, error) {
-	if err := validateCurationReferences(ctx, tx, input); err != nil {
-		return catalogSnapshot{}, "", err
+	if input.Mode == PublishAnalysis {
+		if err := validateCurationReferences(ctx, tx, input); err != nil {
+			return catalogSnapshot{}, "", err
+		}
 	}
-	analysisRun, err := validateCitationAnalysisRun(ctx, tx, input)
-	if err != nil {
-		return catalogSnapshot{}, "", err
+	var (
+		analysisRun citationAnalysisRun
+		err         error
+	)
+	if input.Mode == PublishAnalysis {
+		analysisRun, err = validateCitationAnalysisRun(ctx, tx, input)
+		if err != nil {
+			return catalogSnapshot{}, "", err
+		}
 	}
 	states, err := loadCurrentSourceStates(ctx, tx)
 	if err != nil {
@@ -747,6 +836,9 @@ func buildCurrentSnapshot(
 		}
 		switch state.scopeStatus {
 		case "pending":
+			if input.Mode == PublishFacts {
+				continue
+			}
 			return catalogSnapshot{}, "", fmt.Errorf(
 				"%w: source %s event %s is pending",
 				ErrCatalogNotReady,
@@ -797,34 +889,102 @@ func buildCurrentSnapshot(
 	sort.Slice(workIDs, func(i, j int) bool {
 		return workIDs[i].String() < workIDs[j].String()
 	})
-	eligibleWorkIDs := make([]uuid.UUID, 0, len(workIDs))
 	curationsByWork := make(map[uuid.UUID]catalogValue, len(workIDs))
 	eligibilityByWork := make(
 		map[uuid.UUID]biomedicalEligibilityRevision,
 		len(workIDs),
 	)
-	curationFacts := make([]curationRevisionFact, 0, len(workIDs))
+	officialLinksByWork, err := loadCurrentOfficialLinks(
+		ctx,
+		tx,
+		workIDs,
+		input.GeneratedAt,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
+	visibilityByWork, err := evaluateAndPersistPublisherVisibility(
+		ctx,
+		tx,
+		workIDs,
+		officialLinksByWork,
+		input,
+		nil,
+		input.Mode == PublishFacts,
+	)
+	if err != nil {
+		return catalogSnapshot{}, "", err
+	}
+	eligibleWorkIDs := make([]uuid.UUID, 0, len(workIDs))
+	journalWorkIDs := make([]uuid.UUID, 0, len(workIDs))
+	curationFactByWork := make(
+		map[uuid.UUID]curationRevisionFact,
+		len(workIDs),
+	)
+	curationFacts := make(
+		[]curationRevisionFact,
+		0,
+		len(workIDs),
+	)
 	revisionSources := make([]sourceRevisionFact, 0)
 	for _, workID := range workIDs {
-		curation, accepted, curationErr := loadAcceptedCuration(
-			ctx,
-			tx,
-			workID,
-			input,
-		)
-		if curationErr != nil {
-			return catalogSnapshot{}, "", curationErr
+		visibility := visibilityByWork[workID]
+		if !visibility.State.PubliclyVisible {
+			continue
 		}
-		if !accepted {
+		if input.Mode == PublishFacts {
+			curationsByWork[workID] = catalogValue{State: "missing"}
+			eligibleWorkIDs = append(eligibleWorkIDs, workID)
+			for _, state := range visible[workID].states {
+				revisionSources = append(revisionSources, sourceRevisionFact{
+					LogicalSource:              state.logicalSource,
+					EventKey:                   state.eventKey,
+					NormalizedAssertionID:      state.normalizedAssertionID.String(),
+					RawEventID:                 state.rawEventID.String(),
+					SourceRecordID:             state.sourceRecordID.String(),
+					WorkID:                     state.workID.String(),
+					SourceTime:                 state.sourceTime.UTC().Format(time.RFC3339Nano),
+					TieBreakKey:                state.tieBreakKey,
+					Position:                   state.position,
+					ScopePolicyVersion:         state.scopePolicyVersion,
+					ProjectionPolicyVersion:    state.projectionPolicyVersion,
+					NormalizationPolicyVersion: state.normalizationPolicyVersion,
+					NormalizedPayloadSchema:    state.normalizedPayloadSchema,
+					NormalizedPayload:          state.normalizedPayload,
+				})
+			}
+			continue
+		}
+		switch visibility.Admission.Channel {
+		case scope.ContentChannelJournalPublished,
+			scope.ContentChannelAcceptedEarly:
+			curation, accepted, curationErr := loadAcceptedCuration(
+				ctx,
+				tx,
+				workID,
+				input,
+			)
+			if curationErr != nil {
+				return catalogSnapshot{}, "", curationErr
+			}
+			if !accepted {
+				continue
+			}
+			curationsByWork[workID] = catalogValue{
+				State: "known",
+				Value: curation.Curation,
+			}
+			eligibilityByWork[workID] = curation.Eligibility
+			curationFacts = append(curationFacts, curation)
+			curationFactByWork[workID] = curation
+			journalWorkIDs = append(journalWorkIDs, workID)
+		case scope.ContentChannelPreprint,
+			scope.ContentChannelConferenceProceeding:
+			curationsByWork[workID] = catalogValue{State: "missing"}
+		default:
 			continue
 		}
 		eligibleWorkIDs = append(eligibleWorkIDs, workID)
-		curationsByWork[workID] = catalogValue{
-			State: "known",
-			Value: curation.Curation,
-		}
-		eligibilityByWork[workID] = curation.Eligibility
-		curationFacts = append(curationFacts, curation)
 		for _, state := range visible[workID].states {
 			revisionSources = append(revisionSources, sourceRevisionFact{
 				LogicalSource:              state.logicalSource,
@@ -847,23 +1007,6 @@ func buildCurrentSnapshot(
 	if len(eligibleWorkIDs) == 0 {
 		return catalogSnapshot{}, "", ErrEmptyDomain
 	}
-	cohortRevision, err := biomedicalCohortRevision(
-		eligibleWorkIDs,
-		visible,
-		curationFacts,
-	)
-	if err != nil {
-		return catalogSnapshot{}, "", err
-	}
-	biomedicalRuns, err := validateBiomedicalAnalysisRuns(
-		ctx,
-		tx,
-		input,
-		cohortRevision,
-	)
-	if err != nil {
-		return catalogSnapshot{}, "", err
-	}
 	sort.Slice(revisionSources, func(i, j int) bool {
 		left, right := revisionSources[i], revisionSources[j]
 		if left.LogicalSource != right.LogicalSource {
@@ -880,10 +1023,102 @@ func buildCurrentSnapshot(
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
+	publicationConflictsByWork :=
+		publisherPublicationSourceConflicts(publicationStatesByWork)
+	var (
+		biomedicalRuns        validatedBiomedicalAnalysisRuns
+		publishBiomedicalRuns bool
+		analysisRevision      string
+	)
+	if input.Mode == PublishAnalysis {
+		analysisEvidence, err := loadPublisherAnalysisWorkEvidence(
+			ctx,
+			tx,
+			eligibleWorkIDs,
+			visibilityByWork,
+			publicationConflictsByWork,
+			input,
+		)
+		if err != nil {
+			return catalogSnapshot{}, "", err
+		}
+		visibilityByWork, err = evaluateAndPersistPublisherVisibility(
+			ctx,
+			tx,
+			workIDs,
+			officialLinksByWork,
+			input,
+			analysisEvidence,
+			true,
+		)
+		if err != nil {
+			return catalogSnapshot{}, "", err
+		}
+		for workID, evidence := range analysisEvidence {
+			evidence.State = visibilityByWork[workID].State.Clone()
+		}
+		analysisRevision, err = persistPublisherAnalysisSnapshot(
+			ctx,
+			tx,
+			input,
+			analysisEvidence,
+		)
+		if err != nil {
+			return catalogSnapshot{}, "", err
+		}
+
+		readyJournalWorkIDs := make(
+			[]uuid.UUID,
+			0,
+			len(journalWorkIDs),
+		)
+		readyCurationFacts := make(
+			[]curationRevisionFact,
+			0,
+			len(journalWorkIDs),
+		)
+		for _, workID := range journalWorkIDs {
+			if !visibilityByWork[workID].State.AnalysisReady {
+				continue
+			}
+			readyJournalWorkIDs = append(
+				readyJournalWorkIDs,
+				workID,
+			)
+			readyCurationFacts = append(
+				readyCurationFacts,
+				curationFactByWork[workID],
+			)
+		}
+		if len(readyJournalWorkIDs) > 0 {
+			cohortRevision, err := biomedicalCohortRevision(
+				readyJournalWorkIDs,
+				visible,
+				readyCurationFacts,
+			)
+			if err != nil {
+				return catalogSnapshot{}, "", err
+			}
+			biomedicalRuns, err = validateBiomedicalAnalysisRuns(
+				ctx,
+				tx,
+				input,
+				cohortRevision,
+			)
+			if err != nil {
+				return catalogSnapshot{}, "", err
+			}
+			publishBiomedicalRuns = true
+		}
+	}
 	topicFacts := make(map[uuid.UUID]*taxonomyFact)
 	methodFacts := make(map[uuid.UUID]*taxonomyFact)
 	papers := make([]publishedPaper, 0, len(eligibleWorkIDs))
 	for _, workID := range eligibleWorkIDs {
+		workAnalysisRun := analysisRun
+		if !visibilityByWork[workID].State.AnalysisReady {
+			workAnalysisRun = citationAnalysisRun{}
+		}
 		paper, topics, methods, err := buildPaper(
 			ctx,
 			tx,
@@ -892,8 +1127,10 @@ func buildCurrentSnapshot(
 			curationsByWork[workID],
 			eligibilityByWork[workID],
 			input.JCRImportReceipt,
-			analysisRun,
+			workAnalysisRun,
 			publicationStatesByWork[workID],
+			visibilityByWork[workID],
+			input.Mode,
 		)
 		if err != nil {
 			return catalogSnapshot{}, "", err
@@ -909,12 +1146,51 @@ func buildCurrentSnapshot(
 	sort.Slice(papers, func(i, j int) bool {
 		return papers[i].CanonicalKey < papers[j].CanonicalKey
 	})
-	papers, trends, citationMomentum, err := buildCitationMomentum(
-		analysisRun,
-		papers,
+	var (
+		trends           []publishedTrend
+		citationMomentum map[string]any
 	)
-	if err != nil {
-		return catalogSnapshot{}, "", err
+	if input.Mode == PublishAnalysis {
+		analysisPapers := make(
+			[]publishedPaper,
+			0,
+			len(papers),
+		)
+		for _, paper := range papers {
+			if visibilityByWork[paper.ID].State.AnalysisReady {
+				analysisPapers = append(analysisPapers, paper)
+			}
+		}
+		if len(analysisPapers) == 0 {
+			citationMomentum = unavailableCitationMomentum(
+				input,
+				len(papers),
+			)
+		} else {
+			analysisPapers, trends, citationMomentum, err =
+				buildCitationMomentum(
+					analysisRun,
+					analysisPapers,
+				)
+			if err != nil {
+				return catalogSnapshot{}, "", err
+			}
+			analysisPaperByWork := make(
+				map[uuid.UUID]publishedPaper,
+				len(analysisPapers),
+			)
+			for _, paper := range analysisPapers {
+				analysisPaperByWork[paper.ID] = paper
+			}
+			for index := range papers {
+				if paper, found :=
+					analysisPaperByWork[papers[index].ID]; found {
+					papers[index] = paper
+				}
+			}
+		}
+	} else {
+		citationMomentum = unavailableCitationMomentum(input, len(papers))
 	}
 
 	topics, err := publishTaxonomies(topicFacts)
@@ -929,37 +1205,60 @@ func buildCurrentSnapshot(
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
-	home,
-		subjectListMetadata,
-		journalListMetadata,
-		subjects,
-		journals,
-		err := buildBiomedicalSnapshots(
-		ctx,
-		tx,
-		input,
-		papers,
-		curationFacts,
-		citationMomentum,
+	var (
+		home                json.RawMessage
+		subjectListMetadata json.RawMessage
+		journalListMetadata json.RawMessage
+		subjects            []publishedBiomedicalResource
+		journals            []publishedBiomedicalResource
 	)
+	if input.Mode == PublishFacts {
+		home,
+			subjectListMetadata,
+			journalListMetadata,
+			subjects,
+			journals,
+			err = buildFactsSnapshots(
+			input,
+			papers,
+			citationMomentum,
+		)
+	} else {
+		home,
+			subjectListMetadata,
+			journalListMetadata,
+			subjects,
+			journals,
+			err = buildBiomedicalSnapshots(
+			ctx,
+			tx,
+			input,
+			papers,
+			curationFacts,
+			citationMomentum,
+		)
+	}
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
-	home,
-		subjects,
-		journals,
-		opportunities,
-		err := publishBiomedicalAnalysisSnapshots(
-		ctx,
-		tx,
-		biomedicalRuns,
-		papers,
+	var opportunities []publishedResearchOpportunity
+	if publishBiomedicalRuns {
 		home,
-		subjects,
-		journals,
-	)
-	if err != nil {
-		return catalogSnapshot{}, "", err
+			subjects,
+			journals,
+			opportunities,
+			err = publishBiomedicalAnalysisSnapshots(
+			ctx,
+			tx,
+			biomedicalRuns,
+			papers,
+			home,
+			subjects,
+			journals,
+		)
+		if err != nil {
+			return catalogSnapshot{}, "", err
+		}
 	}
 
 	snapshot := catalogSnapshot{
@@ -976,12 +1275,30 @@ func buildCurrentSnapshot(
 		opportunities:       opportunities,
 		sources:             revisionSources,
 		curations:           curationFacts,
+		analysisRevision:    analysisRevision,
 	}
 	sourceRevision, err := snapshotRevision(input, snapshot)
 	if err != nil {
 		return catalogSnapshot{}, "", err
 	}
 	return snapshot, sourceRevision, nil
+}
+
+func unavailableCitationMomentum(
+	input PublishInput,
+	paperCount int,
+) map[string]any {
+	return map[string]any{
+		"analysis": analysisMetadata(
+			input,
+			30,
+			0,
+			catalogValue{State: "missing"},
+			[]string{},
+			[]string{"citation_analysis_not_published"},
+		),
+		"items": []any{},
+	}
 }
 
 func biomedicalCohortRevision(
@@ -1176,6 +1493,2010 @@ func loadCurrentSourceStates(ctx context.Context, tx pgx.Tx) ([]sourceState, err
 	return states, nil
 }
 
+func loadCurrentOfficialLinks(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+	generatedAt time.Time,
+) (map[uuid.UUID]map[scope.ContentChannel]publishedOfficialLink, error) {
+	linksByWork := make(
+		map[uuid.UUID]map[scope.ContentChannel]publishedOfficialLink,
+		len(workIDs),
+	)
+	if len(workIDs) == 0 {
+		return linksByWork, nil
+	}
+
+	rows, err := tx.Query(ctx, `
+		WITH valid_links AS (
+			SELECT
+				link.id AS link_id,
+				link.work_id,
+				link.content_channel,
+				link.link_role,
+				link.verification_id,
+				link.official_url,
+				link.projection_version,
+				link.projected_at,
+				link.expires_at AS link_expires_at,
+				verification.final_url,
+				verification.identifier_match,
+				verification.verification_state,
+				verification.checked_at,
+				verification.expires_at AS verification_expires_at,
+				verification.verifier_version,
+				verification.policy_version
+			FROM current_work_official_links AS link
+			JOIN work_url_verifications AS verification
+			  ON verification.id = link.verification_id
+			WHERE link.work_id = ANY($1::uuid[])
+			  AND link.projected_at <= $2
+			  AND verification.verification_state = 'verified'
+			  AND verification.identifier_match
+			  AND link.official_url = verification.final_url
+			  AND link.expires_at = verification.expires_at
+			  AND verification.checked_at <= link.projected_at
+			  AND verification.checked_at <= $2
+			  AND link.expires_at > $2
+			  AND verification.expires_at > $2
+			  AND left(link.official_url, 8) = 'https://'
+			  AND left(verification.final_url, 8) = 'https://'
+		),
+		ranked_roles AS (
+			SELECT
+				valid_links.*,
+				row_number() OVER (
+					PARTITION BY work_id, link_role
+					ORDER BY
+						projection_version DESC,
+						link_id DESC
+				) AS role_rank
+			FROM valid_links
+		),
+		active_roles AS (
+			SELECT
+				ranked_roles.*,
+				row_number() OVER (
+					PARTITION BY work_id, content_channel
+					ORDER BY
+						CASE link_role
+							WHEN 'official_article' THEN 1
+							WHEN 'official_preprint' THEN 2
+							WHEN 'official_proceeding' THEN 3
+							WHEN 'doi_url' THEN 4
+							ELSE 5
+						END,
+						projected_at DESC,
+						verification_id
+				) AS work_rank
+			FROM ranked_roles
+			WHERE role_rank = 1
+		)
+		SELECT
+			work_id,
+			content_channel,
+			link_role,
+			verification_id,
+			official_url,
+			projected_at,
+			link_expires_at,
+			final_url,
+			identifier_match,
+			verification_state,
+			checked_at,
+			verification_expires_at,
+			verifier_version,
+			policy_version
+		FROM active_roles
+		WHERE work_rank = 1
+		ORDER BY work_id
+	`, workIDs, generatedAt.UTC())
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query current verified official links: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			workID              uuid.UUID
+			link                publishedOfficialLink
+			projectedAt         time.Time
+			finalURL            string
+			identifierMatch     bool
+			verificationState   string
+			verificationExpires time.Time
+		)
+		if err := rows.Scan(
+			&workID,
+			&link.ContentChannel,
+			&link.LinkRole,
+			&link.VerificationID,
+			&link.URL,
+			&projectedAt,
+			&link.ExpiresAt,
+			&finalURL,
+			&identifierMatch,
+			&verificationState,
+			&link.VerifiedAt,
+			&verificationExpires,
+			&link.VerifierVersion,
+			&link.PolicyVersion,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan current verified official link: %w",
+				err,
+			)
+		}
+		if !validPublishedOfficialLink(
+			link,
+			projectedAt,
+			finalURL,
+			identifierMatch,
+			verificationState,
+			verificationExpires,
+			generatedAt,
+		) {
+			continue
+		}
+		link.VerifiedAt = link.VerifiedAt.UTC()
+		link.ExpiresAt = link.ExpiresAt.UTC()
+		link.ProjectedAt = projectedAt.UTC()
+		link.VerifiedAtText = link.VerifiedAt.Format(time.RFC3339Nano)
+		link.ExpiresAtText = link.ExpiresAt.Format(time.RFC3339Nano)
+		if linksByWork[workID] == nil {
+			linksByWork[workID] = make(
+				map[scope.ContentChannel]publishedOfficialLink,
+			)
+		}
+		linksByWork[workID][scope.ContentChannel(link.ContentChannel)] = link
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate current verified official links: %w",
+			err,
+		)
+	}
+	return linksByWork, nil
+}
+
+func validPublishedOfficialLink(
+	link publishedOfficialLink,
+	projectedAt time.Time,
+	finalURL string,
+	identifierMatch bool,
+	verificationState string,
+	verificationExpires time.Time,
+	generatedAt time.Time,
+) bool {
+	if link.VerificationID == uuid.Nil ||
+		link.URL == "" ||
+		link.URL != strings.TrimSpace(link.URL) ||
+		link.VerifierVersion == "" ||
+		link.VerifierVersion != strings.TrimSpace(link.VerifierVersion) ||
+		link.PolicyVersion == "" ||
+		link.PolicyVersion != strings.TrimSpace(link.PolicyVersion) ||
+		link.VerifiedAt.IsZero() ||
+		link.ExpiresAt.IsZero() ||
+		projectedAt.IsZero() ||
+		verificationExpires.IsZero() ||
+		verificationState != "verified" ||
+		!identifierMatch ||
+		link.URL != finalURL ||
+		!link.ExpiresAt.Equal(verificationExpires) ||
+		projectedAt.After(generatedAt) ||
+		link.VerifiedAt.After(projectedAt) ||
+		!link.ExpiresAt.After(generatedAt) {
+		return false
+	}
+	parsed, err := url.Parse(link.URL)
+	if err != nil ||
+		parsed.Scheme != "https" ||
+		parsed.Hostname() == "" ||
+		parsed.User != nil ||
+		parsed.Fragment != "" {
+		return false
+	}
+	switch link.ContentChannel {
+	case "journal_published", "accepted_early":
+		return link.LinkRole == "official_article" ||
+			link.LinkRole == "doi_url"
+	case "preprint":
+		return link.LinkRole == "official_preprint" ||
+			link.LinkRole == "doi_url"
+	case "conference_proceeding":
+		return link.LinkRole == "official_proceeding" ||
+			link.LinkRole == "doi_url"
+	default:
+		return false
+	}
+}
+
+type publisherVisibilityAssessment struct {
+	State        VisibilityState
+	Admission    scope.AdmissionDecision
+	Lifecycle    scope.LifecycleState
+	OfficialLink publishedOfficialLink
+}
+
+type publisherAbstractRouteBinding struct {
+	RunID                 uuid.UUID
+	WorkID                uuid.UUID
+	ProjectionAssertionID uuid.UUID
+	NormalizedAssertionID uuid.UUID
+	SourceRecordID        uuid.UUID
+}
+
+type publisherAnalysisWorkEvidence struct {
+	WorkID                   uuid.UUID
+	Channel                  scope.ContentChannel
+	ProjectionAssertionID    uuid.UUID
+	NormalizedAssertionID    uuid.UUID
+	SourceRecordID           uuid.UUID
+	SourceTime               time.Time
+	ProjectionPolicyVersion  string
+	ChannelEventAssertionIDs []uuid.UUID
+	CanonicalEventAt         *time.Time
+	TopicAssertionIDs        []uuid.UUID
+	MethodAssertionIDs       []uuid.UUID
+	ClassifierReady          bool
+	ClassifierRevision       string
+	AbstractRoute            *publisherAbstractRouteBinding
+	SourceConflict           bool
+	State                    VisibilityState
+}
+
+func validatePublisherAbstractRouteRun(
+	ctx context.Context,
+	tx pgx.Tx,
+	input PublishInput,
+	runID uuid.UUID,
+) (publisherAbstractRouteBinding, error) {
+	var (
+		binding              publisherAbstractRouteBinding
+		sourceName           string
+		sourceRecordExternal string
+		parserVersion        string
+		sourceTime           time.Time
+		modelProvider        string
+		apiMode              string
+		requestedModel       string
+		promptVersion        string
+		promptText           string
+		promptSHA            string
+		schemaName           string
+		schemaVersion        string
+		schemaJSON           []byte
+		schemaSHA            string
+		inputTitle           string
+		titleSHA             string
+		inputAbstract        string
+		abstractSHA          string
+		inputSHA             string
+		outputPayload        []byte
+		status               string
+		completedAt          pgtype.Timestamptz
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT
+			id,
+			work_id,
+			projection_assertion_id,
+			normalized_assertion_id,
+			source_record_id,
+			source_name,
+			source_record_external_id,
+			parser_version,
+			source_time,
+			model_provider,
+			api_mode,
+			requested_model,
+			prompt_version,
+			prompt_text,
+			prompt_sha256,
+			schema_name,
+			schema_version,
+			schema_json,
+			schema_sha256,
+			input_title,
+			title_sha256,
+			input_abstract,
+			abstract_sha256,
+			input_sha256,
+			output_payload,
+			status,
+			completed_at
+		FROM abstract_route_analysis_runs
+		WHERE id = $1
+	`, runID).Scan(
+		&binding.RunID,
+		&binding.WorkID,
+		&binding.ProjectionAssertionID,
+		&binding.NormalizedAssertionID,
+		&binding.SourceRecordID,
+		&sourceName,
+		&sourceRecordExternal,
+		&parserVersion,
+		&sourceTime,
+		&modelProvider,
+		&apiMode,
+		&requestedModel,
+		&promptVersion,
+		&promptText,
+		&promptSHA,
+		&schemaName,
+		&schemaVersion,
+		&schemaJSON,
+		&schemaSHA,
+		&inputTitle,
+		&titleSHA,
+		&inputAbstract,
+		&abstractSHA,
+		&inputSHA,
+		&outputPayload,
+		&status,
+		&completedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s does not exist",
+			ErrCatalogNotReady,
+			runID,
+		)
+	}
+	if err != nil {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"query abstract route run %s: %w",
+			runID,
+			err,
+		)
+	}
+	if status != "succeeded" ||
+		!completedAt.Valid ||
+		completedAt.Time.After(input.GeneratedAt) {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s must be succeeded by generated_at",
+			ErrCatalogNotReady,
+			runID,
+		)
+	}
+	if sourceTime.After(input.AnalysisCutoff) {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s source revision follows analysis cutoff",
+			ErrCatalogNotReady,
+			runID,
+		)
+	}
+	if modelProvider != abstractanalysis.ModelProvider ||
+		(apiMode != "responses" && apiMode != "chat_completions") ||
+		requestedModel == "" ||
+		requestedModel != strings.TrimSpace(requestedModel) ||
+		promptVersion != abstractanalysis.PromptVersion ||
+		schemaName != abstractanalysis.SchemaName ||
+		schemaVersion != abstractanalysis.SchemaVersion {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s has unsupported frozen analysis metadata",
+			ErrCatalogNotReady,
+			runID,
+		)
+	}
+	if sha256Text(promptText) != promptSHA ||
+		sha256Text(inputTitle) != titleSHA ||
+		sha256Text(inputAbstract) != abstractSHA ||
+		sha256Bytes(abstractanalysis.SchemaJSON()) != schemaSHA {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s has conflicting immutable hashes",
+			ErrCatalogNotReady,
+			runID,
+		)
+	}
+	inputMaterial, err := json.Marshal(struct {
+		PromptVersion string `json:"prompt_version"`
+		PromptText    string `json:"prompt_text"`
+		SchemaVersion string `json:"schema_version"`
+		APIMode       string `json:"api_mode"`
+		Title         string `json:"title"`
+		Abstract      string `json:"abstract"`
+	}{
+		PromptVersion: promptVersion,
+		PromptText:    promptText,
+		SchemaVersion: schemaVersion,
+		APIMode:       apiMode,
+		Title:         inputTitle,
+		Abstract:      inputAbstract,
+	})
+	if err != nil {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"encode abstract route run input identity: %w",
+			err,
+		)
+	}
+	if sha256Bytes(inputMaterial) != inputSHA {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s input hash conflicts with its descriptor",
+			ErrCatalogNotReady,
+			runID,
+		)
+	}
+	if !equalCanonicalJSON(schemaJSON, abstractanalysis.SchemaJSON()) {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s schema conflicts with %s",
+			ErrCatalogNotReady,
+			runID,
+			abstractanalysis.SchemaVersion,
+		)
+	}
+	result, err := abstractanalysis.DecodeResult(outputPayload)
+	if err != nil {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s output is invalid: %v",
+			ErrCatalogNotReady,
+			runID,
+			err,
+		)
+	}
+	if err := abstractanalysis.ValidateEvidence(inputAbstract, result); err != nil {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s evidence is invalid: %v",
+			ErrCatalogNotReady,
+			runID,
+			err,
+		)
+	}
+	if input.AbstractRouteRevision != CatalogAbstractRouteRevision {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route revision %s does not match run %s frozen revision %s",
+			ErrCatalogNotReady,
+			input.AbstractRouteRevision,
+			runID,
+			CatalogAbstractRouteRevision,
+		)
+	}
+
+	var current bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM work_projection_states AS state
+			JOIN ingestion_projection_assertions AS projection
+			  ON projection.id = $2
+			 AND projection.work_id = state.work_id
+			 AND projection.normalized_assertion_id =
+			     state.normalized_assertion_id
+			 AND projection.source_record_uuid =
+			     state.source_record_uuid
+			 AND projection.scope_policy_version =
+			     state.scope_policy_version
+			 AND projection.projection_policy_version =
+			     state.projection_policy_version
+			JOIN source_records AS source_record
+			  ON source_record.id = state.source_record_uuid
+			WHERE state.work_id = $1
+			  AND state.normalized_assertion_id = $3
+			  AND state.source_record_uuid = $4
+			  AND state.source_time = $5
+			  AND source_record.source = $6
+			  AND source_record.source_record_id = $7
+		)
+	`,
+		binding.WorkID,
+		binding.ProjectionAssertionID,
+		binding.NormalizedAssertionID,
+		binding.SourceRecordID,
+		sourceTime,
+		sourceName,
+		sourceRecordExternal,
+	).Scan(&current); err != nil {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"verify abstract route run %s current revision: %w",
+			runID,
+			err,
+		)
+	}
+	if !current {
+		return publisherAbstractRouteBinding{}, fmt.Errorf(
+			"%w: abstract route run %s does not bind the current Work revision",
+			ErrCatalogNotReady,
+			runID,
+		)
+	}
+	return binding, nil
+}
+
+func loadPublisherAbstractRouteBindings(
+	ctx context.Context,
+	tx pgx.Tx,
+	input PublishInput,
+	workIDs []uuid.UUID,
+) (map[uuid.UUID]publisherAbstractRouteBinding, error) {
+	result := make(
+		map[uuid.UUID]publisherAbstractRouteBinding,
+		len(workIDs),
+	)
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT ON (run.work_id)
+			run.work_id,
+			run.id
+		FROM abstract_route_analysis_runs AS run
+		JOIN work_projection_states AS state
+		  ON state.work_id = run.work_id
+		 AND state.normalized_assertion_id =
+		     run.normalized_assertion_id
+		 AND state.source_record_uuid = run.source_record_id
+		JOIN ingestion_projection_assertions AS projection
+		  ON projection.id = run.projection_assertion_id
+		 AND projection.work_id = state.work_id
+		 AND projection.normalized_assertion_id =
+		     state.normalized_assertion_id
+		 AND projection.source_record_uuid =
+		     state.source_record_uuid
+		 AND projection.scope_policy_version =
+		     state.scope_policy_version
+		 AND projection.projection_policy_version =
+		     state.projection_policy_version
+		WHERE run.work_id = ANY($1::uuid[])
+		  AND run.status = 'succeeded'
+		  AND run.completed_at <= $2
+		  AND run.source_time <= $3
+		  AND run.prompt_version = $4
+		  AND run.schema_name = $5
+		  AND run.schema_version = $6
+		ORDER BY
+			run.work_id,
+			run.completed_at DESC,
+			run.id DESC
+	`,
+		workIDs,
+		input.GeneratedAt.UTC(),
+		input.AnalysisCutoff.UTC(),
+		abstractanalysis.PromptVersion,
+		abstractanalysis.SchemaName,
+		abstractanalysis.SchemaVersion,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query per-Work abstract route selections: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+	type selectedRun struct {
+		workID uuid.UUID
+		runID  uuid.UUID
+	}
+	selected := make([]selectedRun, 0, len(workIDs))
+	for rows.Next() {
+		var current selectedRun
+		if err := rows.Scan(&current.workID, &current.runID); err != nil {
+			return nil, fmt.Errorf(
+				"scan per-Work abstract route selection: %w",
+				err,
+			)
+		}
+		selected = append(selected, current)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate per-Work abstract route selections: %w",
+			err,
+		)
+	}
+	for _, current := range selected {
+		binding, err := validatePublisherAbstractRouteRun(
+			ctx,
+			tx,
+			input,
+			current.runID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if binding.WorkID != current.workID {
+			return nil, fmt.Errorf(
+				"%w: abstract route selection %s changed Work identity",
+				ErrCatalogNotReady,
+				current.runID,
+			)
+		}
+		result[current.workID] = binding
+	}
+	return result, nil
+}
+
+func sha256Text(value string) string {
+	return sha256Bytes([]byte(value))
+}
+
+func sha256Bytes(value []byte) string {
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
+}
+
+func equalCanonicalJSON(left, right []byte) bool {
+	var leftValue, rightValue any
+	return json.Unmarshal(left, &leftValue) == nil &&
+		json.Unmarshal(right, &rightValue) == nil &&
+		reflect.DeepEqual(leftValue, rightValue)
+}
+
+func publisherClassifierAssertionRevision(
+	input PublishInput,
+	evidence publisherAnalysisWorkEvidence,
+) (string, error) {
+	if evidence.WorkID == uuid.Nil ||
+		evidence.ProjectionAssertionID == uuid.Nil ||
+		evidence.NormalizedAssertionID == uuid.Nil ||
+		evidence.SourceRecordID == uuid.Nil ||
+		evidence.SourceTime.IsZero() ||
+		evidence.ProjectionPolicyVersion == "" {
+		return "", fmt.Errorf(
+			"%w: Work %s has incomplete classifier assertion provenance",
+			ErrCatalogNotReady,
+			evidence.WorkID,
+		)
+	}
+	material, err := json.Marshal(struct {
+		WorkID                  uuid.UUID   `json:"work_id"`
+		ProjectionAssertionID   uuid.UUID   `json:"projection_assertion_id"`
+		NormalizedAssertionID   uuid.UUID   `json:"normalized_assertion_id"`
+		SourceRecordID          uuid.UUID   `json:"source_record_id"`
+		SourceTime              string      `json:"source_time"`
+		ProjectionPolicyVersion string      `json:"projection_policy_version"`
+		ClassifierVersion       string      `json:"classifier_version"`
+		ClassifierPolicyVersion string      `json:"classifier_policy_version"`
+		TopicAssertionIDs       []uuid.UUID `json:"topic_assertion_ids"`
+		MethodAssertionIDs      []uuid.UUID `json:"method_assertion_ids"`
+	}{
+		WorkID:                  evidence.WorkID,
+		ProjectionAssertionID:   evidence.ProjectionAssertionID,
+		NormalizedAssertionID:   evidence.NormalizedAssertionID,
+		SourceRecordID:          evidence.SourceRecordID,
+		SourceTime:              evidence.SourceTime.UTC().Format(time.RFC3339Nano),
+		ProjectionPolicyVersion: evidence.ProjectionPolicyVersion,
+		ClassifierVersion:       input.ClassifierVersion,
+		ClassifierPolicyVersion: catalogClassifierAssertionPolicyVersion,
+		TopicAssertionIDs:       slices.Clone(evidence.TopicAssertionIDs),
+		MethodAssertionIDs:      slices.Clone(evidence.MethodAssertionIDs),
+	})
+	if err != nil {
+		return "", fmt.Errorf(
+			"encode Work %s classifier assertion revision: %w",
+			evidence.WorkID,
+			err,
+		)
+	}
+	return sha256Bytes(material), nil
+}
+
+func loadPublisherAnalysisWorkEvidence(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+	publicVisibility map[uuid.UUID]publisherVisibilityAssessment,
+	sourceConflicts map[uuid.UUID]bool,
+	input PublishInput,
+) (map[uuid.UUID]*publisherAnalysisWorkEvidence, error) {
+	result := make(
+		map[uuid.UUID]*publisherAnalysisWorkEvidence,
+		len(workIDs),
+	)
+	rows, err := tx.Query(ctx, `
+		SELECT
+			state.work_id,
+			projection.id,
+			state.normalized_assertion_id,
+			state.source_record_uuid,
+			state.source_time,
+			state.projection_policy_version
+		FROM work_projection_states AS state
+		JOIN ingestion_projection_assertions AS projection
+		  ON projection.work_id = state.work_id
+		 AND projection.raw_event_id = state.raw_event_id
+		 AND projection.normalized_assertion_id =
+		     state.normalized_assertion_id
+		 AND projection.source_record_uuid =
+		     state.source_record_uuid
+		 AND projection.scope_policy_version =
+		     state.scope_policy_version
+		 AND projection.projection_policy_version =
+		     state.projection_policy_version
+		WHERE state.work_id = ANY($1::uuid[])
+		ORDER BY state.work_id
+	`, workIDs)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query exact Catalog classifier source revisions: %w",
+			err,
+		)
+	}
+	for rows.Next() {
+		var evidence publisherAnalysisWorkEvidence
+		if err := rows.Scan(
+			&evidence.WorkID,
+			&evidence.ProjectionAssertionID,
+			&evidence.NormalizedAssertionID,
+			&evidence.SourceRecordID,
+			&evidence.SourceTime,
+			&evidence.ProjectionPolicyVersion,
+		); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf(
+				"scan exact Catalog classifier source revision: %w",
+				err,
+			)
+		}
+		visibility, found := publicVisibility[evidence.WorkID]
+		if !found || !visibility.State.PubliclyVisible {
+			continue
+		}
+		evidence.Channel = visibility.Admission.Channel
+		evidence.SourceTime = evidence.SourceTime.UTC()
+		evidence.SourceConflict = sourceConflicts[evidence.WorkID]
+		evidence.ClassifierReady =
+			input.ClassifierVersion == CatalogClassifierVersion &&
+				evidence.ProjectionPolicyVersion ==
+					catalogClassifierProjectionPolicyVersion &&
+				!evidence.SourceTime.After(input.AnalysisCutoff)
+		result[evidence.WorkID] = &evidence
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf(
+			"iterate exact Catalog classifier source revisions: %w",
+			err,
+		)
+	}
+	rows.Close()
+	for _, workID := range workIDs {
+		if visibility := publicVisibility[workID]; visibility.State.PubliclyVisible &&
+			result[workID] == nil {
+			return nil, fmt.Errorf(
+				"%w: publicly visible Work %s lacks an exact current projection revision",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+	}
+
+	topicRows, err := tx.Query(ctx, `
+		SELECT topic.work_id, topic.id
+		FROM work_topics AS topic
+		JOIN work_projection_states AS state
+		  ON state.work_id = topic.work_id
+		 AND state.source_record_uuid = topic.source_record_id
+		WHERE topic.work_id = ANY($1::uuid[])
+		ORDER BY topic.work_id, topic.id
+	`, workIDs)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query exact Catalog topic assertions: %w",
+			err,
+		)
+	}
+	for topicRows.Next() {
+		var workID, assertionID uuid.UUID
+		if err := topicRows.Scan(&workID, &assertionID); err != nil {
+			topicRows.Close()
+			return nil, fmt.Errorf(
+				"scan exact Catalog topic assertion: %w",
+				err,
+			)
+		}
+		if evidence := result[workID]; evidence != nil {
+			evidence.TopicAssertionIDs = append(
+				evidence.TopicAssertionIDs,
+				assertionID,
+			)
+		}
+	}
+	if err := topicRows.Err(); err != nil {
+		topicRows.Close()
+		return nil, fmt.Errorf(
+			"iterate exact Catalog topic assertions: %w",
+			err,
+		)
+	}
+	topicRows.Close()
+
+	methodRows, err := tx.Query(ctx, `
+		SELECT method.work_id, method.id
+		FROM work_methods AS method
+		JOIN work_projection_states AS state
+		  ON state.work_id = method.work_id
+		 AND state.source_record_uuid = method.source_record_id
+		WHERE method.work_id = ANY($1::uuid[])
+		ORDER BY method.work_id, method.id
+	`, workIDs)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query exact Catalog method assertions: %w",
+			err,
+		)
+	}
+	for methodRows.Next() {
+		var workID, assertionID uuid.UUID
+		if err := methodRows.Scan(&workID, &assertionID); err != nil {
+			methodRows.Close()
+			return nil, fmt.Errorf(
+				"scan exact Catalog method assertion: %w",
+				err,
+			)
+		}
+		if evidence := result[workID]; evidence != nil {
+			evidence.MethodAssertionIDs = append(
+				evidence.MethodAssertionIDs,
+				assertionID,
+			)
+		}
+	}
+	if err := methodRows.Err(); err != nil {
+		methodRows.Close()
+		return nil, fmt.Errorf(
+			"iterate exact Catalog method assertions: %w",
+			err,
+		)
+	}
+	methodRows.Close()
+
+	abstractRoutes, err := loadPublisherAbstractRouteBindings(
+		ctx,
+		tx,
+		input,
+		workIDs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for workID, evidence := range result {
+		evidence.ClassifierRevision, err =
+			publisherClassifierAssertionRevision(input, *evidence)
+		if err != nil {
+			return nil, err
+		}
+		evidence.ClassifierReady = evidence.ClassifierReady &&
+			len(evidence.TopicAssertionIDs) > 0 &&
+			len(evidence.MethodAssertionIDs) > 0
+		if binding, found := abstractRoutes[workID]; found {
+			current := binding
+			evidence.AbstractRoute = &current
+		}
+		eventAt, assertionIDs, eventConflict, err :=
+			loadPublisherCanonicalChannelEvent(
+				ctx,
+				tx,
+				*evidence,
+				input.GeneratedAt,
+			)
+		if err != nil {
+			return nil, err
+		}
+		evidence.ChannelEventAssertionIDs = assertionIDs
+		evidence.CanonicalEventAt = eventAt
+		evidence.SourceConflict = evidence.SourceConflict ||
+			eventConflict
+	}
+	return result, nil
+}
+
+func loadPublisherCanonicalChannelEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	work publisherAnalysisWorkEvidence,
+	generatedAt time.Time,
+) (*time.Time, []uuid.UUID, bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT
+			id,
+			work_id,
+			source_record_id,
+			projection_assertion_id,
+			channel,
+			event_kind,
+			event_at,
+			source_path,
+			asserted_at
+		FROM work_channel_event_assertions
+		WHERE work_id = $1
+		  AND channel = $2
+		  AND projection_assertion_id = $3
+		  AND normalized_assertion_id = $4
+		  AND source_record_id = $5
+		  AND asserted_at <= $6
+		ORDER BY id
+	`,
+		work.WorkID,
+		work.Channel,
+		work.ProjectionAssertionID,
+		work.NormalizedAssertionID,
+		work.SourceRecordID,
+		generatedAt.UTC(),
+	)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf(
+			"query Work %s exact channel event assertions: %w",
+			work.WorkID,
+			err,
+		)
+	}
+	defer rows.Close()
+	assertions := make([]contenttruth.ChannelEventAssertion, 0)
+	for rows.Next() {
+		var assertion contenttruth.ChannelEventAssertion
+		if err := rows.Scan(
+			&assertion.ID,
+			&assertion.WorkID,
+			&assertion.SourceRecordID,
+			&assertion.SourceRevisionID,
+			&assertion.Channel,
+			&assertion.Kind,
+			&assertion.EventAt,
+			&assertion.SourcePath,
+			&assertion.AssertedAt,
+		); err != nil {
+			return nil, nil, false, fmt.Errorf(
+				"scan Work %s exact channel event assertion: %w",
+				work.WorkID,
+				err,
+			)
+		}
+		assertion.EventAt = assertion.EventAt.UTC()
+		assertion.AssertedAt = assertion.AssertedAt.UTC()
+		if err := assertion.Validate(); err != nil {
+			return nil, nil, false, fmt.Errorf(
+				"%w: Work %s has invalid exact channel event assertion: %v",
+				ErrCatalogNotReady,
+				work.WorkID,
+				err,
+			)
+		}
+		assertions = append(assertions, assertion)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, false, fmt.Errorf(
+			"iterate Work %s exact channel event assertions: %w",
+			work.WorkID,
+			err,
+		)
+	}
+	policy, err := publisherCanonicalChannelEventPolicy()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	decision, err := contenttruth.ProjectCanonicalChannelEvent(
+		work.WorkID,
+		work.Channel,
+		assertions,
+		policy,
+		generatedAt.UTC(),
+	)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf(
+			"%w: project Work %s canonical channel event: %v",
+			ErrCatalogNotReady,
+			work.WorkID,
+			err,
+		)
+	}
+	assertionIDs := make([]uuid.UUID, len(decision.Evidence))
+	for index, item := range decision.Evidence {
+		assertionIDs[index] = item.AssertionID
+	}
+	switch decision.State {
+	case contenttruth.AssertionStateKnown:
+		eventAt := decision.EventAt.UTC()
+		return &eventAt, assertionIDs, false, nil
+	case contenttruth.AssertionStateMissing:
+		return nil, assertionIDs, false, nil
+	case contenttruth.AssertionStateConflict:
+		return nil, assertionIDs, true, nil
+	default:
+		return nil, nil, false, fmt.Errorf(
+			"%w: Work %s canonical channel event has invalid projected state %q",
+			ErrCatalogNotReady,
+			work.WorkID,
+			decision.State,
+		)
+	}
+}
+
+func publisherCanonicalChannelEventPolicy() (
+	contenttruth.ChannelEventPolicy,
+	error,
+) {
+	policy, err := contenttruth.NewChannelEventPolicy(
+		catalogCanonicalChannelEventPolicyVersion,
+		map[scope.ContentChannel][]contenttruth.ChannelEventKind{
+			scope.ContentChannelJournalPublished: {
+				contenttruth.ChannelEventOfficialOnline,
+				contenttruth.ChannelEventOfficialPrint,
+			},
+			scope.ContentChannelAcceptedEarly: {
+				contenttruth.ChannelEventAccepted,
+				contenttruth.ChannelEventAheadOfPrint,
+				contenttruth.ChannelEventOnlineFirst,
+			},
+			scope.ContentChannelPreprint: {
+				contenttruth.ChannelEventPreprintPosted,
+			},
+			scope.ContentChannelConferenceProceeding: {
+				contenttruth.ChannelEventProceedingPublished,
+			},
+		},
+	)
+	if err != nil {
+		return contenttruth.ChannelEventPolicy{}, fmt.Errorf(
+			"construct frozen Catalog canonical channel event policy: %w",
+			err,
+		)
+	}
+	return policy, nil
+}
+
+func evaluateAndPersistPublisherVisibility(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+	officialLinks map[uuid.UUID]map[scope.ContentChannel]publishedOfficialLink,
+	input PublishInput,
+	analysisEvidence map[uuid.UUID]*publisherAnalysisWorkEvidence,
+	persist bool,
+) (map[uuid.UUID]publisherVisibilityAssessment, error) {
+	admissions, err := loadPublisherAdmissions(
+		ctx,
+		tx,
+		workIDs,
+		input.GeneratedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	lifecycles, err := loadPublisherLifecycles(
+		ctx,
+		tx,
+		workIDs,
+		input.GeneratedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	stableIdentities, err := loadPublisherStableIdentities(ctx, tx, workIDs)
+	if err != nil {
+		return nil, err
+	}
+	activeWorks, err := loadPublisherActiveWorks(ctx, tx, workIDs)
+	if err != nil {
+		return nil, err
+	}
+	analysisEvaluation := input.Mode == PublishAnalysis &&
+		analysisEvidence != nil
+
+	evaluatedAt := input.GeneratedAt.UTC().Truncate(time.Microsecond)
+	var analysisCutoff *time.Time
+	if analysisEvaluation {
+		cutoff := input.AnalysisCutoff.UTC()
+		analysisCutoff = &cutoff
+	}
+	result := make(
+		map[uuid.UUID]publisherVisibilityAssessment,
+		len(workIDs),
+	)
+	for _, workID := range workIDs {
+		workAdmissions := admissions[workID]
+		if len(workAdmissions) == 0 {
+			workAdmissions = []scope.AdmissionDecision{{
+				WorkID:                 workID.String(),
+				Decision:               scope.AdmissionMissing,
+				Reason:                 scope.AdmissionReasonChannelUnresolved,
+				AdmissionPolicyVersion: scope.ChannelAdmissionPolicyVersion,
+				DomainRegistryVersion:  scope.ResearchDomainRegistryVersion,
+				DecidedAt:              evaluatedAt,
+			}}
+		}
+
+		var selected publisherVisibilityAssessment
+		for _, admission := range workAdmissions {
+			lifecycle := scope.LifecycleStateMissing
+			if byChannel := lifecycles[workID]; byChannel != nil {
+				if value, found := byChannel[admission.Channel]; found {
+					lifecycle = value
+				}
+			}
+			link, hasLink := officialLinks[workID][admission.Channel]
+			var visibilityLink *VisibilityOfficialLink
+			if hasLink {
+				visibilityLink = &VisibilityOfficialLink{
+					VerificationID:  link.VerificationID,
+					URL:             link.URL,
+					VerifierVersion: link.VerifierVersion,
+					VerifiedAt:      link.VerifiedAt,
+					ProjectedAt:     link.ProjectedAt,
+					ExpiresAt:       link.ExpiresAt,
+				}
+			}
+			workAnalysis := analysisEvidence[workID]
+			matchesAnalysisChannel := workAnalysis != nil &&
+				workAnalysis.Channel == admission.Channel
+			var canonicalEventAt *time.Time
+			if matchesAnalysisChannel {
+				canonicalEventAt = workAnalysis.CanonicalEventAt
+			}
+			state, err := EvaluateVisibility(VisibilityInput{
+				WorkID:                  workID,
+				Admission:               admission,
+				HasStableIdentity:       stableIdentities[workID],
+				WorkActive:              activeWorks[workID],
+				Lifecycle:               lifecycle,
+				OfficialLink:            visibilityLink,
+				AnalysisCutoff:          analysisCutoff,
+				CanonicalChannelEventAt: canonicalEventAt,
+				DomainClassified:        admission.Decision == scope.AdmissionAccepted,
+				RequiredTaxonomyClassified: matchesAnalysisChannel &&
+					workAnalysis.ClassifierReady,
+				AbstractRouteSucceeded: matchesAnalysisChannel &&
+					workAnalysis.AbstractRoute != nil,
+				DecisiveSourceConflict: matchesAnalysisChannel &&
+					workAnalysis.SourceConflict,
+				EvaluatedAt:   evaluatedAt,
+				PolicyVersion: VisibilityPolicyVersion,
+			})
+			if err != nil {
+				return nil, fmt.Errorf(
+					"evaluate Catalog visibility for Work %s: %w",
+					workID,
+					err,
+				)
+			}
+			candidate := publisherVisibilityAssessment{
+				State:        state,
+				Admission:    admission,
+				Lifecycle:    lifecycle,
+				OfficialLink: link,
+			}
+			if selected.State.WorkID == uuid.Nil ||
+				preferPublisherVisibility(candidate, selected) {
+				selected = candidate
+			}
+		}
+		if persist {
+			restoredState, err := persistPublisherVisibilityAssessment(
+				ctx,
+				tx,
+				selected.State,
+			)
+			if err != nil {
+				return nil, err
+			}
+			selected.State = restoredState
+		}
+		result[workID] = selected
+	}
+	return result, nil
+}
+
+func publisherPublicationSourceConflicts(
+	states map[uuid.UUID]*publishedPublicationState,
+) map[uuid.UUID]bool {
+	result := make(map[uuid.UUID]bool, len(states))
+	for workID, state := range states {
+		if state == nil {
+			continue
+		}
+		result[workID] = state.PrintPublished.State == "conflict" ||
+			state.ElectronicPublished.State == "conflict" ||
+			state.AheadOfPrint.State == "conflict" ||
+			state.Accepted.State == "conflict"
+	}
+	return result
+}
+
+func loadPublisherRequiredTaxonomy(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+	classifierVersion string,
+) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(workIDs))
+	if classifierVersion == "" {
+		return result, nil
+	}
+	if classifierVersion != CatalogClassifierVersion {
+		return nil, fmt.Errorf(
+			"%w: unsupported Catalog classifier version %q",
+			ErrCatalogNotReady,
+			classifierVersion,
+		)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT
+			state.work_id,
+			EXISTS (
+				SELECT 1
+				FROM work_topics AS topic
+				WHERE topic.work_id = state.work_id
+				  AND topic.source_record_id =
+				      state.source_record_uuid
+			),
+			EXISTS (
+				SELECT 1
+				FROM work_methods AS method
+				WHERE method.work_id = state.work_id
+				  AND method.source_record_id =
+				      state.source_record_uuid
+			)
+		FROM work_projection_states AS state
+		WHERE state.work_id = ANY($1::uuid[])
+		  AND state.projection_policy_version = $2
+		ORDER BY state.work_id
+	`, workIDs, catalogClassifierProjectionPolicyVersion)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query exact Catalog taxonomy readiness: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var workID uuid.UUID
+		var hasTopic, hasMethod bool
+		if err := rows.Scan(&workID, &hasTopic, &hasMethod); err != nil {
+			return nil, fmt.Errorf(
+				"scan exact Catalog taxonomy readiness: %w",
+				err,
+			)
+		}
+		result[workID] = hasTopic && hasMethod
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate exact Catalog taxonomy readiness: %w",
+			err,
+		)
+	}
+	return result, nil
+}
+
+func preferPublisherVisibility(
+	left publisherVisibilityAssessment,
+	right publisherVisibilityAssessment,
+) bool {
+	if left.State.PubliclyVisible != right.State.PubliclyVisible {
+		return left.State.PubliclyVisible
+	}
+	leftPriority := publisherChannelPriority(left.Admission.Channel)
+	rightPriority := publisherChannelPriority(right.Admission.Channel)
+	if leftPriority != rightPriority {
+		return leftPriority < rightPriority
+	}
+	return string(left.Admission.Channel) < string(right.Admission.Channel)
+}
+
+func publisherChannelPriority(channel scope.ContentChannel) int {
+	switch channel {
+	case scope.ContentChannelJournalPublished:
+		return 1
+	case scope.ContentChannelAcceptedEarly:
+		return 2
+	case scope.ContentChannelPreprint:
+		return 3
+	case scope.ContentChannelConferenceProceeding:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func loadPublisherAdmissions(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+	generatedAt time.Time,
+) (map[uuid.UUID][]scope.AdmissionDecision, error) {
+	result := make(map[uuid.UUID][]scope.AdmissionDecision, len(workIDs))
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT ON (work_id, channel)
+			work_id,
+			channel,
+			decision,
+			reason,
+			admission_policy_version,
+			domain_registry_version,
+			journal_policy_version,
+			channel_registry_version,
+			evidence,
+			decided_at
+		FROM work_channel_admission_decisions
+		WHERE work_id = ANY($1::uuid[])
+		  AND decided_at <= $2
+		ORDER BY work_id, channel, decided_at DESC, id DESC
+	`, workIDs, generatedAt.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("query Catalog admission decisions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			workID                 uuid.UUID
+			channel                pgtype.Text
+			journalPolicyVersion   pgtype.Text
+			channelRegistryVersion pgtype.Text
+			rawEvidence            []byte
+			decision               scope.AdmissionDecision
+		)
+		if err := rows.Scan(
+			&workID,
+			&channel,
+			&decision.Decision,
+			&decision.Reason,
+			&decision.AdmissionPolicyVersion,
+			&decision.DomainRegistryVersion,
+			&journalPolicyVersion,
+			&channelRegistryVersion,
+			&rawEvidence,
+			&decision.DecidedAt,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan Catalog admission decision: %w",
+				err,
+			)
+		}
+		decision.WorkID = workID.String()
+		if channel.Valid {
+			decision.Channel = scope.ContentChannel(channel.String)
+		}
+		if journalPolicyVersion.Valid {
+			decision.JournalPolicyVersion = journalPolicyVersion.String
+		}
+		if channelRegistryVersion.Valid {
+			decision.ChannelRegistryVersion =
+				channelRegistryVersion.String
+		}
+		var evidence struct {
+			SourcePaths []string `json:"source_paths"`
+		}
+		if err := json.Unmarshal(rawEvidence, &evidence); err != nil {
+			return nil, fmt.Errorf(
+				"%w: decode Work %s admission evidence: %v",
+				ErrCatalogNotReady,
+				workID,
+				err,
+			)
+		}
+		decision.SourcePaths = evidence.SourcePaths
+		decision.DecidedAt = decision.DecidedAt.UTC()
+		if err := decision.Validate(); err != nil {
+			return nil, fmt.Errorf(
+				"%w: Work %s has invalid admission decision: %v",
+				ErrCatalogNotReady,
+				workID,
+				err,
+			)
+		}
+		result[workID] = append(result[workID], decision)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate Catalog admission decisions: %w",
+			err,
+		)
+	}
+	return result, nil
+}
+
+func loadPublisherLifecycles(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+	generatedAt time.Time,
+) (map[uuid.UUID]map[scope.ContentChannel]scope.LifecycleState, error) {
+	result := make(
+		map[uuid.UUID]map[scope.ContentChannel]scope.LifecycleState,
+		len(workIDs),
+	)
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT ON (work_id, channel)
+			work_id,
+			channel,
+			lifecycle_state
+		FROM work_lifecycle_states
+		WHERE work_id = ANY($1::uuid[])
+		  AND decided_at <= $2
+		ORDER BY work_id, channel, decided_at DESC, id DESC
+	`, workIDs, generatedAt.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("query Catalog lifecycle states: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			workID    uuid.UUID
+			channel   scope.ContentChannel
+			lifecycle scope.LifecycleState
+		)
+		if err := rows.Scan(&workID, &channel, &lifecycle); err != nil {
+			return nil, fmt.Errorf(
+				"scan Catalog lifecycle state: %w",
+				err,
+			)
+		}
+		if result[workID] == nil {
+			result[workID] = make(
+				map[scope.ContentChannel]scope.LifecycleState,
+			)
+		}
+		result[workID][channel] = lifecycle
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterate Catalog lifecycle states: %w",
+			err,
+		)
+	}
+	return result, nil
+}
+
+func loadPublisherStableIdentities(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(workIDs))
+	rows, err := tx.Query(ctx, `
+		SELECT id, canonical_key
+		FROM works
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id
+	`, workIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query Catalog Work identities: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			workID       uuid.UUID
+			canonicalKey string
+		)
+		if err := rows.Scan(&workID, &canonicalKey); err != nil {
+			return nil, fmt.Errorf("scan Catalog Work identity: %w", err)
+		}
+		result[workID] = canonicalKey != "" &&
+			canonicalKey == strings.TrimSpace(canonicalKey)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Catalog Work identities: %w", err)
+	}
+	return result, nil
+}
+
+func loadPublisherActiveWorks(
+	ctx context.Context,
+	tx pgx.Tx,
+	workIDs []uuid.UUID,
+) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(workIDs))
+	rows, err := tx.Query(ctx, `
+		SELECT id, status
+		FROM works
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id
+	`, workIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query Catalog Work active states: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			workID uuid.UUID
+			status string
+		)
+		if err := rows.Scan(&workID, &status); err != nil {
+			return nil, fmt.Errorf("scan Catalog Work active state: %w", err)
+		}
+		result[workID] = status == "active"
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Catalog Work active states: %w", err)
+	}
+	return result, nil
+}
+
+func persistPublisherVisibilityAssessment(
+	ctx context.Context,
+	tx pgx.Tx,
+	state VisibilityState,
+) (VisibilityState, error) {
+	reasons := make([]string, len(state.Reasons))
+	for index, reason := range state.Reasons {
+		reasons[index] = string(reason)
+	}
+	var (
+		publiclyVisible bool
+		analysisReady   bool
+		analysisCutoff  pgtype.Timestamptz
+		storedReasons   []string
+		evaluatedAt     time.Time
+	)
+	err := tx.QueryRow(ctx, `
+		INSERT INTO work_visibility_assessments (
+			work_id,
+			policy_version,
+			publicly_visible,
+			analysis_ready,
+			analysis_cutoff,
+			reasons,
+			evaluated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT ON CONSTRAINT
+			work_visibility_assessments_identity_key
+		DO NOTHING
+		RETURNING
+			publicly_visible,
+			analysis_ready,
+			analysis_cutoff,
+			reasons,
+			evaluated_at
+	`,
+		state.WorkID,
+		state.PolicyVersion,
+		state.PubliclyVisible,
+		state.AnalysisReady,
+		state.AnalysisCutoff,
+		reasons,
+		state.EvaluatedAt,
+	).Scan(
+		&publiclyVisible,
+		&analysisReady,
+		&analysisCutoff,
+		&storedReasons,
+		&evaluatedAt,
+	)
+	inserted := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return VisibilityState{}, fmt.Errorf(
+			"persist Work %s Catalog visibility assessment: %w",
+			state.WorkID,
+			err,
+		)
+	}
+	if !inserted {
+		if err := tx.QueryRow(ctx, `
+			SELECT
+				publicly_visible,
+				analysis_ready,
+				analysis_cutoff,
+				reasons,
+				evaluated_at
+			FROM work_visibility_assessments
+			WHERE work_id = $1
+			  AND policy_version = $2
+			  AND evaluated_at = $3
+		`,
+			state.WorkID,
+			state.PolicyVersion,
+			state.EvaluatedAt,
+		).Scan(
+			&publiclyVisible,
+			&analysisReady,
+			&analysisCutoff,
+			&storedReasons,
+			&evaluatedAt,
+		); err != nil {
+			return VisibilityState{}, fmt.Errorf(
+				"restore Work %s Catalog visibility assessment: %w",
+				state.WorkID,
+				err,
+			)
+		}
+	}
+	restored := VisibilityState{
+		WorkID:          state.WorkID,
+		PubliclyVisible: publiclyVisible,
+		AnalysisReady:   analysisReady,
+		Reasons:         make([]VisibilityReason, len(storedReasons)),
+		PolicyVersion:   state.PolicyVersion,
+		EvaluatedAt:     evaluatedAt.UTC(),
+	}
+	if analysisCutoff.Valid {
+		cutoff := analysisCutoff.Time.UTC()
+		restored.AnalysisCutoff = &cutoff
+	}
+	for index, reason := range storedReasons {
+		restored.Reasons[index] = VisibilityReason(reason)
+	}
+	if !inserted {
+		cutoffMatches := state.AnalysisCutoff == nil &&
+			restored.AnalysisCutoff == nil
+		if state.AnalysisCutoff != nil &&
+			restored.AnalysisCutoff != nil {
+			cutoffMatches = restored.AnalysisCutoff.Equal(
+				*state.AnalysisCutoff,
+			)
+		}
+		if restored.PubliclyVisible != state.PubliclyVisible ||
+			restored.AnalysisReady != state.AnalysisReady ||
+			!cutoffMatches ||
+			!slices.Equal(storedReasons, reasons) ||
+			!restored.EvaluatedAt.Equal(state.EvaluatedAt) {
+			return VisibilityState{}, fmt.Errorf(
+				"%w: Work %s has a conflicting immutable visibility assessment",
+				ErrCatalogNotReady,
+				state.WorkID,
+			)
+		}
+	}
+	return restored, nil
+}
+
+func persistPublisherAnalysisSnapshot(
+	ctx context.Context,
+	tx pgx.Tx,
+	input PublishInput,
+	evidenceByWork map[uuid.UUID]*publisherAnalysisWorkEvidence,
+) (string, error) {
+	type revisionWork struct {
+		WorkID                   uuid.UUID            `json:"work_id"`
+		Channel                  scope.ContentChannel `json:"channel"`
+		ProjectionAssertionID    uuid.UUID            `json:"projection_assertion_id"`
+		NormalizedAssertionID    uuid.UUID            `json:"normalized_assertion_id"`
+		SourceRecordID           uuid.UUID            `json:"source_record_id"`
+		SourceTime               string               `json:"source_time"`
+		ChannelEventAssertionIDs []uuid.UUID          `json:"channel_event_assertion_ids"`
+		CanonicalEventAt         string               `json:"canonical_channel_event_at"`
+		TopicAssertionIDs        []uuid.UUID          `json:"topic_assertion_ids"`
+		MethodAssertionIDs       []uuid.UUID          `json:"method_assertion_ids"`
+		ClassifierRevision       string               `json:"classifier_assertion_revision"`
+		AbstractRouteRunID       uuid.UUID            `json:"abstract_route_run_id"`
+		AnalysisReady            bool                 `json:"analysis_ready"`
+		Reasons                  []VisibilityReason   `json:"reasons"`
+	}
+	workIDs := make([]uuid.UUID, 0, len(evidenceByWork))
+	for workID := range evidenceByWork {
+		workIDs = append(workIDs, workID)
+	}
+	sort.Slice(workIDs, func(i, j int) bool {
+		return workIDs[i].String() < workIDs[j].String()
+	})
+	revisionWorks := make([]revisionWork, 0, len(workIDs))
+	for _, workID := range workIDs {
+		evidence := evidenceByWork[workID]
+		if evidence == nil ||
+			evidence.WorkID != workID ||
+			evidence.State.WorkID != workID ||
+			!evidence.State.PubliclyVisible ||
+			evidence.State.AnalysisCutoff == nil {
+			return "", fmt.Errorf(
+				"%w: Work %s has incomplete per-Work analysis evidence",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		eventAt := ""
+		if evidence.CanonicalEventAt != nil {
+			eventAt = evidence.CanonicalEventAt.UTC().Format(
+				time.RFC3339Nano,
+			)
+		}
+		abstractRunID := uuid.Nil
+		if evidence.AbstractRoute != nil {
+			abstractRunID = evidence.AbstractRoute.RunID
+		}
+		revisionWorks = append(revisionWorks, revisionWork{
+			WorkID:                workID,
+			Channel:               evidence.Channel,
+			ProjectionAssertionID: evidence.ProjectionAssertionID,
+			NormalizedAssertionID: evidence.NormalizedAssertionID,
+			SourceRecordID:        evidence.SourceRecordID,
+			SourceTime:            evidence.SourceTime.UTC().Format(time.RFC3339Nano),
+			ChannelEventAssertionIDs: slices.Clone(
+				evidence.ChannelEventAssertionIDs,
+			),
+			CanonicalEventAt: eventAt,
+			TopicAssertionIDs: slices.Clone(
+				evidence.TopicAssertionIDs,
+			),
+			MethodAssertionIDs: slices.Clone(
+				evidence.MethodAssertionIDs,
+			),
+			ClassifierRevision: evidence.ClassifierRevision,
+			AbstractRouteRunID: abstractRunID,
+			AnalysisReady:      evidence.State.AnalysisReady,
+			Reasons: slices.Clone(
+				evidence.State.Reasons,
+			),
+		})
+	}
+	revisionMaterial, err := json.Marshal(struct {
+		AnalysisCutoff          string         `json:"analysis_cutoff"`
+		GeneratedAt             string         `json:"generated_at"`
+		ClassifierVersion       string         `json:"classifier_version"`
+		ClassifierPolicyVersion string         `json:"classifier_policy_version"`
+		ChannelEventPolicy      string         `json:"channel_event_policy_version"`
+		AbstractRouteRevision   string         `json:"abstract_route_revision"`
+		Works                   []revisionWork `json:"works"`
+	}{
+		AnalysisCutoff: input.AnalysisCutoff.UTC().Format(
+			time.RFC3339Nano,
+		),
+		GeneratedAt: input.GeneratedAt.UTC().Format(
+			time.RFC3339Nano,
+		),
+		ClassifierVersion:       input.ClassifierVersion,
+		ClassifierPolicyVersion: catalogClassifierAssertionPolicyVersion,
+		ChannelEventPolicy:      catalogCanonicalChannelEventPolicyVersion,
+		AbstractRouteRevision:   input.AbstractRouteRevision,
+		Works:                   revisionWorks,
+	})
+	if err != nil {
+		return "", fmt.Errorf(
+			"encode immutable Catalog analysis selection: %w",
+			err,
+		)
+	}
+	selectionRevision := sha256Bytes(revisionMaterial)
+	commandTag, err := tx.Exec(ctx, `
+		INSERT INTO catalog_analysis_snapshots (
+			selection_revision,
+			analysis_cutoff,
+			generated_at,
+			classifier_version,
+			classifier_policy_version,
+			channel_event_policy_version,
+			abstract_route_revision
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT ON CONSTRAINT
+			catalog_analysis_snapshots_revision_key
+		DO NOTHING
+	`,
+		selectionRevision,
+		input.AnalysisCutoff.UTC(),
+		input.GeneratedAt.UTC(),
+		input.ClassifierVersion,
+		catalogClassifierAssertionPolicyVersion,
+		catalogCanonicalChannelEventPolicyVersion,
+		input.AbstractRouteRevision,
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"persist immutable Catalog analysis snapshot: %w",
+			err,
+		)
+	}
+	var analysisSnapshotID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM catalog_analysis_snapshots
+		WHERE selection_revision = $1
+		  AND analysis_cutoff = $2
+		  AND generated_at = $3
+		  AND classifier_version = $4
+		  AND classifier_policy_version = $5
+		  AND channel_event_policy_version = $6
+		  AND abstract_route_revision = $7
+	`,
+		selectionRevision,
+		input.AnalysisCutoff.UTC(),
+		input.GeneratedAt.UTC(),
+		input.ClassifierVersion,
+		catalogClassifierAssertionPolicyVersion,
+		catalogCanonicalChannelEventPolicyVersion,
+		input.AbstractRouteRevision,
+	).Scan(&analysisSnapshotID); err != nil {
+		if commandTag.RowsAffected() == 0 &&
+			errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf(
+				"%w: Catalog analysis revision %s conflicts with an immutable snapshot",
+				ErrCatalogNotReady,
+				selectionRevision,
+			)
+		}
+		return "", fmt.Errorf(
+			"restore immutable Catalog analysis snapshot: %w",
+			err,
+		)
+	}
+
+	for _, workID := range workIDs {
+		evidence := evidenceByWork[workID]
+		reasons := make([]string, len(evidence.State.Reasons))
+		for index, reason := range evidence.State.Reasons {
+			reasons[index] = string(reason)
+		}
+		var (
+			canonicalEventAt   any
+			abstractRouteRunID any
+		)
+		if evidence.CanonicalEventAt != nil {
+			canonicalEventAt =
+				evidence.CanonicalEventAt.UTC()
+		}
+		if evidence.AbstractRoute != nil {
+			abstractRouteRunID =
+				evidence.AbstractRoute.RunID
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO catalog_analysis_work_snapshots (
+				analysis_snapshot_id,
+				work_id,
+				channel,
+				projection_assertion_id,
+				normalized_assertion_id,
+				source_record_id,
+				source_time,
+				channel_event_assertion_ids,
+				canonical_channel_event_at,
+				classifier_ready,
+				classifier_assertion_revision,
+				abstract_route_run_id,
+				analysis_ready,
+				reasons
+			) VALUES (
+				$1, $2, $3, $4, $5, $6, $7,
+				$8, $9, $10, $11, $12, $13, $14
+			)
+			ON CONFLICT ON CONSTRAINT
+				catalog_analysis_work_snapshots_identity_key
+			DO NOTHING
+		`,
+			analysisSnapshotID,
+			workID,
+			evidence.Channel,
+			evidence.ProjectionAssertionID,
+			evidence.NormalizedAssertionID,
+			evidence.SourceRecordID,
+			evidence.SourceTime.UTC(),
+			evidence.ChannelEventAssertionIDs,
+			canonicalEventAt,
+			evidence.ClassifierReady,
+			evidence.ClassifierRevision,
+			abstractRouteRunID,
+			evidence.State.AnalysisReady,
+			reasons,
+		); err != nil {
+			return "", fmt.Errorf(
+				"persist Work %s immutable Catalog analysis snapshot: %w",
+				workID,
+				err,
+			)
+		}
+		var workSnapshotID uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			SELECT id
+			FROM catalog_analysis_work_snapshots
+			WHERE analysis_snapshot_id = $1
+			  AND work_id = $2
+			  AND channel = $3
+			  AND projection_assertion_id = $4
+			  AND normalized_assertion_id = $5
+			  AND source_record_id = $6
+			  AND source_time = $7
+			  AND channel_event_assertion_ids = $8
+			  AND canonical_channel_event_at
+			      IS NOT DISTINCT FROM $9::timestamptz
+			  AND classifier_ready = $10
+			  AND classifier_assertion_revision = $11
+			  AND abstract_route_run_id
+			      IS NOT DISTINCT FROM $12::uuid
+			  AND analysis_ready = $13
+			  AND reasons = $14
+		`,
+			analysisSnapshotID,
+			workID,
+			evidence.Channel,
+			evidence.ProjectionAssertionID,
+			evidence.NormalizedAssertionID,
+			evidence.SourceRecordID,
+			evidence.SourceTime.UTC(),
+			evidence.ChannelEventAssertionIDs,
+			canonicalEventAt,
+			evidence.ClassifierReady,
+			evidence.ClassifierRevision,
+			abstractRouteRunID,
+			evidence.State.AnalysisReady,
+			reasons,
+		).Scan(&workSnapshotID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return "", fmt.Errorf(
+					"%w: Work %s conflicts with its immutable Catalog analysis snapshot",
+					ErrCatalogNotReady,
+					workID,
+				)
+			}
+			return "", fmt.Errorf(
+				"restore Work %s immutable Catalog analysis snapshot: %w",
+				workID,
+				err,
+			)
+		}
+		for _, assertionID := range evidence.TopicAssertionIDs {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO catalog_analysis_work_topic_assertions (
+					work_snapshot_id,
+					work_id,
+					source_record_id,
+					work_topic_id
+				) VALUES ($1, $2, $3, $4)
+				ON CONFLICT DO NOTHING
+			`,
+				workSnapshotID,
+				workID,
+				evidence.SourceRecordID,
+				assertionID,
+			); err != nil {
+				return "", fmt.Errorf(
+					"persist Work %s exact topic assertion %s: %w",
+					workID,
+					assertionID,
+					err,
+				)
+			}
+		}
+		for _, assertionID := range evidence.MethodAssertionIDs {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO catalog_analysis_work_method_assertions (
+					work_snapshot_id,
+					work_id,
+					source_record_id,
+					work_method_id
+				) VALUES ($1, $2, $3, $4)
+				ON CONFLICT DO NOTHING
+			`,
+				workSnapshotID,
+				workID,
+				evidence.SourceRecordID,
+				assertionID,
+			); err != nil {
+				return "", fmt.Errorf(
+					"persist Work %s exact method assertion %s: %w",
+					workID,
+					assertionID,
+					err,
+				)
+			}
+		}
+		var storedTopicIDs, storedMethodIDs []uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			SELECT
+				ARRAY(
+					SELECT topic.work_topic_id
+					FROM catalog_analysis_work_topic_assertions AS topic
+					WHERE topic.work_snapshot_id = $1
+					ORDER BY topic.work_topic_id
+				),
+				ARRAY(
+					SELECT method.work_method_id
+					FROM catalog_analysis_work_method_assertions AS method
+					WHERE method.work_snapshot_id = $1
+					ORDER BY method.work_method_id
+				)
+		`, workSnapshotID).Scan(
+			&storedTopicIDs,
+			&storedMethodIDs,
+		); err != nil {
+			return "", fmt.Errorf(
+				"restore Work %s exact classifier assertions: %w",
+				workID,
+				err,
+			)
+		}
+		if !slices.Equal(
+			storedTopicIDs,
+			evidence.TopicAssertionIDs,
+		) || !slices.Equal(
+			storedMethodIDs,
+			evidence.MethodAssertionIDs,
+		) {
+			return "", fmt.Errorf(
+				"%w: Work %s classifier assertion snapshot conflicts with exact topics or methods",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+	}
+	return selectionRevision, nil
+}
+
 func buildPaper(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -1186,6 +3507,8 @@ func buildPaper(
 	jcrImportReceipt uuid.UUID,
 	analysisRun citationAnalysisRun,
 	publicationState *publishedPublicationState,
+	visibility publisherVisibilityAssessment,
+	mode PublishMode,
 ) (publishedPaper, []taxonomyFact, []taxonomyFact, error) {
 	var paper publishedPaper
 	err := tx.QueryRow(ctx, `
@@ -1285,41 +3608,68 @@ func buildPaper(
 	paper.HasDataState, paper.HasDataValue = boolColumns(hasData)
 	paper.HasBenchmarkState, paper.HasBenchmarkValue = boolColumns(hasBenchmark)
 
-	citationValue,
-		citationCount,
-		citationSnapshots,
-		citationVelocity,
-		citationPercentile,
-		citationAnalysisEvidence,
-		err := loadCitationAnalysisEvidence(
-		ctx,
-		tx,
-		workID,
-		analysisRun,
+	var (
+		citationValue            = catalogValue{State: "missing"}
+		citationCount            *int64
+		citationSnapshots        = catalogValue{State: "missing"}
+		citationVelocity         = catalogValue{State: "missing"}
+		citationPercentile       = catalogValue{State: "missing"}
+		citationAnalysisEvidence = catalogValue{State: "missing"}
 	)
-	if err != nil {
-		return publishedPaper{}, nil, nil, err
+	if analysisRun.ID != uuid.Nil {
+		citationValue,
+			citationCount,
+			citationSnapshots,
+			citationVelocity,
+			citationPercentile,
+			citationAnalysisEvidence,
+			err = loadCitationAnalysisEvidence(
+			ctx,
+			tx,
+			workID,
+			analysisRun,
+		)
+		if err != nil {
+			return publishedPaper{}, nil, nil, err
+		}
 	}
 	paper.CitationCountState = citationValue.State
 	paper.CitationCountValue = citationCount
 	paper.TrendScoreState = "missing"
-	paper.CitationTrend, err = loadCitationTrendEvidence(
-		ctx,
-		tx,
-		workID,
-		analysisRun,
-	)
-	if err != nil {
-		return publishedPaper{}, nil, nil, err
+	if analysisRun.ID != uuid.Nil {
+		paper.CitationTrend, err = loadCitationTrendEvidence(
+			ctx,
+			tx,
+			workID,
+			analysisRun,
+		)
+		if err != nil {
+			return publishedPaper{}, nil, nil, err
+		}
 	}
 
-	topics, err := loadTaxonomyFacts(ctx, tx, "topics", workID, sources.sourceRecordIDs)
-	if err != nil {
-		return publishedPaper{}, nil, nil, err
-	}
-	methods, err := loadTaxonomyFacts(ctx, tx, "methods", workID, sources.sourceRecordIDs)
-	if err != nil {
-		return publishedPaper{}, nil, nil, err
+	var topics, methods []taxonomyFact
+	if mode == PublishAnalysis {
+		topics, err = loadTaxonomyFacts(
+			ctx,
+			tx,
+			"topics",
+			workID,
+			sources.sourceRecordIDs,
+		)
+		if err != nil {
+			return publishedPaper{}, nil, nil, err
+		}
+		methods, err = loadTaxonomyFacts(
+			ctx,
+			tx,
+			"methods",
+			workID,
+			sources.sourceRecordIDs,
+		)
+		if err != nil {
+			return publishedPaper{}, nil, nil, err
+		}
 	}
 	paper.TopicSlugs = taxonomySlugs(topics)
 	paper.MethodSlugs = taxonomySlugs(methods)
@@ -1330,18 +3680,53 @@ func buildPaper(
 		return publishedPaper{}, nil, nil, err
 	}
 	provenance := sourceProvenance(sources.states)
-	biomedical, err := loadBiomedicalPaperPayload(
-		ctx,
-		tx,
-		workID,
-		eligibility,
-		jcrImportReceipt,
-	)
+	var biomedical biomedicalPaperPayload
+	if mode == PublishFacts {
+		biomedical, err = loadFactsPaperPayload(
+			ctx,
+			tx,
+			workID,
+			visibility.Admission.Channel,
+		)
+	} else {
+		switch visibility.Admission.Channel {
+		case scope.ContentChannelJournalPublished,
+			scope.ContentChannelAcceptedEarly:
+			biomedical, err = loadBiomedicalPaperPayload(
+				ctx,
+				tx,
+				workID,
+				eligibility,
+				jcrImportReceipt,
+			)
+		case scope.ContentChannelPreprint,
+			scope.ContentChannelConferenceProceeding:
+			biomedical, err = loadNonJournalBiomedicalPaperPayload(
+				ctx,
+				tx,
+				workID,
+			)
+		default:
+			err = fmt.Errorf(
+				"%w: Work %s has unsupported published channel %q",
+				ErrCatalogNotReady,
+				workID,
+				visibility.Admission.Channel,
+			)
+		}
+	}
 	if err != nil {
 		return publishedPaper{}, nil, nil, err
 	}
 	paper.biomedical = biomedical
 
+	citationSource := catalogValue{State: "missing"}
+	if analysisRun.ID != uuid.Nil {
+		citationSource = catalogValue{
+			State: "known",
+			Value: analysisRun.Source,
+		}
+	}
 	paperPayload := map[string]any{
 		"id":                         paper.ID,
 		"canonical_key":              paper.CanonicalKey,
@@ -1353,14 +3738,13 @@ func buildPaper(
 		"has_code":                   hasCode,
 		"has_data":                   hasData,
 		"has_benchmark":              hasBenchmark,
-		"citation_source":            catalogValue{State: "known", Value: analysisRun.Source},
+		"citation_source":            citationSource,
 		"citation_count":             citationValue,
 		"trend_score":                catalogValue{State: "missing"},
 		"topics":                     taxonomyReferences(topics),
 		"methods":                    taxonomyReferences(methods),
 		"authors":                    authors,
 		"curation":                   curation,
-		"journal":                    biomedical.Journal,
 		"subjects":                   biomedical.Subjects,
 		"mesh_headings":              biomedical.MeSHHeadings,
 		"publication_types":          biomedical.PublicationTypes,
@@ -1373,6 +3757,20 @@ func buildPaper(
 		"article_usage":              catalogValue{State: "missing"},
 		"open_fulltext":              catalogValue{State: "missing"},
 		"source_provenance":          catalogValue{State: "known", Value: provenance},
+		"official_link":              visibility.OfficialLink,
+		"publicly_visible":           visibility.State.PubliclyVisible,
+		"analysis_ready":             visibility.State.AnalysisReady,
+		"topics_state": taxonomyReadinessState(
+			topics,
+			visibility.State.AnalysisReady,
+		),
+		"methods_state": taxonomyReadinessState(
+			methods,
+			visibility.State.AnalysisReady,
+		),
+	}
+	if biomedical.Journal.ID != uuid.Nil {
+		paperPayload["journal"] = biomedical.Journal
 	}
 	payload, err := marshalCatalogPayload(paperPayload)
 	if err != nil {
@@ -1395,7 +3793,9 @@ func buildPaper(
 	for _, method := range methods {
 		searchParts = append(searchParts, method.Name)
 	}
-	searchParts = append(searchParts, biomedical.Journal.Title)
+	if biomedical.Journal.Title != "" {
+		searchParts = append(searchParts, biomedical.Journal.Title)
+	}
 	for _, subject := range biomedical.Subjects {
 		searchParts = append(searchParts, subject.Name)
 	}
@@ -1419,6 +3819,19 @@ func buildPaper(
 	searchParts = append(searchParts, paper.SourceNames...)
 	paper.SearchText = strings.Join(searchParts, " ")
 	return paper, topics, methods, nil
+}
+
+func taxonomyReadinessState(
+	values []taxonomyFact,
+	analysisReady bool,
+) string {
+	if !analysisReady {
+		return "not_ready"
+	}
+	if len(values) == 0 {
+		return "missing"
+	}
+	return "known"
 }
 
 func loadCurrentPublicationStates(
@@ -2378,6 +4791,84 @@ func loadBiomedicalPaperPayload(
 			Value: eligibility,
 		},
 	}, nil
+}
+
+func loadNonJournalBiomedicalPaperPayload(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+) (biomedicalPaperPayload, error) {
+	meshHeadings, publicationTypes, publicationTypesState, err :=
+		loadCurrentBiomedicalSemantics(ctx, tx, workID)
+	if err != nil {
+		return biomedicalPaperPayload{}, err
+	}
+	return biomedicalPaperPayload{
+		Subjects:              []taxonomyReference{},
+		MeSHHeadings:          meshHeadings,
+		PublicationTypes:      publicationTypes,
+		PublicationTypesState: publicationTypesState,
+		JCRAssessment:         catalogValue{State: "missing"},
+	}, nil
+}
+
+func loadFactsPaperPayload(
+	ctx context.Context,
+	tx pgx.Tx,
+	workID uuid.UUID,
+	channel scope.ContentChannel,
+) (biomedicalPaperPayload, error) {
+	payload, err := loadNonJournalBiomedicalPaperPayload(ctx, tx, workID)
+	if err != nil {
+		return biomedicalPaperPayload{}, err
+	}
+	switch channel {
+	case scope.ContentChannelJournalPublished,
+		scope.ContentChannelAcceptedEarly:
+		var journal journalReference
+		if err := tx.QueryRow(ctx, `
+			SELECT venue.id, venue.display_title
+			FROM works AS work
+			JOIN venues AS venue
+			  ON venue.id = work.venue_id
+			WHERE work.id = $1
+			  AND venue.venue_type = 'journal'
+		`, workID).Scan(&journal.ID, &journal.Title); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return biomedicalPaperPayload{}, fmt.Errorf(
+					"%w: facts Work %s lacks basic Journal identity",
+					ErrCatalogNotReady,
+					workID,
+				)
+			}
+			return biomedicalPaperPayload{}, fmt.Errorf(
+				"query facts Work %s Journal identity: %w",
+				workID,
+				err,
+			)
+		}
+		if journal.Title == "" ||
+			journal.Title != strings.TrimSpace(journal.Title) {
+			return biomedicalPaperPayload{}, fmt.Errorf(
+				"%w: facts Work %s Journal title is invalid",
+				ErrCatalogNotReady,
+				workID,
+			)
+		}
+		journal.Slug = "journal-" +
+			strings.ReplaceAll(journal.ID.String(), "-", "")
+		payload.Journal = journal
+	case scope.ContentChannelPreprint,
+		scope.ContentChannelConferenceProceeding:
+	default:
+		return biomedicalPaperPayload{}, fmt.Errorf(
+			"%w: Work %s has unsupported published channel %q",
+			ErrCatalogNotReady,
+			workID,
+			channel,
+		)
+	}
+	return payload, nil
 }
 
 func loadEligibilitySubjects(
@@ -4531,55 +7022,65 @@ func boolRatio(
 
 func snapshotRevision(input PublishInput, snapshot catalogSnapshot) (string, error) {
 	material := struct {
-		FormulaVersion           string                         `json:"formula_version"`
-		JCRMetricYear            int                            `json:"jcr_metric_year"`
-		VenuePolicyName          string                         `json:"venue_policy_name"`
-		VenuePolicyVersion       int                            `json:"venue_policy_version"`
-		EligibilityPolicyVersion string                         `json:"eligibility_policy_version"`
-		SubjectVersion           string                         `json:"subject_version"`
-		JCRImportReceipt         uuid.UUID                      `json:"jcr_import_receipt"`
-		CitationSource           string                         `json:"citation_source"`
-		CitationAnalysisRunID    uuid.UUID                      `json:"citation_analysis_run_id"`
-		TrendAnalysisRunID       uuid.UUID                      `json:"trend_analysis_run_id"`
-		JournalAnalysisRunID     uuid.UUID                      `json:"journal_analysis_run_id"`
-		OpportunityAnalysisRunID uuid.UUID                      `json:"opportunity_analysis_run_id"`
-		Sources                  []sourceRevisionFact           `json:"sources"`
-		Curations                []curationRevisionFact         `json:"curations"`
-		Papers                   []publishedPaper               `json:"papers"`
-		Topics                   []publishedTaxonomy            `json:"topics"`
-		Methods                  []publishedTaxonomy            `json:"methods"`
-		Home                     json.RawMessage                `json:"home"`
-		SubjectListMetadata      json.RawMessage                `json:"subject_list_metadata"`
-		JournalListMetadata      json.RawMessage                `json:"journal_list_metadata"`
-		Subjects                 []publishedBiomedicalResource  `json:"subjects"`
-		Journals                 []publishedBiomedicalResource  `json:"journals"`
-		Trends                   []publishedTrend               `json:"trends"`
-		Opportunities            []publishedResearchOpportunity `json:"opportunities"`
+		Mode                      PublishMode                    `json:"mode"`
+		FormulaVersion            string                         `json:"formula_version"`
+		AnalysisCutoff            string                         `json:"analysis_cutoff"`
+		ClassifierVersion         string                         `json:"classifier_version"`
+		AbstractRouteRevision     string                         `json:"abstract_route_revision"`
+		AnalysisSelectionRevision string                         `json:"analysis_selection_revision"`
+		JCRMetricYear             int                            `json:"jcr_metric_year"`
+		VenuePolicyName           string                         `json:"venue_policy_name"`
+		VenuePolicyVersion        int                            `json:"venue_policy_version"`
+		EligibilityPolicyVersion  string                         `json:"eligibility_policy_version"`
+		SubjectVersion            string                         `json:"subject_version"`
+		JCRImportReceipt          uuid.UUID                      `json:"jcr_import_receipt"`
+		CitationSource            string                         `json:"citation_source"`
+		CitationAnalysisRunID     uuid.UUID                      `json:"citation_analysis_run_id"`
+		TrendAnalysisRunID        uuid.UUID                      `json:"trend_analysis_run_id"`
+		JournalAnalysisRunID      uuid.UUID                      `json:"journal_analysis_run_id"`
+		OpportunityAnalysisRunID  uuid.UUID                      `json:"opportunity_analysis_run_id"`
+		Sources                   []sourceRevisionFact           `json:"sources"`
+		Curations                 []curationRevisionFact         `json:"curations"`
+		Papers                    []publishedPaper               `json:"papers"`
+		Topics                    []publishedTaxonomy            `json:"topics"`
+		Methods                   []publishedTaxonomy            `json:"methods"`
+		Home                      json.RawMessage                `json:"home"`
+		SubjectListMetadata       json.RawMessage                `json:"subject_list_metadata"`
+		JournalListMetadata       json.RawMessage                `json:"journal_list_metadata"`
+		Subjects                  []publishedBiomedicalResource  `json:"subjects"`
+		Journals                  []publishedBiomedicalResource  `json:"journals"`
+		Trends                    []publishedTrend               `json:"trends"`
+		Opportunities             []publishedResearchOpportunity `json:"opportunities"`
 	}{
-		FormulaVersion:           input.FormulaVersion,
-		JCRMetricYear:            input.JCRMetricYear,
-		VenuePolicyName:          input.VenuePolicyName,
-		VenuePolicyVersion:       input.VenuePolicyVersion,
-		EligibilityPolicyVersion: input.EligibilityPolicyVersion,
-		SubjectVersion:           input.SubjectVersion,
-		JCRImportReceipt:         input.JCRImportReceipt,
-		CitationSource:           input.CitationSource,
-		CitationAnalysisRunID:    input.CitationAnalysisRunID,
-		TrendAnalysisRunID:       input.TrendAnalysisRunID,
-		JournalAnalysisRunID:     input.JournalAnalysisRunID,
-		OpportunityAnalysisRunID: input.OpportunityAnalysisRunID,
-		Sources:                  snapshot.sources,
-		Curations:                snapshot.curations,
-		Papers:                   snapshot.papers,
-		Topics:                   snapshot.topics,
-		Methods:                  snapshot.methods,
-		Home:                     snapshot.home,
-		SubjectListMetadata:      snapshot.subjectListMetadata,
-		JournalListMetadata:      snapshot.journalListMetadata,
-		Subjects:                 snapshot.subjects,
-		Journals:                 snapshot.journals,
-		Trends:                   snapshot.trends,
-		Opportunities:            snapshot.opportunities,
+		Mode:                      input.Mode,
+		FormulaVersion:            input.FormulaVersion,
+		AnalysisCutoff:            input.AnalysisCutoff.UTC().Format(time.RFC3339Nano),
+		ClassifierVersion:         input.ClassifierVersion,
+		AbstractRouteRevision:     input.AbstractRouteRevision,
+		AnalysisSelectionRevision: snapshot.analysisRevision,
+		JCRMetricYear:             input.JCRMetricYear,
+		VenuePolicyName:           input.VenuePolicyName,
+		VenuePolicyVersion:        input.VenuePolicyVersion,
+		EligibilityPolicyVersion:  input.EligibilityPolicyVersion,
+		SubjectVersion:            input.SubjectVersion,
+		JCRImportReceipt:          input.JCRImportReceipt,
+		CitationSource:            input.CitationSource,
+		CitationAnalysisRunID:     input.CitationAnalysisRunID,
+		TrendAnalysisRunID:        input.TrendAnalysisRunID,
+		JournalAnalysisRunID:      input.JournalAnalysisRunID,
+		OpportunityAnalysisRunID:  input.OpportunityAnalysisRunID,
+		Sources:                   snapshot.sources,
+		Curations:                 snapshot.curations,
+		Papers:                    snapshot.papers,
+		Topics:                    snapshot.topics,
+		Methods:                   snapshot.methods,
+		Home:                      snapshot.home,
+		SubjectListMetadata:       snapshot.subjectListMetadata,
+		JournalListMetadata:       snapshot.journalListMetadata,
+		Subjects:                  snapshot.subjects,
+		Journals:                  snapshot.journals,
+		Trends:                    snapshot.trends,
+		Opportunities:             snapshot.opportunities,
 	}
 	encoded, err := json.Marshal(material)
 	if err != nil {
@@ -4641,7 +7142,8 @@ func persistSnapshot(
 	sourceRevision string,
 	snapshot catalogSnapshot,
 ) (Generation, error) {
-	metadata, err := json.Marshal(map[string]any{
+	metadataValues := map[string]any{
+		"mode":                        input.Mode,
 		"papers":                      len(snapshot.papers),
 		"topics":                      len(snapshot.topics),
 		"methods":                     len(snapshot.methods),
@@ -4660,7 +7162,17 @@ func persistSnapshot(
 		"trend_analysis_run_id":       input.TrendAnalysisRunID,
 		"journal_analysis_run_id":     input.JournalAnalysisRunID,
 		"opportunity_analysis_run_id": input.OpportunityAnalysisRunID,
-	})
+	}
+	if input.Mode == PublishAnalysis {
+		metadataValues["analysis_cutoff"] =
+			input.AnalysisCutoff.UTC().Format(time.RFC3339Nano)
+		metadataValues["classifier_version"] = input.ClassifierVersion
+		metadataValues["abstract_route_revision"] =
+			input.AbstractRouteRevision
+		metadataValues["analysis_selection_revision"] =
+			snapshot.analysisRevision
+	}
+	metadata, err := json.Marshal(metadataValues)
 	if err != nil {
 		return Generation{}, fmt.Errorf("encode public catalog generation metadata: %w", err)
 	}

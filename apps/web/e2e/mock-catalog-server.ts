@@ -95,6 +95,8 @@ const jcrAssessment = known({
   subject_version_key: "jcr-biomedical-2025-v1",
 })
 const paper: HomeResponse["latest_papers"]["items"][number] = {
+  analysis_ready: false,
+  methods_state: "not_ready",
   citation_count: known(27),
   has_benchmark: known(false),
   has_code: known(false),
@@ -107,6 +109,7 @@ const paper: HomeResponse["latest_papers"]["items"][number] = {
   status: "active",
   subjects: [subject],
   title: "Prospective oncology cohort with external validation",
+  topics_state: "not_ready",
   type: known("research_article"),
   article_usage: { state: "missing" as const },
   citation_percentile: { state: "missing" as const },
@@ -115,7 +118,18 @@ const paper: HomeResponse["latest_papers"]["items"][number] = {
   citation_velocity: { state: "missing" as const },
   jcr_assessment: jcrAssessment,
   mesh_headings: { state: "missing" as const },
+  official_link: {
+    content_channel: "journal_published",
+    expires_at: "2026-07-20T06:00:00Z",
+    link_role: "official_article",
+    policy_version: "official-url/v1",
+    url: "https://publisher.example.test/articles/prospective-oncology-cohort",
+    verification_id: "00000000-0000-4000-8000-000000000504",
+    verified_at: "2026-07-19T06:00:00Z",
+    verifier_version: "official-url-verifier/v1",
+  },
   open_fulltext: { state: "missing" as const },
+  publicly_visible: true,
 }
 const provenance = {
   normalized_assertion_id: "00000000-0000-4000-8000-000000000501",

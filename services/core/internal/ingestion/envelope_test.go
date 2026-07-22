@@ -469,6 +469,73 @@ func TestEnvelopeAndCloneDeepCopyPublicationHistory(t *testing.T) {
 	}
 }
 
+func TestEnvelopeAndCloneDeepCopyURLCandidates(t *testing.T) {
+	t.Parallel()
+
+	raw := mustRawRecord(t, `{"DOI":"10.1000/url-candidate"}`)
+	record := source.Record{
+		Source:         source.Crossref,
+		SourceRecordID: "10.1000/url-candidate",
+		Raw:            raw,
+		URLCandidates: []source.URLCandidate{{
+			URL:            "https://resolver.example.test/10.1000/url-candidate",
+			SourcePath:     "$.URL",
+			ContentChannel: "journal_published",
+			LinkRole:       source.URLLinkRoleDOIURL,
+			ParserVersion:  "crossref/works-v2",
+			Identifier: source.Identifier{
+				Scheme: source.IdentifierDOI,
+				Value:  "10.1000/url-candidate",
+			},
+		}},
+	}
+	envelope, err := NewEnvelope(
+		source.Crossref,
+		"crossref:10.1000/url-candidate",
+		time.Date(2026, time.July, 19, 7, 0, 0, 0, time.UTC),
+		"1",
+		1,
+		record,
+		raw,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope() error = %v", err)
+	}
+	cloned := envelope.Clone()
+
+	record.URLCandidates[0].URL = "https://changed.example.test/original"
+	if got := envelope.Record.URLCandidates[0].URL; got !=
+		"https://resolver.example.test/10.1000/url-candidate" {
+		t.Fatalf("Envelope URL candidate = %q, retained Record alias", got)
+	}
+	if got := cloned.Record.URLCandidates[0].URL; got !=
+		"https://resolver.example.test/10.1000/url-candidate" {
+		t.Fatalf("Clone URL candidate = %q, retained Record alias", got)
+	}
+
+	envelope.Record.URLCandidates[0].URL =
+		"https://changed.example.test/envelope"
+	if got := record.URLCandidates[0].URL; got !=
+		"https://changed.example.test/original" {
+		t.Fatalf("Record URL candidate = %q, retained Envelope alias", got)
+	}
+	if got := cloned.Record.URLCandidates[0].URL; got !=
+		"https://resolver.example.test/10.1000/url-candidate" {
+		t.Fatalf("Clone URL candidate = %q, retained Envelope alias", got)
+	}
+
+	cloned.Record.URLCandidates[0].URL =
+		"https://changed.example.test/clone"
+	if got := envelope.Record.URLCandidates[0].URL; got !=
+		"https://changed.example.test/envelope" {
+		t.Fatalf("Envelope URL candidate = %q, retained Clone alias", got)
+	}
+	if got := record.URLCandidates[0].URL; got !=
+		"https://changed.example.test/original" {
+		t.Fatalf("Record URL candidate = %q, retained Clone alias", got)
+	}
+}
+
 func TestNewDeletionEnvelopeDeepCopiesRawPayload(t *testing.T) {
 	t.Parallel()
 

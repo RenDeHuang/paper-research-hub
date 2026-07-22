@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -52,6 +54,13 @@ func validateHomeSnapshotPayload(payload json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	generatedAt, err := parseHomeDateTime(
+		"HomeResponse.generated_at",
+		home["generated_at"],
+	)
+	if err != nil {
+		return err
+	}
 	if err := validateHomeCollection(
 		"HomeResponse.active_journals",
 		home["active_journals"],
@@ -72,7 +81,9 @@ func validateHomeSnapshotPayload(payload json.RawMessage) error {
 		home["citation_momentum"],
 		homeAnalysisWindowDeclaration{known: true, days: 30},
 		false,
-		validateHomeCitationMomentumItem,
+		func(path string, raw json.RawMessage) error {
+			return validateHomeCitationMomentumItemAt(path, raw, generatedAt)
+		},
 	); err != nil {
 		return err
 	}
@@ -100,24 +111,21 @@ func validateHomeSnapshotPayload(payload json.RawMessage) error {
 	); err != nil {
 		return err
 	}
-	if err := validateHomeDateTime(
-		"HomeResponse.generated_at",
-		home["generated_at"],
-	); err != nil {
-		return err
-	}
 	if err := validateHomeCollection(
 		"HomeResponse.latest_papers",
 		home["latest_papers"],
 		homeAnalysisWindowDeclaration{known: true, days: 7},
 		true,
-		validateHomePaperSummary,
+		func(path string, raw json.RawMessage) error {
+			return validateHomePaperSummaryAt(path, raw, generatedAt)
+		},
 	); err != nil {
 		return err
 	}
 	if err := validateHomePublicationUpdates(
 		"HomeResponse.publication_updates",
 		home["publication_updates"],
+		generatedAt,
 	); err != nil {
 		return err
 	}
@@ -602,10 +610,16 @@ func validateHomeCoverage(path string, raw json.RawMessage) error {
 			return err
 		}
 	}
-	if err := validateHomeYear(path+".jcr_metric_year", coverage["jcr_metric_year"]); err != nil {
+	if err := validateHomeKnownOrMissingYear(
+		path+".jcr_metric_year",
+		coverage["jcr_metric_year"],
+	); err != nil {
 		return err
 	}
-	return validateHomeString(path+".taxonomy_version", coverage["taxonomy_version"], 1, 0)
+	return validateHomeKnownOrMissingString(
+		path+".taxonomy_version",
+		coverage["taxonomy_version"],
+	)
 }
 
 func validateHomeScope(path string, raw json.RawMessage) error {
@@ -618,10 +632,16 @@ func validateHomeScope(path string, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := validateHomeYear(path+".jcr_metric_year", scope["jcr_metric_year"]); err != nil {
+	if err := validateHomeKnownOrMissingYear(
+		path+".jcr_metric_year",
+		scope["jcr_metric_year"],
+	); err != nil {
 		return err
 	}
-	return validateHomeString(path+".taxonomy_version", scope["taxonomy_version"], 1, 0)
+	return validateHomeKnownOrMissingString(
+		path+".taxonomy_version",
+		scope["taxonomy_version"],
+	)
 }
 
 func validateHomeJournalActivityItem(path string, raw json.RawMessage) error {
@@ -779,6 +799,14 @@ func validateHomeJournalMetricCategory(path string, raw json.RawMessage) error {
 }
 
 func validateHomeCitationMomentumItem(path string, raw json.RawMessage) error {
+	return validateHomeCitationMomentumItemAt(path, raw, time.Time{})
+}
+
+func validateHomeCitationMomentumItemAt(
+	path string,
+	raw json.RawMessage,
+	generatedAt time.Time,
+) error {
 	item, err := decodeHomeObject(
 		path,
 		raw,
@@ -820,7 +848,7 @@ func validateHomeCitationMomentumItem(path string, raw json.RawMessage) error {
 	); err != nil {
 		return err
 	}
-	return validateHomePaperSummary(path+".paper", item["paper"])
+	return validateHomePaperSummaryAt(path+".paper", item["paper"], generatedAt)
 }
 
 func validateHomeEntityMomentumItem(path string, raw json.RawMessage) error {
@@ -987,7 +1015,11 @@ func validateHomeConfidenceInterval(path string, raw json.RawMessage) error {
 	return validateHomeNumber(path+".upper", interval["upper"])
 }
 
-func validateHomePublicationUpdates(path string, raw json.RawMessage) error {
+func validateHomePublicationUpdates(
+	path string,
+	raw json.RawMessage,
+	generatedAt time.Time,
+) error {
 	updates, err := decodeHomeObject(
 		path,
 		raw,
@@ -1035,7 +1067,13 @@ func validateHomePublicationUpdates(path string, raw json.RawMessage) error {
 			updates[collection.field],
 			collection.window,
 			true,
-			validateHomePublicationUpdateItem,
+			func(itemPath string, itemRaw json.RawMessage) error {
+				return validateHomePublicationUpdateItemAt(
+					itemPath,
+					itemRaw,
+					generatedAt,
+				)
+			},
 		); err != nil {
 			return err
 		}
@@ -1044,6 +1082,14 @@ func validateHomePublicationUpdates(path string, raw json.RawMessage) error {
 }
 
 func validateHomePublicationUpdateItem(path string, raw json.RawMessage) error {
+	return validateHomePublicationUpdateItemAt(path, raw, time.Time{})
+}
+
+func validateHomePublicationUpdateItemAt(
+	path string,
+	raw json.RawMessage,
+	generatedAt time.Time,
+) error {
 	item, err := decodeHomeObject(
 		path,
 		raw,
@@ -1053,7 +1099,11 @@ func validateHomePublicationUpdateItem(path string, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := validateHomePaperSummary(path+".paper", item["paper"]); err != nil {
+	if err := validateHomePaperSummaryAt(
+		path+".paper",
+		item["paper"],
+		generatedAt,
+	); err != nil {
 		return err
 	}
 	return validateHomePublicationUpdateEvent(path+".event", item["event"])
@@ -1156,6 +1206,14 @@ func validateHomePublicationEventProvenance(path string, raw json.RawMessage) er
 }
 
 func validateHomePaperSummary(path string, raw json.RawMessage) error {
+	return validateHomePaperSummaryAt(path, raw, time.Time{})
+}
+
+func validateHomePaperSummaryAt(
+	path string,
+	raw json.RawMessage,
+	generatedAt time.Time,
+) error {
 	paper, err := decodeHomeObject(
 		path,
 		raw,
@@ -1177,6 +1235,11 @@ func validateHomePaperSummary(path string, raw json.RawMessage) error {
 			"jcr_assessment",
 			"article_usage",
 			"open_fulltext",
+			"official_link",
+			"publicly_visible",
+			"analysis_ready",
+			"topics_state",
+			"methods_state",
 		},
 		[]string{
 			"canonical_key",
@@ -1218,6 +1281,35 @@ func validateHomePaperSummary(path string, raw json.RawMessage) error {
 		"rejected",
 		"superseded",
 	); err != nil {
+		return err
+	}
+	contentChannel, err := validateHomeOfficialLinkAndChannelAt(
+		path+".official_link",
+		paper["official_link"],
+		generatedAt,
+	)
+	if err != nil {
+		return err
+	}
+	publiclyVisible, err := decodeHomeBoolean(
+		path+".publicly_visible",
+		paper["publicly_visible"],
+	)
+	if err != nil {
+		return err
+	}
+	if !publiclyVisible {
+		return fmt.Errorf(
+			"%s.publicly_visible must be true in %s",
+			path,
+			homeSnapshotSchemaVersion,
+		)
+	}
+	_, err = decodeHomeBoolean(
+		path+".analysis_ready",
+		paper["analysis_ready"],
+	)
+	if err != nil {
 		return err
 	}
 	if err := validateHomeCatalogValue(
@@ -1374,6 +1466,17 @@ func validateHomePaperSummary(path string, raw json.RawMessage) error {
 			}
 		}
 	}
+	for _, field := range []string{"topics_state", "methods_state"} {
+		if err := validateHomeStringEnum(
+			path+"."+field,
+			paper[field],
+			"known",
+			"missing",
+			"not_ready",
+		); err != nil {
+			return err
+		}
+	}
 	if rawValue, ok := paper["authors"]; ok {
 		authors, err := decodeHomeArray(path+".authors", rawValue, 0)
 		if err != nil {
@@ -1426,15 +1529,31 @@ func validateHomePaperSummary(path string, raw json.RawMessage) error {
 	); err != nil {
 		return err
 	}
-	if err := validateHomeCatalogValue(
-		path+".jcr_assessment",
-		paper["jcr_assessment"],
-		validateHomeBiomedicalEligibilityRevision,
-		false,
-		false,
-		false,
-	); err != nil {
-		return err
+	switch contentChannel {
+	case "journal_published", "accepted_early":
+		if err := validateHomeCatalogValue(
+			path+".jcr_assessment",
+			paper["jcr_assessment"],
+			validateHomeBiomedicalEligibilityRevision,
+			false,
+			true,
+			false,
+		); err != nil {
+			return err
+		}
+	case "preprint", "conference_proceeding":
+		if err := validateHomeMissingCatalogValue(
+			path+".jcr_assessment",
+			paper["jcr_assessment"],
+		); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf(
+			"%s.official_link.content_channel = %q is unsupported",
+			path,
+			contentChannel,
+		)
 	}
 	for _, field := range []string{"article_usage", "open_fulltext"} {
 		if err := validateHomeMissingCatalogValue(path+"."+field, paper[field]); err != nil {
@@ -1453,6 +1572,38 @@ func validateHomePaperSummary(path string, raw json.RawMessage) error {
 			return err
 		}
 	}
+	if contentChannel == "journal_published" ||
+		contentChannel == "accepted_early" {
+		jcrState, err := decodeHomeUnionState(
+			path+".jcr_assessment",
+			paper["jcr_assessment"],
+		)
+		if err != nil {
+			return err
+		}
+		if jcrState == "missing" {
+			rawCuration, found := paper["curation"]
+			if !found {
+				return fmt.Errorf(
+					"%s.curation must explicitly report missing when JCR assessment is missing",
+					path,
+				)
+			}
+			curationState, err := decodeHomeUnionState(
+				path+".curation",
+				rawCuration,
+			)
+			if err != nil {
+				return err
+			}
+			if curationState != "missing" {
+				return fmt.Errorf(
+					"%s.jcr_assessment may be missing only when curation is missing",
+					path,
+				)
+			}
+		}
+	}
 	if rawValue, ok := paper["source_provenance"]; ok {
 		if err := validateHomeCatalogValue(
 			path+".source_provenance",
@@ -1466,6 +1617,150 @@ func validateHomePaperSummary(path string, raw json.RawMessage) error {
 		}
 	}
 	return nil
+}
+
+func validateHomeOfficialLink(path string, raw json.RawMessage) error {
+	return validateHomeOfficialLinkAt(path, raw, time.Time{})
+}
+
+func validateHomeOfficialLinkAt(
+	path string,
+	raw json.RawMessage,
+	generatedAt time.Time,
+) error {
+	_, err := validateHomeOfficialLinkAndChannelAt(path, raw, generatedAt)
+	return err
+}
+
+func validateHomeOfficialLinkAndChannelAt(
+	path string,
+	raw json.RawMessage,
+	generatedAt time.Time,
+) (string, error) {
+	link, err := decodeHomeObject(
+		path,
+		raw,
+		[]string{
+			"url",
+			"verification_id",
+			"link_role",
+			"content_channel",
+			"verified_at",
+			"expires_at",
+			"verifier_version",
+			"policy_version",
+		},
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+	rawURL, err := decodeHomeString(path+".url", link["url"])
+	if err != nil {
+		return "", err
+	}
+	if rawURL == "" || rawURL != strings.TrimSpace(rawURL) {
+		return "", fmt.Errorf("%s.url must be non-empty and trimmed", path)
+	}
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil ||
+		parsedURL.Scheme != "https" ||
+		parsedURL.Hostname() == "" ||
+		parsedURL.User != nil ||
+		parsedURL.Fragment != "" {
+		return "", fmt.Errorf("%s.url must be an absolute public HTTPS URL", path)
+	}
+	if err := validateHomeUUID(
+		path+".verification_id",
+		link["verification_id"],
+	); err != nil {
+		return "", err
+	}
+	linkRole, err := decodeHomeString(path+".link_role", link["link_role"])
+	if err != nil {
+		return "", err
+	}
+	contentChannel, err := decodeHomeString(
+		path+".content_channel",
+		link["content_channel"],
+	)
+	if err != nil {
+		return "", err
+	}
+	validRole := false
+	switch contentChannel {
+	case "journal_published", "accepted_early":
+		validRole = linkRole == "official_article" ||
+			linkRole == "doi_url"
+	case "preprint":
+		validRole = linkRole == "official_preprint" ||
+			linkRole == "doi_url"
+	case "conference_proceeding":
+		validRole = linkRole == "official_proceeding" ||
+			linkRole == "doi_url"
+	}
+	if !validRole {
+		return "", fmt.Errorf(
+			"%s.link_role = %q conflicts with content_channel %q",
+			path,
+			linkRole,
+			contentChannel,
+		)
+	}
+	verifiedAtText, err := decodeHomeString(
+		path+".verified_at",
+		link["verified_at"],
+	)
+	if err != nil {
+		return "", err
+	}
+	verifiedAt, err := time.Parse(time.RFC3339Nano, verifiedAtText)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%s.verified_at must be an RFC 3339 date-time: %w",
+			path,
+			err,
+		)
+	}
+	expiresAtText, err := decodeHomeString(
+		path+".expires_at",
+		link["expires_at"],
+	)
+	if err != nil {
+		return "", err
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresAtText)
+	if err != nil {
+		return "", fmt.Errorf(
+			"%s.expires_at must be an RFC 3339 date-time: %w",
+			path,
+			err,
+		)
+	}
+	if !expiresAt.After(verifiedAt) {
+		return "", fmt.Errorf("%s.expires_at must follow verified_at", path)
+	}
+	if !generatedAt.IsZero() &&
+		(verifiedAt.After(generatedAt) || !expiresAt.After(generatedAt)) {
+		return "", fmt.Errorf(
+			"%s must satisfy verified_at <= generated_at < expires_at",
+			path,
+		)
+	}
+	for _, field := range []string{"verifier_version", "policy_version"} {
+		value, err := decodeHomeString(path+"."+field, link[field])
+		if err != nil {
+			return "", err
+		}
+		if value == "" || value != strings.TrimSpace(value) {
+			return "", fmt.Errorf(
+				"%s.%s must be non-empty and trimmed",
+				path,
+				field,
+			)
+		}
+	}
+	return contentChannel, nil
 }
 
 func validateHomeCitationSnapshots(path string, raw json.RawMessage) error {
@@ -2371,6 +2666,20 @@ func validateHomeMissingCatalogValue(path string, raw json.RawMessage) error {
 	return err
 }
 
+func validateHomeKnownOrMissingYear(path string, raw json.RawMessage) error {
+	if firstNonSpaceByte(raw) != '{' {
+		return validateHomeYear(path, raw)
+	}
+	return validateHomeMissingCatalogValue(path, raw)
+}
+
+func validateHomeKnownOrMissingString(path string, raw json.RawMessage) error {
+	if firstNonSpaceByte(raw) != '{' {
+		return validateHomeString(path, raw, 1, 0)
+	}
+	return validateHomeMissingCatalogValue(path, raw)
+}
+
 func decodeHomeUnionState(path string, raw json.RawMessage) (string, error) {
 	if firstNonSpaceByte(raw) != '{' {
 		return "", fmt.Errorf("%s must be an object", path)
@@ -2712,14 +3021,24 @@ func validateHomeDate(path string, raw json.RawMessage) error {
 }
 
 func validateHomeDateTime(path string, raw json.RawMessage) error {
+	_, err := parseHomeDateTime(path, raw)
+	return err
+}
+
+func parseHomeDateTime(path string, raw json.RawMessage) (time.Time, error) {
 	value, err := decodeHomeString(path, raw)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
-	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
-		return fmt.Errorf("%s must be an RFC 3339 date-time: %w", path, err)
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf(
+			"%s must be an RFC 3339 date-time: %w",
+			path,
+			err,
+		)
 	}
-	return nil
+	return parsed.UTC(), nil
 }
 
 func validateHomeUUID(path string, raw json.RawMessage) error {

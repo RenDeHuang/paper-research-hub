@@ -359,6 +359,7 @@ func (repository *PostgresRepository) PersistRaw(
 		envelope.TieBreakKey,
 		envelope.Position,
 		envelope.Raw,
+		envelope.RawObservation,
 	)
 	if err != nil {
 		return PersistedRaw{}, err
@@ -385,6 +386,7 @@ func (repository *PostgresRepository) PersistDeletion(
 		envelope.TieBreakKey,
 		envelope.Position,
 		envelope.Raw,
+		nil,
 	)
 	if err != nil {
 		return PersistedDeletion{}, err
@@ -403,6 +405,7 @@ func (repository *PostgresRepository) persistRawEvent(
 	tieBreakKey string,
 	position int64,
 	raw source.RawRecord,
+	observation *RawObservationBoundary,
 ) (string, RawDisposition, error) {
 	format := "json"
 	if _, err := source.NewRawRecord(raw.Payload); err != nil {
@@ -477,6 +480,21 @@ func (repository *PostgresRepository) persistRawEvent(
 		return "", "", fmt.Errorf("insert ingestion raw event: %w", err)
 	}
 
+	if observation != nil {
+		if err := observation.Validate(); err != nil {
+			return "", "", err
+		}
+		if err := persistRawObservation(
+			ctx,
+			tx,
+			insertedID,
+			jobID,
+			*observation,
+		); err != nil {
+			return "", "", err
+		}
+	}
+
 	counterColumn := "raw_inserted"
 	if disposition == RawDispositionReused {
 		counterColumn = "raw_reused"
@@ -497,6 +515,79 @@ func (repository *PostgresRepository) persistRawEvent(
 		return "", "", fmt.Errorf("commit raw event transaction: %w", err)
 	}
 	return insertedID, disposition, nil
+}
+
+func persistRawObservation(
+	ctx context.Context,
+	tx pgx.Tx,
+	rawEventID string,
+	jobID string,
+	observation RawObservationBoundary,
+) error {
+	var observationID string
+	err := tx.QueryRow(ctx, `
+		INSERT INTO ingestion_raw_observations (
+			raw_event_id,
+			job_id,
+			connector_run_id,
+			page_ordinal,
+			record_ordinal,
+			observed_at
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (
+			connector_run_id,
+			page_ordinal,
+			record_ordinal
+		) DO NOTHING
+		RETURNING id::text
+	`,
+		rawEventID,
+		jobID,
+		observation.ConnectorRunID,
+		observation.PageOrdinal,
+		observation.RecordOrdinal,
+		observation.ObservedAt,
+	).Scan(&observationID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("insert ingestion raw observation: %w", err)
+	}
+
+	var (
+		existingRawEventID string
+		existingJobID      string
+		existingObservedAt time.Time
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			raw_event_id::text,
+			job_id::text,
+			observed_at
+		FROM ingestion_raw_observations
+		WHERE connector_run_id = $1
+		  AND page_ordinal = $2
+		  AND record_ordinal = $3
+	`,
+		observation.ConnectorRunID,
+		observation.PageOrdinal,
+		observation.RecordOrdinal,
+	).Scan(
+		&existingRawEventID,
+		&existingJobID,
+		&existingObservedAt,
+	); err != nil {
+		return fmt.Errorf("read reused ingestion raw observation: %w", err)
+	}
+	if existingRawEventID != rawEventID ||
+		existingJobID != jobID ||
+		!existingObservedAt.Equal(observation.ObservedAt) {
+		return errors.New(
+			"connector observation coordinates conflict with immutable observation",
+		)
+	}
+	return nil
 }
 
 type persistedPublicationDateV3 struct {
@@ -527,6 +618,16 @@ type persistedLicenseV4 struct {
 	ID         string `json:"id,omitempty"`
 	URL        string `json:"url,omitempty"`
 	SourcePath string `json:"source_path"`
+}
+
+type persistedURLCandidateV4 struct {
+	URL              string                  `json:"url"`
+	SourcePath       string                  `json:"source_path"`
+	ContentChannel   string                  `json:"content_channel"`
+	LinkRole         source.URLLinkRole      `json:"link_role"`
+	ParserVersion    string                  `json:"parser_version"`
+	IdentifierScheme source.IdentifierScheme `json:"identifier_scheme"`
+	IdentifierValue  string                  `json:"identifier_value"`
 }
 
 type persistedRecordPayloadV3 struct {
@@ -564,6 +665,7 @@ type persistedRecordPayloadV3 struct {
 	Venue                     *source.Venue                        `json:"venue,omitempty"`
 	OpenAccess                *persistedOpenAccessV4               `json:"open_access,omitempty"`
 	Licenses                  []persistedLicenseV4                 `json:"licenses,omitempty"`
+	URLCandidates             []persistedURLCandidateV4            `json:"url_candidates,omitempty"`
 	Retracted                 *bool                                `json:"retracted,omitempty"`
 	CodeURLs                  []string                             `json:"code_urls"`
 	Evidence                  []source.FieldEvidence               `json:"evidence"`
@@ -624,6 +726,7 @@ func recordPayload(record source.Record) persistedRecordPayloadV3 {
 		Venue:            cloneRepositoryVenue(record.Venue),
 		OpenAccess:       persistedOpenAccessPayloadV4(record.OpenAccess),
 		Licenses:         persistedLicensePayloadsV4(record.Licenses),
+		URLCandidates:    persistedURLCandidatePayloadsV4(record.URLCandidates),
 		Retracted:        cloneRepositoryBool(record.Retracted),
 		CodeURLs:         slices.Clone(record.CodeURLs),
 		Evidence:         slices.Clone(record.Evidence),
@@ -3826,6 +3929,24 @@ func persistedLicensePayloadsV4(
 			ID:         value.ID,
 			URL:        value.URL,
 			SourcePath: value.SourcePath,
+		}
+	}
+	return result
+}
+
+func persistedURLCandidatePayloadsV4(
+	values []source.URLCandidate,
+) []persistedURLCandidateV4 {
+	result := make([]persistedURLCandidateV4, len(values))
+	for index, value := range values {
+		result[index] = persistedURLCandidateV4{
+			URL:              value.URL,
+			SourcePath:       value.SourcePath,
+			ContentChannel:   value.ContentChannel,
+			LinkRole:         value.LinkRole,
+			ParserVersion:    value.ParserVersion,
+			IdentifierScheme: value.Identifier.Scheme,
+			IdentifierValue:  value.Identifier.Value,
 		}
 	}
 	return result

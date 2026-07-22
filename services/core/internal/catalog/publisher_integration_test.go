@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/abstractanalysis"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/contenttruth"
+	"github.com/RenDeHuang/paper-research-hub/services/core/internal/scope"
 )
 
 func TestPublisherBuildsAndAtomicallyPublishesNormalizedCurrentState(t *testing.T) {
@@ -113,6 +119,1625 @@ func TestPublisherBuildsAndAtomicallyPublishesNormalizedCurrentState(t *testing.
 	assertNestedJSONValue(t, stats.Payload, []string{"with_code_ratio", "value"}, float64(1))
 }
 
+func TestPublisherFactsModePublishesWithoutAnalysisRunsAndPersistsVisibility(
+	t *testing.T,
+) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "openalex:publisher-facts-visibility",
+		canonicalKey:      "doi:10.1000/publisher-facts-visibility",
+		title:             "Facts-only visibility assessment",
+		paperType:         "research_article",
+		publishedAt:       time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+	})
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC),
+	)
+	input.Mode = PublishFacts
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	input.CitationSource = ""
+	input.CitationAnalysisRunID = uuid.Nil
+	input.TrendAnalysisRunID = uuid.Nil
+	input.JournalAnalysisRunID = uuid.Nil
+	input.OpportunityAnalysisRunID = uuid.Nil
+	preparePublisherAcceptedCurationWithoutBiomedicalRuns(
+		t,
+		pool,
+		input,
+		fixture,
+	)
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf("PublishCurrent(facts) error = %v", err)
+	}
+
+	paper, err := mustRepository(t, pool).Paper(
+		context.Background(),
+		fixture.workID,
+	)
+	if err != nil {
+		t.Fatalf("Paper(facts) error = %v", err)
+	}
+	assertNestedJSONValue(t, paper.Payload, []string{"publicly_visible"}, true)
+	assertNestedJSONValue(t, paper.Payload, []string{"analysis_ready"}, false)
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"citation_analysis_evidence", "state"},
+		"missing",
+	)
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"trend_score", "state"},
+		"missing",
+	)
+
+	var (
+		publiclyVisible bool
+		analysisReady   bool
+		reasons         []string
+		evaluatedAt     time.Time
+	)
+	if err := pool.QueryRow(context.Background(), `
+		SELECT publicly_visible, analysis_ready, reasons, evaluated_at
+		FROM work_visibility_assessments
+		WHERE work_id = $1
+		  AND policy_version = $2
+		  AND evaluated_at = $3
+	`, fixture.workID, VisibilityPolicyVersion, input.GeneratedAt).Scan(
+		&publiclyVisible,
+		&analysisReady,
+		&reasons,
+		&evaluatedAt,
+	); err != nil {
+		t.Fatalf("query facts visibility assessment: %v", err)
+	}
+	if !publiclyVisible || analysisReady || len(reasons) != 0 ||
+		!evaluatedAt.Equal(input.GeneratedAt) {
+		t.Fatalf(
+			"facts visibility assessment = public %v analysis %v reasons %v evaluated %s",
+			publiclyVisible,
+			analysisReady,
+			reasons,
+			evaluatedAt,
+		)
+	}
+
+	var genericAnalysisRuns, abstractRouteRuns int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*) FROM analysis_runs),
+			(SELECT count(*) FROM abstract_route_analysis_runs)
+	`).Scan(&genericAnalysisRuns, &abstractRouteRuns); err != nil {
+		t.Fatalf("count facts-only analysis rows: %v", err)
+	}
+	if genericAnalysisRuns != 0 || abstractRouteRuns != 0 {
+		t.Fatalf(
+			"facts-only analysis rows = generic %d abstract-route %d, want zero",
+			genericAnalysisRuns,
+			abstractRouteRuns,
+		)
+	}
+}
+
+func TestPublisherFactsModePublishesJournalWithoutJCRSubjectOrCurationEvidence(
+	t *testing.T,
+) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "crossref:publisher-facts-no-jcr",
+		logicalSource:     "crossref",
+		canonicalKey:      "doi:10.1000/publisher-facts-no-jcr",
+		title:             "Facts publication without JCR dependencies",
+		paperType:         "research_article",
+		publishedAt:       time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 18, 9, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+	})
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+	)
+	input.Mode = PublishFacts
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	input.JCRMetricYear = 0
+	input.VenuePolicyName = ""
+	input.VenuePolicyVersion = 0
+	input.EligibilityPolicyVersion = ""
+	input.SubjectVersion = ""
+	input.JCRImportReceipt = uuid.Nil
+	input.CitationSource = ""
+	input.CitationAnalysisRunID = uuid.Nil
+	input.TrendAnalysisRunID = uuid.Nil
+	input.JournalAnalysisRunID = uuid.Nil
+	input.OpportunityAnalysisRunID = uuid.Nil
+
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf("PublishCurrent(facts without JCR evidence) error = %v", err)
+	}
+
+	paper, err := mustRepository(t, pool).Paper(
+		context.Background(),
+		fixture.workID,
+	)
+	if err != nil {
+		t.Fatalf("Paper(facts without JCR evidence) error = %v", err)
+	}
+	assertNestedJSONValue(t, paper.Payload, []string{"publicly_visible"}, true)
+	assertNestedJSONValue(t, paper.Payload, []string{"analysis_ready"}, false)
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"curation", "state"},
+		"missing",
+	)
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"jcr_assessment", "state"},
+		"missing",
+	)
+}
+
+func TestPublisherFactsModeIgnoresUnrelatedPendingSourceState(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	included := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "crossref:publisher-facts-pending-control",
+		logicalSource:     "crossref",
+		canonicalKey:      "doi:10.1000/publisher-facts-pending-control",
+		title:             "Facts pending control",
+		paperType:         "preprint",
+		publishedAt:       time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 18, 9, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+		contentChannel:    scope.ContentChannelPreprint,
+		lifecycleState:    scope.LifecycleStatePreprintActive,
+	})
+	pending := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:            "openalex:publisher-facts-unrelated-pending",
+		canonicalKey:        "doi:10.1000/publisher-facts-unrelated-pending",
+		title:               "Unrelated pending enrichment",
+		scopeStatus:         "pending",
+		includeWorkLink:     false,
+		includeWorkID:       false,
+		includeNormalized:   true,
+		noJCRAssessment:     true,
+		withoutOfficialLink: true,
+	})
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+	)
+	input.Mode = PublishFacts
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	input.JCRMetricYear = 0
+	input.VenuePolicyName = ""
+	input.VenuePolicyVersion = 0
+	input.EligibilityPolicyVersion = ""
+	input.SubjectVersion = ""
+	input.JCRImportReceipt = uuid.Nil
+	input.CitationSource = ""
+	input.CitationAnalysisRunID = uuid.Nil
+	input.TrendAnalysisRunID = uuid.Nil
+	input.JournalAnalysisRunID = uuid.Nil
+	input.OpportunityAnalysisRunID = uuid.Nil
+
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf(
+			"PublishCurrent(facts with unrelated pending source) error = %v",
+			err,
+		)
+	}
+	page, err := mustRepository(t, pool).Papers(
+		context.Background(),
+		PaperListQuery{Limit: 20},
+	)
+	if err != nil {
+		t.Fatalf("Papers(facts with unrelated pending source) error = %v", err)
+	}
+	assertPaperIDs(t, page.Items, included.workID)
+	if _, err := mustRepository(t, pool).Paper(
+		context.Background(),
+		pending.workID,
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Paper(unrelated pending Work) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPublisherFactsModeDoesNotReadTaxonomyAnalysisRows(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "crossref:publisher-facts-taxonomy-not-ready",
+		logicalSource:     "crossref",
+		canonicalKey:      "doi:10.1000/publisher-facts-taxonomy-not-ready",
+		title:             "Facts taxonomy not ready",
+		topicNames:        []string{"Broken classifier topic"},
+		paperType:         "preprint",
+		publishedAt:       time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 18, 9, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+		contentChannel:    scope.ContentChannelPreprint,
+		lifecycleState:    scope.LifecycleStatePreprintActive,
+	})
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE topics
+		SET description = ''
+		WHERE id = (
+			SELECT topic_id
+			FROM work_topics
+			WHERE work_id = $1
+		)
+	`, fixture.workID); err != nil {
+		t.Fatalf("corrupt unrelated taxonomy analysis row: %v", err)
+	}
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+	)
+	input.Mode = PublishFacts
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	input.JCRMetricYear = 0
+	input.VenuePolicyName = ""
+	input.VenuePolicyVersion = 0
+	input.EligibilityPolicyVersion = ""
+	input.SubjectVersion = ""
+	input.JCRImportReceipt = uuid.Nil
+	input.CitationSource = ""
+	input.CitationAnalysisRunID = uuid.Nil
+	input.TrendAnalysisRunID = uuid.Nil
+	input.JournalAnalysisRunID = uuid.Nil
+	input.OpportunityAnalysisRunID = uuid.Nil
+
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf("PublishCurrent(facts with bad taxonomy analysis) error = %v", err)
+	}
+	paper, err := mustRepository(t, pool).Paper(
+		context.Background(),
+		fixture.workID,
+	)
+	if err != nil {
+		t.Fatalf("Paper(facts with bad taxonomy analysis) error = %v", err)
+	}
+	assertNestedJSONValue(t, paper.Payload, []string{"topics"}, []any{})
+	assertNestedJSONValue(t, paper.Payload, []string{"methods"}, []any{})
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"topics_state"},
+		"not_ready",
+	)
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"methods_state"},
+		"not_ready",
+	)
+	assertNestedJSONValue(t, paper.Payload, []string{"analysis_ready"}, false)
+}
+
+func TestPublisherFactsModePersistsInactiveWorkVisibilityAndExcludesIt(
+	t *testing.T,
+) {
+	pool := openCatalogTestPool(t)
+	active := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "crossref:publisher-facts-active-control",
+		logicalSource:     "crossref",
+		canonicalKey:      "doi:10.1000/publisher-facts-active-control",
+		title:             "Active facts control",
+		paperType:         "preprint",
+		publishedAt:       time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 18, 9, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+		contentChannel:    scope.ContentChannelPreprint,
+		lifecycleState:    scope.LifecycleStatePreprintActive,
+	})
+	inactive := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "crossref:publisher-facts-inactive",
+		logicalSource:     "crossref",
+		canonicalKey:      "doi:10.1000/publisher-facts-inactive",
+		title:             "Inactive facts work",
+		paperType:         "preprint",
+		publishedAt:       time.Date(2026, time.July, 18, 7, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+		contentChannel:    scope.ContentChannelPreprint,
+		lifecycleState:    scope.LifecycleStatePreprintActive,
+	})
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE works
+		SET status = 'retracted'
+		WHERE id = $1
+	`, inactive.workID); err != nil {
+		t.Fatalf("mark facts Work inactive: %v", err)
+	}
+
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+	)
+	input.Mode = PublishFacts
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	input.CitationSource = ""
+	input.CitationAnalysisRunID = uuid.Nil
+	input.TrendAnalysisRunID = uuid.Nil
+	input.JournalAnalysisRunID = uuid.Nil
+	input.OpportunityAnalysisRunID = uuid.Nil
+	preparePublisherFactsReferences(t, pool, input)
+
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf("PublishCurrent(facts with inactive Work) error = %v", err)
+	}
+	page, err := mustRepository(t, pool).Papers(
+		context.Background(),
+		PaperListQuery{Limit: 20},
+	)
+	if err != nil {
+		t.Fatalf("Papers(facts with inactive Work) error = %v", err)
+	}
+	assertPaperIDs(t, page.Items, active.workID)
+
+	var publiclyVisible, analysisReady bool
+	var reasons []string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT publicly_visible, analysis_ready, reasons
+		FROM work_visibility_assessments
+		WHERE work_id = $1
+		  AND policy_version = $2
+		  AND evaluated_at = $3
+	`, inactive.workID, VisibilityPolicyVersion, input.GeneratedAt).Scan(
+		&publiclyVisible,
+		&analysisReady,
+		&reasons,
+	); err != nil {
+		t.Fatalf("query inactive Work visibility: %v", err)
+	}
+	if publiclyVisible || analysisReady ||
+		!slices.Contains(reasons, "work_inactive") {
+		t.Fatalf(
+			"inactive Work visibility = public %v analysis %v reasons %v",
+			publiclyVisible,
+			analysisReady,
+			reasons,
+		)
+	}
+}
+
+func TestPublisherFactsModeFiltersUsingRestoredVisibilityState(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	control := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "crossref:publisher-facts-restored-control",
+		logicalSource:     "crossref",
+		canonicalKey:      "doi:10.1000/publisher-facts-restored-control",
+		title:             "Restored visibility control",
+		paperType:         "preprint",
+		publishedAt:       time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 18, 9, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+		contentChannel:    scope.ContentChannelPreprint,
+		lifecycleState:    scope.LifecycleStatePreprintActive,
+	})
+	restoredHidden := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:          "crossref:publisher-facts-restored-hidden",
+		logicalSource:     "crossref",
+		canonicalKey:      "doi:10.1000/publisher-facts-restored-hidden",
+		title:             "Restored hidden visibility",
+		paperType:         "preprint",
+		publishedAt:       time.Date(2026, time.July, 18, 7, 0, 0, 0, time.UTC),
+		sourceTime:        time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC),
+		scopeStatus:       "included",
+		includeWorkLink:   true,
+		includeWorkID:     true,
+		includeNormalized: true,
+		noJCRAssessment:   true,
+		contentChannel:    scope.ContentChannelPreprint,
+		lifecycleState:    scope.LifecycleStatePreprintActive,
+	})
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf(`
+		CREATE FUNCTION rewrite_test_visibility_state()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.work_id = '%s'::uuid THEN
+				NEW.publicly_visible = false;
+				NEW.analysis_ready = false;
+				NEW.reasons = ARRAY['work_inactive']::text[];
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_test_visibility_state
+		BEFORE INSERT ON work_visibility_assessments
+		FOR EACH ROW
+		EXECUTE FUNCTION rewrite_test_visibility_state()
+	`, restoredHidden.workID)); err != nil {
+		t.Fatalf("install exact visibility persistence trigger: %v", err)
+	}
+	input := catalogCurationInputAt(
+		time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+	)
+	input.Mode = PublishFacts
+	input.AnalysisCutoff = time.Time{}
+	input.ClassifierVersion = ""
+	input.AbstractRouteRevision = ""
+	input.JCRMetricYear = 0
+	input.VenuePolicyName = ""
+	input.VenuePolicyVersion = 0
+	input.EligibilityPolicyVersion = ""
+	input.SubjectVersion = ""
+	input.JCRImportReceipt = uuid.Nil
+	input.CitationSource = ""
+	input.CitationAnalysisRunID = uuid.Nil
+	input.TrendAnalysisRunID = uuid.Nil
+	input.JournalAnalysisRunID = uuid.Nil
+	input.OpportunityAnalysisRunID = uuid.Nil
+
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf("PublishCurrent(facts exact visibility state) error = %v", err)
+	}
+	page, err := mustRepository(t, pool).Papers(
+		context.Background(),
+		PaperListQuery{Limit: 20},
+	)
+	if err != nil {
+		t.Fatalf("Papers(facts exact visibility state) error = %v", err)
+	}
+	assertPaperIDs(t, page.Items, control.workID)
+
+	var publiclyVisible, analysisReady bool
+	var reasons []string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT publicly_visible, analysis_ready, reasons
+		FROM work_visibility_assessments
+		WHERE work_id = $1
+		  AND policy_version = $2
+		  AND evaluated_at = $3
+	`, restoredHidden.workID, VisibilityPolicyVersion, input.GeneratedAt).Scan(
+		&publiclyVisible,
+		&analysisReady,
+		&reasons,
+	); err != nil {
+		t.Fatalf("query exact restored visibility state: %v", err)
+	}
+	if publiclyVisible || analysisReady ||
+		!slices.Equal(reasons, []string{"work_inactive"}) {
+		t.Fatalf(
+			"restored visibility state = public %v analysis %v reasons %v",
+			publiclyVisible,
+			analysisReady,
+			reasons,
+		)
+	}
+}
+
+func TestPublisherFactsModePublishesEveryAcceptedChannel(t *testing.T) {
+	tests := []struct {
+		name        string
+		channel     scope.ContentChannel
+		lifecycle   scope.LifecycleState
+		withJCRGate bool
+		linkRole    string
+	}{
+		{
+			name:        "journal published",
+			channel:     scope.ContentChannelJournalPublished,
+			lifecycle:   scope.LifecycleStatePublished,
+			withJCRGate: true,
+		},
+		{
+			name:        "accepted early",
+			channel:     scope.ContentChannelAcceptedEarly,
+			lifecycle:   scope.LifecycleStateAcceptedEarly,
+			withJCRGate: true,
+		},
+		{
+			name:      "preprint",
+			channel:   scope.ContentChannelPreprint,
+			lifecycle: scope.LifecycleStatePreprintActive,
+		},
+		{
+			name:      "preprint DOI URL",
+			channel:   scope.ContentChannelPreprint,
+			lifecycle: scope.LifecycleStatePreprintActive,
+			linkRole:  "doi_url",
+		},
+		{
+			name:      "conference proceeding",
+			channel:   scope.ContentChannelConferenceProceeding,
+			lifecycle: scope.LifecycleStateConferencePublished,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			pool := openCatalogTestPool(t)
+			slug := strings.ToLower(strings.ReplaceAll(test.name, " ", "-"))
+			fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+				eventKey:          "openalex:publisher-channel-" + slug,
+				canonicalKey:      "doi:10.1000/publisher-channel-" + slug,
+				title:             "Publisher channel " + test.name,
+				paperType:         "research_article",
+				publishedAt:       time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+				sourceTime:        time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+				scopeStatus:       "included",
+				includeWorkLink:   true,
+				includeWorkID:     true,
+				includeNormalized: true,
+				noJCRAssessment:   true,
+				contentChannel:    test.channel,
+				lifecycleState:    test.lifecycle,
+				officialLinkRole:  test.linkRole,
+			})
+			input := catalogCurationInput()
+			input.Mode = PublishFacts
+			input.AnalysisCutoff = time.Time{}
+			input.ClassifierVersion = ""
+			input.AbstractRouteRevision = ""
+			input.CitationSource = ""
+			input.CitationAnalysisRunID = uuid.Nil
+			input.TrendAnalysisRunID = uuid.Nil
+			input.JournalAnalysisRunID = uuid.Nil
+			input.OpportunityAnalysisRunID = uuid.Nil
+			if test.withJCRGate {
+				preparePublisherAcceptedCurationWithoutBiomedicalRuns(
+					t,
+					pool,
+					input,
+					fixture,
+				)
+			} else {
+				preparePublisherFactsReferences(t, pool, input)
+			}
+
+			if _, err := mustPublisher(t, pool).PublishCurrent(
+				context.Background(),
+				input,
+			); err != nil {
+				t.Fatalf("PublishCurrent(%s facts) error = %v", test.name, err)
+			}
+			paper, err := mustRepository(t, pool).Paper(
+				context.Background(),
+				fixture.workID,
+			)
+			if err != nil {
+				t.Fatalf("Paper(%s facts) error = %v", test.name, err)
+			}
+			assertNestedJSONValue(
+				t,
+				paper.Payload,
+				[]string{"official_link", "content_channel"},
+				string(test.channel),
+			)
+			assertNestedJSONValue(
+				t,
+				paper.Payload,
+				[]string{"publicly_visible"},
+				true,
+			)
+		})
+	}
+}
+
+func TestPublisherAnalysisModePublishesOnlyWithExactSucceededAbstractRouteRevision(
+	t *testing.T,
+) {
+	t.Run("exact current revision is analysis ready", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:                "pubmed:publisher-analysis-ready",
+			logicalSource:           "pubmed",
+			canonicalKey:            "doi:10.1000/publisher-analysis-ready",
+			title:                   "Exact abstract route readiness",
+			topicNames:              []string{"Agent Systems"},
+			methodNames:             []string{"Causal Inference"},
+			paperType:               "research_article",
+			publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:             "included",
+			includeWorkLink:         true,
+			includeWorkID:           true,
+			includeNormalized:       true,
+			normalizedPayloadSchema: "normalized-record/v4",
+			noJCRAssessment:         true,
+		})
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printState:      "missing",
+				electronicState: "missing",
+				aheadState:      "missing",
+				acceptedState:   "missing",
+			},
+		)
+		input := catalogCurationInput()
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent(analysis exact revision) error = %v", err)
+		}
+		paper, err := mustRepository(t, pool).Paper(
+			context.Background(),
+			fixture.workID,
+		)
+		if err != nil {
+			t.Fatalf("Paper(analysis exact revision) error = %v", err)
+		}
+		assertNestedJSONValue(
+			t,
+			paper.Payload,
+			[]string{"analysis_ready"},
+			true,
+		)
+
+		var (
+			analysisReady  bool
+			analysisCutoff time.Time
+			reasons        []string
+		)
+		if err := pool.QueryRow(context.Background(), `
+			SELECT analysis_ready, analysis_cutoff, reasons
+			FROM work_visibility_assessments
+			WHERE work_id = $1
+			  AND policy_version = $2
+			  AND evaluated_at = $3
+		`, fixture.workID, VisibilityPolicyVersion, input.GeneratedAt).Scan(
+			&analysisReady,
+			&analysisCutoff,
+			&reasons,
+		); err != nil {
+			t.Fatalf("query analysis visibility assessment: %v", err)
+		}
+		if !analysisReady ||
+			!analysisCutoff.Equal(input.AnalysisCutoff) ||
+			len(reasons) != 0 {
+			t.Fatalf(
+				"analysis assessment = ready %v cutoff %s reasons %v",
+				analysisReady,
+				analysisCutoff,
+				reasons,
+			)
+		}
+	})
+
+	t.Run("stale classifier projection is not analysis ready", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:                "openalex:publisher-analysis-stale-classifier",
+			canonicalKey:            "doi:10.1000/publisher-analysis-stale-classifier",
+			title:                   "Stale classifier projection",
+			topicNames:              []string{"Agent Systems"},
+			methodNames:             []string{"Causal Inference"},
+			paperType:               "research_article",
+			publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:             "included",
+			includeWorkLink:         true,
+			includeWorkID:           true,
+			includeNormalized:       true,
+			projectionPolicyVersion: "projection/stale-source-mapping/v1",
+			noJCRAssessment:         true,
+		})
+		input := catalogCurationInput()
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent(stale classifier projection) error = %v", err)
+		}
+		paper, err := mustRepository(t, pool).Paper(
+			context.Background(),
+			fixture.workID,
+		)
+		if err != nil {
+			t.Fatalf("Paper(stale classifier projection) error = %v", err)
+		}
+		assertNestedJSONValue(
+			t,
+			paper.Payload,
+			[]string{"analysis_ready"},
+			false,
+		)
+		var reasons []string
+		if err := pool.QueryRow(context.Background(), `
+			SELECT reasons
+			FROM work_visibility_assessments
+			WHERE work_id = $1
+			  AND policy_version = $2
+			  AND evaluated_at = $3
+		`, fixture.workID, VisibilityPolicyVersion, input.GeneratedAt).Scan(
+			&reasons,
+		); err != nil {
+			t.Fatalf("query stale classifier visibility assessment: %v", err)
+		}
+		if !slices.Contains(reasons, string(VisibilityReasonTaxonomyMissing)) {
+			t.Fatalf(
+				"stale classifier visibility reasons = %v, want %s",
+				reasons,
+				VisibilityReasonTaxonomyMissing,
+			)
+		}
+	})
+
+	t.Run("mismatched revision is rejected", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:                "pubmed:publisher-analysis-revision-mismatch",
+			logicalSource:           "pubmed",
+			canonicalKey:            "doi:10.1000/publisher-analysis-revision-mismatch",
+			title:                   "Mismatched abstract route revision",
+			topicNames:              []string{"Agent Systems"},
+			methodNames:             []string{"Causal Inference"},
+			paperType:               "research_article",
+			publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:             "included",
+			includeWorkLink:         true,
+			includeWorkID:           true,
+			includeNormalized:       true,
+			normalizedPayloadSchema: "normalized-record/v4",
+			noJCRAssessment:         true,
+		})
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printState:      "missing",
+				electronicState: "missing",
+				aheadState:      "missing",
+				acceptedState:   "missing",
+			},
+		)
+		input := catalogCurationInput()
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		input.AbstractRouteRevision = strings.Repeat("b", 64)
+
+		_, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		)
+		if err == nil ||
+			!strings.Contains(err.Error(), "abstract route revision") {
+			t.Fatalf(
+				"PublishCurrent(mismatched abstract route revision) error = %v",
+				err,
+			)
+		}
+		assertNoCatalogWrites(t, pool)
+	})
+
+	t.Run("missing exact run publishes facts-only", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:                "pubmed:publisher-analysis-run-missing",
+			logicalSource:           "pubmed",
+			canonicalKey:            "doi:10.1000/publisher-analysis-run-missing",
+			title:                   "Missing abstract route run",
+			topicNames:              []string{"Agent Systems"},
+			methodNames:             []string{"Causal Inference"},
+			paperType:               "research_article",
+			publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:             "included",
+			includeWorkLink:         true,
+			includeWorkID:           true,
+			includeNormalized:       true,
+			normalizedPayloadSchema: "normalized-record/v4",
+			noJCRAssessment:         true,
+		})
+		insertPublisherPublicationState(
+			t,
+			pool,
+			fixture,
+			publisherPublicationStateFixture{
+				printState:      "missing",
+				electronicState: "missing",
+				aheadState:      "missing",
+				acceptedState:   "missing",
+			},
+		)
+		input := catalogCurationInput()
+		preparePublisherAcceptedCurationReferences(t, pool, input, fixture)
+		insertCatalogCitationAnalysisRun(t, pool, input, fixture.workID)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf(
+				"PublishCurrent(missing abstract route run) error = %v",
+				err,
+			)
+		}
+		paper, err := mustRepository(t, pool).Paper(
+			context.Background(),
+			fixture.workID,
+		)
+		if err != nil {
+			t.Fatalf("Paper(missing abstract route run) error = %v", err)
+		}
+		assertNestedJSONValue(
+			t,
+			paper.Payload,
+			[]string{"publicly_visible"},
+			true,
+		)
+		assertNestedJSONValue(
+			t,
+			paper.Payload,
+			[]string{"analysis_ready"},
+			false,
+		)
+		var reasons []string
+		if err := pool.QueryRow(context.Background(), `
+			SELECT reasons
+			FROM work_visibility_assessments
+			WHERE work_id = $1
+			  AND policy_version = $2
+			  AND evaluated_at = $3
+		`, fixture.workID, VisibilityPolicyVersion, input.GeneratedAt).Scan(
+			&reasons,
+		); err != nil {
+			t.Fatalf("query missing abstract route visibility: %v", err)
+		}
+		if !slices.Contains(
+			reasons,
+			string(VisibilityReasonAbstractRouteMissing),
+		) {
+			t.Fatalf(
+				"missing abstract route visibility reasons = %v, want %s",
+				reasons,
+				VisibilityReasonAbstractRouteMissing,
+			)
+		}
+	})
+}
+
+func TestPublisherAnalysisModeOutputsRestoredAnalysisReadiness(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:                "pubmed:publisher-analysis-restored-state",
+		logicalSource:           "pubmed",
+		canonicalKey:            "doi:10.1000/publisher-analysis-restored-state",
+		title:                   "Restored analysis readiness",
+		topicNames:              []string{"Agent Systems"},
+		methodNames:             []string{"Causal Inference"},
+		paperType:               "research_article",
+		publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+		sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+		scopeStatus:             "included",
+		includeWorkLink:         true,
+		includeWorkID:           true,
+		includeNormalized:       true,
+		normalizedPayloadSchema: "normalized-record/v4",
+		noJCRAssessment:         true,
+	})
+	insertPublisherPublicationState(
+		t,
+		pool,
+		fixture,
+		publisherPublicationStateFixture{
+			printState:      "missing",
+			electronicState: "missing",
+			aheadState:      "missing",
+			acceptedState:   "missing",
+		},
+	)
+	input := catalogCurationInput()
+	preparePublisherAcceptedCuration(t, pool, input, fixture)
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf(`
+		CREATE FUNCTION rewrite_test_analysis_readiness()
+		RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.work_id = '%s'::uuid AND NEW.analysis_ready THEN
+				NEW.analysis_ready = false;
+				NEW.reasons = ARRAY['required_taxonomy_missing']::text[];
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_test_analysis_readiness
+		BEFORE INSERT ON work_visibility_assessments
+		FOR EACH ROW
+		EXECUTE FUNCTION rewrite_test_analysis_readiness()
+	`, fixture.workID)); err != nil {
+		t.Fatalf("install exact analysis readiness trigger: %v", err)
+	}
+
+	if _, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	); err != nil {
+		t.Fatalf("PublishCurrent(restored analysis readiness) error = %v", err)
+	}
+	paper, err := mustRepository(t, pool).Paper(
+		context.Background(),
+		fixture.workID,
+	)
+	if err != nil {
+		t.Fatalf("Paper(restored analysis readiness) error = %v", err)
+	}
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"analysis_ready"},
+		false,
+	)
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"topics_state"},
+		"not_ready",
+	)
+	assertNestedJSONValue(
+		t,
+		paper.Payload,
+		[]string{"methods_state"},
+		"not_ready",
+	)
+
+	var visibilityReady, snapshotReady bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT
+			(
+				SELECT analysis_ready
+				FROM work_visibility_assessments
+				WHERE work_id = $1
+				  AND policy_version = $2
+				  AND evaluated_at = $3
+			),
+			(
+				SELECT analysis_ready
+				FROM catalog_analysis_work_snapshots
+				WHERE work_id = $1
+			)
+	`, fixture.workID, VisibilityPolicyVersion, input.GeneratedAt).Scan(
+		&visibilityReady,
+		&snapshotReady,
+	); err != nil {
+		t.Fatalf("query restored analysis readiness states: %v", err)
+	}
+	if visibilityReady || snapshotReady {
+		t.Fatalf(
+			"restored analysis readiness = visibility %v snapshot %v, want false/false",
+			visibilityReady,
+			snapshotReady,
+		)
+	}
+}
+
+func TestPublisherAnalysisCutoffRejectsLaterAnalysisInputTimes(t *testing.T) {
+	pool := openCatalogTestPool(t)
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:                "pubmed:publisher-analysis-cutoff-inputs",
+		logicalSource:           "pubmed",
+		canonicalKey:            "doi:10.1000/publisher-analysis-cutoff-inputs",
+		title:                   "Analysis inputs after cutoff",
+		topicNames:              []string{"Agent Systems"},
+		methodNames:             []string{"Causal Inference"},
+		paperType:               "research_article",
+		publishedAt:             time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+		sourceTime:              time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+		scopeStatus:             "included",
+		includeWorkLink:         true,
+		includeWorkID:           true,
+		includeNormalized:       true,
+		normalizedPayloadSchema: "normalized-record/v4",
+		noJCRAssessment:         true,
+	})
+	insertPublisherPublicationState(
+		t,
+		pool,
+		fixture,
+		publisherPublicationStateFixture{
+			printState:      "missing",
+			electronicState: "missing",
+			aheadState:      "missing",
+			acceptedState:   "missing",
+		},
+	)
+	input := catalogCurationInput()
+	preparePublisherAcceptedCuration(t, pool, input, fixture)
+	input.AnalysisCutoff = input.AnalysisCutoff.Add(-5 * time.Minute)
+
+	_, err := mustPublisher(t, pool).PublishCurrent(
+		context.Background(),
+		input,
+	)
+	if err == nil || !strings.Contains(err.Error(), "analysis cutoff") {
+		t.Fatalf(
+			"PublishCurrent(analysis inputs after cutoff) error = %v, want analysis cutoff rejection",
+			err,
+		)
+	}
+	assertNoCatalogWrites(t, pool)
+}
+
+func TestPublisherAnalysisSelectsExactPerWorkEvidenceBeforeCohort(t *testing.T) {
+	t.Run("selects distinct abstract route runs for each ready Work", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInput()
+		eventAt := time.Date(2026, time.July, 17, 0, 0, 0, 0, time.UTC)
+		first := insertPublisherAnalysisWork(
+			t,
+			pool,
+			"publisher-per-work-first",
+			eventAt,
+		)
+		second := insertPublisherAnalysisWork(
+			t,
+			pool,
+			"publisher-per-work-second",
+			eventAt,
+		)
+		preparePublisherAnalysisReferencesForCohort(
+			t,
+			pool,
+			input,
+			[]publisherWorkFixture{first, second},
+			[]publisherWorkFixture{first, second},
+		)
+		firstRunID := uuid.MustParse(
+			"00000000-0000-0000-0000-000000000705",
+		)
+		secondRunID := uuid.MustParse(
+			"00000000-0000-0000-0000-000000000706",
+		)
+		insertCatalogSucceededAbstractRouteRunWithID(
+			t,
+			pool,
+			input,
+			first,
+			firstRunID,
+		)
+		insertCatalogSucceededAbstractRouteRunWithID(
+			t,
+			pool,
+			input,
+			second,
+			secondRunID,
+		)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent(per-Work analysis selection) error = %v", err)
+		}
+		for _, fixture := range []publisherWorkFixture{first, second} {
+			paper, err := mustRepository(t, pool).Paper(
+				context.Background(),
+				fixture.workID,
+			)
+			if err != nil {
+				t.Fatalf("Paper(%s) error = %v", fixture.workID, err)
+			}
+			assertNestedJSONValue(
+				t,
+				paper.Payload,
+				[]string{"analysis_ready"},
+				true,
+			)
+		}
+
+		rows, err := pool.Query(context.Background(), `
+			SELECT work_id, abstract_route_run_id
+			FROM catalog_analysis_work_snapshots
+			ORDER BY work_id
+		`)
+		if err != nil {
+			t.Fatalf("query per-Work analysis snapshot: %v", err)
+		}
+		defer rows.Close()
+		selected := make(map[uuid.UUID]uuid.UUID)
+		for rows.Next() {
+			var workID, runID uuid.UUID
+			if err := rows.Scan(&workID, &runID); err != nil {
+				t.Fatalf("scan per-Work analysis snapshot: %v", err)
+			}
+			selected[workID] = runID
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate per-Work analysis snapshot: %v", err)
+		}
+		if selected[first.workID] != firstRunID ||
+			selected[second.workID] != secondRunID {
+			t.Fatalf(
+				"selected abstract runs = %#v, want first %s second %s",
+				selected,
+				firstRunID,
+				secondRunID,
+			)
+		}
+		for _, fixture := range []publisherWorkFixture{first, second} {
+			var (
+				projectionAssertionID uuid.UUID
+				normalizedAssertionID uuid.UUID
+				sourceRecordID        uuid.UUID
+				classifierVersion     string
+				classifierPolicy      string
+				topicAssertions       int
+				methodAssertions      int
+			)
+			if err := pool.QueryRow(context.Background(), `
+				SELECT
+					work_snapshot.projection_assertion_id,
+					work_snapshot.normalized_assertion_id,
+					work_snapshot.source_record_id,
+					analysis_snapshot.classifier_version,
+					analysis_snapshot.classifier_policy_version,
+					(
+						SELECT count(*)
+						FROM catalog_analysis_work_topic_assertions AS topic
+						WHERE topic.work_snapshot_id = work_snapshot.id
+					),
+					(
+						SELECT count(*)
+						FROM catalog_analysis_work_method_assertions AS method
+						WHERE method.work_snapshot_id = work_snapshot.id
+					)
+				FROM catalog_analysis_work_snapshots AS work_snapshot
+				JOIN catalog_analysis_snapshots AS analysis_snapshot
+				  ON analysis_snapshot.id =
+				     work_snapshot.analysis_snapshot_id
+				WHERE work_snapshot.work_id = $1
+			`, fixture.workID).Scan(
+				&projectionAssertionID,
+				&normalizedAssertionID,
+				&sourceRecordID,
+				&classifierVersion,
+				&classifierPolicy,
+				&topicAssertions,
+				&methodAssertions,
+			); err != nil {
+				t.Fatalf(
+					"query exact classifier snapshot for Work %s: %v",
+					fixture.workID,
+					err,
+				)
+			}
+			if projectionAssertionID != fixture.projectionAssertionID ||
+				normalizedAssertionID != fixture.normalizedAssertionID ||
+				sourceRecordID != fixture.sourceRecord ||
+				classifierVersion != CatalogClassifierVersion ||
+				classifierPolicy != catalogClassifierAssertionPolicyVersion ||
+				topicAssertions != 1 ||
+				methodAssertions != 1 {
+				t.Fatalf(
+					"classifier snapshot for Work %s = projection %s normalized %s source %s version %q policy %q topics %d methods %d",
+					fixture.workID,
+					projectionAssertionID,
+					normalizedAssertionID,
+					sourceRecordID,
+					classifierVersion,
+					classifierPolicy,
+					topicAssertions,
+					methodAssertions,
+				)
+			}
+		}
+	})
+
+	t.Run("excludes a Work whose canonical event follows cutoff", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInputAt(
+			time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+		)
+		input.AnalysisCutoff = time.Date(
+			2026,
+			time.July,
+			18,
+			0,
+			0,
+			0,
+			0,
+			time.UTC,
+		)
+		ready := insertPublisherAnalysisWork(
+			t,
+			pool,
+			"publisher-cohort-ready",
+			input.AnalysisCutoff,
+		)
+		late := insertPublisherAnalysisWork(
+			t,
+			pool,
+			"publisher-cohort-late",
+			input.AnalysisCutoff.Add(time.Hour),
+		)
+		preparePublisherAnalysisReferencesForCohort(
+			t,
+			pool,
+			input,
+			[]publisherWorkFixture{ready, late},
+			[]publisherWorkFixture{ready},
+		)
+		insertCatalogSucceededAbstractRouteRunWithID(
+			t,
+			pool,
+			input,
+			ready,
+			uuid.MustParse("00000000-0000-0000-0000-000000000705"),
+		)
+		insertCatalogSucceededAbstractRouteRunWithID(
+			t,
+			pool,
+			input,
+			late,
+			uuid.MustParse("00000000-0000-0000-0000-000000000707"),
+		)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent(analysis-ready cohort) error = %v", err)
+		}
+		readyPaper, err := mustRepository(t, pool).Paper(
+			context.Background(),
+			ready.workID,
+		)
+		if err != nil {
+			t.Fatalf("Paper(ready) error = %v", err)
+		}
+		assertNestedJSONValue(
+			t,
+			readyPaper.Payload,
+			[]string{"analysis_ready"},
+			true,
+		)
+		latePaper, err := mustRepository(t, pool).Paper(
+			context.Background(),
+			late.workID,
+		)
+		if err != nil {
+			t.Fatalf("Paper(late) error = %v", err)
+		}
+		assertNestedJSONValue(
+			t,
+			latePaper.Payload,
+			[]string{"analysis_ready"},
+			false,
+		)
+		var eventAt time.Time
+		var analysisReady bool
+		var reasons []string
+		if err := pool.QueryRow(context.Background(), `
+			SELECT canonical_channel_event_at, analysis_ready, reasons
+			FROM catalog_analysis_work_snapshots
+			WHERE work_id = $1
+		`, late.workID).Scan(&eventAt, &analysisReady, &reasons); err != nil {
+			t.Fatalf("query late per-Work analysis snapshot: %v", err)
+		}
+		if !eventAt.Equal(input.AnalysisCutoff.Add(time.Hour)) ||
+			analysisReady ||
+			!slices.Contains(
+				reasons,
+				string(VisibilityReasonCanonicalChannelEventAfterCutoff),
+			) {
+			t.Fatalf(
+				"late snapshot = event %s ready %v reasons %v",
+				eventAt,
+				analysisReady,
+				reasons,
+			)
+		}
+	})
+
+}
+
+func TestPublisherRequiresActiveVerifiedHTTPSOfficialURL(t *testing.T) {
+	t.Run("publishes only the URL-backed Work and preserves the exact DB link", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInput()
+		dbURL := "https://publisher.example.test/articles/exact-db-link?view=full"
+		withURL := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:          "openalex:publisher-official-url-backed",
+			canonicalKey:      "doi:10.1000/catalog-must-not-construct-this-url",
+			title:             "Official URL backed publication",
+			paperType:         "research_article",
+			publishedAt:       time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:        time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:       "included",
+			includeWorkLink:   true,
+			includeWorkID:     true,
+			includeNormalized: true,
+			officialURL:       dbURL,
+			noJCRAssessment:   true,
+		})
+		withoutURL := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:            "openalex:publisher-official-url-missing",
+			canonicalKey:        "doi:10.1000/catalog-official-url-missing",
+			title:               "Publication without official URL",
+			paperType:           "research_article",
+			publishedAt:         time.Date(2026, time.July, 17, 8, 30, 0, 0, time.UTC),
+			sourceTime:          time.Date(2026, time.July, 17, 9, 30, 0, 0, time.UTC),
+			scopeStatus:         "included",
+			includeWorkLink:     true,
+			includeWorkID:       true,
+			includeNormalized:   true,
+			withoutOfficialLink: true,
+			noJCRAssessment:     true,
+		})
+		preparePublisherAcceptedCurationForPublishedCohort(
+			t,
+			pool,
+			input,
+			[]publisherWorkFixture{withURL, withoutURL},
+			[]publisherWorkFixture{withURL},
+		)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent() error = %v", err)
+		}
+		repository := mustRepository(t, pool)
+		page, err := repository.Papers(
+			context.Background(),
+			PaperListQuery{Limit: 20},
+		)
+		if err != nil {
+			t.Fatalf("Papers() error = %v", err)
+		}
+		assertPaperIDs(t, page.Items, withURL.workID)
+		if _, err := repository.Paper(
+			context.Background(),
+			withoutURL.workID,
+		); !errors.Is(err, ErrNotFound) {
+			t.Fatalf(
+				"Paper(without official URL) error = %v, want ErrNotFound",
+				err,
+			)
+		}
+
+		paper, err := repository.Paper(context.Background(), withURL.workID)
+		if err != nil {
+			t.Fatalf("Paper(with official URL) error = %v", err)
+		}
+		assertNestedJSONValue(t, paper.Payload, []string{"publicly_visible"}, true)
+		assertNestedJSONValue(t, paper.Payload, []string{"analysis_ready"}, false)
+		for path, want := range map[string]any{
+			"url":              dbURL,
+			"verification_id":  withURL.officialVerificationID.String(),
+			"link_role":        "official_article",
+			"content_channel":  "journal_published",
+			"verified_at":      withURL.officialVerifiedAt.Format(time.RFC3339Nano),
+			"expires_at":       withURL.officialExpiresAt.Format(time.RFC3339Nano),
+			"verifier_version": "publisher-fixture-verifier/v1",
+			"policy_version":   "official-url/v1",
+		} {
+			assertNestedJSONValue(
+				t,
+				paper.Payload,
+				[]string{"official_link", path},
+				want,
+			)
+		}
+		if strings.Contains(string(paper.Payload), "https://doi.org/") {
+			t.Fatalf(
+				"Paper payload constructed a DOI URL instead of publishing the exact DB URL: %s",
+				paper.Payload,
+			)
+		}
+	})
+
+	t.Run("keeps valid v1 when newer same-role v2 is expired", func(t *testing.T) {
+		pool := openCatalogTestPool(t)
+		input := catalogCurationInput()
+		dbURL := "https://publisher.example.test/articles/versioned-official-link"
+		fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+			eventKey:          "openalex:publisher-official-url-version-fallback",
+			canonicalKey:      "doi:10.1000/catalog-official-url-version-fallback",
+			title:             "Official URL version fallback",
+			paperType:         "research_article",
+			publishedAt:       time.Date(2026, time.July, 17, 8, 0, 0, 0, time.UTC),
+			sourceTime:        time.Date(2026, time.July, 17, 9, 0, 0, 0, time.UTC),
+			scopeStatus:       "included",
+			includeWorkLink:   true,
+			includeWorkID:     true,
+			includeNormalized: true,
+			officialURL:       dbURL,
+			noJCRAssessment:   true,
+		})
+		preparePublisherAcceptedCuration(t, pool, input, fixture)
+		insertPublisherExpiredOfficialLinkVersion(
+			t,
+			pool,
+			fixture,
+			time.Date(2026, time.July, 17, 10, 0, 0, 0, time.UTC),
+			time.Date(2026, time.July, 17, 11, 0, 0, 0, time.UTC),
+		)
+
+		if _, err := mustPublisher(t, pool).PublishCurrent(
+			context.Background(),
+			input,
+		); err != nil {
+			t.Fatalf("PublishCurrent() error = %v", err)
+		}
+		paper, err := mustRepository(t, pool).Paper(
+			context.Background(),
+			fixture.workID,
+		)
+		if err != nil {
+			t.Fatalf("Paper() error = %v", err)
+		}
+		assertNestedJSONValue(
+			t,
+			paper.Payload,
+			[]string{"official_link", "verification_id"},
+			fixture.officialVerificationID.String(),
+		)
+		assertNestedJSONValue(
+			t,
+			paper.Payload,
+			[]string{"official_link", "url"},
+			dbURL,
+		)
+	})
+
+	for _, test := range []struct {
+		name    string
+		options publisherWorkOptions
+	}{
+		{
+			name: "missing link",
+			options: publisherWorkOptions{
+				withoutOfficialLink: true,
+			},
+		},
+		{
+			name: "expired link",
+			options: publisherWorkOptions{
+				officialLinkExpiresAt: time.Date(
+					2026,
+					time.July,
+					17,
+					10,
+					0,
+					0,
+					0,
+					time.UTC,
+				),
+			},
+		},
+		{
+			name: "link projected after generation cutoff",
+			options: publisherWorkOptions{
+				officialLinkProjectedAt: time.Date(
+					2026,
+					time.July,
+					17,
+					13,
+					0,
+					0,
+					0,
+					time.UTC,
+				),
+			},
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			pool := openCatalogTestPool(t)
+			options := test.options
+			testSlug := strings.ToLower(
+				strings.ReplaceAll(test.name, " ", "-"),
+			)
+			options.eventKey = "openalex:publisher-url-gate-" + testSlug
+			options.canonicalKey = "doi:10.1000/publisher-url-gate-" +
+				testSlug
+			options.title = "Publisher URL gate " + test.name
+			options.paperType = "research_article"
+			options.publishedAt = time.Date(
+				2026,
+				time.July,
+				17,
+				8,
+				0,
+				0,
+				0,
+				time.UTC,
+			)
+			options.sourceTime = time.Date(
+				2026,
+				time.July,
+				17,
+				9,
+				0,
+				0,
+				0,
+				time.UTC,
+			)
+			options.scopeStatus = "included"
+			options.includeWorkLink = true
+			options.includeWorkID = true
+			options.includeNormalized = true
+			options.noJCRAssessment = true
+			fixture := insertPublisherVisibleWork(t, pool, options)
+			input := catalogCurationInput()
+			preparePublisherAcceptedCuration(t, pool, input, fixture)
+
+			_, err := mustPublisher(t, pool).PublishCurrent(
+				context.Background(),
+				input,
+			)
+			if !errors.Is(err, ErrEmptyDomain) {
+				t.Fatalf(
+					"PublishCurrent(%s) error = %v, want ErrEmptyDomain",
+					test.name,
+					err,
+				)
+			}
+			assertNoCatalogWrites(t, pool)
+		})
+	}
+}
+
 func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 	t.Run("publication state does not match exact work winner", func(t *testing.T) {
 		pool := openCatalogTestPool(t)
@@ -122,7 +1747,9 @@ func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 			"winner-mismatch",
 			"doi:10.1000/publication-winner-mismatch",
 		)
-		input := catalogCurationInput()
+		input := catalogCurationInputAt(
+			time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+		)
 		preparePublisherAcceptedCuration(t, pool, input, fixture)
 		insertPublisherBiomedicalProjection(t, pool, fixture)
 		alternateProjectionID := insertPublisherAlternateProjectionAssertion(
@@ -170,7 +1797,9 @@ func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 				"/PubmedArticle/PubmedData/History/PubMedPubDate[1]", 1,
 			),
 		)
-		input := catalogCurationInput()
+		input := catalogCurationInputAt(
+			time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+		)
 		preparePublisherAcceptedCuration(t, pool, input, fixture)
 		insertPublisherBiomedicalProjection(t, pool, fixture)
 		acceptedDate := publicationUpdateDate(2026, time.July, 17)
@@ -215,7 +1844,9 @@ func TestPublisherRejectsPublicationEventProvenanceMismatch(t *testing.T) {
 				"/PubmedArticle/JournalIssue/PubDate", 1,
 			),
 		)
-		input := catalogCurationInput()
+		input := catalogCurationInputAt(
+			time.Date(2026, time.July, 18, 12, 0, 0, 0, time.UTC),
+		)
 		preparePublisherAcceptedCuration(t, pool, input, fixture)
 		insertPublisherBiomedicalProjection(t, pool, fixture)
 		printDate := publicationUpdateDate(2026, time.July, 17)
@@ -793,6 +2424,7 @@ func TestPublisherUsesOnlyTheExplicitCitationSource(t *testing.T) {
 		input,
 		fixture.workID,
 	)
+	insertCatalogSucceededAbstractRouteRun(t, pool, input, fixture)
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO metric_snapshots (
 			work_id,
@@ -945,6 +2577,7 @@ func TestPublisherRejectsCitationVelocityWindowThatDiffersFromAnalysisRun(
 		},
 		fixture.workID,
 	)
+	insertCatalogSucceededAbstractRouteRun(t, pool, input, fixture)
 
 	_, err := mustPublisher(t, pool).PublishCurrent(
 		context.Background(),
@@ -1002,6 +2635,7 @@ func TestPublisherRejectsCitationPercentileMinimumThatDiffersFromAnalysisRun(
 		},
 		fixture.workID,
 	)
+	insertCatalogSucceededAbstractRouteRun(t, pool, input, fixture)
 
 	_, err := mustPublisher(t, pool).PublishCurrent(
 		context.Background(),
@@ -1559,6 +3193,7 @@ func TestPublisherRejectsInconsistentExactJIFAcrossJCRCategories(t *testing.T) {
 		),
 		input.TrendAnalysisRunID,
 	)
+	insertCatalogSucceededAbstractRouteRun(t, pool, input, fixture)
 
 	_, err := mustPublisher(t, pool).PublishCurrent(
 		context.Background(),
@@ -1808,6 +3443,7 @@ func TestPublisherRejectsEligibilitySubjectEvidenceFromAnotherJCRReceipt(
 		),
 		input.TrendAnalysisRunID,
 	)
+	insertCatalogSucceededAbstractRouteRun(t, pool, input, fixture)
 
 	_, err := mustPublisher(t, pool).PublishCurrent(
 		context.Background(),
@@ -2020,7 +3656,39 @@ func TestPublisherPreservesKnownUnknownAndMissingWithoutInventingValues(t *testi
 	input := catalogCurationInputAt(
 		time.Date(2026, time.July, 15, 12, 0, 0, 0, time.UTC),
 	)
-	preparePublisherAcceptedCuration(t, pool, input, known, unknown, missing)
+	factsInput := input
+	factsInput.Mode = PublishFacts
+	preparePublisherAcceptedCurationWithoutBiomedicalRuns(
+		t,
+		pool,
+		factsInput,
+		known,
+		unknown,
+		missing,
+	)
+	ensurePublisherClassifierAssertions(t, pool, known, unknown, missing)
+	insertCatalogCitationAnalysisRun(
+		t,
+		pool,
+		input,
+		known.workID,
+		unknown.workID,
+		missing.workID,
+	)
+	cohortRevision := catalogBiomedicalCohortRevisionForFixtures(
+		t,
+		pool,
+		input,
+		[]publisherWorkFixture{known},
+	)
+	insertCatalogBiomedicalAnalysisRuns(
+		t,
+		pool,
+		input,
+		cohortRevision,
+		input.TrendAnalysisRunID,
+	)
+	insertCatalogSucceededAbstractRouteRun(t, pool, input, known)
 	if _, err := publisher.PublishCurrent(context.Background(), input); err != nil {
 		t.Fatalf("PublishCurrent() error = %v", err)
 	}
@@ -2292,6 +3960,15 @@ type publisherWorkOptions struct {
 	publicationModel           string
 	publicationStatus          string
 	publicationHistory         []publisherPublicationHistoryFixture
+	withoutOfficialLink        bool
+	officialURL                string
+	officialLinkProjectedAt    time.Time
+	officialLinkExpiresAt      time.Time
+	officialLinkRole           string
+	contentChannel             scope.ContentChannel
+	lifecycleState             scope.LifecycleState
+	venueType                  string
+	projectionPolicyVersion    string
 }
 
 type publisherPublicationDateFixture struct {
@@ -2331,10 +4008,124 @@ func publisherPublicationHistoryEntry(
 }
 
 type publisherWorkFixture struct {
-	workID                uuid.UUID
-	sourceRecord          uuid.UUID
-	rawEventID            uuid.UUID
-	normalizedAssertionID uuid.UUID
+	workID                 uuid.UUID
+	sourceRecord           uuid.UUID
+	rawEventID             uuid.UUID
+	normalizedAssertionID  uuid.UUID
+	projectionAssertionID  uuid.UUID
+	sourceName             string
+	sourceRecordExternalID string
+	parserVersion          string
+	sourceTime             time.Time
+	title                  string
+	abstract               string
+	officialVerificationID uuid.UUID
+	officialVerifiedAt     time.Time
+	officialExpiresAt      time.Time
+}
+
+func insertPublisherAnalysisWork(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	slug string,
+	eventAt time.Time,
+) publisherWorkFixture {
+	t.Helper()
+
+	event := publisherPublicationEventFixture{
+		kind:       "electronic_published",
+		date:       visibilityTimePointer(eventAt),
+		precision:  "day",
+		statusRaw:  "epublish",
+		modelRaw:   visibilityStringPointer("electronic"),
+		sourcePath: "$.publication_history[0]",
+		ordinal:    1,
+	}
+	fixture := insertPublisherVisibleWork(t, pool, publisherWorkOptions{
+		eventKey:                   "pubmed:" + slug,
+		logicalSource:              "pubmed",
+		canonicalKey:               "doi:10.1000/" + slug,
+		title:                      "Analysis Work " + slug,
+		topicNames:                 []string{"Topic " + slug},
+		methodNames:                []string{"Method " + slug},
+		paperType:                  "research_article",
+		publishedAt:                eventAt,
+		sourceTime:                 time.Date(2026, time.July, 16, 9, 0, 0, 0, time.UTC),
+		scopeStatus:                "included",
+		includeWorkLink:            true,
+		includeWorkID:              true,
+		includeNormalized:          true,
+		normalizedPayloadSchema:    "normalized-record/v4",
+		includePublicationMetadata: true,
+		publicationModel:           "electronic",
+		publicationStatus:          "epublish",
+		publicationHistory: publisherPublicationHistoryFromEvents(
+			t,
+			[]publisherPublicationEventFixture{event},
+		),
+		noJCRAssessment: true,
+	})
+	insertPublisherPublicationState(
+		t,
+		pool,
+		fixture,
+		publisherPublicationStateFixture{
+			printState:       "missing",
+			electronicDate:   visibilityTimePointer(eventAt),
+			electronicState:  "known",
+			aheadState:       "missing",
+			acceptedState:    "missing",
+			publicationModel: visibilityStringPointer("electronic"),
+			publicationStatus: visibilityStringPointer(
+				"epublish",
+			),
+			events: []publisherPublicationEventFixture{event},
+		},
+	)
+	return fixture
+}
+
+func preparePublisherAnalysisReferencesForCohort(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	input PublishInput,
+	publicFixtures []publisherWorkFixture,
+	cohortFixtures []publisherWorkFixture,
+) {
+	t.Helper()
+
+	factsInput := input
+	factsInput.Mode = PublishFacts
+	preparePublisherAcceptedCurationWithoutBiomedicalRuns(
+		t,
+		pool,
+		factsInput,
+		publicFixtures...,
+	)
+	cohortRevision := catalogBiomedicalCohortRevisionForFixtures(
+		t,
+		pool,
+		input,
+		cohortFixtures,
+	)
+	insertCatalogBiomedicalPublicationFixtures(
+		t,
+		pool,
+		input,
+		cohortRevision,
+		cohortRevision,
+		input.TrendAnalysisRunID,
+		cohortFixtures[0],
+	)
+	workIDs := make([]uuid.UUID, 0, len(publicFixtures))
+	for _, fixture := range publicFixtures {
+		workIDs = append(workIDs, fixture.workID)
+	}
+	insertCatalogCitationAnalysisRun(t, pool, input, workIDs...)
+}
+
+func visibilityStringPointer(value string) *string {
+	return &value
 }
 
 func insertPublisherVisibleWork(
@@ -2365,11 +4156,46 @@ func insertPublisherVisibleWork(
 	if options.normalizedPayloadSchema == "" {
 		options.normalizedPayloadSchema = "normalized-record/v2"
 	}
+	if options.projectionPolicyVersion == "" {
+		options.projectionPolicyVersion =
+			catalogClassifierProjectionPolicyVersion
+	}
+	if options.contentChannel == "" {
+		options.contentChannel = scope.ContentChannelJournalPublished
+	}
+	if options.lifecycleState == "" {
+		switch options.contentChannel {
+		case scope.ContentChannelJournalPublished:
+			options.lifecycleState = scope.LifecycleStatePublished
+		case scope.ContentChannelAcceptedEarly:
+			options.lifecycleState = scope.LifecycleStateAcceptedEarly
+		case scope.ContentChannelPreprint:
+			options.lifecycleState = scope.LifecycleStatePreprintActive
+		case scope.ContentChannelConferenceProceeding:
+			options.lifecycleState = scope.LifecycleStateConferencePublished
+		}
+	}
+	if options.venueType == "" {
+		switch options.contentChannel {
+		case scope.ContentChannelPreprint:
+			options.venueType = "preprint"
+		case scope.ContentChannelConferenceProceeding:
+			options.venueType = "conference"
+		default:
+			options.venueType = "journal"
+		}
+	}
 
 	fixture := publisherWorkFixture{
-		workID:       uuid.New(),
-		sourceRecord: uuid.New(),
-		rawEventID:   uuid.New(),
+		workID:                 uuid.New(),
+		sourceRecord:           uuid.New(),
+		rawEventID:             uuid.New(),
+		sourceName:             options.logicalSource,
+		sourceRecordExternalID: options.eventKey,
+		parserVersion:          "publisher-parser/v1",
+		sourceTime:             options.sourceTime,
+		title:                  options.title,
+		abstract:               "Source-backed abstract",
 	}
 	jobID := uuid.New()
 	venueID := uuid.New()
@@ -2437,6 +4263,10 @@ func insertPublisherVisibleWork(
 			"canonical_key":    options.canonicalKey,
 			"title":            options.title,
 		}
+		if options.normalizedPayloadSchema == "normalized-record/v4" {
+			normalizedPayloadMap["parser_version"] = fixture.parserVersion
+			normalizedPayloadMap["abstract"] = fixture.abstract
+		}
 		if options.includePublicationMetadata || options.publicationModel != "" {
 			normalizedPayloadMap["publication_model"] = options.publicationModel
 		}
@@ -2474,9 +4304,10 @@ func insertPublisherVisibleWork(
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO venues (
 			id, venue_type, display_title, source_scheme, source_identifier
-		) VALUES ($1, 'journal', $2, 'openalex', $3)
+		) VALUES ($1, $2, $3, 'openalex', $4)
 	`,
 		venueID,
+		options.venueType,
 		"Publisher Journal "+options.eventKey,
 		"V"+strings.ReplaceAll(fixture.workID.String(), "-", ""),
 	); err != nil {
@@ -2506,6 +4337,88 @@ func insertPublisherVisibleWork(
 			t.Fatalf("insert publisher source/work association: %v", err)
 		}
 	}
+	if options.includeWorkLink &&
+		options.includeWorkID &&
+		options.includeNormalized {
+		journalPolicyVersion := any(nil)
+		channelRegistryVersion := any(nil)
+		switch options.contentChannel {
+		case scope.ContentChannelJournalPublished,
+			scope.ContentChannelAcceptedEarly:
+			journalPolicyVersion = scope.JournalAllQ1PolicyVersion
+		case scope.ContentChannelPreprint:
+			channelRegistryVersion = scope.PreprintRegistryVersion
+		case scope.ContentChannelConferenceProceeding:
+			channelRegistryVersion = scope.ConferenceRegistryVersion
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO work_lifecycle_states (
+				work_id,
+				channel,
+				lifecycle_state,
+				source_record_id,
+				source_path,
+				policy_version,
+				evidence,
+				decided_at
+			) VALUES (
+				$1,
+				$2,
+				$3,
+				$4,
+				'$.publication_status',
+				'lifecycle-projection/v1',
+				'{"assertion_ids":["publisher-fixture"]}'::jsonb,
+				$5
+			)
+		`,
+			fixture.workID,
+			options.contentChannel,
+			options.lifecycleState,
+			fixture.sourceRecord,
+			options.sourceTime,
+		); err != nil {
+			t.Fatalf("insert publisher lifecycle state: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO work_channel_admission_decisions (
+				work_id,
+				channel,
+				decision,
+				reason,
+				source_record_id,
+				source_path,
+				admission_policy_version,
+				domain_registry_version,
+				journal_policy_version,
+				channel_registry_version,
+				evidence,
+				decided_at
+			) VALUES (
+				$1,
+				$3,
+				'accepted',
+				'eligible',
+				$2,
+				'$.venue_assessment',
+				'channel-admission/v1',
+				'research-domains-jcr-subjects/v2',
+				$4,
+				$5,
+				'{"source_paths":["$.venue_assessment"]}'::jsonb,
+				$6
+			)
+		`,
+			fixture.workID,
+			fixture.sourceRecord,
+			options.contentChannel,
+			journalPolicyVersion,
+			channelRegistryVersion,
+			options.sourceTime,
+		); err != nil {
+			t.Fatalf("insert publisher admission decision: %v", err)
+		}
+	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO ingestion_source_states (
@@ -2515,7 +4428,7 @@ func insertPublisherVisibleWork(
 			normalized_assertion_id, is_deleted
 		) VALUES (
 			$8, $1, $2, $3, NULLIF($4, '')::uuid, $5,
-			'publisher-fixture', 1, $6, 'scope/v1', 'projection/v1',
+			'publisher-fixture', 1, $6, 'scope/v1', $9,
 			NULLIF($7, '')::uuid, false
 		)
 	`,
@@ -2527,13 +4440,14 @@ func insertPublisherVisibleWork(
 		options.scopeStatus,
 		optionalUUID(options.includeNormalized, fixture.normalizedAssertionID),
 		options.logicalSource,
+		options.projectionPolicyVersion,
 	); err != nil {
 		t.Fatalf("insert publisher source state: %v", err)
 	}
 	if options.includeWorkLink &&
 		options.includeWorkID &&
 		options.includeNormalized {
-		if _, err := tx.Exec(ctx, `
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO ingestion_projection_assertions (
 				raw_event_id,
 				normalized_assertion_id,
@@ -2545,15 +4459,17 @@ func insertPublisherVisibleWork(
 				record_payload
 			) VALUES (
 				$1, $2, $3, $4, $5,
-				'scope/v1', 'projection/v1', '{"fixture":"publisher-winner"}'
+				'scope/v1', $6, '{"fixture":"publisher-winner"}'
 			)
+			RETURNING id
 		`,
 			fixture.rawEventID,
 			fixture.normalizedAssertionID,
 			fixture.sourceRecord,
 			fixture.workID,
 			jobID,
-		); err != nil {
+			options.projectionPolicyVersion,
+		).Scan(&fixture.projectionAssertionID); err != nil {
 			t.Fatalf("insert publisher projection winner assertion: %v", err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -2582,6 +4498,52 @@ func insertPublisherVisibleWork(
 			WHERE work_id = $1
 		`, fixture.workID); err != nil {
 			t.Fatalf("insert publisher projection winner state: %v", err)
+		}
+		if !options.publishedAt.IsZero() {
+			eventKind := contenttruth.ChannelEventOfficialOnline
+			switch options.contentChannel {
+			case scope.ContentChannelAcceptedEarly:
+				eventKind = contenttruth.ChannelEventAccepted
+			case scope.ContentChannelPreprint:
+				eventKind = contenttruth.ChannelEventPreprintPosted
+			case scope.ContentChannelConferenceProceeding:
+				eventKind =
+					contenttruth.ChannelEventProceedingPublished
+			}
+			assertionID := uuid.New()
+			const sourcePath = "$.published_at"
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO work_channel_event_assertions (
+					id,
+					projection_assertion_id,
+					normalized_assertion_id,
+					source_record_id,
+					work_id,
+					channel,
+					event_kind,
+					event_at,
+					source_path,
+					asserted_at
+				) VALUES (
+					$1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+				)
+			`,
+				assertionID,
+				fixture.projectionAssertionID,
+				fixture.normalizedAssertionID,
+				fixture.sourceRecord,
+				fixture.workID,
+				options.contentChannel,
+				eventKind,
+				options.publishedAt.UTC(),
+				sourcePath,
+				options.sourceTime.UTC(),
+			); err != nil {
+				t.Fatalf(
+					"insert publisher canonical channel event assertion: %v",
+					err,
+				)
+			}
 		}
 	}
 
@@ -2761,10 +4723,796 @@ func insertPublisherVisibleWork(
 		}
 	}
 
+	if !options.withoutOfficialLink {
+		insertPublisherOfficialLinkFixture(
+			t,
+			ctx,
+			tx,
+			jobID,
+			options,
+			&fixture,
+		)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit publisher fixture: %v", err)
 	}
 	return fixture
+}
+
+func ensurePublisherClassifierAssertions(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	fixtures ...publisherWorkFixture,
+) {
+	t.Helper()
+	ctx := context.Background()
+	for _, fixture := range fixtures {
+		var projectionID, normalizedID, sourceRecordID uuid.UUID
+		if err := pool.QueryRow(ctx, `
+			SELECT
+				projection.id,
+				state.normalized_assertion_id,
+				state.source_record_uuid
+			FROM work_projection_states AS state
+			JOIN ingestion_projection_assertions AS projection
+			  ON projection.work_id = state.work_id
+			 AND projection.raw_event_id = state.raw_event_id
+			 AND projection.normalized_assertion_id =
+			     state.normalized_assertion_id
+			 AND projection.source_record_uuid =
+			     state.source_record_uuid
+			 AND projection.scope_policy_version =
+			     state.scope_policy_version
+			 AND projection.projection_policy_version =
+			     state.projection_policy_version
+			WHERE state.work_id = $1
+		`, fixture.workID).Scan(
+			&projectionID,
+			&normalizedID,
+			&sourceRecordID,
+		); err != nil {
+			t.Fatalf(
+				"query Work %s exact classifier source: %v",
+				fixture.workID,
+				err,
+			)
+		}
+		for _, taxonomy := range []struct {
+			table       string
+			registry    string
+			foreignKey  string
+			fixtureName string
+		}{
+			{
+				table:       "work_topics",
+				registry:    "topics",
+				foreignKey:  "topic_id",
+				fixtureName: "Classifier Topic " + fixture.workID.String(),
+			},
+			{
+				table:       "work_methods",
+				registry:    "methods",
+				foreignKey:  "method_id",
+				fixtureName: "Classifier Method " + fixture.workID.String(),
+			},
+		} {
+			var exists bool
+			if err := pool.QueryRow(ctx, fmt.Sprintf(`
+				SELECT EXISTS (
+					SELECT 1
+					FROM %s
+					WHERE work_id = $1
+					  AND source_record_id = $2
+				)
+			`, taxonomy.table), fixture.workID, sourceRecordID).Scan(
+				&exists,
+			); err != nil {
+				t.Fatalf(
+					"query Work %s exact %s assertion: %v",
+					fixture.workID,
+					taxonomy.table,
+					err,
+				)
+			}
+			if exists {
+				continue
+			}
+			var taxonomyID uuid.UUID
+			if err := pool.QueryRow(ctx, fmt.Sprintf(`
+				INSERT INTO %s (name)
+				VALUES ($1)
+				RETURNING id
+			`, taxonomy.registry), taxonomy.fixtureName).Scan(
+				&taxonomyID,
+			); err != nil {
+				t.Fatalf(
+					"insert Work %s classifier fixture %s: %v",
+					fixture.workID,
+					taxonomy.registry,
+					err,
+				)
+			}
+			if _, err := pool.Exec(ctx, fmt.Sprintf(`
+				INSERT INTO %s (
+					work_id,
+					%s,
+					source_record_id
+				) VALUES ($1, $2, $3)
+			`, taxonomy.table, taxonomy.foreignKey),
+				fixture.workID,
+				taxonomyID,
+				sourceRecordID,
+			); err != nil {
+				t.Fatalf(
+					"bind Work %s classifier fixture %s to projection %s normalized %s: %v",
+					fixture.workID,
+					taxonomy.table,
+					projectionID,
+					normalizedID,
+					err,
+				)
+			}
+		}
+	}
+}
+
+func insertCatalogSucceededAbstractRouteRun(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	input PublishInput,
+	fixture publisherWorkFixture,
+) string {
+	t.Helper()
+
+	return insertCatalogSucceededAbstractRouteRunWithID(
+		t,
+		pool,
+		input,
+		fixture,
+		uuid.New(),
+	)
+}
+
+func insertCatalogSucceededAbstractRouteRunWithID(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	input PublishInput,
+	fixture publisherWorkFixture,
+	runID uuid.UUID,
+) string {
+	t.Helper()
+
+	if fixture.projectionAssertionID == uuid.Nil ||
+		fixture.normalizedAssertionID == uuid.Nil ||
+		fixture.sourceRecord == uuid.Nil ||
+		fixture.workID == uuid.Nil {
+		t.Fatal("abstract route fixture requires an exact projection revision")
+	}
+	output := make(map[string]any, len(abstractanalysis.FieldNames()))
+	for _, field := range abstractanalysis.FieldNames() {
+		output[field] = map[string]any{
+			"state":    "not_reported",
+			"value":    "",
+			"evidence": []string{},
+		}
+	}
+	outputJSON, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("encode abstract route output fixture: %v", err)
+	}
+	schemaJSON := abstractanalysis.SchemaJSON()
+	schemaSHA := sha256.Sum256(schemaJSON)
+	const promptText = "publisher abstract route fixture"
+	titleSHA := sha256.Sum256([]byte(fixture.title))
+	abstractSHA := sha256.Sum256([]byte(fixture.abstract))
+	promptSHA := sha256.Sum256([]byte(promptText))
+	inputJSON, err := json.Marshal(struct {
+		PromptVersion string `json:"prompt_version"`
+		PromptText    string `json:"prompt_text"`
+		SchemaVersion string `json:"schema_version"`
+		APIMode       string `json:"api_mode"`
+		Title         string `json:"title"`
+		Abstract      string `json:"abstract"`
+	}{
+		PromptVersion: abstractanalysis.PromptVersion,
+		PromptText:    promptText,
+		SchemaVersion: abstractanalysis.SchemaVersion,
+		APIMode:       "responses",
+		Title:         fixture.title,
+		Abstract:      fixture.abstract,
+	})
+	if err != nil {
+		t.Fatalf("encode abstract route input fixture: %v", err)
+	}
+	inputSHA := sha256.Sum256(inputJSON)
+	startedAt := input.GeneratedAt.Add(-10 * time.Minute)
+	completedAt := startedAt.Add(time.Minute)
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO abstract_route_analysis_runs (
+			id,
+			work_id,
+			projection_assertion_id,
+			normalized_assertion_id,
+			source_record_id,
+			source_name,
+			source_record_external_id,
+			parser_version,
+			source_time,
+			model_provider,
+			api_mode,
+			requested_model,
+			actual_model,
+			prompt_version,
+			prompt_text,
+			prompt_sha256,
+			schema_name,
+			schema_version,
+			schema_json,
+			schema_sha256,
+			input_title,
+			title_sha256,
+			input_abstract,
+			abstract_sha256,
+			input_sha256,
+			response_id,
+			usage,
+			input_tokens,
+			output_tokens,
+			total_tokens,
+			output_payload,
+			status,
+			started_at,
+			lease_expires_at,
+			completed_at
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9,
+			'openai-compatible', 'responses', 'publisher-model',
+			'publisher-model-2026-07-19',
+			$10, $11, $12,
+			$13, $14, $15::jsonb, $16,
+			$17, $18,
+			$19, $20, $21,
+			'resp_publisher_abstract_route',
+			'{"input_tokens":10,"output_tokens":20,"total_tokens":30}'::jsonb,
+			10, 20, 30, $22::jsonb, 'succeeded', $23, $24, $25
+		)
+	`,
+		runID,
+		fixture.workID,
+		fixture.projectionAssertionID,
+		fixture.normalizedAssertionID,
+		fixture.sourceRecord,
+		fixture.sourceName,
+		fixture.sourceRecordExternalID,
+		fixture.parserVersion,
+		fixture.sourceTime,
+		abstractanalysis.PromptVersion,
+		promptText,
+		hex.EncodeToString(promptSHA[:]),
+		abstractanalysis.SchemaName,
+		abstractanalysis.SchemaVersion,
+		schemaJSON,
+		hex.EncodeToString(schemaSHA[:]),
+		fixture.title,
+		hex.EncodeToString(titleSHA[:]),
+		fixture.abstract,
+		hex.EncodeToString(abstractSHA[:]),
+		hex.EncodeToString(inputSHA[:]),
+		outputJSON,
+		startedAt,
+		startedAt.Add(10*time.Minute),
+		completedAt,
+	); err != nil {
+		t.Fatalf("insert succeeded abstract route run: %v", err)
+	}
+	return CatalogAbstractRouteRevision
+}
+
+func insertPublisherOfficialLinkFixture(
+	t *testing.T,
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+	options publisherWorkOptions,
+	fixture *publisherWorkFixture,
+) {
+	t.Helper()
+
+	officialURL := options.officialURL
+	if officialURL == "" {
+		officialURL = "https://publisher.example.test/articles/" +
+			fixture.workID.String()
+	}
+	checkedAt := options.sourceTime
+	projectedAt := options.officialLinkProjectedAt
+	if projectedAt.IsZero() {
+		projectedAt = checkedAt
+	}
+	expiresAt := options.officialLinkExpiresAt
+	if expiresAt.IsZero() {
+		expiresAt = checkedAt.Add(365 * 24 * time.Hour)
+	}
+	identifierScheme := "doi"
+	identifierValue := "10.1000/publisher-fixture-" +
+		fixture.workID.String()
+	if scheme, value, found := strings.Cut(
+		options.canonicalKey,
+		":",
+	); found && scheme == "doi" && value != "" {
+		identifierValue = value
+	}
+
+	rawEventID := uuid.New()
+	sourceRecordID := uuid.New()
+	normalizedAssertionID := uuid.New()
+	projectionAssertionID := uuid.New()
+	candidateID := uuid.New()
+	verificationID := uuid.New()
+	urlEventKey := options.eventKey + ":official-url"
+	sourcePath := "$.URL"
+	parserVersion := "publisher-fixture-url-parser/v1"
+	contentChannel := string(options.contentChannel)
+	linkRole := "official_article"
+	switch options.contentChannel {
+	case scope.ContentChannelPreprint:
+		linkRole = "official_preprint"
+	case scope.ContentChannelConferenceProceeding:
+		linkRole = "official_proceeding"
+	}
+	if options.officialLinkRole != "" {
+		linkRole = options.officialLinkRole
+	}
+	hash := sha256.Sum256([]byte(urlEventKey + "\x00" + officialURL))
+	contentHash := hex.EncodeToString(hash[:])
+	normalizedPayload, err := json.Marshal(map[string]any{
+		"source":              options.logicalSource,
+		"source_record_id":    urlEventKey,
+		"canonical_key":       options.canonicalKey,
+		"title":               options.title,
+		"parser_version":      parserVersion,
+		"publication_history": []publisherPublicationHistoryFixture{},
+		"url_candidates": []map[string]any{{
+			"url":               officialURL,
+			"source_path":       sourcePath,
+			"content_channel":   contentChannel,
+			"link_role":         linkRole,
+			"parser_version":    parserVersion,
+			"identifier_scheme": identifierScheme,
+			"identifier_value":  identifierValue,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("encode publisher official URL normalized payload: %v", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ingestion_raw_events (
+			id, job_id, logical_source, event_key, event_kind, source_record_id,
+			source_time, tie_break_key, position, content_hash, raw_format, raw_payload
+		) VALUES (
+			$1, $2, $3, $4, 'upsert', $4, $5,
+			'publisher-official-url-fixture', 2, $6, 'json', $7
+		)
+	`,
+		rawEventID,
+		jobID,
+		options.logicalSource,
+		urlEventKey,
+		options.sourceTime,
+		contentHash,
+		normalizedPayload,
+	); err != nil {
+		t.Fatalf("insert publisher official URL raw event: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO source_records (
+			id, source, source_record_id, source_identity, source_time,
+			content_hash, raw_payload
+		) VALUES (
+			$1, $2, $3, $4::jsonb, $5, $6, $7::jsonb
+		)
+	`,
+		sourceRecordID,
+		options.logicalSource,
+		urlEventKey,
+		fmt.Sprintf(`{"canonical_key":%q}`, options.canonicalKey),
+		options.sourceTime,
+		contentHash,
+		normalizedPayload,
+	); err != nil {
+		t.Fatalf("insert publisher official URL source record: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ingestion_normalized_records (
+			id, raw_event_id, source_record_uuid, normalization_policy_version,
+			payload_schema_version, normalized_payload
+		) VALUES ($1, $2, $3, 'normalize/v1', 'normalized-record/v4', $4::jsonb)
+	`,
+		normalizedAssertionID,
+		rawEventID,
+		sourceRecordID,
+		normalizedPayload,
+	); err != nil {
+		t.Fatalf("insert publisher official URL normalized record: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO source_record_works (source_record_id, work_id)
+		VALUES ($1, $2)
+	`, sourceRecordID, fixture.workID); err != nil {
+		t.Fatalf("associate publisher official URL source/work: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ingestion_projection_assertions (
+			id, raw_event_id, normalized_assertion_id, source_record_uuid,
+			work_id, job_id, scope_policy_version, projection_policy_version,
+			record_payload
+		) VALUES (
+			$1, $2, $3, $4, $5, $6,
+			'scope/v1', 'projection/v1', '{"fixture":"publisher-official-url"}'
+		)
+	`,
+		projectionAssertionID,
+		rawEventID,
+		normalizedAssertionID,
+		sourceRecordID,
+		fixture.workID,
+		jobID,
+	); err != nil {
+		t.Fatalf("insert publisher official URL projection assertion: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO work_url_candidates (
+			id, work_id, projection_assertion_id, normalized_assertion_id,
+			source_record_id, source_path, content_channel, link_role,
+			candidate_url, parser_version, identifier_scheme, identifier_value,
+			asserted_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+		)
+	`,
+		candidateID,
+		fixture.workID,
+		projectionAssertionID,
+		normalizedAssertionID,
+		sourceRecordID,
+		sourcePath,
+		contentChannel,
+		linkRole,
+		officialURL,
+		parserVersion,
+		identifierScheme,
+		identifierValue,
+		options.sourceTime,
+	); err != nil {
+		t.Fatalf("insert publisher official URL candidate: %v", err)
+	}
+	parsedOfficialURL, err := url.Parse(officialURL)
+	if err != nil || parsedOfficialURL.Hostname() == "" {
+		t.Fatalf("parse publisher official URL %q: %v", officialURL, err)
+	}
+	importPublisherOfficialURLHostRegistryFixture(t, ctx, tx)
+	var registeredHost bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM official_url_host_registry AS registry
+			JOIN official_url_registry_versions AS version
+			  ON version.id = registry.registry_version_id
+			 AND version.policy_version = registry.policy_version
+			WHERE version.policy_version = 'official-url/v1'
+			  AND version.sealed_at IS NOT NULL
+			  AND registry.content_channel = $1
+			  AND registry.link_role = $2
+			  AND registry.hostname = $3
+		)
+	`, contentChannel, linkRole, parsedOfficialURL.Hostname()).Scan(
+		&registeredHost,
+	); err != nil {
+		t.Fatalf("query publisher official URL host Registry: %v", err)
+	}
+	if !registeredHost {
+		t.Fatalf(
+			"publisher official URL host Registry lacks %s/%s/%s",
+			contentChannel,
+			linkRole,
+			parsedOfficialURL.Hostname(),
+		)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO work_url_verifications (
+			id, candidate_id, source_url, final_url, redirect_chain, http_status,
+			expected_identifier_scheme, expected_identifier_value,
+			observed_identifiers, identifier_evidence, response_metadata,
+			matched_identifier_scheme,
+			matched_identifier_value, identifier_match, verification_state,
+			checked_at, expires_at, verifier_version, policy_version
+		) VALUES (
+			$1, $2, $3, $3, $4::jsonb, 200, $5, $6, $7::jsonb,
+			$8::jsonb, $9::jsonb, $5, $6, true, 'verified', $10, $11,
+			'publisher-fixture-verifier/v1', 'official-url/v1'
+		)
+	`,
+		verificationID,
+		candidateID,
+		officialURL,
+		fmt.Sprintf(
+			`[{"url":%q,"status_code":200,"metadata":{"content_type":"text/html","etag":"","last_modified":""}}]`,
+			officialURL,
+		),
+		identifierScheme,
+		identifierValue,
+		fmt.Sprintf(
+			`[{"scheme":%q,"value":%q}]`,
+			identifierScheme,
+			identifierValue,
+		),
+		fmt.Sprintf(
+			`[{"identifier":{"scheme":%q,"value":%q},"source_kind":"html_meta","source_path":"meta[name=\"citation_doi\"]@content","raw_value":%q}]`,
+			identifierScheme,
+			identifierValue,
+			identifierValue,
+		),
+		`{"content_type":"text/html","etag":"","last_modified":""}`,
+		checkedAt,
+		expiresAt,
+	); err != nil {
+		t.Fatalf("insert publisher official URL verification: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO current_work_official_links (
+			work_id, content_channel, link_role, verification_id, official_url,
+			projection_version, projected_at, expires_at
+		) VALUES ($1, $2, $3, $4, $5, 1, $6, $7)
+	`,
+		fixture.workID,
+		contentChannel,
+		linkRole,
+		verificationID,
+		officialURL,
+		projectedAt,
+		expiresAt,
+	); err != nil {
+		t.Fatalf("insert publisher current official URL link: %v", err)
+	}
+	fixture.officialVerificationID = verificationID
+	fixture.officialVerifiedAt = checkedAt.UTC()
+	fixture.officialExpiresAt = expiresAt.UTC()
+}
+
+func importPublisherOfficialURLHostRegistryFixture(
+	t *testing.T,
+	ctx context.Context,
+	tx pgx.Tx,
+) {
+	t.Helper()
+
+	var registryVersionID uuid.UUID
+	err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM official_url_registry_versions
+		WHERE policy_version = 'official-url/v1'
+		  AND sealed_at IS NOT NULL
+	`).Scan(&registryVersionID)
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("query publisher official URL Registry receipt: %v", err)
+	}
+
+	importedAt := time.Date(2026, time.July, 15, 0, 0, 0, 0, time.UTC)
+	fileSHA256 := fmt.Sprintf(
+		"%x",
+		sha256.Sum256(
+			[]byte("publisher-integration-test/official-url-hosts/v1"),
+		),
+	)
+	const hostCount = 8
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO official_url_registry_versions (
+			registry_name,
+			policy_version,
+			file_sha256,
+			host_count,
+			imported_at
+		) VALUES (
+			'official-url-hosts',
+			'official-url/v1',
+			$1,
+			$2,
+			$3
+		)
+		RETURNING id
+	`, fileSHA256, hostCount, importedAt).Scan(&registryVersionID); err != nil {
+		t.Fatalf("insert publisher official URL Registry receipt: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO official_url_host_registry (
+			registry_version_id,
+			policy_version,
+			content_channel,
+			link_role,
+			hostname,
+			registry_source,
+			source_reference,
+			registered_at
+		) VALUES
+			($1, 'official-url/v1', 'journal_published', 'official_article',
+				'publisher.example.test', 'catalog_test_fixture',
+				'publisher-integration-test/v1', $2),
+			($1, 'official-url/v1', 'journal_published', 'doi_url',
+				'publisher.example.test', 'catalog_test_fixture',
+				'publisher-integration-test/v1', $2),
+			($1, 'official-url/v1', 'accepted_early', 'official_article',
+				'publisher.example.test', 'catalog_test_fixture',
+				'publisher-integration-test/v1', $2),
+			($1, 'official-url/v1', 'accepted_early', 'doi_url',
+				'publisher.example.test', 'catalog_test_fixture',
+				'publisher-integration-test/v1', $2),
+			($1, 'official-url/v1', 'preprint', 'official_preprint',
+				'publisher.example.test', 'catalog_test_fixture',
+				'publisher-integration-test/v1', $2),
+			($1, 'official-url/v1', 'preprint', 'doi_url',
+				'publisher.example.test', 'catalog_test_fixture',
+				'publisher-integration-test/v1', $2),
+			($1, 'official-url/v1', 'conference_proceeding',
+				'official_proceeding', 'publisher.example.test',
+				'catalog_test_fixture', 'publisher-integration-test/v1', $2),
+			($1, 'official-url/v1', 'conference_proceeding', 'doi_url',
+				'publisher.example.test', 'catalog_test_fixture',
+				'publisher-integration-test/v1', $2)
+	`, registryVersionID, importedAt); err != nil {
+		t.Fatalf("insert publisher official URL Registry hosts: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE official_url_registry_versions
+		SET sealed_at = $2
+		WHERE id = $1
+	`, registryVersionID, importedAt); err != nil {
+		t.Fatalf("seal publisher official URL Registry receipt: %v", err)
+	}
+}
+
+func insertPublisherExpiredOfficialLinkVersion(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	fixture publisherWorkFixture,
+	checkedAt time.Time,
+	expiresAt time.Time,
+) {
+	t.Helper()
+
+	ctx := context.Background()
+	verificationID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_url_verifications (
+			id, candidate_id, source_url, final_url, redirect_chain, http_status,
+			expected_identifier_scheme, expected_identifier_value,
+			observed_identifiers, identifier_evidence, response_metadata,
+			matched_identifier_scheme, matched_identifier_value,
+			identifier_match, verification_state, checked_at, expires_at,
+			verifier_version, policy_version, failure_code
+		)
+		SELECT
+			$1, candidate_id, source_url, final_url, redirect_chain, http_status,
+			expected_identifier_scheme, expected_identifier_value,
+			observed_identifiers, identifier_evidence, response_metadata,
+			matched_identifier_scheme, matched_identifier_value,
+			identifier_match, verification_state, $2, $3,
+			verifier_version, policy_version, failure_code
+		FROM work_url_verifications
+		WHERE id = $4
+	`, verificationID, checkedAt, expiresAt, fixture.officialVerificationID); err != nil {
+		t.Fatalf("insert expired publisher official URL verification: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO current_work_official_links (
+			work_id, content_channel, link_role, verification_id, official_url,
+			projection_version, projected_at, expires_at
+		)
+		SELECT
+			work_id, content_channel, link_role, $1, official_url,
+			2, $2, $3
+		FROM current_work_official_links
+		WHERE verification_id = $4
+	`, verificationID, checkedAt, expiresAt, fixture.officialVerificationID); err != nil {
+		t.Fatalf("insert expired publisher current official URL link: %v", err)
+	}
+}
+
+func preparePublisherFactsReferences(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	input PublishInput,
+) {
+	t.Helper()
+
+	_, subjectRuleID := insertCatalogSubjectVersion(
+		t,
+		pool,
+		input.SubjectVersion,
+	)
+	insertCatalogJCRBundle(t, pool, input, subjectRuleID, nil)
+}
+
+func preparePublisherAcceptedCurationForPublishedCohort(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	input PublishInput,
+	acceptedFixtures []publisherWorkFixture,
+	publishedFixtures []publisherWorkFixture,
+) {
+	t.Helper()
+
+	_, subjectRuleID := insertCatalogSubjectVersion(
+		t,
+		pool,
+		input.SubjectVersion,
+	)
+	jcrFixtures := make(
+		[]catalogJCRVenueFixture,
+		0,
+		len(acceptedFixtures),
+	)
+	for index, fixture := range acceptedFixtures {
+		venueID := catalogWorkVenueID(t, pool, fixture.workID)
+		if _, err := pool.Exec(context.Background(), `
+			UPDATE venues
+			SET venue_type = 'journal',
+			    issn_l = $2
+			WHERE id = $1
+		`, venueID, deterministicCatalogISSN(2000+index)); err != nil {
+			t.Fatalf("prepare publisher URL gate Venue curation: %v", err)
+		}
+		jcrFixtures = append(jcrFixtures, catalogJCRVenueFixture{
+			venueID:     venueID,
+			index:       2000 + index,
+			withSubject: true,
+		})
+	}
+	insertCatalogJCRBundle(t, pool, input, subjectRuleID, jcrFixtures)
+	assessCatalogVenuePolicy(t, pool, input)
+	for _, fixture := range acceptedFixtures {
+		assessCatalogBiomedicalEligibility(
+			t,
+			pool,
+			fixture.workID,
+			input,
+		)
+	}
+	cohortRevision := catalogBiomedicalCohortRevisionForFixtures(
+		t,
+		pool,
+		input,
+		publishedFixtures,
+	)
+	if len(publishedFixtures) == 0 {
+		t.Fatal("publisher URL gate fixture requires a published cohort")
+	}
+	insertCatalogBiomedicalPublicationFixtures(
+		t,
+		pool,
+		input,
+		cohortRevision,
+		cohortRevision,
+		input.TrendAnalysisRunID,
+		publishedFixtures[0],
+	)
+	workIDs := make([]uuid.UUID, 0, len(publishedFixtures))
+	for _, fixture := range publishedFixtures {
+		workIDs = append(workIDs, fixture.workID)
+	}
+	insertCatalogCitationAnalysisRun(t, pool, input, workIDs...)
+	if input.Mode == PublishAnalysis {
+		insertCatalogSucceededAbstractRouteRun(
+			t,
+			pool,
+			input,
+			publishedFixtures[0],
+		)
+	}
 }
 
 type publisherPublicationEventFixture struct {
@@ -3173,7 +5921,7 @@ func insertPublisherBiomedicalProjection(
 				record_payload
 			) VALUES (
 				$1, $2, $3, $4, $5, $6,
-				'scope/v1', 'projection/v1', '{"fixture":"biomedical"}'
+				'scope/v1', $7, '{"fixture":"biomedical"}'
 			)
 			ON CONFLICT (
 				normalized_assertion_id,
@@ -3188,7 +5936,7 @@ func insertPublisherBiomedicalProjection(
 		FROM ingestion_projection_assertions
 		WHERE normalized_assertion_id = $3
 		  AND scope_policy_version = 'scope/v1'
-		  AND projection_policy_version = 'projection/v1'
+		  AND projection_policy_version = $7
 		LIMIT 1
 	`,
 		uuid.New(),
@@ -3197,6 +5945,7 @@ func insertPublisherBiomedicalProjection(
 		fixture.sourceRecord,
 		fixture.workID,
 		jobID,
+		catalogClassifierProjectionPolicyVersion,
 	).Scan(&projectionAssertionID); err != nil {
 		t.Fatalf("insert publisher biomedical projection assertion: %v", err)
 	}

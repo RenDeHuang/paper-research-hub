@@ -52,6 +52,7 @@ const (
 	commandImportSubjects                    commandKind = "import_subjects"
 	commandAssessVenues                      commandKind = "assess_venues"
 	commandAssessBiomedicalEligibility       commandKind = "assess_biomedical_eligibility"
+	commandVerifyURLs                        commandKind = "verify_urls"
 	commandAnalyzeCitations                  commandKind = "analyze_citations"
 	commandAnalyzeAbstractRoutes             commandKind = "analyze_abstract_routes"
 	commandAnalyzeTrends                     commandKind = "analyze_trends"
@@ -87,7 +88,10 @@ type workerCommand struct {
 	VenuePolicyVersion             int
 	EligibilityPolicyVersion       string
 	SubjectVersion                 string
+	PublishMode                    string
 	CitationSource                 string
+	ClassifierVersion              string
+	AbstractRouteRevision          string
 	CitationAnalysisRunID          string
 	TrendAnalysisRunID             string
 	JournalAnalysisRunID           string
@@ -195,8 +199,18 @@ func realMain(
 func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	if len(args) < 2 {
 		return workerCommand{}, "", errors.New(
-			"usage: paper-hub-worker <sync|import|assess|analyze|publish> <source> [flags]",
+			"usage: paper-hub-worker <sync|import|assess|verify|analyze|publish> <source> [flags]",
 		)
+	}
+	if args[0] == "verify" {
+		if args[1] != "urls" {
+			return workerCommand{}, "", fmt.Errorf(
+				"unsupported verify target %q; expected urls",
+				args[1],
+			)
+		}
+		command, err := parseURLVerificationCommand(args[2:])
+		return command, config.RoleMigrate, err
 	}
 	if args[0] == "analyze" {
 		switch args[1] {
@@ -264,7 +278,7 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 	}
 	if args[0] != "sync" {
 		return workerCommand{}, "", errors.New(
-			"usage: paper-hub-worker <sync|import|assess|analyze|publish> <source> [flags]",
+			"usage: paper-hub-worker <sync|import|assess|verify|analyze|publish> <source> [flags]",
 		)
 	}
 	switch args[1] {
@@ -295,6 +309,58 @@ func parseWorkerCommand(args []string) (workerCommand, config.Role, error) {
 			args[1],
 		)
 	}
+}
+
+func parseURLVerificationCommand(args []string) (workerCommand, error) {
+	set := flag.NewFlagSet("verify urls", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	var command workerCommand
+	set.StringVar(
+		&command.PolicyVersion,
+		"policy-version",
+		"",
+		"frozen official URL verification policy version",
+	)
+	set.IntVar(
+		&command.Limit,
+		"limit",
+		0,
+		"maximum current URL candidates to verify",
+	)
+	if err := set.Parse(args); err != nil {
+		return workerCommand{}, fmt.Errorf(
+			"parse official URL verification flags: %w",
+			err,
+		)
+	}
+	if set.NArg() != 0 {
+		return workerCommand{}, fmt.Errorf(
+			"unexpected official URL verification arguments: %s",
+			strings.Join(set.Args(), " "),
+		)
+	}
+	command.Kind = commandVerifyURLs
+	if command.PolicyVersion == "" {
+		return workerCommand{}, errors.New(
+			"official URL verification requires an explicit --policy-version",
+		)
+	}
+	if command.PolicyVersion != strings.TrimSpace(command.PolicyVersion) {
+		return workerCommand{}, errors.New(
+			"official URL verification policy-version must be trimmed",
+		)
+	}
+	if command.PolicyVersion != "official-url/v1" {
+		return workerCommand{}, errors.New(
+			"official URL verification --policy-version must equal official-url/v1",
+		)
+	}
+	if command.Limit < 1 || command.Limit > 1000 {
+		return workerCommand{}, errors.New(
+			"official URL verification limit must be between 1 and 1000",
+		)
+	}
+	return command, nil
 }
 
 func parseAbstractAnalysisCommand(args []string) (workerCommand, error) {
@@ -1218,7 +1284,7 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 	set := flag.NewFlagSet("publish catalog", flag.ContinueOnError)
 	set.SetOutput(io.Discard)
 	var command workerCommand
-	var generatedAt string
+	var generatedAt, analysisCutoff string
 	set.StringVar(
 		&command.FormulaVersion,
 		"formula-version",
@@ -1268,10 +1334,34 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 		"authorized JCR import receipt UUID",
 	)
 	set.StringVar(
+		&command.PublishMode,
+		"mode",
+		"",
+		"catalog publish mode: facts or analysis",
+	)
+	set.StringVar(
 		&command.CitationSource,
 		"citation-source",
 		"",
 		"exact citation evidence source to publish",
+	)
+	set.StringVar(
+		&analysisCutoff,
+		"analysis-cutoff",
+		"",
+		"exact RFC3339Nano analysis cutoff",
+	)
+	set.StringVar(
+		&command.ClassifierVersion,
+		"classifier-version",
+		"",
+		"exact structured classification version",
+	)
+	set.StringVar(
+		&command.AbstractRouteRevision,
+		"abstract-route-revision",
+		"",
+		"exact lowercase SHA-256 abstract-route revision",
 	)
 	set.StringVar(
 		&command.CitationAnalysisRunID,
@@ -1308,6 +1398,22 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 	}
 
 	command.Kind = commandPublishCatalog
+	if command.PublishMode == "" {
+		return workerCommand{}, errors.New(
+			"catalog publish requires an explicit --mode",
+		)
+	}
+	if command.PublishMode != strings.TrimSpace(command.PublishMode) {
+		return workerCommand{}, errors.New(
+			"catalog publish mode must be trimmed",
+		)
+	}
+	if command.PublishMode != string(catalog.PublishFacts) &&
+		command.PublishMode != string(catalog.PublishAnalysis) {
+		return workerCommand{}, errors.New(
+			"catalog publish --mode must equal facts or analysis",
+		)
+	}
 	if command.FormulaVersion == "" {
 		return workerCommand{}, errors.New(
 			"catalog publish requires an explicit --formula-version",
@@ -1335,106 +1441,166 @@ func parseCatalogPublishCommand(args []string) (workerCommand, error) {
 		return workerCommand{}, errors.New("catalog generated-at must be non-zero")
 	}
 	command.GeneratedAt = parsed
-	if command.MetricYear < 1900 || command.MetricYear > 3000 {
-		return workerCommand{}, errors.New(
-			"catalog publish requires --jcr-metric-year between 1900 and 3000",
+	if command.PublishMode == string(catalog.PublishFacts) {
+		if command.CitationAnalysisRunID != "" ||
+			command.TrendAnalysisRunID != "" ||
+			command.JournalAnalysisRunID != "" ||
+			command.OpportunityAnalysisRunID != "" {
+			return workerCommand{}, errors.New(
+				"catalog publish facts mode must not include analysis run IDs",
+			)
+		}
+		if analysisCutoff != "" ||
+			command.ClassifierVersion != "" ||
+			command.AbstractRouteRevision != "" {
+			return workerCommand{}, errors.New(
+				"catalog publish facts mode must not include analysis readiness bindings",
+			)
+		}
+	} else {
+		if command.MetricYear < 1900 || command.MetricYear > 3000 {
+			return workerCommand{}, errors.New(
+				"catalog publish requires --jcr-metric-year between 1900 and 3000",
+			)
+		}
+		if command.VenuePolicyName != venue.JournalAllQ1PolicyName {
+			return workerCommand{}, fmt.Errorf(
+				"catalog --venue-policy-name must equal %s",
+				venue.JournalAllQ1PolicyName,
+			)
+		}
+		if command.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
+			return workerCommand{}, fmt.Errorf(
+				"catalog --venue-policy-version must equal version %d",
+				venue.JournalAllQ1PolicyRevision,
+			)
+		}
+		if command.EligibilityPolicyVersion == "" {
+			return workerCommand{}, errors.New(
+				"catalog publish requires an explicit --eligibility-policy-version",
+			)
+		}
+		if command.EligibilityPolicyVersion !=
+			strings.TrimSpace(command.EligibilityPolicyVersion) {
+			return workerCommand{}, errors.New(
+				"catalog eligibility-policy-version must be trimmed",
+			)
+		}
+		if command.EligibilityPolicyVersion !=
+			biomed.BiomedicalPublicEligibilityPolicyVersion {
+			return workerCommand{}, fmt.Errorf(
+				"catalog --eligibility-policy-version must equal %s",
+				biomed.BiomedicalPublicEligibilityPolicyVersion,
+			)
+		}
+		if command.SubjectVersion == "" {
+			return workerCommand{}, errors.New(
+				"catalog publish requires an explicit --subject-version",
+			)
+		}
+		if command.SubjectVersion != strings.TrimSpace(command.SubjectVersion) {
+			return workerCommand{}, errors.New(
+				"catalog subject-version must be trimmed",
+			)
+		}
+		command.JCRReceipt = strings.TrimSpace(command.JCRReceipt)
+		if command.JCRReceipt == "" {
+			return workerCommand{}, errors.New(
+				"catalog publish requires an explicit --jcr-import-receipt",
+			)
+		}
+		parsedReceipt, err := uuid.Parse(command.JCRReceipt)
+		if err != nil {
+			return workerCommand{}, fmt.Errorf(
+				"catalog jcr-import-receipt must be a UUID: %w",
+				err,
+			)
+		}
+		command.JCRReceipt = parsedReceipt.String()
+		if command.CitationSource == "" {
+			return workerCommand{}, errors.New(
+				"catalog publish analysis mode requires an explicit --citation-source",
+			)
+		}
+		if command.CitationSource != strings.TrimSpace(command.CitationSource) {
+			return workerCommand{}, errors.New(
+				"catalog citation-source must be trimmed",
+			)
+		}
+		if analysisCutoff == "" {
+			return workerCommand{}, errors.New(
+				"catalog publish analysis mode requires an explicit --analysis-cutoff",
+			)
+		}
+		if analysisCutoff != strings.TrimSpace(analysisCutoff) {
+			return workerCommand{}, errors.New(
+				"catalog analysis-cutoff must be trimmed",
+			)
+		}
+		parsedAnalysisCutoff, err := time.Parse(
+			time.RFC3339Nano,
+			analysisCutoff,
 		)
-	}
-	if command.VenuePolicyName != venue.JournalAllQ1PolicyName {
-		return workerCommand{}, fmt.Errorf(
-			"catalog --venue-policy-name must equal %s",
-			venue.JournalAllQ1PolicyName,
+		if err != nil {
+			return workerCommand{}, fmt.Errorf(
+				"catalog analysis-cutoff must use RFC3339Nano: %w",
+				err,
+			)
+		}
+		if parsedAnalysisCutoff.IsZero() {
+			return workerCommand{}, errors.New(
+				"catalog analysis-cutoff must be non-zero",
+			)
+		}
+		if parsedAnalysisCutoff.After(command.GeneratedAt) {
+			return workerCommand{}, errors.New(
+				"catalog analysis-cutoff must not follow generated-at",
+			)
+		}
+		command.AnalysisCutoff = parsedAnalysisCutoff.UTC()
+		if command.ClassifierVersion != catalog.CatalogClassifierVersion {
+			return workerCommand{}, fmt.Errorf(
+				"catalog --classifier-version must equal %s",
+				catalog.CatalogClassifierVersion,
+			)
+		}
+		if !isLowerSHA256(command.AbstractRouteRevision) {
+			return workerCommand{}, errors.New(
+				"catalog abstract-route-revision must be a lowercase SHA-256 digest",
+			)
+		}
+		command.CitationAnalysisRunID, err = parseRequiredRunID(
+			command.CitationAnalysisRunID,
+			"catalog publish",
+			"citation-analysis-run-id",
 		)
-	}
-	if command.VenuePolicyVersion != venue.JournalAllQ1PolicyRevision {
-		return workerCommand{}, fmt.Errorf(
-			"catalog --venue-policy-version must equal version %d",
-			venue.JournalAllQ1PolicyRevision,
+		if err != nil {
+			return workerCommand{}, err
+		}
+		command.TrendAnalysisRunID, err = parseRequiredRunID(
+			command.TrendAnalysisRunID,
+			"catalog publish",
+			"trend-analysis-run-id",
 		)
-	}
-	if command.EligibilityPolicyVersion == "" {
-		return workerCommand{}, errors.New(
-			"catalog publish requires an explicit --eligibility-policy-version",
+		if err != nil {
+			return workerCommand{}, err
+		}
+		command.JournalAnalysisRunID, err = parseRequiredRunID(
+			command.JournalAnalysisRunID,
+			"catalog publish",
+			"journal-analysis-run-id",
 		)
-	}
-	if command.EligibilityPolicyVersion !=
-		strings.TrimSpace(command.EligibilityPolicyVersion) {
-		return workerCommand{}, errors.New(
-			"catalog eligibility-policy-version must be trimmed",
+		if err != nil {
+			return workerCommand{}, err
+		}
+		command.OpportunityAnalysisRunID, err = parseRequiredRunID(
+			command.OpportunityAnalysisRunID,
+			"catalog publish",
+			"opportunity-analysis-run-id",
 		)
-	}
-	if command.EligibilityPolicyVersion !=
-		biomed.BiomedicalPublicEligibilityPolicyVersion {
-		return workerCommand{}, fmt.Errorf(
-			"catalog --eligibility-policy-version must equal %s",
-			biomed.BiomedicalPublicEligibilityPolicyVersion,
-		)
-	}
-	if command.SubjectVersion == "" {
-		return workerCommand{}, errors.New(
-			"catalog publish requires an explicit --subject-version",
-		)
-	}
-	if command.SubjectVersion != strings.TrimSpace(command.SubjectVersion) {
-		return workerCommand{}, errors.New(
-			"catalog subject-version must be trimmed",
-		)
-	}
-	command.JCRReceipt = strings.TrimSpace(command.JCRReceipt)
-	if command.JCRReceipt == "" {
-		return workerCommand{}, errors.New(
-			"catalog publish requires an explicit --jcr-import-receipt",
-		)
-	}
-	parsedReceipt, err := uuid.Parse(command.JCRReceipt)
-	if err != nil {
-		return workerCommand{}, fmt.Errorf(
-			"catalog jcr-import-receipt must be a UUID: %w",
-			err,
-		)
-	}
-	command.JCRReceipt = parsedReceipt.String()
-	if command.CitationSource == "" {
-		return workerCommand{}, errors.New(
-			"catalog publish requires an explicit --citation-source",
-		)
-	}
-	if command.CitationSource != strings.TrimSpace(command.CitationSource) {
-		return workerCommand{}, errors.New(
-			"catalog citation-source must be trimmed",
-		)
-	}
-	command.CitationAnalysisRunID, err = parseRequiredRunID(
-		command.CitationAnalysisRunID,
-		"catalog publish",
-		"citation-analysis-run-id",
-	)
-	if err != nil {
-		return workerCommand{}, err
-	}
-	command.TrendAnalysisRunID, err = parseRequiredRunID(
-		command.TrendAnalysisRunID,
-		"catalog publish",
-		"trend-analysis-run-id",
-	)
-	if err != nil {
-		return workerCommand{}, err
-	}
-	command.JournalAnalysisRunID, err = parseRequiredRunID(
-		command.JournalAnalysisRunID,
-		"catalog publish",
-		"journal-analysis-run-id",
-	)
-	if err != nil {
-		return workerCommand{}, err
-	}
-	command.OpportunityAnalysisRunID, err = parseRequiredRunID(
-		command.OpportunityAnalysisRunID,
-		"catalog publish",
-		"opportunity-analysis-run-id",
-	)
-	if err != nil {
-		return workerCommand{}, err
+		if err != nil {
+			return workerCommand{}, err
+		}
 	}
 	return command, nil
 }
@@ -1740,6 +1906,8 @@ func runCommand(
 	}
 	defer pool.Close()
 	switch command.Kind {
+	case commandVerifyURLs:
+		return runURLVerification(ctx, pool, command)
 	case commandAnalyzeAbstractRoutes:
 		return runAbstractAnalysis(ctx, pool, cfg, command)
 	case commandAnalyzeCitations:
@@ -2192,28 +2360,31 @@ func runCatalogPublish(
 
 func catalogPublishInput(command workerCommand) catalog.PublishInput {
 	return catalog.PublishInput{
+		Mode:                     catalog.PublishMode(command.PublishMode),
 		FormulaVersion:           command.FormulaVersion,
 		GeneratedAt:              command.GeneratedAt,
+		AnalysisCutoff:           command.AnalysisCutoff,
+		ClassifierVersion:        command.ClassifierVersion,
+		AbstractRouteRevision:    command.AbstractRouteRevision,
 		JCRMetricYear:            command.MetricYear,
 		VenuePolicyName:          command.VenuePolicyName,
 		VenuePolicyVersion:       command.VenuePolicyVersion,
 		EligibilityPolicyVersion: command.EligibilityPolicyVersion,
 		SubjectVersion:           command.SubjectVersion,
-		JCRImportReceipt:         uuid.MustParse(command.JCRReceipt),
+		JCRImportReceipt:         parseOptionalWorkerUUID(command.JCRReceipt),
 		CitationSource:           command.CitationSource,
-		CitationAnalysisRunID: uuid.MustParse(
-			command.CitationAnalysisRunID,
-		),
-		TrendAnalysisRunID: uuid.MustParse(
-			command.TrendAnalysisRunID,
-		),
-		JournalAnalysisRunID: uuid.MustParse(
-			command.JournalAnalysisRunID,
-		),
-		OpportunityAnalysisRunID: uuid.MustParse(
-			command.OpportunityAnalysisRunID,
-		),
+		CitationAnalysisRunID:    parseOptionalWorkerUUID(command.CitationAnalysisRunID),
+		TrendAnalysisRunID:       parseOptionalWorkerUUID(command.TrendAnalysisRunID),
+		JournalAnalysisRunID:     parseOptionalWorkerUUID(command.JournalAnalysisRunID),
+		OpportunityAnalysisRunID: parseOptionalWorkerUUID(command.OpportunityAnalysisRunID),
 	}
+}
+
+func parseOptionalWorkerUUID(value string) uuid.UUID {
+	if value == "" {
+		return uuid.Nil
+	}
+	return uuid.MustParse(value)
 }
 
 func catalogPublishResult(
@@ -2221,6 +2392,10 @@ func catalogPublishResult(
 	command workerCommand,
 ) map[string]any {
 	result := catalogGenerationResult(generation)
+	result["mode"] = command.PublishMode
+	result["analysis_cutoff"] = optionalWorkerTime(command.AnalysisCutoff)
+	result["classifier_version"] = command.ClassifierVersion
+	result["abstract_route_revision"] = command.AbstractRouteRevision
 	result["jcr_metric_year"] = command.MetricYear
 	result["venue_policy_name"] = command.VenuePolicyName
 	result["venue_policy_version"] = command.VenuePolicyVersion
@@ -2234,6 +2409,22 @@ func catalogPublishResult(
 	result["journal_analysis_run_id"] = command.JournalAnalysisRunID
 	result["opportunity_analysis_run_id"] = command.OpportunityAnalysisRunID
 	return result
+}
+
+func optionalWorkerTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}
+
+func isLowerSHA256(value string) bool {
+	if len(value) != sha256.Size*2 ||
+		value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func catalogGenerationResult(generation catalog.Generation) map[string]any {
@@ -2493,6 +2684,19 @@ func executeCrossrefConnectorRun(
 	if err != nil {
 		return ingestion.JobSummary{}, err
 	}
+	observationTracker, err := newCrossrefObservationTracker(run.ID)
+	if err != nil {
+		return ingestion.JobSummary{}, errors.Join(
+			err,
+			failConnectorRun(
+				ctx,
+				store,
+				run,
+				"observation",
+				"observation_tracker_failed",
+			),
+		)
+	}
 
 	records := fetch(
 		ctx,
@@ -2512,7 +2716,14 @@ func executeCrossrefConnectorRun(
 			if receiptErr != nil {
 				return receiptErr
 			}
-			return store.RecordPage(pageContext, run, receipt)
+			if receiptErr := store.RecordPage(
+				pageContext,
+				run,
+				receipt,
+			); receiptErr != nil {
+				return receiptErr
+			}
+			return observationTracker.RecordPage(page)
 		},
 	)
 	fetchFailed := false
@@ -2529,10 +2740,10 @@ func executeCrossrefConnectorRun(
 	summary, err := runIngestion(
 		ctx,
 		job,
-		recordEventsForCommand(
+		observedCrossrefEventsForCommand(
 			command,
-			source.Crossref,
 			source.ClientSequence(trackedRecords),
+			observationTracker,
 		),
 	)
 	if err != nil {

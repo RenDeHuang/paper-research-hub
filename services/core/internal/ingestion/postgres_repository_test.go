@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +31,7 @@ var (
 	postgresRepositoryContainer     *postgres.PostgresContainer
 	postgresRepositoryDatabaseURL   string
 	postgresRepositoryContainerErr  error
+	postgresRepositoryDatabaseID    atomic.Uint64
 )
 
 func TestControlledIdentifiersRebuildsPMIDCanonicalIdentity(t *testing.T) {
@@ -6513,35 +6515,36 @@ func openIngestionTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(admin.Close)
 
-	schema := "ingestion_test_" + strings.ReplaceAll(
-		strings.ToLower(t.Name()),
-		"/",
-		"_",
+	databaseName := fmt.Sprintf(
+		"ingestion_test_%d",
+		postgresRepositoryDatabaseID.Add(1),
 	)
-	schema = strings.NewReplacer(" ", "_", "-", "_").Replace(schema)
-	if len(schema) > 55 {
-		schema = schema[:55]
+	quotedDatabaseName := pgx.Identifier{databaseName}.Sanitize()
+	if _, err := admin.Exec(
+		context.Background(),
+		"CREATE DATABASE "+quotedDatabaseName,
+	); err != nil {
+		t.Fatalf("create isolated ingestion test database: %v", err)
 	}
-	if _, err := admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`); err != nil {
-		t.Fatalf("drop test schema: %v", err)
-	}
-	if _, err := admin.Exec(context.Background(), `CREATE SCHEMA `+schema); err != nil {
-		t.Fatalf("create test schema: %v", err)
-	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(
+			context.Background(),
+			"DROP DATABASE "+quotedDatabaseName+" WITH (FORCE)",
+		); err != nil && !strings.Contains(err.Error(), "does not exist") {
+			t.Errorf("drop isolated ingestion test database: %v", err)
+		}
+	})
 
 	config, err := pgxpool.ParseConfig(postgresRepositoryDatabaseURL)
 	if err != nil {
 		t.Fatalf("parse PostgreSQL config: %v", err)
 	}
-	config.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	config.ConnConfig.Database = databaseName
 	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
-		t.Fatalf("open schema PostgreSQL pool: %v", err)
+		t.Fatalf("open isolated ingestion test database pool: %v", err)
 	}
-	t.Cleanup(func() {
-		pool.Close()
-		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	})
+	t.Cleanup(pool.Close)
 	if err := database.Up(context.Background(), pool); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}

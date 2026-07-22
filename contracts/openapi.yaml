@@ -1978,16 +1978,20 @@ components:
         citation_coverage_ratio:
           $ref: "#/components/schemas/RatioCatalogValue"
         jcr_metric_year:
-          type: integer
-          minimum: 1900
-          maximum: 3000
+          oneOf:
+            - type: integer
+              minimum: 1900
+              maximum: 3000
+            - $ref: "#/components/schemas/MissingCatalogValue"
         mesh_coverage_ratio:
           $ref: "#/components/schemas/RatioCatalogValue"
         publication_type_coverage_ratio:
           $ref: "#/components/schemas/RatioCatalogValue"
         taxonomy_version:
-          type: string
-          minLength: 1
+          oneOf:
+            - type: string
+              minLength: 1
+            - $ref: "#/components/schemas/MissingCatalogValue"
     HomeResponse:
       type: object
       additionalProperties: false
@@ -2042,12 +2046,16 @@ components:
             - taxonomy_version
           properties:
             jcr_metric_year:
-              type: integer
-              minimum: 1900
-              maximum: 3000
+              oneOf:
+                - type: integer
+                  minimum: 1900
+                  maximum: 3000
+                - $ref: "#/components/schemas/MissingCatalogValue"
             taxonomy_version:
-              type: string
-              minLength: 1
+              oneOf:
+                - type: string
+                  minLength: 1
+                - $ref: "#/components/schemas/MissingCatalogValue"
         subject_momentum:
           $ref: "#/components/schemas/SubjectTrendCollection"
     SubjectSummary:
@@ -2534,6 +2542,52 @@ components:
             $ref: "#/components/schemas/ResearchOpportunity"
         pagination:
           $ref: "#/components/schemas/Pagination"
+    OfficialLink:
+      type: object
+      additionalProperties: false
+      required:
+        - url
+        - verification_id
+        - link_role
+        - content_channel
+        - verified_at
+        - expires_at
+        - verifier_version
+        - policy_version
+      properties:
+        url:
+          type: string
+          format: uri
+          pattern: "^https://"
+        verification_id:
+          type: string
+          format: uuid
+        link_role:
+          type: string
+          enum:
+            - official_article
+            - doi_url
+            - official_preprint
+            - official_proceeding
+        content_channel:
+          type: string
+          enum:
+            - journal_published
+            - accepted_early
+            - preprint
+            - conference_proceeding
+        verified_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        verifier_version:
+          type: string
+          minLength: 1
+        policy_version:
+          type: string
+          minLength: 1
     PaperSummary:
       type: object
       additionalProperties: false
@@ -2555,6 +2609,11 @@ components:
         - jcr_assessment
         - article_usage
         - open_fulltext
+        - official_link
+        - publicly_visible
+        - analysis_ready
+        - topics_state
+        - methods_state
       properties:
         id:
           type: string
@@ -2599,10 +2658,22 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TaxonomyReference"
+        topics_state:
+          type: string
+          enum:
+            - known
+            - missing
+            - not_ready
         methods:
           type: array
           items:
             $ref: "#/components/schemas/TaxonomyReference"
+        methods_state:
+          type: string
+          enum:
+            - known
+            - missing
+            - not_ready
         authors:
           type: array
           items:
@@ -2632,6 +2703,12 @@ components:
           $ref: "#/components/schemas/CurationCatalogValue"
         source_provenance:
           $ref: "#/components/schemas/SourceProvenanceCatalogValue"
+        official_link:
+          $ref: "#/components/schemas/OfficialLink"
+        publicly_visible:
+          type: boolean
+        analysis_ready:
+          type: boolean
     PaperDetail:
       type: object
       additionalProperties: false
@@ -2653,6 +2730,11 @@ components:
         - jcr_assessment
         - article_usage
         - open_fulltext
+        - official_link
+        - publicly_visible
+        - analysis_ready
+        - topics_state
+        - methods_state
       properties:
         id:
           type: string
@@ -2697,10 +2779,22 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TaxonomyReference"
+        topics_state:
+          type: string
+          enum:
+            - known
+            - missing
+            - not_ready
         methods:
           type: array
           items:
             $ref: "#/components/schemas/TaxonomyReference"
+        methods_state:
+          type: string
+          enum:
+            - known
+            - missing
+            - not_ready
         authors:
           type: array
           items:
@@ -2730,6 +2824,12 @@ components:
           $ref: "#/components/schemas/CurationCatalogValue"
         source_provenance:
           $ref: "#/components/schemas/SourceProvenanceCatalogValue"
+        official_link:
+          $ref: "#/components/schemas/OfficialLink"
+        publicly_visible:
+          type: boolean
+        analysis_ready:
+          type: boolean
     JournalReference:
       type: object
       additionalProperties: false

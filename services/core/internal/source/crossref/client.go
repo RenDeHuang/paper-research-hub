@@ -66,6 +66,7 @@ type Client struct {
 	contactEmail string
 	batchSize    int
 	httpClient   *httpclient.Client
+	now          func() time.Time
 }
 
 type PageReceipt struct {
@@ -74,6 +75,7 @@ type PageReceipt struct {
 	CursorOut     string
 	ContentSHA256 string
 	RecordCount   int
+	ObservedAt    time.Time
 }
 
 type PageReceiptRecorder func(context.Context, PageReceipt) error
@@ -110,12 +112,17 @@ func NewClient(
 	if err != nil {
 		return nil, fmt.Errorf("create Crossref HTTP policy: %w", err)
 	}
+	now := dependencies.Now
+	if now == nil {
+		now = time.Now
+	}
 
 	return &Client{
 		baseURL:      baseURL,
 		contactEmail: contactEmail,
 		batchSize:    config.BatchSize,
 		httpClient:   policy,
+		now:          now,
 	}, nil
 }
 
@@ -287,6 +294,7 @@ func (client *Client) FetchWithPageReceipts(
 				yield(source.Record{}, fmt.Errorf("fetch Crossref works page: %w", err))
 				return
 			}
+			observedAt := client.now().UTC().Truncate(time.Microsecond)
 			payload, readErr := io.ReadAll(response.Body)
 			closeErr := response.Body.Close()
 			if readErr != nil {
@@ -357,6 +365,7 @@ func (client *Client) FetchWithPageReceipts(
 				CursorOut:     cursorOut,
 				ContentSHA256: fmt.Sprintf("%x", contentHash),
 				RecordCount:   len(records),
+				ObservedAt:    observedAt,
 			}); err != nil {
 				yield(
 					source.Record{},

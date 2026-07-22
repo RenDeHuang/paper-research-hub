@@ -208,6 +208,25 @@ type RejectedIdentifierAssertion struct {
 	Reason     string
 }
 
+type URLLinkRole string
+
+const (
+	URLLinkRoleOfficialArticle    URLLinkRole = "official_article"
+	URLLinkRoleDOIURL             URLLinkRole = "doi_url"
+	URLLinkRoleOfficialPreprint   URLLinkRole = "official_preprint"
+	URLLinkRoleOfficialProceeding URLLinkRole = "official_proceeding"
+	URLLinkRoleAuxiliary          URLLinkRole = "auxiliary"
+)
+
+type URLCandidate struct {
+	URL            string
+	SourcePath     string
+	ContentChannel string
+	LinkRole       URLLinkRole
+	ParserVersion  string
+	Identifier     Identifier
+}
+
 type Record struct {
 	Source                    string
 	SourceRecordID            string
@@ -246,6 +265,7 @@ type Record struct {
 	Venue                     *Venue
 	OpenAccess                OpenAccess
 	Licenses                  []License
+	URLCandidates             []URLCandidate
 	Retracted                 *bool
 	CodeURLs                  []string
 	Scope                     ScopeDecision

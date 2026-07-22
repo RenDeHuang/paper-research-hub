@@ -418,9 +418,9 @@ func validateBiomedicalAnalysisRunScope(
 		)
 	}
 	asOf, err := time.Parse(time.RFC3339Nano, payload.AsOf)
-	if err != nil || asOf.After(input.GeneratedAt) {
+	if err != nil || asOf.After(input.AnalysisCutoff) {
 		return persistedBiomedicalAnalysisRun{}, fmt.Errorf(
-			"%w: biomedical analysis run %s has invalid as_of",
+			"%w: biomedical analysis run %s has invalid as_of for the analysis cutoff",
 			ErrCatalogNotReady,
 			raw.ID,
 		)

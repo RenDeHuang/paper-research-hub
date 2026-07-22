@@ -24,6 +24,8 @@ func TestParseCatalogPublishRequiresExplicitBiomedicalCurationInputs(t *testing.
 		"public-catalog/biomedical-v1",
 		"--generated-at",
 		"2026-07-17T12:00:00Z",
+		"--mode",
+		"analysis",
 		"--jcr-metric-year",
 		"2025",
 		"--venue-policy-name",
@@ -38,6 +40,12 @@ func TestParseCatalogPublishRequiresExplicitBiomedicalCurationInputs(t *testing.
 		"00000000-0000-0000-0000-000000000501",
 		"--citation-source",
 		"openalex",
+		"--analysis-cutoff",
+		"2026-07-17T11:00:00Z",
+		"--classifier-version",
+		catalog.CatalogClassifierVersion,
+		"--abstract-route-revision",
+		catalog.CatalogAbstractRouteRevision,
 		"--citation-analysis-run-id",
 		"00000000-0000-0000-0000-000000000701",
 		"--trend-analysis-run-id",
@@ -94,6 +102,176 @@ func TestParseCatalogPublishRequiresExplicitBiomedicalCurationInputs(t *testing.
 				t.Fatalf("parseWorkerCommand() error = %v, want containing %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestParseCatalogPublishRequiresExplicitMode(t *testing.T) {
+	t.Parallel()
+
+	args := removeWorkerFlag(catalogPublishCommandArgs(), "--mode")
+	_, _, err := parseWorkerCommand(args)
+	if err == nil || !strings.Contains(err.Error(), "--mode") {
+		t.Fatalf(
+			"parseWorkerCommand(without mode) error = %v, want --mode",
+			err,
+		)
+	}
+}
+
+func TestParseCatalogPublishFactsRejectsAnalysisRunIDs(t *testing.T) {
+	t.Parallel()
+
+	args := append(catalogPublishCommandArgs(), "--mode", "facts")
+	_, _, err := parseWorkerCommand(args)
+	if err == nil ||
+		!strings.Contains(err.Error(), "facts mode must not include analysis run IDs") {
+		t.Fatalf(
+			"parseWorkerCommand(facts with analysis runs) error = %v",
+			err,
+		)
+	}
+}
+
+func TestParseCatalogPublishFactsMapsWithoutAnalysisInputs(t *testing.T) {
+	t.Parallel()
+
+	args := catalogPublishCommandArgs()
+	for _, name := range []string{
+		"--citation-source",
+		"--analysis-cutoff",
+		"--classifier-version",
+		"--abstract-route-revision",
+		"--citation-analysis-run-id",
+		"--trend-analysis-run-id",
+		"--journal-analysis-run-id",
+		"--opportunity-analysis-run-id",
+	} {
+		args = removeWorkerFlag(args, name)
+	}
+	args = append(args, "--mode", "facts")
+	command, _, err := parseWorkerCommand(args)
+	if err != nil {
+		t.Fatalf("parseWorkerCommand(facts) error = %v", err)
+	}
+	input := catalogPublishInput(command)
+	if input.Mode != catalog.PublishFacts ||
+		input.CitationSource != "" ||
+		input.CitationAnalysisRunID != uuid.Nil ||
+		input.TrendAnalysisRunID != uuid.Nil ||
+		input.JournalAnalysisRunID != uuid.Nil ||
+		input.OpportunityAnalysisRunID != uuid.Nil {
+		t.Fatalf("facts PublishInput = %#v", input)
+	}
+}
+
+func TestParseCatalogPublishFactsDoesNotRequireCurationInputs(t *testing.T) {
+	t.Parallel()
+
+	args := catalogPublishCommandArgs()
+	for _, name := range []string{
+		"--jcr-metric-year",
+		"--venue-policy-name",
+		"--venue-policy-version",
+		"--eligibility-policy-version",
+		"--subject-version",
+		"--jcr-import-receipt",
+		"--citation-source",
+		"--analysis-cutoff",
+		"--classifier-version",
+		"--abstract-route-revision",
+		"--citation-analysis-run-id",
+		"--trend-analysis-run-id",
+		"--journal-analysis-run-id",
+		"--opportunity-analysis-run-id",
+	} {
+		args = removeWorkerFlag(args, name)
+	}
+	args = append(args, "--mode", "facts")
+
+	command, _, err := parseWorkerCommand(args)
+	if err != nil {
+		t.Fatalf(
+			"parseWorkerCommand(facts without curation inputs) error = %v",
+			err,
+		)
+	}
+	input := catalogPublishInput(command)
+	if input.Mode != catalog.PublishFacts ||
+		input.JCRMetricYear != 0 ||
+		input.VenuePolicyName != "" ||
+		input.VenuePolicyVersion != 0 ||
+		input.EligibilityPolicyVersion != "" ||
+		input.SubjectVersion != "" ||
+		input.JCRImportReceipt != uuid.Nil {
+		t.Fatalf(
+			"facts PublishInput unexpectedly requires curation = %#v",
+			input,
+		)
+	}
+}
+
+func TestParseCatalogPublishAnalysisRequiresReadinessBindings(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		flag string
+		want string
+	}{
+		{flag: "--analysis-cutoff", want: "--analysis-cutoff"},
+		{flag: "--classifier-version", want: "--classifier-version"},
+		{flag: "--abstract-route-revision", want: "abstract-route-revision"},
+	} {
+		test := test
+		t.Run(test.flag, func(t *testing.T) {
+			t.Parallel()
+
+			args := removeWorkerFlag(catalogPublishCommandArgs(), test.flag)
+			_, _, err := parseWorkerCommand(args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf(
+					"parseWorkerCommand(analysis without %s) error = %v, want %s",
+					test.flag,
+					err,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func TestParseCatalogPublishAnalysisSelectsAbstractRoutesPerWork(t *testing.T) {
+	t.Parallel()
+
+	command, _, err := parseWorkerCommand(catalogPublishCommandArgs())
+	if err != nil {
+		t.Fatalf(
+			"parseWorkerCommand(analysis without batch abstract route run) error = %v",
+			err,
+		)
+	}
+	if command.AbstractRouteRevision != catalog.CatalogAbstractRouteRevision {
+		t.Fatalf(
+			"AbstractRouteRevision = %q, want %q",
+			command.AbstractRouteRevision,
+			catalog.CatalogAbstractRouteRevision,
+		)
+	}
+}
+
+func TestParseCatalogPublishRejectsBatchAbstractRouteRunID(t *testing.T) {
+	t.Parallel()
+
+	args := append(
+		catalogPublishCommandArgs(),
+		"--abstract-route-run-id",
+		"00000000-0000-0000-0000-000000000705",
+	)
+	_, _, err := parseWorkerCommand(args)
+	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf(
+			"parseWorkerCommand(batch abstract route run) error = %v, want undefined flag",
+			err,
+		)
 	}
 }
 
@@ -195,6 +373,8 @@ func TestRealMainParsesCatalogBiomedicalCurationInputs(t *testing.T) {
 			"public-catalog/biomedical-v1",
 			"--generated-at",
 			"2026-07-17T12:00:00Z",
+			"--mode",
+			"analysis",
 			"--jcr-metric-year",
 			"2025",
 			"--venue-policy-name",
@@ -209,6 +389,12 @@ func TestRealMainParsesCatalogBiomedicalCurationInputs(t *testing.T) {
 			"00000000-0000-0000-0000-000000000501",
 			"--citation-source",
 			"openalex",
+			"--analysis-cutoff",
+			"2026-07-17T11:00:00Z",
+			"--classifier-version",
+			catalog.CatalogClassifierVersion,
+			"--abstract-route-revision",
+			catalog.CatalogAbstractRouteRevision,
 			"--citation-analysis-run-id",
 			"00000000-0000-0000-0000-000000000701",
 			"--trend-analysis-run-id",
@@ -234,7 +420,20 @@ func TestRealMainParsesCatalogBiomedicalCurationInputs(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("realMain() code = %d, stderr = %s", code, stderr.String())
 	}
-	if received.MetricYear != 2025 ||
+	if received.PublishMode != string(catalog.PublishAnalysis) ||
+		!received.AnalysisCutoff.Equal(time.Date(
+			2026,
+			time.July,
+			17,
+			11,
+			0,
+			0,
+			0,
+			time.UTC,
+		)) ||
+		received.ClassifierVersion != catalog.CatalogClassifierVersion ||
+		received.AbstractRouteRevision != catalog.CatalogAbstractRouteRevision ||
+		received.MetricYear != 2025 ||
 		received.VenuePolicyName != "journal-all-q1" ||
 		received.VenuePolicyVersion != 2 ||
 		received.EligibilityPolicyVersion !=
@@ -262,6 +461,23 @@ func TestCatalogPublishMapsAndReportsEligibilityPolicyVersion(t *testing.T) {
 		t.Fatalf("parseWorkerCommand() error = %v", err)
 	}
 	input := catalogPublishInput(command)
+	if input.Mode != catalog.PublishAnalysis {
+		t.Fatalf("PublishInput.Mode = %q, want analysis", input.Mode)
+	}
+	if !input.AnalysisCutoff.Equal(time.Date(
+		2026,
+		time.July,
+		17,
+		11,
+		0,
+		0,
+		0,
+		time.UTC,
+	)) ||
+		input.ClassifierVersion != catalog.CatalogClassifierVersion ||
+		input.AbstractRouteRevision != catalog.CatalogAbstractRouteRevision {
+		t.Fatalf("PublishInput analysis readiness bindings = %#v", input)
+	}
 	if input.EligibilityPolicyVersion !=
 		biomed.BiomedicalPublicEligibilityPolicyVersion {
 		t.Fatalf(
@@ -294,6 +510,16 @@ func TestCatalogPublishMapsAndReportsEligibilityPolicyVersion(t *testing.T) {
 		ID: uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
 	}
 	result := catalogPublishResult(generation, command)
+	if result["mode"] != string(catalog.PublishAnalysis) ||
+		result["analysis_cutoff"] != "2026-07-17T11:00:00Z" ||
+		result["classifier_version"] != catalog.CatalogClassifierVersion ||
+		result["abstract_route_revision"] !=
+			catalog.CatalogAbstractRouteRevision {
+		t.Fatalf(
+			"catalog publish result analysis readiness bindings = %#v",
+			result,
+		)
+	}
 	if result["eligibility_policy_version"] !=
 		biomed.BiomedicalPublicEligibilityPolicyVersion {
 		t.Fatalf(
@@ -341,6 +567,8 @@ func catalogPublishCommandArgs() []string {
 			0,
 			time.UTC,
 		).Format(time.RFC3339Nano),
+		"--mode",
+		"analysis",
 		"--jcr-metric-year",
 		"2025",
 		"--venue-policy-name",
@@ -355,6 +583,12 @@ func catalogPublishCommandArgs() []string {
 		"00000000-0000-0000-0000-000000000501",
 		"--citation-source",
 		"openalex",
+		"--analysis-cutoff",
+		"2026-07-17T11:00:00Z",
+		"--classifier-version",
+		catalog.CatalogClassifierVersion,
+		"--abstract-route-revision",
+		catalog.CatalogAbstractRouteRevision,
 		"--citation-analysis-run-id",
 		"00000000-0000-0000-0000-000000000701",
 		"--trend-analysis-run-id",

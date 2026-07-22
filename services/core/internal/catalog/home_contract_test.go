@@ -3,6 +3,7 @@ package catalog
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 const (
@@ -16,6 +17,240 @@ func TestHomeSnapshotStrictContractAcceptsCompleteOpenAPIPayload(t *testing.T) {
 	payload := strictHomeContractPayload(t, strictHomeContractFixture())
 	if err := validateHomeSnapshotPayload(payload); err != nil {
 		t.Fatalf("validateHomeSnapshotPayload() rejected valid OpenAPI payload: %v", err)
+	}
+}
+
+func TestHomeOfficialLinkStrictContractAcceptsVerifiedPreprintDOIURL(
+	t *testing.T,
+) {
+	payload := strictHomeContractPayload(t, map[string]any{
+		"url":              "https://doi.org/10.1000/preprint",
+		"verification_id":  strictContractUUIDA,
+		"link_role":        "doi_url",
+		"content_channel":  "preprint",
+		"verified_at":      "2026-07-18T07:30:00Z",
+		"expires_at":       "2026-08-18T07:30:00Z",
+		"verifier_version": "official-url-verifier/v1",
+		"policy_version":   "official-url-policy/v1",
+	})
+	channel, err := validateHomeOfficialLinkAndChannelAt(
+		"PaperSummary.official_link",
+		payload,
+		time.Time{},
+	)
+	if err != nil {
+		t.Fatalf(
+			"validateHomeOfficialLinkAndChannelAt(preprint doi_url) error = %v",
+			err,
+		)
+	}
+	if channel != "preprint" {
+		t.Fatalf("content channel = %q, want preprint", channel)
+	}
+}
+
+func TestHomeSnapshotStrictContractRequiresExactOfficialLinkVisibilityFields(
+	t *testing.T,
+) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{
+			name: "missing official link",
+			mutate: func(home map[string]any) {
+				delete(
+					strictContractObject(home, "latest_papers", "items", 0),
+					"official_link",
+				)
+			},
+		},
+		{
+			name: "missing public visibility",
+			mutate: func(home map[string]any) {
+				delete(
+					strictContractObject(home, "latest_papers", "items", 0),
+					"publicly_visible",
+				)
+			},
+		},
+		{
+			name: "missing analysis readiness",
+			mutate: func(home map[string]any) {
+				delete(
+					strictContractObject(home, "latest_papers", "items", 0),
+					"analysis_ready",
+				)
+			},
+		},
+		{
+			name: "missing topics readiness",
+			mutate: func(home map[string]any) {
+				delete(
+					strictContractObject(home, "latest_papers", "items", 0),
+					"topics_state",
+				)
+			},
+		},
+		{
+			name: "missing methods readiness",
+			mutate: func(home map[string]any) {
+				delete(
+					strictContractObject(home, "latest_papers", "items", 0),
+					"methods_state",
+				)
+			},
+		},
+		{
+			name: "official link unknown field",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+					"official_link",
+				)["extra"] = true
+			},
+		},
+		{
+			name: "official link is not HTTPS",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+					"official_link",
+				)["url"] = "http://publisher.example.test/article"
+			},
+		},
+		{
+			name: "official link has nil verification id",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+					"official_link",
+				)["verification_id"] =
+					"00000000-0000-0000-0000-000000000000"
+			},
+		},
+		{
+			name: "official link role conflicts with channel",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+					"official_link",
+				)["link_role"] = "official_preprint"
+			},
+		},
+		{
+			name: "official link expires before verification",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+					"official_link",
+				)["expires_at"] = "2026-07-18T07:59:59Z"
+			},
+		},
+		{
+			name: "public visibility is false",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+				)["publicly_visible"] = false
+			},
+		},
+		{
+			name: "analysis readiness is not boolean",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+				)["analysis_ready"] = "true"
+			},
+		},
+		{
+			name: "invalid topics readiness",
+			mutate: func(home map[string]any) {
+				strictContractObject(
+					home,
+					"latest_papers",
+					"items",
+					0,
+				)["topics_state"] = "unknown"
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := strictHomeContractClone(t)
+			test.mutate(candidate)
+			if err := validateHomeSnapshotPayload(
+				strictHomeContractPayload(t, candidate),
+			); err == nil {
+				t.Fatalf("validateHomeSnapshotPayload() accepted %s", test.name)
+			}
+		})
+	}
+}
+
+func TestHomeSnapshotStrictContractBindsOfficialLinkToGeneratedAt(
+	t *testing.T,
+) {
+	tests := []struct {
+		name       string
+		verifiedAt string
+		expiresAt  string
+	}{
+		{
+			name:       "verified after generated at",
+			verifiedAt: "2026-07-18T08:30:00.124Z",
+			expiresAt:  "2026-08-18T08:30:00Z",
+		},
+		{
+			name:       "expires at generated at",
+			verifiedAt: "2026-07-18T07:30:00Z",
+			expiresAt:  "2026-07-18T08:30:00.123Z",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			candidate := strictHomeContractClone(t)
+			link := strictContractObject(
+				candidate,
+				"latest_papers",
+				"items",
+				0,
+				"official_link",
+			)
+			link["verified_at"] = test.verifiedAt
+			link["expires_at"] = test.expiresAt
+			if err := validateHomeSnapshotPayload(
+				strictHomeContractPayload(t, candidate),
+			); err == nil {
+				t.Fatalf(
+					"validateHomeSnapshotPayload() accepted %s",
+					test.name,
+				)
+			}
+		})
 	}
 }
 
@@ -1337,6 +1572,7 @@ func strictHomeContractPaper() map[string]any {
 				"name": "Spatial transcriptomics",
 			},
 		},
+		"topics_state": "known",
 		"methods": []any{
 			map[string]any{
 				"id":   strictContractUUIDB,
@@ -1344,6 +1580,7 @@ func strictHomeContractPaper() map[string]any {
 				"name": "Single-cell sequencing",
 			},
 		},
+		"methods_state": "known",
 		"authors": []any{
 			map[string]any{
 				"id":               strictContractUUIDA,
@@ -1422,6 +1659,18 @@ func strictHomeContractPaper() map[string]any {
 		}),
 		"article_usage": strictMissing(),
 		"open_fulltext": strictMissing(),
+		"official_link": map[string]any{
+			"url":              "https://publisher.example.test/article?view=full",
+			"verification_id":  strictContractUUIDD,
+			"link_role":        "official_article",
+			"content_channel":  "journal_published",
+			"verified_at":      "2026-07-18T08:00:00Z",
+			"expires_at":       "2026-08-18T08:00:00Z",
+			"verifier_version": "official-url-verifier/v1",
+			"policy_version":   "official-url/v1",
+		},
+		"publicly_visible": true,
+		"analysis_ready":   false,
 		"subjects": []any{
 			map[string]any{
 				"id":   strictContractUUIDC,
